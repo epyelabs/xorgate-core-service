@@ -1,0 +1,7 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.cdk.json" },
+    { "path": "./tsconfig.lambda.json" }
+  ]
+}

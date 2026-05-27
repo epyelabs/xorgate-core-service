@@ -1,0 +1,43 @@
+{
+  "name": "xorgate-core-service",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.cdk.json",
+    "watch": "tsc -p tsconfig.cdk.json --watch",
+    "cdk": "cdk",
+    "synth": "cdk synth --context stage=dev",
+    "synth:dev": "cdk synth --context stage=dev",
+    "synth:prod": "cdk synth --context stage=prod",
+    "deploy": "cdk deploy --context stage=dev --all --require-approval never",
+    "deploy:dev": "cdk deploy --context stage=dev --all --require-approval never",
+    "deploy:prod": "cdk deploy --context stage=prod --all --require-approval never",
+    "diff": "cdk diff --context stage=dev --all",
+    "diff:dev": "cdk diff --context stage=dev --all",
+    "diff:prod": "cdk diff --context stage=prod --all",
+    "destroy:dev": "cdk destroy --context stage=dev --all",
+    "destroy:prod": "cdk destroy --context stage=prod --all",
+    "typecheck": "tsc -p tsconfig.cdk.json --noEmit && tsc -p tsconfig.lambda.json --noEmit",
+    "db:generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@aws-sdk/client-rds-data": "^3.800.0",
+    "@aws-sdk/client-s3": "^3.800.0",
+    "@aws-sdk/client-secrets-manager": "^3.800.0",
+    "@aws-sdk/s3-request-presigner": "^3.800.0",
+    "aws-jwt-verify": "^5.1.1",
+    "drizzle-orm": "^0.43.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.149",
+    "@types/node": "^24.0.0",
+    "aws-cdk": "2.1114.1",
+    "aws-cdk-lib": "2.245.0",
+    "constructs": "^10.4.2",
+    "drizzle-kit": "^0.31.10",
+    "esbuild": "^0.25.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.9.3"
+  }
+}
