@@ -58,6 +58,18 @@ export const handler = async (
         return ok({ device: row });
       }
       if (orgProjectIds.length === 0) return ok({ devices: [] });
+      const headerProjectId =
+        event.headers['x-project-id'] ?? event.headers['X-Project-Id'];
+      if (headerProjectId) {
+        if (!orgProjectIds.includes(headerProjectId)) {
+          return ok({ devices: [] });
+        }
+        const rows = await db.query.devices.findMany({
+          where: eq(schema.devices.projectId, headerProjectId),
+          orderBy: [desc(schema.devices.updatedAt)],
+        });
+        return ok({ devices: rows });
+      }
       const rows = await db.query.devices.findMany({
         where: inArray(schema.devices.projectId, orgProjectIds),
         orderBy: [desc(schema.devices.updatedAt)],

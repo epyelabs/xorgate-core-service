@@ -25,6 +25,14 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         description:
           'Active organization UUID. Required when the caller belongs to more than one organization.',
       },
+      ProjectIdHeader: {
+        name: 'X-Project-Id',
+        in: 'header',
+        required: false,
+        schema: { type: 'string', format: 'uuid' },
+        description:
+          'Optional project UUID. When present on GET /devices, the response is filtered to devices in this project. Must belong to the active organization.',
+      },
       IdPath: {
         name: 'id',
         in: 'path',
@@ -802,7 +810,10 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       get: {
         operationId: 'listDevices',
         summary: 'List devices in the active organization',
-        description: 'Returns every device whose project belongs to the active organization.',
+        description:
+          'Returns every device whose project belongs to the active organization. ' +
+          'Pass X-Project-Id to filter the results to a single project.',
+        parameters: [{ $ref: '#/components/parameters/ProjectIdHeader' }],
         tags: ['Devices'],
         responses: {
           '200': {
