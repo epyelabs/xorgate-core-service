@@ -275,6 +275,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
           "Content-Type",
           "X-Request-ID",
           "X-Organization-Id",
+          "X-Project-Id",
         ],
         maxAge: cdk.Duration.hours(24),
       },
