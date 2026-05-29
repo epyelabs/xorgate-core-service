@@ -83,7 +83,6 @@ export const handler = async (
         serial?: string;
         name?: string;
         firmwareVersion?: string;
-        simIccid?: string;
         status?: string;
       };
       try {
@@ -111,7 +110,6 @@ export const handler = async (
           serial: body.serial,
           name: body.name ?? null,
           firmwareVersion: body.firmwareVersion ?? null,
-          simIccid: body.simIccid ?? null,
           status,
         })
         .returning();
@@ -122,12 +120,8 @@ export const handler = async (
       let body: {
         name?: string;
         firmwareVersion?: string;
-        simIccid?: string;
         status?: string;
         lastSeenAt?: string;
-        lastLatitude?: number | string;
-        lastLongitude?: number | string;
-        lastAccuracyM?: number;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -143,12 +137,8 @@ export const handler = async (
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
-      if (body.simIccid !== undefined) updates.simIccid = body.simIccid;
       if (body.status !== undefined) updates.status = body.status;
       if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
-      if (body.lastLatitude !== undefined) updates.lastLatitude = String(body.lastLatitude);
-      if (body.lastLongitude !== undefined) updates.lastLongitude = String(body.lastLongitude);
-      if (body.lastAccuracyM !== undefined) updates.lastAccuracyM = body.lastAccuracyM;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 

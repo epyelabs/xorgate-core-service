@@ -123,7 +123,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           id: { type: 'string', format: 'uuid' },
           name: { type: 'string' },
           sku: { type: 'string' },
-          sensorCapabilities: {
+          ioCapabilities: {
             type: 'object',
             additionalProperties: true,
             description: 'Free-form jsonb. Suggested keys: camera, gps, accel, env.',
@@ -144,15 +144,11 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           serial: { type: 'string' },
           name: { type: 'string', nullable: true },
           firmwareVersion: { type: 'string', nullable: true },
-          simIccid: { type: 'string', nullable: true },
           status: {
             type: 'string',
             enum: ['provisioned', 'online', 'offline', 'decommissioned'],
           },
           lastSeenAt: { type: 'string', format: 'date-time', nullable: true },
-          lastLatitude: { type: 'string', nullable: true, description: 'numeric(9,6) decimal degrees' },
-          lastLongitude: { type: 'string', nullable: true, description: 'numeric(9,6) decimal degrees' },
-          lastAccuracyM: { type: 'integer', nullable: true },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
@@ -705,7 +701,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 properties: {
                   name: { type: 'string' },
                   sku: { type: 'string' },
-                  sensorCapabilities: { type: 'object', additionalProperties: true, nullable: true },
+                  ioCapabilities: { type: 'object', additionalProperties: true, nullable: true },
                   firmwareChannel: { type: 'string', nullable: true },
                 },
               },
@@ -767,7 +763,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 properties: {
                   name: { type: 'string' },
                   sku: { type: 'string' },
-                  sensorCapabilities: { type: 'object', additionalProperties: true, nullable: true },
+                  ioCapabilities: { type: 'object', additionalProperties: true, nullable: true },
                   firmwareChannel: { type: 'string', nullable: true },
                 },
               },
@@ -851,7 +847,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   serial: { type: 'string' },
                   name: { type: 'string', nullable: true },
                   firmwareVersion: { type: 'string', nullable: true },
-                  simIccid: { type: 'string', nullable: true },
                   status: {
                     type: 'string',
                     enum: ['provisioned', 'online', 'offline', 'decommissioned'],
@@ -918,15 +913,11 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 properties: {
                   name: { type: 'string', nullable: true },
                   firmwareVersion: { type: 'string', nullable: true },
-                  simIccid: { type: 'string', nullable: true },
                   status: {
                     type: 'string',
                     enum: ['provisioned', 'online', 'offline', 'decommissioned'],
                   },
                   lastSeenAt: { type: 'string', format: 'date-time' },
-                  lastLatitude: { oneOf: [{ type: 'number' }, { type: 'string' }] },
-                  lastLongitude: { oneOf: [{ type: 'number' }, { type: 'string' }] },
-                  lastAccuracyM: { type: 'integer' },
                 },
               },
             },

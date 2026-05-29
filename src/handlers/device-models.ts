@@ -54,7 +54,7 @@ export const handler = async (
       let body: {
         name?: string;
         sku?: string;
-        sensorCapabilities?: unknown;
+        ioCapabilities?: unknown;
         firmwareChannel?: string;
       };
       try {
@@ -71,7 +71,7 @@ export const handler = async (
         .values({
           name,
           sku,
-          sensorCapabilities: body.sensorCapabilities ?? null,
+          ioCapabilities: body.ioCapabilities ?? null,
           firmwareChannel: body.firmwareChannel ?? null,
         })
         .returning();
@@ -84,7 +84,7 @@ export const handler = async (
       let body: {
         name?: string;
         sku?: string;
-        sensorCapabilities?: unknown;
+        ioCapabilities?: unknown;
         firmwareChannel?: string;
       };
       try {
@@ -95,8 +95,8 @@ export const handler = async (
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.sku !== undefined) updates.sku = body.sku;
-      if (body.sensorCapabilities !== undefined) {
-        updates.sensorCapabilities = body.sensorCapabilities;
+      if (body.ioCapabilities !== undefined) {
+        updates.ioCapabilities = body.ioCapabilities;
       }
       if (body.firmwareChannel !== undefined) updates.firmwareChannel = body.firmwareChannel;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');

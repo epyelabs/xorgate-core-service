@@ -1,0 +1,1 @@
+ALTER TABLE "device_models" RENAME COLUMN "sensor_capabilities" TO "io_capabilities";
