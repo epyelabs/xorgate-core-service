@@ -23,6 +23,11 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   vpc?: ec2.Vpc;
   userPoolId: string;
   userPoolClientId: string;
+  iotThingTypeName: string;
+  iotPolicyName: string;
+  iotRoleAlias: string;
+  cognitoIdentityPoolId: string;
+  cognitoUserPoolProvider: string;
 }
 
 export class XorgateCoreApiStack extends cdk.Stack {
@@ -43,6 +48,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       dbName,
       userPoolId,
       userPoolClientId,
+      iotThingTypeName,
+      iotPolicyName,
+      iotRoleAlias,
+      cognitoIdentityPoolId,
+      cognitoUserPoolProvider,
     } = props;
 
     const isProd = stage === "prod";
@@ -124,6 +134,44 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     dbSecret.grantRead(lambdaRole);
 
+    // Device provisioning (P1): mint IoT thing/cert, attach the base policy, create KVS channels.
+    // Resource authorization is per-action: AttachThingPrincipal checks BOTH the thing and the
+    // certificate; AttachPolicy/UpdateCertificate check the certificate. Grant these on both ARNs.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "IotProvisioning",
+        actions: [
+          "iot:CreateThing",
+          "iot:DescribeThing",
+          "iot:AttachThingPrincipal",
+          "iot:AttachPolicy",
+          "iot:UpdateCertificate",
+        ],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:thing/*`,
+          `arn:aws:iot:${this.region}:${this.account}:cert/*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        // CreateKeysAndCertificate / DescribeEndpoint do not support resource-level scoping.
+        sid: "IotCreateKeysAndEndpoint",
+        actions: ["iot:CreateKeysAndCertificate", "iot:DescribeEndpoint"],
+        resources: ["*"],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "KvsChannels",
+        actions: [
+          "kinesisvideo:CreateSignalingChannel",
+          "kinesisvideo:DescribeSignalingChannel",
+        ],
+        resources: [`arn:aws:kinesisvideo:${this.region}:${this.account}:channel/*`],
+      }),
+    );
+
     lambdaRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName(
         "service-role/AWSLambdaBasicExecutionRole",
@@ -138,6 +186,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       BUCKET_NAME: bucket.bucketName,
       COGNITO_USER_POOL_ID: userPoolId,
       COGNITO_CLIENT_ID: userPoolClientId,
+      IOT_THING_TYPE_NAME: iotThingTypeName,
+      IOT_POLICY_NAME: iotPolicyName,
+      IOT_ROLE_ALIAS: iotRoleAlias,
+      COGNITO_IDENTITY_POOL_ID: cognitoIdentityPoolId,
+      COGNITO_USER_POOL_PROVIDER: cognitoUserPoolProvider,
       AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1",
     };
 
@@ -242,6 +295,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
       standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
     );
 
+    const deviceProvisioningFn = new nodejs.NodejsFunction(this, "DeviceProvisioningFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-provisioning.ts"),
+        "POST /devices/{id}/provision — IoT cert + KVS channels",
+      ),
+      // Provisioning makes several IoT/KVS round-trips; give it more headroom than the 10s default.
+      timeout: cdk.Duration.seconds(30),
+    });
+
     const docsFn = new nodejs.NodejsFunction(this, "DocsFn", {
       entry: path.join(entryBase, "docs.ts"),
       handler: "handler",
@@ -309,6 +371,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const devicesInt = new apigwv2int.HttpLambdaIntegration(
       "DevicesInt",
       devicesFn,
+    );
+    const deviceProvisioningInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceProvisioningInt",
+      deviceProvisioningFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
@@ -407,6 +473,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.DELETE,
       ],
       integration: devicesInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/provision",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceProvisioningInt,
     });
 
     this.api.addRoutes({

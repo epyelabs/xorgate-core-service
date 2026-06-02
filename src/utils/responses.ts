@@ -27,6 +27,10 @@ export function notFound(message: string): APIGatewayProxyResultV2 {
   return errorResponse(404, 'NOT_FOUND', message);
 }
 
+export function conflict(message: string): APIGatewayProxyResultV2 {
+  return errorResponse(409, 'CONFLICT', message);
+}
+
 export function ok<T>(body: T): APIGatewayProxyResultV2 {
   return {
     statusCode: 200,

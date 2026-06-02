@@ -126,7 +126,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           ioCapabilities: {
             type: 'object',
             additionalProperties: true,
-            description: 'Free-form jsonb. Suggested keys: camera, gps, accel, env.',
+            description:
+              'Structured capabilities (jsonb): { schemaVersion, media{video[],audio[]}, sensors{imu}, comm{gps,signal}, system }. ' +
+              'Drives telemetry metrics and media stream keys (cam0/cam1/audio0).',
             nullable: true,
           },
           firmwareChannel: { type: 'string', nullable: true },
@@ -153,6 +155,73 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           updatedAt: { type: 'string', format: 'date-time' },
         },
       },
+      DeviceProvisioning: {
+        type: 'object',
+        required: ['device', 'iot', 'mqtt', 'kvs'],
+        description:
+          'One-shot credential bundle returned by POST /devices/{id}/provision. ' +
+          'certificatePem and privateKey are shown only here and are never stored server-side.',
+        properties: {
+          device: {
+            type: 'object',
+            required: ['id', 'thingName'],
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              thingName: { type: 'string', description: 'AWS IoT thing name (equals the device id).' },
+            },
+          },
+          iot: {
+            type: 'object',
+            required: ['dataEndpoint', 'credentialEndpoint', 'roleAlias', 'certificatePem', 'caUrl'],
+            properties: {
+              dataEndpoint: {
+                type: 'string',
+                description: 'AWS IoT Core data endpoint (iot:Data-ATS); MQTT over mTLS on port 8883.',
+              },
+              credentialEndpoint: {
+                type: 'string',
+                description: 'AWS IoT credential-provider endpoint used with the role alias to obtain short-lived AWS creds.',
+              },
+              roleAlias: { type: 'string', description: 'IoT role alias the device assumes for KVS + S3 access.' },
+              certificatePem: { type: 'string', description: 'X.509 device certificate (PEM). Shown once.' },
+              privateKey: {
+                type: 'string',
+                nullable: true,
+                description: 'Device private key (PEM). Shown once, never stored.',
+              },
+              caUrl: { type: 'string', format: 'uri', description: 'Amazon Root CA 1 download URL.' },
+            },
+          },
+          mqtt: {
+            type: 'object',
+            required: ['telemetryTopic', 'statusTopic'],
+            properties: {
+              telemetryTopic: { type: 'string', example: 'xorgate/devices/{id}/telemetry' },
+              statusTopic: { type: 'string', example: 'xorgate/devices/{id}/status' },
+            },
+          },
+          kvs: {
+            type: 'object',
+            required: ['region', 'channels'],
+            properties: {
+              region: { type: 'string' },
+              channels: {
+                type: 'array',
+                description: 'One signaling channel per declared video stream.',
+                items: {
+                  type: 'object',
+                  required: ['streamKey', 'channelName', 'channelArn'],
+                  properties: {
+                    streamKey: { type: 'string', example: 'cam0' },
+                    channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
+                    channelArn: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
     },
     responses: {
       Unauthorized: {
@@ -169,6 +238,10 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       },
       BadRequest: {
         description: 'Bad request',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+      },
+      Conflict: {
+        description: 'Conflict',
         content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
       },
       NoContent: { description: 'No content' },
@@ -951,6 +1024,34 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/provision': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      post: {
+        operationId: 'provisionDevice',
+        summary: 'Provision device identity (owner/admin only)',
+        description:
+          'Mints an AWS IoT thing + X.509 certificate, attaches the device policy, and creates a KVS signaling ' +
+          'channel per declared video stream. Returns the certificate, private key, and connection endpoints ' +
+          'exactly once — persist them on the device immediately, they cannot be retrieved later. Idempotent: a ' +
+          'second call for an already-provisioned device returns 409.',
+        tags: ['Devices'],
+        responses: {
+          '201': {
+            description: 'Device provisioned. Credential bundle shown only here.',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/DeviceProvisioning' },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
         },
       },
     },

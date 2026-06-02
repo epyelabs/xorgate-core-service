@@ -3,6 +3,7 @@ import * as cdk from 'aws-cdk-lib';
 import { XorgateCoreStorageStack } from '../lib/stacks/storage-stack';
 import { XorgateCoreDatabaseStack } from '../lib/stacks/database-stack';
 import { XorgateCoreAuthStack } from '../lib/stacks/auth-stack';
+import { XorgateCoreIotStack } from '../lib/stacks/iot-stack';
 import { XorgateCoreApiStack } from '../lib/stacks/api-stack';
 
 const app = new cdk.App();
@@ -30,6 +31,14 @@ if (stage === 'prod') {
 
   const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStack', { env, stage });
 
+  const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStack', {
+    env,
+    stage,
+    bucket: storageStack.bucket,
+    userPool: authStack.userPool,
+    userPoolClient: authStack.userPoolClient,
+  });
+
   new XorgateCoreApiStack(app, 'XorgateCoreApiStack', {
     env,
     stage,
@@ -41,12 +50,25 @@ if (stage === 'prod') {
     dbName: 'xorgatedb',
     userPoolId: authStack.userPool.userPoolId,
     userPoolClientId: authStack.userPoolClient.userPoolClientId,
+    iotThingTypeName: iotStack.thingTypeName,
+    iotPolicyName: iotStack.iotPolicyName,
+    iotRoleAlias: iotStack.roleAliasName,
+    cognitoIdentityPoolId: iotStack.identityPoolId,
+    cognitoUserPoolProvider: iotStack.userPoolProviderName,
   });
 } else {
   // Dev: no dedicated DB cluster, no VPC. Imports the shared sandbox Aurora
   // cluster (epyelabs/epye-sandbox-stack) and reaches it via RDS Data API.
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStackDev', { env, stage });
   const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStackDev', { env, stage });
+
+  const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStackDev', {
+    env,
+    stage,
+    bucket: storageStack.bucket,
+    userPool: authStack.userPool,
+    userPoolClient: authStack.userPoolClient,
+  });
 
   new XorgateCoreApiStack(app, 'XorgateCoreApiStackDev', {
     env,
@@ -57,6 +79,11 @@ if (stage === 'prod') {
     dbName: 'xorgatedb_dev',
     userPoolId: authStack.userPool.userPoolId,
     userPoolClientId: authStack.userPoolClient.userPoolClientId,
+    iotThingTypeName: iotStack.thingTypeName,
+    iotPolicyName: iotStack.iotPolicyName,
+    iotRoleAlias: iotStack.roleAliasName,
+    cognitoIdentityPoolId: iotStack.identityPoolId,
+    cognitoUserPoolProvider: iotStack.userPoolProviderName,
   });
 }
 
