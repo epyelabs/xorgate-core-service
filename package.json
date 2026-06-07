@@ -21,6 +21,7 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@aws-sdk/client-cognito-identity": "^3.1063.0",
     "@aws-sdk/client-iot": "^3.800.0",
     "@aws-sdk/client-kinesis-video": "^3.800.0",
     "@aws-sdk/client-rds-data": "^3.800.0",

@@ -8,6 +8,10 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2int from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as iot from "aws-cdk-lib/aws-iot";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -25,6 +29,7 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   userPoolClientId: string;
   iotThingTypeName: string;
   iotPolicyName: string;
+  browserIotPolicyName: string;
   iotRoleAlias: string;
   cognitoIdentityPoolId: string;
   cognitoUserPoolProvider: string;
@@ -50,6 +55,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       userPoolClientId,
       iotThingTypeName,
       iotPolicyName,
+      browserIotPolicyName,
       iotRoleAlias,
       cognitoIdentityPoolId,
       cognitoUserPoolProvider,
@@ -172,6 +178,27 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // Browser live-telemetry (P2): attach the AWS IoT policy to a caller's Cognito
+    // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
+    // authorizes against the *target* (a Cognito identity id, not an ARN) → resource "*";
+    // the handler only ever attaches the fixed BROWSER_IOT_POLICY_NAME.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "IotAttachBrowserPolicy",
+        actions: ["iot:AttachPolicy"],
+        resources: ["*"],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "CognitoGetId",
+        actions: ["cognito-identity:GetId"],
+        resources: [
+          `arn:aws:cognito-identity:${this.region}:${this.account}:identitypool/${cognitoIdentityPoolId}`,
+        ],
+      }),
+    );
+
     lambdaRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName(
         "service-role/AWSLambdaBasicExecutionRole",
@@ -188,6 +215,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       COGNITO_CLIENT_ID: userPoolClientId,
       IOT_THING_TYPE_NAME: iotThingTypeName,
       IOT_POLICY_NAME: iotPolicyName,
+      BROWSER_IOT_POLICY_NAME: browserIotPolicyName,
       IOT_ROLE_ALIAS: iotRoleAlias,
       COGNITO_IDENTITY_POOL_ID: cognitoIdentityPoolId,
       COGNITO_USER_POOL_PROVIDER: cognitoUserPoolProvider,
@@ -304,6 +332,83 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
     });
 
+    // --- Live telemetry ingestion (P2): IoT Topic Rule -> Lambda -> Postgres ---
+    // The ingestion Lambda has NO HTTP route; it is invoked directly by the IoT
+    // rule below. The rule MUST be created in this (api) stack — iot-stack is
+    // synthesized first and cannot reference this Lambda.
+    const telemetryIngestFn = new nodejs.NodejsFunction(this, "TelemetryIngestFn", {
+      ...standardFnProps(
+        path.join(entryBase, "telemetry-ingest.ts"),
+        "IoT rule -> telemetry_readings + device_latest + last_seen",
+      ),
+      // One message = up to 3 Data API round-trips (insert + upsert + heartbeat).
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(15),
+    });
+
+    // EventBridge ~1 min -> flip stale `online` devices to `offline`.
+    const offlineSweeperFn = new nodejs.NodejsFunction(
+      this,
+      "OfflineSweeperFn",
+      standardFnProps(
+        path.join(entryBase, "offline-sweeper.ts"),
+        "Schedule (1m) -> flip stale online devices to offline",
+      ),
+    );
+    new events.Rule(this, "OfflineSweeperSchedule", {
+      description: "Flip stale online devices to offline (P2 telemetry)",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
+      targets: [new targets.LambdaFunction(offlineSweeperFn)],
+    });
+
+    // Dead-letter queue for messages the rule could not act on (action failure).
+    const telemetryDlq = new sqs.Queue(this, "TelemetryIngestDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    // The IoT rule assumes this role to write to the DLQ on action error.
+    const telemetryRuleRole = new iam.Role(this, "TelemetryRuleRole", {
+      assumedBy: new iam.ServicePrincipal("iot.amazonaws.com"),
+      description: "Lets the telemetry IoT rule send failed messages to the DLQ",
+    });
+    telemetryDlq.grantSendMessages(telemetryRuleRole);
+
+    const telemetryRule = new iot.CfnTopicRule(this, "TelemetryIngestRule", {
+      // IoT rule names allow only [A-Za-z0-9_] — underscores, not the kebab convention.
+      ruleName: isProd ? "xorgate_telemetry_ingest" : "xorgate_telemetry_ingest_dev",
+      topicRulePayload: {
+        sql: "SELECT *, topic(3) AS topicDeviceId FROM 'xorgate/devices/+/telemetry'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: telemetryIngestFn.functionArn } }],
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    // Resource-based invoke permission keyed on the rule ARN. This keeps a clean
+    // fn -> rule -> permission DAG (no cycle); do NOT instead give the rule an IAM
+    // role with lambda:InvokeFunction. sourceAccount guards the confused-deputy.
+    telemetryIngestFn.addPermission("AllowIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: telemetryRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
+    const iotAttachPolicyFn = new nodejs.NodejsFunction(
+      this,
+      "IotAttachPolicyFn",
+      standardFnProps(
+        path.join(entryBase, "iot-attach-policy.ts"),
+        "POST /iot/attach-policy — attach browser IoT policy to caller's Cognito identity",
+      ),
+    );
+
     const docsFn = new nodejs.NodejsFunction(this, "DocsFn", {
       entry: path.join(entryBase, "docs.ts"),
       handler: "handler",
@@ -375,6 +480,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const deviceProvisioningInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceProvisioningInt",
       deviceProvisioningFn,
+    );
+    const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
+      "IotAttachPolicyInt",
+      iotAttachPolicyFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
@@ -478,6 +587,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceProvisioningInt,
+    });
+
+    this.api.addRoutes({
+      path: "/iot/attach-policy",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: iotAttachPolicyInt,
     });
 
     this.api.addRoutes({

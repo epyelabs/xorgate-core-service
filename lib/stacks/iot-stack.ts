@@ -20,6 +20,7 @@ export interface XorgateCoreIotStackProps extends cdk.StackProps {
 export class XorgateCoreIotStack extends cdk.Stack {
   public readonly thingTypeName: string;
   public readonly iotPolicyName: string;
+  public readonly browserPolicyName: string;
   public readonly roleAliasName: string;
   public readonly identityPoolId: string;
   public readonly userPoolProviderName: string;
@@ -37,6 +38,7 @@ export class XorgateCoreIotStack extends cdk.Stack {
 
     this.thingTypeName = `xorgate-device${slugSuffix}`;
     this.iotPolicyName = `XorgateDevicePolicy${nameSuffix}`;
+    this.browserPolicyName = `XorgateBrowserPolicy${nameSuffix}`;
     this.roleAliasName = `XorgateDeviceCreds${nameSuffix}`;
     this.userPoolProviderName = userPool.userPoolProviderName;
 
@@ -111,6 +113,39 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Effect: 'Allow',
             Action: 'iot:AssumeRoleWithCertificate',
             Resource: roleAliasArn,
+          },
+        ],
+      },
+    });
+
+    // --- Browser IoT policy (attached to each Cognito identity via AttachPolicy) ---
+    // AWS IoT does NOT authorize MQTT for Cognito-federated principals via their
+    // IAM role policy — it requires an AWS IoT policy attached to the *identity*.
+    // The backend `POST /iot/attach-policy` attaches this to the caller's identity.
+    // v1 broad-but-authenticated (any authed user → any device telemetry); per-tenant
+    // scoping via policy variables is the P7 hardening hook.
+    new iot.CfnPolicy(this, 'BrowserPolicy', {
+      policyName: this.browserPolicyName,
+      policyDocument: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Sid: 'Connect',
+            Effect: 'Allow',
+            Action: 'iot:Connect',
+            Resource: `arn:aws:iot:${region}:${account}:client/*`,
+          },
+          {
+            Sid: 'Subscribe',
+            Effect: 'Allow',
+            Action: 'iot:Subscribe',
+            Resource: `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
+          },
+          {
+            Sid: 'Receive',
+            Effect: 'Allow',
+            Action: 'iot:Receive',
+            Resource: `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
           },
         ],
       },
