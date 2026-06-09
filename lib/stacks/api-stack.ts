@@ -17,6 +17,10 @@ import * as path from "path";
 
 export interface XorgateCoreApiStackProps extends cdk.StackProps {
   stage: "dev" | "prod";
+  // When true, EventBridge-scheduled jobs (OfflineSweeper) are deployed but
+  // disabled. They poll the shared sandbox Aurora via the Data API and block
+  // its auto-pause; defaults off in dev (see bin/app.ts).
+  disableScheduledJobs?: boolean;
   bucket: s3.Bucket;
   dbCluster?: rds.DatabaseCluster;
   dbClusterArn?: string;
@@ -369,6 +373,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     new events.Rule(this, "OfflineSweeperSchedule", {
       description: "Flip stale online devices to offline (P2 telemetry)",
+      enabled: !props.disableScheduledJobs,
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
       targets: [new targets.LambdaFunction(offlineSweeperFn)],
     });

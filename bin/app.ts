@@ -21,6 +21,20 @@ if (stage !== 'dev' && stage !== 'prod') {
   );
 }
 
+// Cron jobs (OfflineSweeper) poll the shared sandbox Aurora via Data API and
+// block its auto-pause (~$1.45/day). Default OFF in dev; override with
+// --context scheduledJobs=on (or =off to force-disable).
+const scheduledJobsCtx = app.node.tryGetContext('scheduledJobs') as
+  | 'on'
+  | 'off'
+  | undefined;
+const disableScheduledJobs =
+  scheduledJobsCtx === 'on'
+    ? false
+    : scheduledJobsCtx === 'off'
+      ? true
+      : stage === 'dev';
+
 if (stage === 'prod') {
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStack', { env, stage });
 
@@ -74,6 +88,7 @@ if (stage === 'prod') {
   new XorgateCoreApiStack(app, 'XorgateCoreApiStackDev', {
     env,
     stage,
+    disableScheduledJobs,
     bucket: storageStack.bucket,
     dbClusterArn: cdk.Fn.importValue('EpyeSandboxClusterArn'),
     dbSecretName: 'epye-sandbox/xorgate-db-credentials',
