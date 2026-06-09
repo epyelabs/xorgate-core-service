@@ -222,6 +222,17 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           },
         },
       },
+      KvsChannel: {
+        type: 'object',
+        required: ['streamKey', 'channelName', 'channelArn', 'region'],
+        description: 'A KVS WebRTC signaling channel for the browser viewer.',
+        properties: {
+          streamKey: { type: 'string', example: 'cam0' },
+          channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
+          channelArn: { type: 'string' },
+          region: { type: 'string', example: 'us-east-1' },
+        },
+      },
     },
     responses: {
       Unauthorized: {
@@ -1052,6 +1063,37 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
           '409': { $ref: '#/components/responses/Conflict' },
+        },
+      },
+    },
+    '/devices/{id}/kvs-channels': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getDeviceKvsChannels',
+        summary: 'List the device\'s KVS signaling channels (for the browser viewer)',
+        description:
+          'Returns the device\'s KVS WebRTC signaling channels (one per provisioned video stream). The browser ' +
+          'obtains its own scoped AWS credentials via the Cognito identity pool, so this endpoint returns channel ' +
+          'metadata only (no credentials). An empty array means the device is not yet provisioned.',
+        tags: ['Devices'],
+        responses: {
+          '200': {
+            description: 'KVS channels (possibly empty if the device is not provisioned).',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['channels'],
+                  properties: {
+                    channels: { type: 'array', items: { $ref: '#/components/schemas/KvsChannel' } },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
         },
       },
     },

@@ -332,6 +332,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
     });
 
+    // GET /devices/{id}/kvs-channels (P3) — returns the device's KVS signaling
+    // channels so the browser can run a WebRTC VIEWER. Reads Postgres only (no KVS
+    // call, no new IAM); the browser mints its own scoped creds via Cognito.
+    const deviceKvsChannelsFn = new nodejs.NodejsFunction(
+      this,
+      "DeviceKvsChannelsFn",
+      standardFnProps(
+        path.join(entryBase, "device-kvs-channels.ts"),
+        "GET /devices/{id}/kvs-channels — KVS channels for the browser viewer",
+      ),
+    );
+
     // --- Live telemetry ingestion (P2): IoT Topic Rule -> Lambda -> Postgres ---
     // The ingestion Lambda has NO HTTP route; it is invoked directly by the IoT
     // rule below. The rule MUST be created in this (api) stack — iot-stack is
@@ -481,6 +493,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DeviceProvisioningInt",
       deviceProvisioningFn,
     );
+    const deviceKvsChannelsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceKvsChannelsInt",
+      deviceKvsChannelsFn,
+    );
     const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
@@ -587,6 +603,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceProvisioningInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/kvs-channels",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceKvsChannelsInt,
     });
 
     this.api.addRoutes({
