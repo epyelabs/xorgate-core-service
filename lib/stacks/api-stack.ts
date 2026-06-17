@@ -8,6 +8,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2int from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as iot from "aws-cdk-lib/aws-iot";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
@@ -348,6 +349,31 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // GET /devices/{id}/identity (P3) — the device's IoT X.509 identity metadata
+    // (thing name, cert id, status, policy/role binding). Non-secret fields only;
+    // reads Postgres (no IoT call, no new IAM).
+    const deviceIdentityFn = new nodejs.NodejsFunction(
+      this,
+      "DeviceIdentityFn",
+      standardFnProps(
+        path.join(entryBase, "device-identity.ts"),
+        "GET /devices/{id}/identity — IoT identity metadata",
+      ),
+    );
+
+    // GET /devices/{id}/telemetry + /devices/{id}/telemetry/latest (P4) — historical
+    // telemetry reads over the partitioned telemetry_readings + device_latest tables.
+    // Reads Postgres only (no new IAM).
+    const telemetryHistoryFn = new nodejs.NodejsFunction(this, "TelemetryHistoryFn", {
+      ...standardFnProps(
+        path.join(entryBase, "telemetry-history.ts"),
+        "GET /devices/{id}/telemetry(+/latest) — historical telemetry reads",
+      ),
+      // Range queries scan monthly partitions; give them more headroom than the default.
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(15),
+    });
+
     // --- Live telemetry ingestion (P2): IoT Topic Rule -> Lambda -> Postgres ---
     // The ingestion Lambda has NO HTTP route; it is invoked directly by the IoT
     // rule below. The rule MUST be created in this (api) stack — iot-stack is
@@ -378,6 +404,24 @@ export class XorgateCoreApiStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(offlineSweeperFn)],
     });
 
+    // EventBridge monthly -> pre-create upcoming telemetry_readings partitions
+    // (a missing month partition breaks ingestion). Mid-month cron: the +1/+2
+    // partitions from the previous run still cover us if one run fails.
+    const partitionMaintenanceFn = new nodejs.NodejsFunction(
+      this,
+      "PartitionMaintenanceFn",
+      standardFnProps(
+        path.join(entryBase, "partition-maintenance.ts"),
+        "Schedule (monthly) -> ensure telemetry_readings month partitions",
+      ),
+    );
+    new events.Rule(this, "PartitionMaintenanceSchedule", {
+      description: "Pre-create monthly telemetry_readings partitions (P4)",
+      enabled: !props.disableScheduledJobs,
+      schedule: events.Schedule.cron({ minute: "0", hour: "2", day: "15" }),
+      targets: [new targets.LambdaFunction(partitionMaintenanceFn)],
+    });
+
     // Dead-letter queue for messages the rule could not act on (action failure).
     const telemetryDlq = new sqs.Queue(this, "TelemetryIngestDlq", {
       retentionPeriod: cdk.Duration.days(14),
@@ -388,6 +432,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
       description: "Lets the telemetry IoT rule send failed messages to the DLQ",
     });
     telemetryDlq.grantSendMessages(telemetryRuleRole);
+
+    // Any message in the DLQ means ingestion is failing (e.g. a missing month
+    // partition). No SNS topic exists yet, so the alarm has no action — it
+    // surfaces in the CloudWatch console/dashboards.
+    new cloudwatch.Alarm(this, "TelemetryDlqDepthAlarm", {
+      metric: telemetryDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "Telemetry ingest IoT rule wrote failed messages to the DLQ",
+    });
 
     const telemetryRule = new iot.CfnTopicRule(this, "TelemetryIngestRule", {
       // IoT rule names allow only [A-Za-z0-9_] — underscores, not the kebab convention.
@@ -502,6 +562,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DeviceKvsChannelsInt",
       deviceKvsChannelsFn,
     );
+    const deviceIdentityInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceIdentityInt",
+      deviceIdentityFn,
+    );
+    const telemetryHistoryInt = new apigwv2int.HttpLambdaIntegration(
+      "TelemetryHistoryInt",
+      telemetryHistoryFn,
+    );
     const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
@@ -613,6 +681,21 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/kvs-channels",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceKvsChannelsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/identity",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceIdentityInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/telemetry",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/telemetry/latest",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
     });
 
     this.api.addRoutes({

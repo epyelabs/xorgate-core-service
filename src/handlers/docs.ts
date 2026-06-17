@@ -233,6 +233,30 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           region: { type: 'string', example: 'us-east-1' },
         },
       },
+      TelemetryReading: {
+        type: 'object',
+        required: ['ts', 'metric'],
+        description:
+          'One telemetry reading (raw) or one downsample bucket (when `interval` was given; ' +
+          '`value` is then the bucket average and `ts` the bucket start).',
+        properties: {
+          ts: { type: 'string', format: 'date-time' },
+          metric: { type: 'string', example: 'imu.z' },
+          value: { type: 'number', nullable: true },
+          unit: { type: 'string', nullable: true, example: 'm/s^2' },
+        },
+      },
+      DeviceLatest: {
+        type: 'object',
+        required: ['ts', 'metric'],
+        description: 'The most recent reading for one (device, metric) pair.',
+        properties: {
+          metric: { type: 'string', example: 'system.cpu_temp' },
+          value: { type: 'number', nullable: true },
+          unit: { type: 'string', nullable: true, example: '°C' },
+          ts: { type: 'string', format: 'date-time' },
+        },
+      },
     },
     responses: {
       Unauthorized: {
@@ -1086,6 +1110,108 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   required: ['channels'],
                   properties: {
                     channels: { type: 'array', items: { $ref: '#/components/schemas/KvsChannel' } },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/telemetry': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getDeviceTelemetry',
+        summary: 'Query historical telemetry over a time range',
+        description:
+          'Returns telemetry_readings rows for the device over `[from, to)` (max 31 days), ordered by `ts`. ' +
+          'With `interval` (seconds) the result is downsampled server-side: readings are grouped into ' +
+          '`interval`-wide buckets per metric and averaged. Without it, raw rows are returned up to a hard cap; ' +
+          '`truncated: true` signals the cap was hit (narrow the range or pass `interval`).',
+        tags: ['Devices'],
+        parameters: [
+          {
+            name: 'from',
+            in: 'query',
+            required: true,
+            schema: { type: 'string', format: 'date-time' },
+            description: 'Range start (inclusive), ISO-8601.',
+          },
+          {
+            name: 'to',
+            in: 'query',
+            required: true,
+            schema: { type: 'string', format: 'date-time' },
+            description: 'Range end (exclusive), ISO-8601.',
+          },
+          {
+            name: 'metric',
+            in: 'query',
+            required: false,
+            schema: { type: 'string' },
+            description: 'Comma-separated metric filter (max 20), e.g. `imu.x,imu.y,gps.lat`.',
+          },
+          {
+            name: 'interval',
+            in: 'query',
+            required: false,
+            schema: { type: 'integer', minimum: 1, maximum: 86400 },
+            description: 'Downsample bucket width in seconds.',
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Telemetry readings (raw or bucket-averaged), ordered by ts then metric.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['readings', 'bucketSeconds', 'truncated'],
+                  properties: {
+                    readings: { type: 'array', items: { $ref: '#/components/schemas/TelemetryReading' } },
+                    bucketSeconds: {
+                      type: 'integer',
+                      nullable: true,
+                      description: 'Echo of `interval`; null when raw rows were returned.',
+                    },
+                    truncated: {
+                      type: 'boolean',
+                      description: 'True when the row cap was hit and the result is incomplete.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/telemetry/latest': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getDeviceTelemetryLatest',
+        summary: "The device's most recent reading per metric",
+        description:
+          'Returns the device_latest rows (one per metric, last-writer-wins), ordered by metric. ' +
+          'Empty when the device has never reported telemetry.',
+        tags: ['Devices'],
+        responses: {
+          '200': {
+            description: 'Latest reading per metric.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['latest'],
+                  properties: {
+                    latest: { type: 'array', items: { $ref: '#/components/schemas/DeviceLatest' } },
                   },
                 },
               },
