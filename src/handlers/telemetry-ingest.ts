@@ -1,10 +1,29 @@
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import {
   telemetryPayloadSchema,
   flattenTelemetryToRows,
 } from '../schemas/telemetry';
 import { buildDeviceLatestUpsert } from '../utils/upsert';
+
+// Per-device telemetry persistence is opt-in (default off). Cache the flag in the
+// warm Lambda container so the 1 Hz hot path doesn't read `devices` every message;
+// the short TTL bounds how long a settings toggle takes to take effect (~30s).
+const persistCache = new Map<string, { value: boolean; expires: number }>();
+const PERSIST_TTL_MS = 30_000;
+
+async function shouldPersist(deviceId: string): Promise<boolean> {
+  const now = Date.now();
+  const hit = persistCache.get(deviceId);
+  if (hit && hit.expires > now) return hit.value;
+  const device = await db.query.devices.findFirst({
+    where: eq(schema.devices.id, deviceId),
+    columns: { persistTelemetry: true },
+  });
+  const value = device?.persistTelemetry ?? false;
+  persistCache.set(deviceId, { value, expires: now + PERSIST_TTL_MS });
+  return value;
+}
 
 /**
  * Telemetry ingestion (P2). Invoked directly by the AWS IoT Topic Rule
@@ -14,8 +33,10 @@ import { buildDeviceLatestUpsert } from '../utils/upsert';
  * so the `event` IS the telemetry payload JSON (plus `topicDeviceId` injected by
  * the rule), NOT an API Gateway event. There is no HTTP auth context.
  *
- * Pipeline: validate → flatten → batch-insert `telemetry_readings` → last-writer
- * upsert `device_latest` → throttled `devices.last_seen_at`/`status` heartbeat.
+ * Pipeline: validate → flatten → (if the device opts in via `persist_telemetry`)
+ * batch-insert `telemetry_readings` + last-writer upsert `device_latest` → throttled
+ * `devices.last_seen_at`/`status` heartbeat. The heartbeat always runs, so status
+ * tracking is unaffected when persistence is off.
  *
  * Error semantics (IoT rule lambda actions are *async* invokes):
  *  - Bad/unparseable payloads can never succeed on retry → log and return (drop).
@@ -47,7 +68,9 @@ export const handler = async (event: unknown): Promise<void> => {
 
   const rows = flattenTelemetryToRows(payload);
 
-  if (rows.length > 0) {
+  // DB persistence is opt-in per device. When disabled (default) we still run the
+  // heartbeat below so status tracking is unaffected, but write no telemetry.
+  if (rows.length > 0 && (await shouldPersist(payload.deviceId))) {
     // Batched insert. Typed columns give `ts` (a Date) the correct typeHint, and
     // Postgres routes the row to the right monthly partition automatically.
     await db.insert(schema.telemetryReadings).values(rows);

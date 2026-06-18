@@ -112,6 +112,9 @@ export const devices = pgTable(
     name: text('name'),
     firmwareVersion: text('firmware_version'),
     status: text('status').default('provisioned').notNull(),
+    // Opt-in telemetry persistence. When false (default) the ingest Lambda streams
+    // to IoT Core but writes nothing to telemetry_readings / device_latest.
+    persistTelemetry: boolean('persist_telemetry').default(false).notNull(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),

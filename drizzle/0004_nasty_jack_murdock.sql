@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "persist_telemetry" boolean DEFAULT false NOT NULL;

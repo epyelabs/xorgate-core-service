@@ -122,6 +122,7 @@ export const handler = async (
         firmwareVersion?: string;
         status?: string;
         lastSeenAt?: string;
+        persistTelemetry?: boolean;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -134,11 +135,17 @@ export const handler = async (
         return badRequest(`status must be one of: ${VALID_STATUSES.join(', ')}`);
       }
 
+      if (body.persistTelemetry !== undefined &&
+          typeof body.persistTelemetry !== 'boolean') {
+        return badRequest('persistTelemetry must be a boolean');
+      }
+
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
       if (body.status !== undefined) updates.status = body.status;
       if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
+      if (body.persistTelemetry !== undefined) updates.persistTelemetry = body.persistTelemetry;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
