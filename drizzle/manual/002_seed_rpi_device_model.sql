@@ -16,7 +16,7 @@ VALUES (
 		},
 		"sensors": {"imu": {"axes":["x","y","z"],"unit":"m/s^2","rateHz":10}},
 		"comm": {"module":"4g-lte","gps":{"fields":["lat","lon","alt","speed"]},"signal":{"fields":["rssi","quality"]}},
-		"system": {"fields":["cpu_usage","cpu_temp","ram_usage"]}
+		"system": {"fields":["cpu_usage","cpu_temp","ram_usage","disk_usage"]}
 	}'::jsonb,
 	'stable'
 )
