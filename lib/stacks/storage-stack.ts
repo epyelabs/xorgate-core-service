@@ -10,6 +10,10 @@ export interface XorgateCoreStorageStackProps extends cdk.StackProps {
 export class XorgateCoreStorageStack extends cdk.Stack {
   public readonly vpc?: ec2.Vpc;
   public readonly bucket: s3.Bucket;
+  // Public-read bucket holding the device-agent tarballs. Devices download the
+  // build during `install.sh` with no AWS credentials, so the objects must be
+  // anonymously readable (the registration code, not S3 auth, gates access).
+  public readonly distBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: XorgateCoreStorageStackProps) {
     super(scope, id, props);
@@ -50,6 +54,25 @@ export class XorgateCoreStorageStack extends cdk.Stack {
       autoDeleteObjects: !isProd,
     });
 
+    this.distBucket = new s3.Bucket(this, 'DeviceDistBucket', {
+      bucketName: isProd
+        ? `xorgate-device-dist-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`
+        : `xorgate-device-dist-dev-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      versioned: isProd,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      // Anonymous GET on objects; everything else still blocked.
+      blockPublicAccess: new s3.BlockPublicAccess({
+        blockPublicAcls: true,
+        ignorePublicAcls: true,
+        blockPublicPolicy: false,
+        restrictPublicBuckets: false,
+      }),
+      publicReadAccess: true,
+      enforceSSL: true,
+      removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: !isProd,
+    });
+
     if (this.vpc) {
       new cdk.CfnOutput(this, 'VpcId', {
         value: this.vpc.vpcId,
@@ -60,6 +83,17 @@ export class XorgateCoreStorageStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'BucketName', {
       value: this.bucket.bucketName,
       exportName: `XorgateCoreBucketName${suffix}`,
+    });
+
+    // Read by the device-deploy GitHub Actions workflows (resolve the bucket
+    // name from the stack output to avoid drift with the CDK-generated name).
+    new cdk.CfnOutput(this, 'DeviceDistBucketName', {
+      value: this.distBucket.bucketName,
+      exportName: `XorgateDeviceDistBucketName${suffix}`,
+    });
+    new cdk.CfnOutput(this, 'DeviceDistBucketUrl', {
+      value: `https://${this.distBucket.bucketRegionalDomainName}`,
+      exportName: `XorgateDeviceDistBucketUrl${suffix}`,
     });
   }
 }

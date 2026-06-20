@@ -1,18 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, eq, inArray } from 'drizzle-orm';
-import {
-  IoTClient,
-  CreateThingCommand,
-  CreateKeysAndCertificateCommand,
-  AttachPolicyCommand,
-  AttachThingPrincipalCommand,
-  DescribeEndpointCommand,
-} from '@aws-sdk/client-iot';
-import {
-  KinesisVideoClient,
-  CreateSignalingChannelCommand,
-  DescribeSignalingChannelCommand,
-} from '@aws-sdk/client-kinesis-video';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import {
@@ -22,14 +9,7 @@ import {
   methodNotAllowed,
   notFound,
 } from '../utils/responses';
-import { ioCapabilitiesSchema } from '../schemas/capabilities';
-
-// SDK clients created once at module load, reused across warm invocations.
-const iotClient = new IoTClient({});
-const kvsClient = new KinesisVideoClient({});
-
-const errName = (err: unknown): string | undefined =>
-  (err as { name?: string } | null)?.name;
+import { provisionDevice } from '../services/iot-provisioning';
 
 async function projectIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.projects.findMany({
@@ -80,116 +60,30 @@ export const handler = async (
     );
   }
 
-  // Derive video stream keys from the device model's declared capabilities.
   const model = await db.query.deviceModels.findFirst({
     where: eq(schema.deviceModels.id, device.deviceModelId),
   });
-  const caps = ioCapabilitiesSchema.safeParse(model?.ioCapabilities);
-  const videoStreamKeys = caps.success
-    ? (caps.data.media?.video ?? []).map((v) => v.key)
-    : [];
 
-  const region = process.env.AWS_REGION!;
-  const thingName = device.id;
-
-  // --- IoT thing + certificate + policy ---
-  try {
-    await iotClient.send(
-      new CreateThingCommand({
-        thingName,
-        thingTypeName: process.env.IOT_THING_TYPE_NAME,
-      }),
-    );
-  } catch (err) {
-    // Tolerate a thing left over from a prior partial run.
-    if (errName(err) !== 'ResourceAlreadyExistsException') throw err;
-  }
-
-  const keys = await iotClient.send(
-    new CreateKeysAndCertificateCommand({ setAsActive: true }),
-  );
-  await iotClient.send(
-    new AttachPolicyCommand({
-      policyName: process.env.IOT_POLICY_NAME!,
-      target: keys.certificateArn!,
-    }),
-  );
-  await iotClient.send(
-    new AttachThingPrincipalCommand({
-      thingName,
-      principal: keys.certificateArn!,
-    }),
-  );
-
-  // --- KVS signaling channel per video stream ---
-  const channels: { streamKey: string; channelName: string; channelArn: string }[] = [];
-  for (const streamKey of videoStreamKeys) {
-    const channelName = `${device.id}-${streamKey}`;
-    let channelArn: string | undefined;
-    try {
-      const res = await kvsClient.send(
-        new CreateSignalingChannelCommand({ ChannelName: channelName }),
-      );
-      channelArn = res.ChannelARN;
-    } catch (err) {
-      if (errName(err) === 'ResourceInUseException') {
-        const desc = await kvsClient.send(
-          new DescribeSignalingChannelCommand({ ChannelName: channelName }),
-        );
-        channelArn = desc.ChannelInfo?.ChannelARN;
-      } else {
-        throw err;
-      }
-    }
-    if (channelArn) channels.push({ streamKey, channelName, channelArn });
-  }
-
-  // --- Resolve account-stable IoT endpoints ---
-  const [dataEp, credEp] = await Promise.all([
-    iotClient.send(new DescribeEndpointCommand({ endpointType: 'iot:Data-ATS' })),
-    iotClient.send(new DescribeEndpointCommand({ endpointType: 'iot:CredentialProvider' })),
-  ]);
-  const dataEndpoint = dataEp.endpointAddress!;
-  const credentialEndpoint = credEp.endpointAddress!;
-  const roleAlias = process.env.IOT_ROLE_ALIAS!;
-
-  // --- Persist identity + channels (never the private key) ---
-  await db.insert(schema.deviceIdentities).values({
-    deviceId: device.id,
-    iotThingName: thingName,
-    certificateId: keys.certificateId!,
-    certificateArn: keys.certificateArn!,
-    policyName: process.env.IOT_POLICY_NAME!,
-    roleAlias,
-    credentialEndpoint,
-  });
-  if (channels.length > 0) {
-    await db.insert(schema.kvsChannels).values(
-      channels.map((c) => ({
-        deviceId: device.id,
-        streamKey: c.streamKey,
-        channelName: c.channelName,
-        channelArn: c.channelArn,
-        region,
-      })),
-    );
-  }
+  // IoT thing + cert + policy, KVS channels, endpoint resolution, and identity
+  // persistence all live in the shared provisioning service (reused by the
+  // device-registration claim path).
+  const result = await provisionDevice(device, model);
 
   // --- One-shot credential bundle ---
   return created({
-    device: { id: device.id, thingName },
+    device: { id: device.id, thingName: result.thingName },
     iot: {
-      dataEndpoint,
-      credentialEndpoint,
-      roleAlias,
-      certificatePem: keys.certificatePem,
-      privateKey: keys.keyPair?.PrivateKey,
-      caUrl: 'https://www.amazontrust.com/repository/AmazonRootCA1.pem',
+      dataEndpoint: result.dataEndpoint,
+      credentialEndpoint: result.credentialEndpoint,
+      roleAlias: result.roleAlias,
+      certificatePem: result.certificatePem,
+      privateKey: result.privateKey,
+      caUrl: result.caUrl,
     },
     mqtt: {
       telemetryTopic: `xorgate/devices/${device.id}/telemetry`,
       statusTopic: `xorgate/devices/${device.id}/status`,
     },
-    kvs: { region, channels },
+    kvs: { region: result.region, channels: result.channels },
   });
 };

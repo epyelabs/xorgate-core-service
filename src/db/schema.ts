@@ -126,6 +126,43 @@ export const devices = pgTable(
   ],
 );
 
+// Device onboarding codes. A short-lived code minted by the web app and claimed
+// (unauthenticated) by install.sh running on the remote device. On claim the
+// `devices` row + IoT identity are created and linked back here via `deviceId`.
+// `status` is text (not pgEnum) to dodge the aws-data-api enum-cast issue — same
+// reasoning as devices.status / deviceIdentities.status.
+export const deviceRegistrations = pgTable(
+  'device_registrations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    code: text('code').notNull(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    projectId: uuid('project_id')
+      .references(() => projects.id, { onDelete: 'cascade' })
+      .notNull(),
+    deviceModelId: uuid('device_model_id')
+      .references(() => deviceModels.id, { onDelete: 'restrict' })
+      .notNull(),
+    createdByUserId: text('created_by_user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    status: text('status').default('pending').notNull(), // pending | claimed | expired
+    // Set on claim. onDelete set null so deleting a claimed device leaves the
+    // (now historical) registration row intact.
+    deviceId: uuid('device_id').references(() => devices.id, { onDelete: 'set null' }),
+    serial: text('serial'), // filled on claim (derived from the device's machine-id)
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    claimedAt: timestamp('claimed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('device_registrations_code_idx').on(t.code),
+    index('device_registrations_project_status_idx').on(t.projectId, t.status),
+  ],
+);
+
 // --- Device Media & Telemetry Streaming (P0) ---
 
 // Per-device KVS WebRTC signaling channel, one row per media stream (cam0/cam1/audio0).
@@ -260,6 +297,8 @@ export type DeviceModel = InferSelectModel<typeof deviceModels>;
 export type NewDeviceModel = InferInsertModel<typeof deviceModels>;
 export type Device = InferSelectModel<typeof devices>;
 export type NewDevice = InferInsertModel<typeof devices>;
+export type DeviceRegistration = InferSelectModel<typeof deviceRegistrations>;
+export type NewDeviceRegistration = InferInsertModel<typeof deviceRegistrations>;
 export type KvsChannel = InferSelectModel<typeof kvsChannels>;
 export type NewKvsChannel = InferInsertModel<typeof kvsChannels>;
 export type DeviceIdentity = InferSelectModel<typeof deviceIdentities>;

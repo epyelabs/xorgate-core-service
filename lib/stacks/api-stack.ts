@@ -23,6 +23,9 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   // its auto-pause; defaults off in dev (see bin/app.ts).
   disableScheduledJobs?: boolean;
   bucket: s3.Bucket;
+  // Public-read bucket holding device-agent tarballs; its URL is baked into the
+  // per-request install.sh so devices can download the build without AWS creds.
+  distBucket: s3.Bucket;
   dbCluster?: rds.DatabaseCluster;
   dbClusterArn?: string;
   dbSecret?: secretsmanager.ISecret;
@@ -50,6 +53,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       stage,
       vpc,
       bucket,
+      distBucket,
       dbCluster,
       dbClusterArn: dbClusterArnProp,
       dbSecret: dbSecretProp,
@@ -157,6 +161,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
           "iot:AttachThingPrincipal",
           "iot:AttachPolicy",
           "iot:UpdateCertificate",
+          // Used only on the device-registration claim rollback path: tear down a
+          // half-provisioned thing/cert so a failed claim leaves no orphans.
+          "iot:ListThingPrincipals",
+          "iot:DetachThingPrincipal",
+          "iot:DetachPolicy",
+          "iot:DeleteCertificate",
+          "iot:DeleteThing",
         ],
         resources: [
           `arn:aws:iot:${this.region}:${this.account}:thing/*`,
@@ -336,6 +347,31 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // Provisioning makes several IoT/KVS round-trips; give it more headroom than the 10s default.
       timeout: cdk.Duration.seconds(30),
     });
+
+    // Device registration (onboarding): mint/poll a code, and the unauthenticated
+    // claim that creates the device row + provisions IoT/KVS (same round-trips as
+    // DeviceProvisioningFn → 30s timeout). API_BASE_URL injected below.
+    const deviceRegistrationsFn = new nodejs.NodejsFunction(this, "DeviceRegistrationsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-registrations.ts"),
+        "device registrations — create/poll/claim",
+      ),
+      timeout: cdk.Duration.seconds(30),
+    });
+
+    // GET /get/{code} — serves the per-request install.sh as text/x-shellscript.
+    // No DB writes; bakes the dist bucket URL + version into the script.
+    const installScriptFn = new nodejs.NodejsFunction(this, "InstallScriptFn", {
+      ...standardFnProps(
+        path.join(entryBase, "install-script.ts"),
+        "GET /get/{code} — render install.sh",
+      ),
+    });
+    installScriptFn.addEnvironment(
+      "DEVICE_DIST_BUCKET_URL",
+      `https://${distBucket.bucketRegionalDomainName}`,
+    );
+    installScriptFn.addEnvironment("DEVICE_DIST_VERSION", "latest");
 
     // GET /devices/{id}/kvs-channels (P3) — returns the device's KVS signaling
     // channels so the browser can run a WebRTC VIEWER. Reads Postgres only (no KVS
@@ -558,6 +594,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DeviceProvisioningInt",
       deviceProvisioningFn,
     );
+    const deviceRegistrationsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceRegistrationsInt",
+      deviceRegistrationsFn,
+    );
+    const installScriptInt = new apigwv2int.HttpLambdaIntegration(
+      "InstallScriptInt",
+      installScriptFn,
+    );
     const deviceKvsChannelsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceKvsChannelsInt",
       deviceKvsChannelsFn,
@@ -578,6 +622,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     // Inject the API endpoint into the docs Lambda now that the api exists.
     docsFn.addEnvironment("DOCS_BASE_URL", this.api.apiEndpoint);
+
+    // Device-registration Lambdas need the public API base to build the install
+    // URL and the claim URL baked into install.sh. Same chicken-and-egg as
+    // DOCS_BASE_URL — inject it now that `this.api` exists. No DNS yet, so this
+    // is the generated execute-api endpoint.
+    deviceRegistrationsFn.addEnvironment("API_BASE_URL", this.api.apiEndpoint);
+    installScriptFn.addEnvironment("API_BASE_URL", this.api.apiEndpoint);
 
     this.api.addRoutes({
       path: "/health",
@@ -676,6 +727,29 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceProvisioningInt,
+    });
+
+    // Device registration (onboarding). The {code}/claim route is reached
+    // unauthenticated by install.sh — the handler skips auth for it.
+    this.api.addRoutes({
+      path: "/device-registrations",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceRegistrationsInt,
+    });
+    this.api.addRoutes({
+      path: "/device-registrations/{code}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceRegistrationsInt,
+    });
+    this.api.addRoutes({
+      path: "/device-registrations/{code}/claim",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceRegistrationsInt,
+    });
+    this.api.addRoutes({
+      path: "/get/{code}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: installScriptInt,
     });
     this.api.addRoutes({
       path: "/devices/{id}/kvs-channels",
