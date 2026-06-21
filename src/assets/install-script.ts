@@ -49,6 +49,19 @@ if [ "$(id -u)" -ne 0 ]; then
   fail "run with sudo"
 fi
 
+# 0. Resolve the user the agent will RUN as (the installer itself must be root).
+#    Captured from \$SUDO_USER so the operator who ran \`sudo bash install.sh\`
+#    owns the cert/state and can inspect the agent without sudo. Falls back to
+#    root when run as actual root (no SUDO_USER) — the agent only needs an
+#    outbound mTLS connection, so it doesn't require root.
+SVC_USER="root"
+SVC_GROUP="root"
+if [ -n "\${SUDO_USER:-}" ] && [ "\${SUDO_USER}" != "root" ] && id "\${SUDO_USER}" >/dev/null 2>&1; then
+  SVC_USER="\${SUDO_USER}"
+  SVC_GROUP="$(id -gn "\${SUDO_USER}")"
+fi
+log "agent will run as '$SVC_USER'"
+
 # 1. Distro detection + dependency install.
 if [ -r /etc/os-release ]; then
   . /etc/os-release
@@ -99,26 +112,27 @@ CA_URL=$(echo "$CLAIM_RESPONSE"      | jq -r '.caUrl // empty')
 [ -n "$DEVICE_ID" ] || fail "claim response missing deviceId"
 [ -n "$ENDPOINT" ]  || fail "claim response missing dataEndpoint"
 
-# 3. Drop certs + agent.env into /etc/xorgate. Mode 0600 root:root since the
-#    agent runs as root.
-install -d -m 0700 -o root -g root "$CONF_DIR"
+# 3. Drop certs + agent.env into /etc/xorgate. Mode 0600, owned by the service
+#    user (not root) so the non-root agent can read them and they stay private
+#    to that user.
+install -d -m 0700 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR"
 
 echo "$CLAIM_RESPONSE" | jq -r '.certPem'     \\
-  | install -m 0600 -o root -g root /dev/stdin "$CONF_DIR/device.cert.pem"
+  | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/device.cert.pem"
 echo "$CLAIM_RESPONSE" | jq -r '.privateKey'  \\
-  | install -m 0600 -o root -g root /dev/stdin "$CONF_DIR/device.key.pem"
+  | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/device.key.pem"
 
 # The Amazon Root CA is public; fetch it by URL rather than embedding a copy.
 if [ -n "$CA_URL" ]; then
   curl -fsSL --retry 3 --retry-delay 2 "$CA_URL" \\
-    | install -m 0600 -o root -g root /dev/stdin "$CONF_DIR/root-ca.pem"
+    | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/root-ca.pem"
 else
   curl -fsSL --retry 3 --retry-delay 2 \\
     https://www.amazontrust.com/repository/AmazonRootCA1.pem \\
-    | install -m 0600 -o root -g root /dev/stdin "$CONF_DIR/root-ca.pem"
+    | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/root-ca.pem"
 fi
 
-install -m 0600 -o root -g root /dev/stdin "$CONF_DIR/agent.env" <<EOF
+install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/agent.env" <<EOF
 DEVICE_ID=$DEVICE_ID
 IOT_DATA_ENDPOINT=$ENDPOINT
 CERT_PATH=$CONF_DIR/device.cert.pem
@@ -144,8 +158,9 @@ log "installing node modules in $INSTALL_PREFIX"
 (cd "$INSTALL_PREFIX" && npm ci --omit=dev --no-audit --no-fund)
 
 # 5b. Install the \`xorgate\` CLI as a thin wrapper that defaults XORGATE_HOME to
-#     the systemd agent's state dir, so \`sudo xorgate status\`/\`monitor\` reflect
-#     the running service. Use systemctl/journalctl for lifecycle — \`xorgate start\`
+#     the systemd agent's state dir, so \`xorgate status\`/\`monitor\` reflect the
+#     running service (no sudo needed when the agent runs as you — see the
+#     drop-in below). Use systemctl/journalctl for lifecycle — \`xorgate start\`
 #     would launch a SECOND worker that fights the systemd one for the IoT clientId.
 # rm first: \`cat >\` follows an existing symlink and would clobber its target
 # (e.g. a prior \`xorgate -> dist/cli.js\` symlink).
@@ -158,6 +173,18 @@ chmod +x /usr/local/bin/xorgate
 
 # 6. systemd.
 install -m 0644 "$INSTALL_PREFIX/systemd/xorgate-agent.service" "$UNIT_DEST"
+
+# Run the service as the provisioning user via a drop-in (keeps the shipped unit
+# generic). StateDirectory=xorgate then makes systemd create/own /var/lib/xorgate
+# as this user, so its pidfile + state are readable without sudo. systemd reads
+# EnvironmentFile + sets up StateDirectory as root before dropping privileges.
+install -d -m 0755 "$UNIT_DEST.d"
+cat > "$UNIT_DEST.d/10-user.conf" <<EOF
+[Service]
+User=$SVC_USER
+Group=$SVC_GROUP
+EOF
+
 systemctl daemon-reload
 systemctl enable --now xorgate-agent
 
