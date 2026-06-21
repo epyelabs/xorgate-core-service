@@ -1152,7 +1152,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             in: 'query',
             required: false,
             schema: { type: 'string' },
-            description: 'Comma-separated metric filter (max 20), e.g. `imu.x,imu.y,gps.lat`.',
+            description: 'Comma-separated metric filter (max 20), e.g. `imu.accel_x,imu.euler_yaw,gps.lat`.',
           },
           {
             name: 'interval',

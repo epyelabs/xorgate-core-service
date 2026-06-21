@@ -30,7 +30,15 @@ const mediaCapabilitiesSchema = z.object({
 });
 
 const imuSensorSchema = z.object({
-  axes: z.array(z.string()), // ['x','y','z']
+  // BNO085-class IMU. `accel` is linear acceleration (gravity removed);
+  // `quaternion` is the rotation vector; `euler` are the angles derived from it.
+  // Each list names the fields published under the `imu.<prefix>_<field>` metric
+  // namespace (e.g. accel ['x','y','z'] -> imu.accel_x). `axes` is retained for
+  // back-compat with older accel-only models.
+  axes: z.array(z.string()).optional(), // legacy alias for accel, e.g. ['x','y','z']
+  accel: z.array(z.string()).optional(), // ['x','y','z']
+  quaternion: z.array(z.string()).optional(), // ['r','i','j','k']
+  euler: z.array(z.string()).optional(), // ['roll','pitch','yaw']
   unit: z.string().optional(),
   rateHz: z.number().positive().optional(),
 });

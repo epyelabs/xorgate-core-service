@@ -87,6 +87,35 @@ case "\${ID:-}\${ID_LIKE:-}" in
     ;;
 esac
 
+# 1b. IMU (BNO085) tooling — best-effort so a device without the sensor (or a
+#     non-Pi host) still installs cleanly. i2cdetect + the Adafruit CircuitPython
+#     stack back the agent's real IMU collector (src/hardware/imu.ts); the agent
+#     spawns bare \`python3\`, so the libs go system-wide. The IMU collector
+#     self-gates when none of this is present, so failures here only disable IMU.
+log "installing IMU tooling (i2c-tools, adafruit-circuitpython-bno08x)"
+case "\${ID:-}\${ID_LIKE:-}" in
+  *debian*|*ubuntu*)
+    apt-get install -y -qq i2c-tools python3-pip python3-dev \\
+      || log "WARN: i2c-tools/python3 pip install failed; IMU disabled"
+    # PEP 668 (Bookworm+) blocks system-wide pip installs without an override;
+    # older pip lacks the flag, so try with it and fall back to a plain install.
+    python3 -m pip install --break-system-packages -q \\
+        adafruit-circuitpython-bno08x adafruit-blinka 2>/dev/null \\
+      || python3 -m pip install -q adafruit-circuitpython-bno08x adafruit-blinka \\
+      || log "WARN: adafruit python libs failed to install; IMU disabled until installed"
+    ;;
+esac
+
+# Enable the I2C bus and let the (non-root) agent user reach /dev/i2c-*.
+if command -v raspi-config >/dev/null 2>&1; then
+  raspi-config nonint do_i2c 0 || log "WARN: 'raspi-config do_i2c' failed; enable I2C manually"
+else
+  modprobe i2c-dev 2>/dev/null || true
+fi
+if getent group i2c >/dev/null 2>&1 && [ "$SVC_USER" != "root" ]; then
+  usermod -aG i2c "$SVC_USER" || log "WARN: could not add $SVC_USER to the i2c group"
+fi
+
 # 2. Claim the registration code. The serial is a stable host identifier so a
 #    re-run on the same machine maps to the same device (the backend rejects a
 #    duplicate serial in the project). machine-id is preferred; fall back to the
