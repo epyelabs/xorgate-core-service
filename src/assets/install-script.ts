@@ -143,6 +143,19 @@ tar -xzf "$TMP/$TARBALL" -C "$INSTALL_PREFIX"
 log "installing node modules in $INSTALL_PREFIX"
 (cd "$INSTALL_PREFIX" && npm ci --omit=dev --no-audit --no-fund)
 
+# 5b. Install the \`xorgate\` CLI as a thin wrapper that defaults XORGATE_HOME to
+#     the systemd agent's state dir, so \`sudo xorgate status\`/\`monitor\` reflect
+#     the running service. Use systemctl/journalctl for lifecycle — \`xorgate start\`
+#     would launch a SECOND worker that fights the systemd one for the IoT clientId.
+# rm first: \`cat >\` follows an existing symlink and would clobber its target
+# (e.g. a prior \`xorgate -> dist/cli.js\` symlink).
+rm -f /usr/local/bin/xorgate
+cat > /usr/local/bin/xorgate <<'WRAP'
+#!/usr/bin/env bash
+exec env XORGATE_HOME="\${XORGATE_HOME:-/var/lib/xorgate}" node /opt/xorgate/dist/cli.js "$@"
+WRAP
+chmod +x /usr/local/bin/xorgate
+
 # 6. systemd.
 install -m 0644 "$INSTALL_PREFIX/systemd/xorgate-agent.service" "$UNIT_DEST"
 systemctl daemon-reload
