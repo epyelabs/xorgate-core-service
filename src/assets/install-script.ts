@@ -139,6 +139,9 @@ CERT_PATH=$CONF_DIR/device.cert.pem
 KEY_PATH=$CONF_DIR/device.key.pem
 CA_PATH=$CONF_DIR/root-ca.pem
 MODE=sim
+# Where \`xorgate update\` pulls new builds from.
+DEVICE_DIST_BUCKET_URL=$DIST_BUCKET_URL
+DEVICE_DIST_VERSION=$DIST_VERSION
 EOF
 
 # 4. Fetch + extract the device tarball.
