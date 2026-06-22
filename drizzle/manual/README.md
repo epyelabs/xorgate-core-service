@@ -23,6 +23,14 @@ Apply after the latest generated migration, in filename order:
    monthly RANGE-partitioned table + bootstrap partitions (`2026_06`, `2026_07`).
 3. `manual/002_seed_rpi_device_model.sql` — upserts the full-capability reference
    device model (idempotent).
+4. `manual/003_imu_bno085_capabilities.sql` — re-upserts the same model with the
+   richer BNO085 `sensors.imu` block (idempotent).
+5. `manual/004_gps_extended_fields.sql` — re-upserts the same model with
+   `satellites` + `fix_quality` added to `comm.gps.fields` (idempotent).
+
+The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
+forward, so applying only the latest is enough on a fresh cluster; re-running all
+in order is safe.
 
 Going forward, future monthly partitions are created by the P4
 `partition-maintenance` Lambda; these bootstrap files only cover the first two months.

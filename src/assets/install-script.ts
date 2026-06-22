@@ -220,6 +220,44 @@ EOF
 systemctl daemon-reload
 systemctl enable --now xorgate-agent
 
+# 7. SIM7600 LTE connection manager (cellular uplink + GPS NMEA source).
+#    Best-effort and self-gating like the IMU step (1b): a device without the
+#    modem still installs cleanly. The daemon owns the modem AT port, brings up
+#    the cellular link, and publishes signal telemetry the agent's \`lte\`
+#    collector reads (/run/sim7600-lte/telemetry.json); it also enables GNSS so
+#    the agent's \`gps\` collector can read NMEA on /dev/ttyUSB1.
+log "installing SIM7600 connection manager (LTE + GPS)"
+case "\${ID:-}\${ID_LIKE:-}" in
+  *debian*|*ubuntu*)
+    apt-get install -y -qq isc-dhcp-client usbutils \\
+      || log "WARN: isc-dhcp-client/usbutils install failed; LTE may not come up"
+    ;;
+esac
+
+# ModemManager claims the AT port and fights the daemon for it — disable it.
+systemctl disable --now ModemManager.service 2>/dev/null || true
+
+# The agent reads NMEA on /dev/ttyUSB1; the non-root agent user needs 'dialout'.
+if getent group dialout >/dev/null 2>&1 && [ "$SVC_USER" != "root" ]; then
+  usermod -aG dialout "$SVC_USER" || log "WARN: could not add $SVC_USER to the dialout group"
+fi
+
+# Install the daemon + its systemd unit + udev rule from the extracted tarball.
+if [ -f "$INSTALL_PREFIX/modem/sim7600-lte.sh" ]; then
+  install -m 0755 "$INSTALL_PREFIX/modem/sim7600-lte.sh" /usr/local/bin/sim7600-lte.sh
+  install -m 0644 "$INSTALL_PREFIX/modem/sim7600-lte.service" /etc/systemd/system/sim7600-lte.service
+  install -m 0644 "$INSTALL_PREFIX/modem/99-sim7600-lte.rules" /etc/udev/rules.d/99-sim7600-lte.rules
+  udevadm control --reload-rules 2>/dev/null || true
+  systemctl daemon-reload
+  # Enable so it persists + starts now if the modem is already enumerated; the
+  # udev rule also starts it on hotplug. Failure here only disables LTE/GPS.
+  systemctl enable --now sim7600-lte.service 2>/dev/null \\
+    || systemctl enable sim7600-lte.service 2>/dev/null \\
+    || log "WARN: could not enable sim7600-lte.service; LTE/GPS disabled"
+else
+  log "WARN: modem assets missing from build ($INSTALL_PREFIX/modem); LTE/GPS disabled"
+fi
+
 log "registered device $DEVICE_ID"
 log "tail logs: sudo journalctl -u xorgate-agent -f"
 `;
