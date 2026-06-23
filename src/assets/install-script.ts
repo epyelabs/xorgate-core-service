@@ -168,6 +168,15 @@ CERT_PATH=$CONF_DIR/device.cert.pem
 KEY_PATH=$CONF_DIR/device.key.pem
 CA_PATH=$CONF_DIR/root-ca.pem
 MODE=real
+# KVS WebRTC media runtime (supervised by the agent's media collector; it reuses
+# the IoT cert above for KVS creds — channels/endpoints live in kvs.json). Off
+# until the operator runs \`xorgate set media on\`.
+KVS_RUNTIME_BIN=$INSTALL_PREFIX/media/xorgate-kvs-webrtc
+KVS_RUNTIME_LIB_DIR=$INSTALL_PREFIX/media/lib
+KVS_MANIFEST=$CONF_DIR/kvs.json
+# Per-stream GStreamer pipelines: drop <streamKey>.gst here (e.g. cam0.gst), or
+# manage them with \`xorgate pipeline set <streamKey> <file>\`.
+KVS_PIPELINE_DIR=$CONF_DIR/pipelines
 # Where \`xorgate update\` pulls new builds from.
 DEVICE_DIST_BUCKET_URL=$DIST_BUCKET_URL
 DEVICE_DIST_VERSION=$DIST_VERSION
@@ -256,6 +265,54 @@ if [ -f "$INSTALL_PREFIX/modem/sim7600-lte.sh" ]; then
     || log "WARN: could not enable sim7600-lte.service; LTE/GPS disabled"
 else
   log "WARN: modem assets missing from build ($INSTALL_PREFIX/modem); LTE/GPS disabled"
+fi
+
+# 8. KVS WebRTC media runtime — deps + manifest. Best-effort and self-gating like
+#    the IMU (1b) and SIM7600 (7) steps: a device that won't stream still installs
+#    cleanly. The aarch64 \`xorgate-kvs-webrtc\` binary ships in the tarball under
+#    media/; its KVS SDK .so libs are supplied separately into media/lib. The media
+#    collector stays inert until enabled (\`xorgate set media on\`) and the libs land.
+log "installing KVS WebRTC media runtime deps"
+case "\${ID:-}\${ID_LIKE:-}" in
+  *debian*|*ubuntu*)
+    # apt-provided runtime libs the binary links + the GStreamer elements its
+    # pipeline needs at runtime (videotestsrc from -base, x264enc from -ugly,
+    # libcamerasrc from -libcamera). glib + its deps (libffi, pcre2, …) and the
+    # gst base/app libs come in transitively with these.
+    apt-get install -y -qq \\
+        libglib2.0-0 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \\
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-good \\
+        gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-tools \\
+      || log "WARN: GStreamer runtime install failed; media streaming disabled"
+    # libcamera source (Raspberry Pi cameras); absent on some distros — ignore.
+    apt-get install -y -qq gstreamer1.0-libcamera 2>/dev/null || true
+    # NOTE: the rest are NOT apt packages — the KVS SDK libs, its vendored
+    # OpenSSL 1.1 (libssl/libcrypto.so.1.1, which differ from the system
+    # OpenSSL 3 on current Pi OS), and libwebsockets ship in the bundle at
+    # $INSTALL_PREFIX/media/lib and are found via LD_LIBRARY_PATH.
+    ;;
+esac
+
+# Write the KVS manifest the media collector reads — region, IoT credential
+# endpoint, role alias, and per-channel names, all straight from the claim
+# response. Mode 0600, owned by the service user (matches the cert files).
+echo "$CLAIM_RESPONSE" \\
+  | jq '{deviceId, region, credentialEndpoint, roleAlias, channels: (.channels // [])}' \\
+  | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/kvs.json"
+
+# Per-stream pipeline dir (operator drops <streamKey>.gst files here for cameras).
+install -d -m 0755 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR/pipelines"
+
+# Stage the runtime binary (tar preserves the +x bit, but be defensive) and warn
+# if the user-supplied KVS SDK .so libs aren't present yet.
+if [ -f "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" ]; then
+  chmod 0755 "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" || true
+  log "media runtime staged; enable streaming with: xorgate set media on"
+  if ! ls "$INSTALL_PREFIX"/media/lib/*.so* >/dev/null 2>&1; then
+    log "NOTE: KVS SDK .so libs missing in $INSTALL_PREFIX/media/lib; supply them to enable streaming"
+  fi
+else
+  log "WARN: media runtime binary missing from build ($INSTALL_PREFIX/media); streaming disabled"
 fi
 
 log "registered device $DEVICE_ID"

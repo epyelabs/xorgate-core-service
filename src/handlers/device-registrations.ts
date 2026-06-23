@@ -274,6 +274,16 @@ async function claimRegistration(
     privateKey: result.privateKey,
     caUrl: result.caUrl,
     name: device!.name,
+    // KVS WebRTC runtime config: the install script writes these to kvs.json so
+    // the device-agent media collector can run a master per channel (IoT-cert
+    // creds via the credential provider). Already on `result` — just surfaced.
+    region: result.region,
+    credentialEndpoint: result.credentialEndpoint,
+    roleAlias: result.roleAlias,
+    channels: result.channels.map((c) => ({
+      streamKey: c.streamKey,
+      channelName: c.channelName,
+    })),
   });
 }
 
