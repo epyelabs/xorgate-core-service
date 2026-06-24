@@ -267,6 +267,36 @@ else
   log "WARN: modem assets missing from build ($INSTALL_PREFIX/modem); LTE/GPS disabled"
 fi
 
+# 7b. Uplink priority: prefer WiFi over the LTE modem for the IPv4 default route.
+#     The modem (usb0) is an ethernet-class device, so NetworkManager gives it the
+#     default route metric 100, beating WiFi's 600. That means a dead-but-up LTE
+#     link (antenna out / no signal, but the USB net iface still up) keeps winning
+#     the route and black-holes IPv4 — including KVS WebRTC video, whose endpoints
+#     are IPv4-only. Dropping WiFi's metric below the modem's makes WiFi win
+#     whenever it is associated, with LTE as the fallback (used only when WiFi is
+#     down/absent). Best-effort and self-gating: only applied when NetworkManager
+#     is the active stack. The SIM7600 manager is unaffected — its health checks
+#     bind to usb0 directly (ping -I usb0), independent of the default route.
+#     NOTE: this is link-based, not connectivity-based; it assumes the device only
+#     joins trusted WiFi that has real internet (a captive/dead AP would black-hole).
+if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  log "setting WiFi to outrank the LTE modem for the IPv4 default route"
+  install -d -m 0755 /etc/NetworkManager/conf.d
+  cat > /etc/NetworkManager/conf.d/10-uplink-priority.conf <<'NMEOF'
+# Prefer WiFi over the LTE modem (usb0) for the IPv4 default route.
+# WiFi connections get route-metric 50; the modem's ethernet-class usb0 keeps its
+# default ~100, so WiFi wins whenever it is associated. LTE stays the fallback,
+# used only when WiFi is down or absent. Interface-bound health checks in the
+# SIM7600 manager (ping -I usb0) are unaffected by this.
+[connection-wifi-priority]
+match-device=type:wifi
+ipv4.route-metric=50
+NMEOF
+  systemctl reload NetworkManager 2>/dev/null || true
+else
+  log "NOTE: NetworkManager not active; skipping WiFi/LTE route-priority config"
+fi
+
 # 8. KVS WebRTC media runtime — deps + manifest. Best-effort and self-gating like
 #    the IMU (1b) and SIM7600 (7) steps: a device that won't stream still installs
 #    cleanly. The aarch64 \`xorgate-kvs-webrtc\` binary ships in the tarball under
