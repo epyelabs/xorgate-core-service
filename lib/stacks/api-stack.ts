@@ -318,10 +318,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       standardFnProps(path.join(entryBase, "api-keys.ts"), "CRUD /api-keys"),
     );
 
-    const projectsFn = new nodejs.NodejsFunction(
+    const workspacesFn = new nodejs.NodejsFunction(
       this,
-      "ProjectsFn",
-      standardFnProps(path.join(entryBase, "projects.ts"), "CRUD /projects"),
+      "WorkspacesFn",
+      standardFnProps(path.join(entryBase, "workspaces.ts"), "CRUD /workspaces"),
     );
 
     const deviceModelsFn = new nodejs.NodejsFunction(
@@ -555,7 +555,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
           "Content-Type",
           "X-Request-ID",
           "X-Organization-Id",
-          "X-Project-Id",
+          "X-Workspace-Id",
         ],
         maxAge: cdk.Duration.hours(24),
       },
@@ -578,9 +578,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "ApiKeysInt",
       apiKeysFn,
     );
-    const projectsInt = new apigwv2int.HttpLambdaIntegration(
-      "ProjectsInt",
-      projectsFn,
+    const workspacesInt = new apigwv2int.HttpLambdaIntegration(
+      "WorkspacesInt",
+      workspacesFn,
     );
     const deviceModelsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceModelsInt",
@@ -680,18 +680,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
 
     this.api.addRoutes({
-      path: "/projects",
+      path: "/workspaces",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
-      integration: projectsInt,
+      integration: workspacesInt,
     });
     this.api.addRoutes({
-      path: "/projects/{id}",
+      path: "/workspaces/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
         apigwv2.HttpMethod.PUT,
         apigwv2.HttpMethod.DELETE,
       ],
-      integration: projectsInt,
+      integration: workspacesInt,
     });
 
     this.api.addRoutes({

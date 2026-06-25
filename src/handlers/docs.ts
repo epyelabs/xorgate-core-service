@@ -6,7 +6,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
     title: 'Xorgate Core API',
     version: '0.1.0',
     description:
-      'Backend API for organizations, projects, devices, and platform-level device models. ' +
+      'Backend API for organizations, workspaces, devices, and platform-level device models. ' +
       'Most endpoints require a Bearer JWT (Cognito ID token). Org-scoped endpoints additionally ' +
       'resolve the active organization from the `X-Organization-Id` header (omit if the caller belongs to a single org).',
   },
@@ -25,13 +25,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         description:
           'Active organization UUID. Required when the caller belongs to more than one organization.',
       },
-      ProjectIdHeader: {
-        name: 'X-Project-Id',
+      WorkspaceIdHeader: {
+        name: 'X-Workspace-Id',
         in: 'header',
         required: false,
         schema: { type: 'string', format: 'uuid' },
         description:
-          'Optional project UUID. When present on GET /devices, the response is filtered to devices in this project. Must belong to the active organization.',
+          'Optional workspace UUID. When present on GET /devices, the response is filtered to devices in this workspace. Must belong to the active organization.',
       },
       IdPath: {
         name: 'id',
@@ -103,7 +103,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           createdAt: { type: 'string', format: 'date-time' },
         },
       },
-      Project: {
+      Workspace: {
         type: 'object',
         required: ['id', 'organizationId', 'name', 'slug'],
         properties: {
@@ -138,10 +138,10 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       },
       Device: {
         type: 'object',
-        required: ['id', 'projectId', 'deviceModelId', 'serial', 'status'],
+        required: ['id', 'workspaceId', 'deviceModelId', 'serial', 'status'],
         properties: {
           id: { type: 'string', format: 'uuid' },
-          projectId: { type: 'string', format: 'uuid' },
+          workspaceId: { type: 'string', format: 'uuid' },
           deviceModelId: { type: 'string', format: 'uuid' },
           serial: { type: 'string' },
           name: { type: 'string', nullable: true },
@@ -632,22 +632,22 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
     },
-    '/projects': {
+    '/workspaces': {
       parameters: [{ $ref: '#/components/parameters/OrganizationIdHeader' }],
       get: {
-        operationId: 'listProjects',
-        summary: 'List projects in the active organization',
-        tags: ['Projects'],
+        operationId: 'listWorkspaces',
+        summary: 'List workspaces in the active organization',
+        tags: ['Workspaces'],
         responses: {
           '200': {
-            description: 'List of projects',
+            description: 'List of workspaces',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['projects'],
+                  required: ['workspaces'],
                   properties: {
-                    projects: { type: 'array', items: { $ref: '#/components/schemas/Project' } },
+                    workspaces: { type: 'array', items: { $ref: '#/components/schemas/Workspace' } },
                   },
                 },
               },
@@ -658,9 +658,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
       post: {
-        operationId: 'createProject',
-        summary: 'Create a project in the active organization',
-        tags: ['Projects'],
+        operationId: 'createWorkspace',
+        summary: 'Create a workspace in the active organization',
+        tags: ['Workspaces'],
         requestBody: {
           required: true,
           content: {
@@ -679,13 +679,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
         responses: {
           '201': {
-            description: 'Project created',
+            description: 'Workspace created',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['project'],
-                  properties: { project: { $ref: '#/components/schemas/Project' } },
+                  required: ['workspace'],
+                  properties: { workspace: { $ref: '#/components/schemas/Workspace' } },
                 },
               },
             },
@@ -696,21 +696,21 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
     },
-    '/projects/{id}': {
+    '/workspaces/{id}': {
       parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
       get: {
-        operationId: 'getProject',
-        summary: 'Get a project',
-        tags: ['Projects'],
+        operationId: 'getWorkspace',
+        summary: 'Get a workspace',
+        tags: ['Workspaces'],
         responses: {
           '200': {
-            description: 'Project',
+            description: 'Workspace',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['project'],
-                  properties: { project: { $ref: '#/components/schemas/Project' } },
+                  required: ['workspace'],
+                  properties: { workspace: { $ref: '#/components/schemas/Workspace' } },
                 },
               },
             },
@@ -721,9 +721,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
       put: {
-        operationId: 'updateProject',
-        summary: 'Update a project',
-        tags: ['Projects'],
+        operationId: 'updateWorkspace',
+        summary: 'Update a workspace',
+        tags: ['Workspaces'],
         requestBody: {
           required: true,
           content: {
@@ -741,13 +741,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
         responses: {
           '200': {
-            description: 'Project updated',
+            description: 'Workspace updated',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['project'],
-                  properties: { project: { $ref: '#/components/schemas/Project' } },
+                  required: ['workspace'],
+                  properties: { workspace: { $ref: '#/components/schemas/Workspace' } },
                 },
               },
             },
@@ -759,9 +759,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
       delete: {
-        operationId: 'deleteProject',
-        summary: 'Delete a project',
-        tags: ['Projects'],
+        operationId: 'deleteWorkspace',
+        summary: 'Delete a workspace',
+        tags: ['Workspaces'],
         responses: {
           '204': { $ref: '#/components/responses/NoContent' },
           '401': { $ref: '#/components/responses/Unauthorized' },
@@ -915,9 +915,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         operationId: 'listDevices',
         summary: 'List devices in the active organization',
         description:
-          'Returns every device whose project belongs to the active organization. ' +
-          'Pass X-Project-Id to filter the results to a single project.',
-        parameters: [{ $ref: '#/components/parameters/ProjectIdHeader' }],
+          'Returns every device whose workspace belongs to the active organization. ' +
+          'Pass X-Workspace-Id to filter the results to a single workspace.',
+        parameters: [{ $ref: '#/components/parameters/WorkspaceIdHeader' }],
         tags: ['Devices'],
         responses: {
           '200': {
@@ -940,7 +940,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       },
       post: {
         operationId: 'createDevice',
-        summary: 'Register a device under a project in the active organization',
+        summary: 'Register a device under a workspace in the active organization',
         tags: ['Devices'],
         requestBody: {
           required: true,
@@ -948,9 +948,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['projectId', 'deviceModelId', 'serial'],
+                required: ['workspaceId', 'deviceModelId', 'serial'],
                 properties: {
-                  projectId: { type: 'string', format: 'uuid' },
+                  workspaceId: { type: 'string', format: 'uuid' },
                   deviceModelId: { type: 'string', format: 'uuid' },
                   serial: { type: 'string' },
                   name: { type: 'string', nullable: true },

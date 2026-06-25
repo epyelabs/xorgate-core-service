@@ -16,9 +16,9 @@ import {
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
-async function projectIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.projects.findMany({
-    where: eq(schema.projects.organizationId, organizationId),
+async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
+  const rows = await db.query.workspaces.findMany({
+    where: eq(schema.workspaces.organizationId, organizationId),
     columns: { id: true },
   });
   return rows.map((r) => r.id);
@@ -42,43 +42,43 @@ export const handler = async (
     throw err;
   }
 
-  const orgProjectIds = await projectIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
 
   switch (method) {
     case 'GET': {
       if (id) {
-        if (orgProjectIds.length === 0) return notFound(`Device "${id}" not found`);
+        if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
         const row = await db.query.devices.findFirst({
           where: and(
             eq(schema.devices.id, id),
-            inArray(schema.devices.projectId, orgProjectIds),
+            inArray(schema.devices.workspaceId, orgWorkspaceIds),
           ),
         });
         if (!row) return notFound(`Device "${id}" not found`);
         return ok({ device: row });
       }
-      if (orgProjectIds.length === 0) return ok({ devices: [] });
-      const headerProjectId =
-        event.headers['x-project-id'] ?? event.headers['X-Project-Id'];
-      if (headerProjectId) {
-        if (!orgProjectIds.includes(headerProjectId)) {
+      if (orgWorkspaceIds.length === 0) return ok({ devices: [] });
+      const headerWorkspaceId =
+        event.headers['x-workspace-id'] ?? event.headers['X-Workspace-Id'];
+      if (headerWorkspaceId) {
+        if (!orgWorkspaceIds.includes(headerWorkspaceId)) {
           return ok({ devices: [] });
         }
         const rows = await db.query.devices.findMany({
-          where: eq(schema.devices.projectId, headerProjectId),
+          where: eq(schema.devices.workspaceId, headerWorkspaceId),
           orderBy: [desc(schema.devices.updatedAt)],
         });
         return ok({ devices: rows });
       }
       const rows = await db.query.devices.findMany({
-        where: inArray(schema.devices.projectId, orgProjectIds),
+        where: inArray(schema.devices.workspaceId, orgWorkspaceIds),
         orderBy: [desc(schema.devices.updatedAt)],
       });
       return ok({ devices: rows });
     }
     case 'POST': {
       let body: {
-        projectId?: string;
+        workspaceId?: string;
         deviceModelId?: string;
         serial?: string;
         name?: string;
@@ -90,12 +90,12 @@ export const handler = async (
       } catch {
         return badRequest('Invalid JSON body');
       }
-      if (!body.projectId) return badRequest('projectId is required');
+      if (!body.workspaceId) return badRequest('workspaceId is required');
       if (!body.deviceModelId) return badRequest('deviceModelId is required');
       if (!body.serial) return badRequest('serial is required');
 
-      if (!orgProjectIds.includes(body.projectId)) {
-        return badRequest('projectId does not belong to the active organization');
+      if (!orgWorkspaceIds.includes(body.workspaceId)) {
+        return badRequest('workspaceId does not belong to the active organization');
       }
       const status = body.status ?? 'provisioned';
       if (!VALID_STATUSES.includes(status as (typeof VALID_STATUSES)[number])) {
@@ -105,7 +105,7 @@ export const handler = async (
       const [row] = await db
         .insert(schema.devices)
         .values({
-          projectId: body.projectId,
+          workspaceId: body.workspaceId,
           deviceModelId: body.deviceModelId,
           serial: body.serial,
           name: body.name ?? null,
@@ -149,14 +149,14 @@ export const handler = async (
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
-      if (orgProjectIds.length === 0) return notFound(`Device "${id}" not found`);
+      if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
       const updated = await db
         .update(schema.devices)
         .set(updates)
         .where(
           and(
             eq(schema.devices.id, id),
-            inArray(schema.devices.projectId, orgProjectIds),
+            inArray(schema.devices.workspaceId, orgWorkspaceIds),
           ),
         )
         .returning();
@@ -165,13 +165,13 @@ export const handler = async (
     }
     case 'DELETE': {
       if (!id) return badRequest('device id required in path');
-      if (orgProjectIds.length === 0) return notFound(`Device "${id}" not found`);
+      if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
       const deleted = await db
         .delete(schema.devices)
         .where(
           and(
             eq(schema.devices.id, id),
-            inArray(schema.devices.projectId, orgProjectIds),
+            inArray(schema.devices.workspaceId, orgWorkspaceIds),
           ),
         )
         .returning({ id: schema.devices.id });

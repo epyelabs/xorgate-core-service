@@ -43,9 +43,9 @@ function toView(row: DeviceRegistration): RegistrationView {
   };
 }
 
-async function projectIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.projects.findMany({
-    where: eq(schema.projects.organizationId, organizationId),
+async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
+  const rows = await db.query.workspaces.findMany({
+    where: eq(schema.workspaces.organizationId, organizationId),
     columns: { id: true },
   });
   return rows.map((r) => r.id);
@@ -67,7 +67,7 @@ export const handler = async (
   return methodNotAllowed(method, 'GET, POST');
 };
 
-// POST /device-registrations (auth). Idempotent: returns the project's existing
+// POST /device-registrations (auth). Idempotent: returns the workspace's existing
 // pending, un-expired registration instead of minting a new code, so reloading
 // the dialog doesn't burn codes.
 async function createRegistration(
@@ -81,14 +81,14 @@ async function createRegistration(
     throw err;
   }
 
-  const projectId =
-    event.headers['x-project-id'] ?? event.headers['X-Project-Id'];
-  if (!projectId) {
-    return badRequest('Select a project first (missing X-Project-Id header)');
+  const workspaceId =
+    event.headers['x-workspace-id'] ?? event.headers['X-Workspace-Id'];
+  if (!workspaceId) {
+    return badRequest('Select a workspace first (missing X-Workspace-Id header)');
   }
-  const orgProjectIds = await projectIdsForOrg(auth.organizationId);
-  if (!orgProjectIds.includes(projectId)) {
-    return badRequest('projectId does not belong to the active organization');
+  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  if (!orgWorkspaceIds.includes(workspaceId)) {
+    return badRequest('workspaceId does not belong to the active organization');
   }
 
   // Auto-pick the device model. Today there is exactly one seeded model; when
@@ -103,7 +103,7 @@ async function createRegistration(
 
   const existing = await db.query.deviceRegistrations.findFirst({
     where: and(
-      eq(schema.deviceRegistrations.projectId, projectId),
+      eq(schema.deviceRegistrations.workspaceId, workspaceId),
       eq(schema.deviceRegistrations.status, 'pending'),
       gt(schema.deviceRegistrations.expiresAt, sql`now()`),
     ),
@@ -116,7 +116,7 @@ async function createRegistration(
     .values({
       code: generateRegistrationCode(),
       organizationId: auth.organizationId,
-      projectId,
+      workspaceId,
       deviceModelId: model.id,
       createdByUserId: auth.userId,
       expiresAt: new Date(Date.now() + REGISTRATION_TTL_MS),
@@ -169,7 +169,7 @@ async function getRegistration(
 // POST /device-registrations/{code}/claim (UNAUTHENTICATED — this is what
 // install.sh on the device calls). Order:
 //   1. Atomic UPDATE flips pending -> claimed (only one concurrent caller wins).
-//   2. Insert the devices row (serial unique per project).
+//   2. Insert the devices row (serial unique per workspace).
 //   3. Provision IoT (thing + cert + KVS) via the shared service.
 //   4. Link the device back to the registration.
 // On failure after step 2 we delete the device row + IoT thing and revert the
@@ -208,17 +208,17 @@ async function claimRegistration(
   const name = body.hostname?.trim() || null;
 
   // Reject a re-registration of the same physical host (serial unique per
-  // project) with a clean 409 rather than letting the unique index 500.
+  // workspace) with a clean 409 rather than letting the unique index 500.
   const dup = await db.query.devices.findFirst({
     where: and(
-      eq(schema.devices.projectId, reg.projectId),
+      eq(schema.devices.workspaceId, reg.workspaceId),
       eq(schema.devices.serial, serial),
     ),
   });
   if (dup) {
     await revertClaim(reg.id);
     return conflict(
-      'A device with this serial is already registered in the project; delete it first to re-provision.',
+      'A device with this serial is already registered in the workspace; delete it first to re-provision.',
     );
   }
 
@@ -228,7 +228,7 @@ async function claimRegistration(
     [device] = await db
       .insert(schema.devices)
       .values({
-        projectId: reg.projectId,
+        workspaceId: reg.workspaceId,
         deviceModelId: reg.deviceModelId,
         serial,
         name,

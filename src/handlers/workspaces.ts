@@ -35,20 +35,20 @@ export const handler = async (
   switch (method) {
     case 'GET': {
       if (id) {
-        const row = await db.query.projects.findFirst({
+        const row = await db.query.workspaces.findFirst({
           where: and(
-            eq(schema.projects.id, id),
-            eq(schema.projects.organizationId, auth.organizationId),
+            eq(schema.workspaces.id, id),
+            eq(schema.workspaces.organizationId, auth.organizationId),
           ),
         });
-        if (!row) return notFound(`Project "${id}" not found`);
-        return ok({ project: row });
+        if (!row) return notFound(`Workspace "${id}" not found`);
+        return ok({ workspace: row });
       }
-      const rows = await db.query.projects.findMany({
-        where: eq(schema.projects.organizationId, auth.organizationId),
-        orderBy: [desc(schema.projects.updatedAt)],
+      const rows = await db.query.workspaces.findMany({
+        where: eq(schema.workspaces.organizationId, auth.organizationId),
+        orderBy: [desc(schema.workspaces.updatedAt)],
       });
-      return ok({ projects: rows });
+      return ok({ workspaces: rows });
     }
     case 'POST': {
       let body: { name?: string; slug?: string; description?: string };
@@ -62,7 +62,7 @@ export const handler = async (
       if (!name || !slug) return badRequest('name and slug are required');
 
       const [row] = await db
-        .insert(schema.projects)
+        .insert(schema.workspaces)
         .values({
           organizationId: auth.organizationId,
           name,
@@ -70,10 +70,10 @@ export const handler = async (
           description: body.description ?? null,
         })
         .returning();
-      return created({ project: row });
+      return created({ workspace: row });
     }
     case 'PUT': {
-      if (!id) return badRequest('project id required in path');
+      if (!id) return badRequest('workspace id required in path');
       let body: { name?: string; slug?: string; description?: string };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -88,30 +88,30 @@ export const handler = async (
       updates.updatedAt = new Date();
 
       const updated = await db
-        .update(schema.projects)
+        .update(schema.workspaces)
         .set(updates)
         .where(
           and(
-            eq(schema.projects.id, id),
-            eq(schema.projects.organizationId, auth.organizationId),
+            eq(schema.workspaces.id, id),
+            eq(schema.workspaces.organizationId, auth.organizationId),
           ),
         )
         .returning();
-      if (updated.length === 0) return notFound(`Project "${id}" not found`);
-      return ok({ project: updated[0] });
+      if (updated.length === 0) return notFound(`Workspace "${id}" not found`);
+      return ok({ workspace: updated[0] });
     }
     case 'DELETE': {
-      if (!id) return badRequest('project id required in path');
+      if (!id) return badRequest('workspace id required in path');
       const deleted = await db
-        .delete(schema.projects)
+        .delete(schema.workspaces)
         .where(
           and(
-            eq(schema.projects.id, id),
-            eq(schema.projects.organizationId, auth.organizationId),
+            eq(schema.workspaces.id, id),
+            eq(schema.workspaces.organizationId, auth.organizationId),
           ),
         )
-        .returning({ id: schema.projects.id });
-      if (deleted.length === 0) return notFound(`Project "${id}" not found`);
+        .returning({ id: schema.workspaces.id });
+      if (deleted.length === 0) return notFound(`Workspace "${id}" not found`);
       return { statusCode: 204, body: '' };
     }
     default:

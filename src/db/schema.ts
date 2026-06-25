@@ -67,8 +67,8 @@ export const apiKeys = pgTable(
   (t) => [uniqueIndex('api_keys_hashed_key_idx').on(t.hashedKey)],
 );
 
-export const projects = pgTable(
-  'projects',
+export const workspaces = pgTable(
+  'workspaces',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     organizationId: uuid('organization_id')
@@ -80,7 +80,7 @@ export const projects = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [uniqueIndex('projects_org_slug_idx').on(t.organizationId, t.slug)],
+  (t) => [uniqueIndex('workspaces_org_slug_idx').on(t.organizationId, t.slug)],
 );
 
 // Platform-wide catalog. No organizationId. Read by any authed user; mutation gated to users.role='admin'.
@@ -102,8 +102,8 @@ export const devices = pgTable(
   'devices',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    projectId: uuid('project_id')
-      .references(() => projects.id, { onDelete: 'cascade' })
+    workspaceId: uuid('workspace_id')
+      .references(() => workspaces.id, { onDelete: 'cascade' })
       .notNull(),
     deviceModelId: uuid('device_model_id')
       .references(() => deviceModels.id, { onDelete: 'restrict' })
@@ -120,8 +120,8 @@ export const devices = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [
-    uniqueIndex('devices_project_serial_idx').on(t.projectId, t.serial),
-    index('devices_project_idx').on(t.projectId),
+    uniqueIndex('devices_workspace_serial_idx').on(t.workspaceId, t.serial),
+    index('devices_workspace_idx').on(t.workspaceId),
     index('devices_model_idx').on(t.deviceModelId),
   ],
 );
@@ -139,8 +139,8 @@ export const deviceRegistrations = pgTable(
     organizationId: uuid('organization_id')
       .references(() => organizations.id, { onDelete: 'cascade' })
       .notNull(),
-    projectId: uuid('project_id')
-      .references(() => projects.id, { onDelete: 'cascade' })
+    workspaceId: uuid('workspace_id')
+      .references(() => workspaces.id, { onDelete: 'cascade' })
       .notNull(),
     deviceModelId: uuid('device_model_id')
       .references(() => deviceModels.id, { onDelete: 'restrict' })
@@ -159,7 +159,7 @@ export const deviceRegistrations = pgTable(
   },
   (t) => [
     uniqueIndex('device_registrations_code_idx').on(t.code),
-    index('device_registrations_project_status_idx').on(t.projectId, t.status),
+    index('device_registrations_workspace_status_idx').on(t.workspaceId, t.status),
   ],
 );
 
@@ -291,8 +291,8 @@ export type Membership = InferSelectModel<typeof memberships>;
 export type NewMembership = InferInsertModel<typeof memberships>;
 export type ApiKey = InferSelectModel<typeof apiKeys>;
 export type NewApiKey = InferInsertModel<typeof apiKeys>;
-export type Project = InferSelectModel<typeof projects>;
-export type NewProject = InferInsertModel<typeof projects>;
+export type Workspace = InferSelectModel<typeof workspaces>;
+export type NewWorkspace = InferInsertModel<typeof workspaces>;
 export type DeviceModel = InferSelectModel<typeof deviceModels>;
 export type NewDeviceModel = InferInsertModel<typeof deviceModels>;
 export type Device = InferSelectModel<typeof devices>;

@@ -11,9 +11,9 @@ import {
 } from '../utils/responses';
 import { provisionDevice } from '../services/iot-provisioning';
 
-async function projectIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.projects.findMany({
-    where: eq(schema.projects.organizationId, organizationId),
+async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
+  const rows = await db.query.workspaces.findMany({
+    where: eq(schema.workspaces.organizationId, organizationId),
     columns: { id: true },
   });
   return rows.map((r) => r.id);
@@ -39,13 +39,13 @@ export const handler = async (
     throw err;
   }
 
-  const orgProjectIds = await projectIdsForOrg(auth.organizationId);
-  if (orgProjectIds.length === 0) return notFound(`Device "${id}" not found`);
+  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
 
   const device = await db.query.devices.findFirst({
     where: and(
       eq(schema.devices.id, id),
-      inArray(schema.devices.projectId, orgProjectIds),
+      inArray(schema.devices.workspaceId, orgWorkspaceIds),
     ),
   });
   if (!device) return notFound(`Device "${id}" not found`);

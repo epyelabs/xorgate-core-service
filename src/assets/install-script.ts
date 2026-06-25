@@ -118,7 +118,7 @@ fi
 
 # 2. Claim the registration code. The serial is a stable host identifier so a
 #    re-run on the same machine maps to the same device (the backend rejects a
-#    duplicate serial in the project). machine-id is preferred; fall back to the
+#    duplicate serial in the workspace). machine-id is preferred; fall back to the
 #    DMI product UUID, then the hostname.
 HOSTNAME_VAL=$(hostname || echo unknown)
 PLATFORM_VAL=$(uname -m || echo unknown)
