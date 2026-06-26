@@ -41,6 +41,15 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   iotRoleAlias: string;
   cognitoIdentityPoolId: string;
   cognitoUserPoolProvider: string;
+  // Cloud viewer-recorder (Fargate) launch config — see recorder-stack.ts.
+  recorderClusterArn: string;
+  recorderClusterName: string;
+  recorderTaskFamily: string;
+  recorderTaskRoleArn: string;
+  recorderExecutionRoleArn: string;
+  recorderSecurityGroupId: string;
+  recorderSubnets: string; // comma-separated public subnet ids
+  recorderContainerName: string;
 }
 
 export class XorgateCoreApiStack extends cdk.Stack {
@@ -68,6 +77,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       iotRoleAlias,
       cognitoIdentityPoolId,
       cognitoUserPoolProvider,
+      recorderClusterArn,
+      recorderClusterName,
+      recorderTaskFamily,
+      recorderTaskRoleArn,
+      recorderExecutionRoleArn,
+      recorderSecurityGroupId,
+      recorderSubnets,
+      recorderContainerName,
     } = props;
 
     const isProd = stage === "prod";
@@ -194,6 +211,36 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // Recordings: launch/stop the Fargate viewer-recorder and pass its roles.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "RecorderRunTask",
+        actions: ["ecs:RunTask"],
+        resources: [
+          `arn:aws:ecs:${this.region}:${this.account}:task-definition/${recorderTaskFamily}:*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "RecorderStopTask",
+        actions: ["ecs:StopTask", "ecs:DescribeTasks"],
+        resources: [
+          `arn:aws:ecs:${this.region}:${this.account}:task/${recorderClusterName}/*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "RecorderPassRole",
+        actions: ["iam:PassRole"],
+        resources: [recorderTaskRoleArn, recorderExecutionRoleArn],
+        conditions: {
+          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+        },
+      }),
+    );
+
     // Browser live-telemetry (P2): attach the AWS IoT policy to a caller's Cognito
     // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
     // authorizes against the *target* (a Cognito identity id, not an ARN) → resource "*";
@@ -236,6 +283,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       COGNITO_IDENTITY_POOL_ID: cognitoIdentityPoolId,
       COGNITO_USER_POOL_PROVIDER: cognitoUserPoolProvider,
       AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1",
+      // Cloud viewer-recorder (Fargate) launch config — read by services/recordings.ts.
+      RECORDER_CLUSTER_ARN: recorderClusterArn,
+      RECORDER_TASKDEF: recorderTaskFamily,
+      RECORDER_SUBNETS: recorderSubnets,
+      RECORDER_SG: recorderSecurityGroupId,
+      RECORDER_CONTAINER_NAME: recorderContainerName,
     };
 
     const commonBundling: nodejs.BundlingOptions = {
@@ -244,6 +297,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       target: "node20",
       externalModules: ["@aws-sdk/*"],
       forceDockerBundling: false,
+    };
+
+    // @aws-sdk/client-ecs is not guaranteed to be in the Lambda runtime's bundled
+    // SDK (unlike client-s3 / client-rds-data), so the recorder-launching Lambdas
+    // bundle the SDK rather than externalize it.
+    const bundlingWithSdk: nodejs.BundlingOptions = {
+      ...commonBundling,
+      externalModules: [],
     };
 
     const vpcProps: Pick<
@@ -397,6 +458,41 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // /devices/{id}/recordings (+ control sub-routes) — cloud viewer-recorder
+    // start/stop/list/playback/delete. Launches/stops Fargate tasks (RunTask/
+    // StopTask) and presigns S3 GETs, so give it more than the 10s default.
+    const deviceRecordingsFn = new nodejs.NodejsFunction(this, "DeviceRecordingsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-recordings.ts"),
+        "CRUD + control /devices/{id}/recordings (cloud recorder)",
+      ),
+      timeout: cdk.Duration.seconds(20),
+      bundling: bundlingWithSdk,
+    });
+
+    // S3 ObjectCreated(media/v1/*) -> flip the matching recording to completed.
+    // Routed via EventBridge (the bucket has EventBridge notifications enabled in
+    // storage-stack) so there's no cross-stack notification cycle. The rule matches
+    // the bucket by NAME, so this stack -> storage-stack stays one-directional.
+    const mediaFinalizeFn = new nodejs.NodejsFunction(this, "MediaFinalizeFn", {
+      ...standardFnProps(
+        path.join(entryBase, "media-finalize.ts"),
+        "S3 Object Created(media/v1/*.mp4) -> mark recording completed",
+      ),
+    });
+    new events.Rule(this, "MediaFinalizeRule", {
+      description: "Recorder MP4 uploaded -> finalize recording row",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ prefix: "media/v1/" }] },
+        },
+      },
+      targets: [new targets.LambdaFunction(mediaFinalizeFn)],
+    });
+
     // GET /devices/{id}/telemetry + /devices/{id}/telemetry/latest (P4) — historical
     // telemetry reads over the partitioned telemetry_readings + device_latest tables.
     // Reads Postgres only (no new IAM).
@@ -422,6 +518,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // One message = up to 3 Data API round-trips (insert + upsert + heartbeat).
       memorySize: 256,
       timeout: cdk.Duration.seconds(15),
+      // Bundles client-ecs for the auto-record path (RunTask/StopTask).
+      bundling: bundlingWithSdk,
     });
 
     // EventBridge ~1 min -> flip stale `online` devices to `offline`.
@@ -614,6 +712,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "TelemetryHistoryInt",
       telemetryHistoryFn,
     );
+    const deviceRecordingsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceRecordingsInt",
+      deviceRecordingsFn,
+    );
     const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
@@ -760,6 +862,26 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/identity",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceIdentityInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/recordings",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: deviceRecordingsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/recordings/{recordingId}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: deviceRecordingsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/recordings/{recordingId}/stop",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceRecordingsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/recordings/{recordingId}/playback",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceRecordingsInt,
     });
     this.api.addRoutes({
       path: "/devices/{id}/telemetry",

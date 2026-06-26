@@ -13,6 +13,18 @@ import type { NewTelemetryReading } from '../db/schema';
 const numericLeaf = z.object({ value: z.number(), unit: z.string().optional() });
 const boolLeaf = z.object({ value: z.boolean() });
 
+// The device reports per-stream state as objects ({ streamKey, channelName?, state? });
+// older/synthetic builds may send a bare stream-key string. Accept both so a media
+// payload never fails validation. Informational only — not stored as readings.
+const mediaStreamLeaf = z.union([
+  z.string(),
+  z.object({
+    streamKey: z.string(),
+    channelName: z.string().optional(),
+    state: z.string().optional(), // starting | running | retrying | failed | stopped
+  }),
+]);
+
 export const telemetryPayloadSchema = z.object({
   v: z.literal(1),
   deviceId: z.string().uuid(),
@@ -23,12 +35,33 @@ export const telemetryPayloadSchema = z.object({
     .object({
       kvs: boolLeaf.optional(),
       recording: boolLeaf.optional(),
-      streams: z.array(z.string()).optional(), // informational; not stored as readings
+      streams: z.array(mediaStreamLeaf).optional(),
     })
     .optional(),
 });
 
 export type TelemetryPayload = z.infer<typeof telemetryPayloadSchema>;
+
+/**
+ * Stream keys that are currently live in a telemetry payload, used by the
+ * auto-record path. Object streams count as active when running/starting (or when
+ * no state is reported); bare-string streams are assumed active (best effort).
+ * Returns null when the payload carries no media block at all, so the caller can
+ * distinguish "no streams active" from "media state unknown this tick".
+ */
+export function activeStreamKeys(payload: TelemetryPayload): string[] | null {
+  const streams = payload.media?.streams;
+  if (!payload.media || streams === undefined) return null;
+  const keys: string[] = [];
+  for (const s of streams) {
+    if (typeof s === 'string') {
+      keys.push(s);
+    } else if (!s.state || s.state === 'running' || s.state === 'starting') {
+      keys.push(s.streamKey);
+    }
+  }
+  return keys;
+}
 
 /**
  * Encode the metric-naming contract: flatten a payload into rows ready for

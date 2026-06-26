@@ -54,6 +54,11 @@ export class XorgateCoreStorageStack extends cdk.Stack {
       autoDeleteObjects: !isProd,
     });
 
+    // Emit S3 events to EventBridge so the api-stack can react to recorder uploads
+    // (media/v1/*.mp4) via a rule, without a cross-stack notification dependency
+    // cycle (bucket here, finalize Lambda in the api-stack).
+    this.bucket.enableEventBridgeNotification();
+
     this.distBucket = new s3.Bucket(this, 'DeviceDistBucket', {
       bucketName: isProd
         ? `xorgate-device-dist-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`

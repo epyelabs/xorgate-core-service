@@ -3,26 +3,103 @@ import { db, schema } from '../db/index';
 import {
   telemetryPayloadSchema,
   flattenTelemetryToRows,
+  activeStreamKeys,
+  type TelemetryPayload,
 } from '../schemas/telemetry';
 import { buildDeviceLatestUpsert } from '../utils/upsert';
+import {
+  activeRecordings,
+  recorderConfigured,
+  startRecording,
+  stopRecording,
+} from '../services/recordings';
 
-// Per-device telemetry persistence is opt-in (default off). Cache the flag in the
-// warm Lambda container so the 1 Hz hot path doesn't read `devices` every message;
-// the short TTL bounds how long a settings toggle takes to take effect (~30s).
-const persistCache = new Map<string, { value: boolean; expires: number }>();
-const PERSIST_TTL_MS = 30_000;
+// Per-device settings (telemetry persistence + auto-record) are opt-in (default
+// off). Cache the flags in the warm Lambda container so the 1 Hz hot path doesn't
+// read `devices` every message; the short TTL bounds how long a settings toggle
+// takes to take effect (~30s).
+interface DeviceFlags {
+  persistTelemetry: boolean;
+  autoRecord: boolean;
+}
+const flagsCache = new Map<string, { value: DeviceFlags; expires: number }>();
+const FLAGS_TTL_MS = 30_000;
 
-async function shouldPersist(deviceId: string): Promise<boolean> {
+async function deviceFlags(deviceId: string): Promise<DeviceFlags> {
   const now = Date.now();
-  const hit = persistCache.get(deviceId);
+  const hit = flagsCache.get(deviceId);
   if (hit && hit.expires > now) return hit.value;
   const device = await db.query.devices.findFirst({
     where: eq(schema.devices.id, deviceId),
-    columns: { persistTelemetry: true },
+    columns: { persistTelemetry: true, autoRecord: true },
   });
-  const value = device?.persistTelemetry ?? false;
-  persistCache.set(deviceId, { value, expires: now + PERSIST_TTL_MS });
+  const value: DeviceFlags = {
+    persistTelemetry: device?.persistTelemetry ?? false,
+    autoRecord: device?.autoRecord ?? false,
+  };
+  flagsCache.set(deviceId, { value, expires: now + FLAGS_TTL_MS });
   return value;
+}
+
+// Auto-record reconcile is throttled per device (the existence checks already make
+// it idempotent; this just bounds DB/ECS calls). Stops use a grace window so a
+// brief stream restart (cred refresh) doesn't chop the recording into fragments.
+const RECONCILE_INTERVAL_MS = 8_000;
+const STOP_GRACE_MS = 30_000;
+const nextReconcileAt = new Map<string, number>();
+const streamMissingSince = new Map<string, number>(); // `${deviceId}:${streamKey}` -> first-missing ts
+
+/**
+ * Auto-record: when a device opts in, keep a cloud viewer-recorder running for each
+ * live stream. Starts a recorder for any active stream that isn't recording; stops
+ * an auto recording once its stream has been gone for STOP_GRACE_MS. No-ops when
+ * the recorder isn't configured or the payload carries no media state this tick.
+ */
+async function reconcileAutoRecord(payload: TelemetryPayload): Promise<void> {
+  if (!recorderConfigured()) return;
+  const deviceId = payload.deviceId;
+
+  const now = Date.now();
+  const due = nextReconcileAt.get(deviceId) ?? 0;
+  if (now < due) return;
+  nextReconcileAt.set(deviceId, now + RECONCILE_INTERVAL_MS);
+
+  if (!(await deviceFlags(deviceId)).autoRecord) return;
+
+  const active = activeStreamKeys(payload);
+  if (active === null) return; // media state unknown this tick — don't touch anything
+  const desired = new Set(active);
+
+  const current = await activeRecordings(deviceId);
+  const recordingStreams = new Set(current.map((r) => r.streamKey));
+
+  // Start a recorder for each desired stream that isn't already recording.
+  for (const streamKey of desired) {
+    streamMissingSince.delete(`${deviceId}:${streamKey}`);
+    if (!recordingStreams.has(streamKey)) {
+      try {
+        await startRecording(deviceId, streamKey, 'auto');
+      } catch (err) {
+        console.error('auto-record: start failed', { deviceId, streamKey, err });
+      }
+    }
+  }
+
+  // Stop auto recordings whose stream has been absent past the grace window.
+  for (const r of current) {
+    if (r.trigger !== 'auto' || desired.has(r.streamKey)) continue;
+    const k = `${deviceId}:${r.streamKey}`;
+    const missingSince = streamMissingSince.get(k) ?? now;
+    streamMissingSince.set(k, missingSince);
+    if (now - missingSince >= STOP_GRACE_MS) {
+      streamMissingSince.delete(k);
+      try {
+        await stopRecording(r.id);
+      } catch (err) {
+        console.error('auto-record: stop failed', { id: r.id, err });
+      }
+    }
+  }
 }
 
 /**
@@ -70,7 +147,7 @@ export const handler = async (event: unknown): Promise<void> => {
 
   // DB persistence is opt-in per device. When disabled (default) we still run the
   // heartbeat below so status tracking is unaffected, but write no telemetry.
-  if (rows.length > 0 && (await shouldPersist(payload.deviceId))) {
+  if (rows.length > 0 && (await deviceFlags(payload.deviceId)).persistTelemetry) {
     // Batched insert. Typed columns give `ts` (a Date) the correct typeHint, and
     // Postgres routes the row to the right monthly partition automatically.
     await db.insert(schema.telemetryReadings).values(rows);
@@ -93,4 +170,12 @@ export const handler = async (event: unknown): Promise<void> => {
     WHERE id = ${payload.deviceId}::uuid
       AND (last_seen_at IS NULL OR last_seen_at < now() - interval '15 seconds')
   `);
+
+  // Auto-record (opt-in, throttled). Best-effort: never let a recorder failure
+  // break telemetry ingestion / the heartbeat above.
+  try {
+    await reconcileAutoRecord(payload);
+  } catch (err) {
+    console.error('telemetry-ingest: auto-record reconcile failed', { deviceId: payload.deviceId, err });
+  }
 };

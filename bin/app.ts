@@ -5,6 +5,22 @@ import { XorgateCoreDatabaseStack } from '../lib/stacks/database-stack';
 import { XorgateCoreAuthStack } from '../lib/stacks/auth-stack';
 import { XorgateCoreIotStack } from '../lib/stacks/iot-stack';
 import { XorgateCoreApiStack } from '../lib/stacks/api-stack';
+import { XorgateCoreRecorderStack } from '../lib/stacks/recorder-stack';
+
+// Recorder props shared by both stages: launch/stop config the api-stack Lambdas
+// need to run the Fargate viewer-recorder and pass its roles.
+function recorderProps(rec: XorgateCoreRecorderStack) {
+  return {
+    recorderClusterArn: rec.cluster.clusterArn,
+    recorderClusterName: rec.cluster.clusterName,
+    recorderTaskFamily: rec.taskFamily,
+    recorderTaskRoleArn: rec.taskRoleArn,
+    recorderExecutionRoleArn: rec.executionRoleArn,
+    recorderSecurityGroupId: rec.securityGroup.securityGroupId,
+    recorderSubnets: rec.publicSubnetIds.join(','),
+    recorderContainerName: rec.containerName,
+  };
+}
 
 const app = new cdk.App();
 
@@ -53,6 +69,12 @@ if (stage === 'prod') {
     userPoolClient: authStack.userPoolClient,
   });
 
+  const recorderStack = new XorgateCoreRecorderStack(app, 'XorgateCoreRecorderStack', {
+    env,
+    stage,
+    bucket: storageStack.bucket,
+  });
+
   new XorgateCoreApiStack(app, 'XorgateCoreApiStack', {
     env,
     stage,
@@ -71,6 +93,7 @@ if (stage === 'prod') {
     iotRoleAlias: iotStack.roleAliasName,
     cognitoIdentityPoolId: iotStack.identityPoolId,
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
+    ...recorderProps(recorderStack),
   });
 } else {
   // Dev: no dedicated DB cluster, no VPC. Imports the shared sandbox Aurora
@@ -84,6 +107,12 @@ if (stage === 'prod') {
     bucket: storageStack.bucket,
     userPool: authStack.userPool,
     userPoolClient: authStack.userPoolClient,
+  });
+
+  const recorderStack = new XorgateCoreRecorderStack(app, 'XorgateCoreRecorderStackDev', {
+    env,
+    stage,
+    bucket: storageStack.bucket,
   });
 
   new XorgateCoreApiStack(app, 'XorgateCoreApiStackDev', {
@@ -103,6 +132,7 @@ if (stage === 'prod') {
     iotRoleAlias: iotStack.roleAliasName,
     cognitoIdentityPoolId: iotStack.identityPoolId,
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
+    ...recorderProps(recorderStack),
   });
 }
 

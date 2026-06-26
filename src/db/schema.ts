@@ -115,6 +115,10 @@ export const devices = pgTable(
     // Opt-in telemetry persistence. When false (default) the ingest Lambda streams
     // to IoT Core but writes nothing to telemetry_readings / device_latest.
     persistTelemetry: boolean('persist_telemetry').default(false).notNull(),
+    // Opt-in automatic recording. When true the telemetry-ingest Lambda spawns a
+    // cloud viewer-recorder (Fargate) whenever a media stream becomes active, and
+    // stops it when the stream drops. Off by default.
+    autoRecord: boolean('auto_record').default(false).notNull(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
@@ -283,6 +287,35 @@ export const mediaSegments = pgTable(
   ],
 );
 
+// A cloud-side recording of one stream. A headless KVS viewer-recorder (Fargate)
+// joins the device's existing signaling channel as an extra VIEWER, remuxes the
+// incoming H.264 to a single MP4, and uploads it to S3 on stop. One row per run.
+// `status` / `trigger` are text (not pgEnum) to dodge the aws-data-api enum-cast
+// issue — same reasoning as devices.status.
+export const recordings = pgTable(
+  'recordings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    streamKey: text('stream_key').notNull(), // cam0 | cam1 | ...
+    status: text('status').default('recording').notNull(), // recording | completed | failed
+    trigger: text('trigger').default('manual').notNull(), // manual | auto
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    s3Key: text('s3_key'), // media/v1/<deviceId>/<streamKey>/<recordingId>.mp4
+    sizeBytes: integer('size_bytes'),
+    durationMs: integer('duration_ms'),
+    taskArn: text('task_arn'), // Fargate task ARN, for StopTask
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index('recordings_device_stream_status_idx').on(t.deviceId, t.streamKey, t.status),
+    index('recordings_device_created_idx').on(t.deviceId, t.createdAt),
+  ],
+);
+
 export type User = InferSelectModel<typeof users>;
 export type NewUser = InferInsertModel<typeof users>;
 export type Organization = InferSelectModel<typeof organizations>;
@@ -311,3 +344,5 @@ export type MediaSession = InferSelectModel<typeof mediaSessions>;
 export type NewMediaSession = InferInsertModel<typeof mediaSessions>;
 export type MediaSegment = InferSelectModel<typeof mediaSegments>;
 export type NewMediaSegment = InferInsertModel<typeof mediaSegments>;
+export type Recording = InferSelectModel<typeof recordings>;
+export type NewRecording = InferInsertModel<typeof recordings>;
