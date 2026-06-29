@@ -73,6 +73,14 @@ case "\${ID:-}\${ID_LIKE:-}" in
   *debian*|*ubuntu*)
     log "installing apt dependencies"
     export DEBIAN_FRONTEND=noninteractive
+    # A fresh boot usually has apt-daily/unattended-upgrades holding the dpkg
+    # lock. Make EVERY apt call in this script (and the NodeSource sub-installer)
+    # WAIT for the lock instead of failing instantly. Without this, the later
+    # GStreamer install (step 8) loses the race, hits its '|| log WARN' guard, and
+    # the device ends up provisioned-but-unable-to-stream. 600s is well past any
+    # boot-time apt job; honored from apt.conf.d by every apt-get invocation.
+    install -d -m 0755 /etc/apt/apt.conf.d
+    echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99xorgate-lock-timeout
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates jq build-essential python3
     if ! command -v node >/dev/null 2>&1 \\
@@ -313,7 +321,7 @@ case "\${ID:-}\${ID_LIKE:-}" in
         libglib2.0-0 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \\
         gstreamer1.0-plugins-base gstreamer1.0-plugins-good \\
         gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-tools \\
-      || log "WARN: GStreamer runtime install failed; media streaming disabled"
+      || log "WARN: GStreamer runtime install failed; media streaming disabled. Re-run: sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly"
     # libcamera source (Raspberry Pi cameras); absent on some distros — ignore.
     apt-get install -y -qq gstreamer1.0-libcamera 2>/dev/null || true
     # NOTE: the rest are NOT apt packages — the KVS SDK libs, its vendored
@@ -333,6 +341,22 @@ echo "$CLAIM_RESPONSE" \\
 # Per-stream pipeline dir (operator drops <streamKey>.gst files here for cameras).
 install -d -m 0755 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR/pipelines"
 
+# Default per-stream pipelines for the current fleet hardware: CM5 carrier with
+# two IMX290 sensors on the cam0 (i2c@88000) and cam1 (i2c@70000) connectors,
+# H.264 via x264enc at 1280x720@15. Written only if absent so a later
+# \`xorgate pipeline set\` customization is never clobbered. Hardware-specific by
+# design (pairs with the imx290 overlays in step 8b) — revisit for other sensors.
+if [ ! -f "$CONF_DIR/pipelines/cam0.gst" ]; then
+  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/cam0.gst" <<'GST'
+libcamerasrc name=cam0 camera-name=/base/axi/pcie@1000120000/rp1/i2c@88000/imx290@1a ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
+GST
+fi
+if [ ! -f "$CONF_DIR/pipelines/cam1.gst" ]; then
+  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/cam1.gst" <<'GST'
+libcamerasrc name=cam1 camera-name=/base/axi/pcie@1000120000/rp1/i2c@70000/imx290@1a ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
+GST
+fi
+
 # Stage the runtime binary (tar preserves the +x bit, but be defensive) and warn
 # if the user-supplied KVS SDK .so libs aren't present yet.
 if [ -f "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" ]; then
@@ -343,6 +367,33 @@ if [ -f "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" ]; then
   fi
 else
   log "WARN: media runtime binary missing from build ($INSTALL_PREFIX/media); streaming disabled"
+fi
+
+# 8b. Camera device-tree overlays for the current fleet hardware (CM5 + dual
+#     IMX290 on the cam0/cam1 connectors). IMX290 has no camera EEPROM, so
+#     camera_auto_detect never finds it; the sensors only bind with explicit
+#     overlays. Idempotent + backed up + best-effort. Hardware-specific by design
+#     (pairs with the default pipelines above). Takes effect on the NEXT BOOT, so
+#     a fresh device needs one reboot after install before streaming works.
+CONFIG_TXT=/boot/firmware/config.txt
+[ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
+if [ -f "$CONFIG_TXT" ]; then
+  cp -n "$CONFIG_TXT" "$CONFIG_TXT.bak-xorgate" 2>/dev/null || true
+  CAM_OVERLAY_ADDED=0
+  if grep -qE '^camera_auto_detect=' "$CONFIG_TXT"; then
+    sed -i 's/^camera_auto_detect=.*/camera_auto_detect=0/' "$CONFIG_TXT"
+  else
+    echo 'camera_auto_detect=0' >> "$CONFIG_TXT"
+  fi
+  grep -qE '^dtoverlay=imx290,cam0' "$CONFIG_TXT" || { echo 'dtoverlay=imx290,cam0' >> "$CONFIG_TXT"; CAM_OVERLAY_ADDED=1; }
+  grep -qE '^dtoverlay=imx290,cam1' "$CONFIG_TXT" || { echo 'dtoverlay=imx290,cam1' >> "$CONFIG_TXT"; CAM_OVERLAY_ADDED=1; }
+  if [ "$CAM_OVERLAY_ADDED" = "1" ]; then
+    log "camera overlays (dual IMX290) added to $CONFIG_TXT — REBOOT required before cameras stream"
+  else
+    log "camera overlays already present in $CONFIG_TXT"
+  fi
+else
+  log "WARN: no config.txt found; skipping camera overlays"
 fi
 
 log "registered device $DEVICE_ID"
