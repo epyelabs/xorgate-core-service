@@ -167,25 +167,42 @@ export async function startRecording(
 }
 
 /**
- * Stop a recording's Fargate task. The recorder finalizes the MP4 and uploads on
- * SIGTERM; the S3 finalize Lambda flips the row to 'completed'. Tolerates a
- * task that has already exited.
+ * Stop a recording: signal the Fargate task to stop, then immediately mark the row
+ * 'stopping' so the UI reflects the stop right away (without waiting on the upload).
+ * The recorder finalizes the MP4 on SIGTERM and the finalize Lambda flips the row
+ * 'stopping' -> 'completed' once the object lands. A row that never produces a file
+ * (the task had already died) stays 'stopping' — a dud the user can delete.
+ * Tolerates a task that has already exited.
  */
 export async function stopRecording(recordingId: string): Promise<void> {
   const row = await db.query.recordings.findFirst({
     where: eq(schema.recordings.id, recordingId),
-    columns: { taskArn: true },
+    columns: { taskArn: true, status: true },
   });
-  if (!row?.taskArn || !CLUSTER) return;
-  try {
-    await ecs.send(
-      new StopTaskCommand({
-        cluster: CLUSTER,
-        task: row.taskArn,
-        reason: 'xorgate: recording stopped',
-      }),
-    );
-  } catch (err) {
-    console.warn(`stopRecording: StopTask failed for ${recordingId}`, err);
+  if (!row) return;
+
+  if (row.taskArn && CLUSTER) {
+    try {
+      await ecs.send(
+        new StopTaskCommand({
+          cluster: CLUSTER,
+          task: row.taskArn,
+          reason: 'xorgate: recording stopped',
+        }),
+      );
+    } catch (err) {
+      console.warn(`stopRecording: StopTask failed for ${recordingId}`, err);
+    }
+  }
+
+  // Only transition out of the active state; never clobber a row already
+  // completed/failed (e.g. a double-stop racing the finalize Lambda).
+  if (row.status === ACTIVE_STATUS) {
+    await db
+      .update(schema.recordings)
+      .set({ status: 'stopping', endedAt: new Date() })
+      .where(
+        and(eq(schema.recordings.id, recordingId), eq(schema.recordings.status, ACTIVE_STATUS)),
+      );
   }
 }

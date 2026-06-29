@@ -1,5 +1,5 @@
 import type { EventBridgeEvent } from 'aws-lambda';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge.
@@ -40,7 +40,7 @@ export const handler = async (
     .where(
       and(
         eq(schema.recordings.s3Key, key),
-        eq(schema.recordings.status, 'recording'),
+        inArray(schema.recordings.status, ['recording', 'stopping']),
       ),
     )
     .returning({ id: schema.recordings.id });
