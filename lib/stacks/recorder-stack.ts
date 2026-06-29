@@ -103,6 +103,27 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         resources: [bucket.arnForObjects('media/v1/*')],
       }),
     );
+    // On its first received frame the recorder publishes a "capturing" event to
+    // IoT Core (xorgate/recordings/<recordingId>/status), which a topic rule turns
+    // into recordings.capture_started_at. Scoped to the recordings topic space.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'IotPublishStatus',
+        actions: ['iot:Publish'],
+        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/xorgate/recordings/*`],
+      }),
+    );
+    // The bundled aws-cli v1 defaults iot-data to the deprecated non-ATS endpoint
+    // (data.iot.<region>), whose cert is no longer trusted. entrypoint.sh resolves the
+    // account's ATS data endpoint at startup so the publish can target it explicitly.
+    // DescribeEndpoint does not support resource-level permissions.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'IotDescribeEndpoint',
+        actions: ['iot:DescribeEndpoint'],
+        resources: ['*'],
+      }),
+    );
 
     this.taskFamily = isProd ? 'xorgate-recorder' : 'xorgate-recorder-dev';
     this.taskDefinition = new ecs.FargateTaskDefinition(this, 'RecorderTaskDef', {

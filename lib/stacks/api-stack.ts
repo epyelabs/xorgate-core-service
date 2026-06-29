@@ -611,6 +611,45 @@ export class XorgateCoreApiStack extends cdk.Stack {
       action: "lambda:InvokeFunction",
     });
 
+    // --- Recording capture signal (Method #3): IoT Topic Rule -> Lambda -> Postgres ---
+    // The cloud recorder publishes a one-shot "capturing" event on its first received
+    // frame; this stamps recordings.capture_started_at so the UI can flip the badge
+    // from "Starting…" to "REC". DB-only (no new IAM); like telemetry ingest it has no
+    // HTTP route and the rule lives in this stack (it must reference this Lambda).
+    const recordingCaptureFn = new nodejs.NodejsFunction(this, "RecordingCaptureFn", {
+      ...standardFnProps(
+        path.join(entryBase, "recording-capture.ts"),
+        "IoT rule -> recordings.capture_started_at (first-frame signal)",
+      ),
+    });
+
+    const recordingCaptureRule = new iot.CfnTopicRule(this, "RecordingCaptureRule", {
+      ruleName: isProd ? "xorgate_recording_capture" : "xorgate_recording_capture_dev",
+      topicRulePayload: {
+        // topic(3) is the recordingId wildcard in xorgate/recordings/<id>/status.
+        sql: "SELECT *, topic(3) AS recordingId FROM 'xorgate/recordings/+/status'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: recordingCaptureFn.functionArn } }],
+        // Reuse the telemetry DLQ + role: one low-volume error sink already covered by
+        // the TelemetryDlqDepthAlarm above.
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    recordingCaptureFn.addPermission("AllowIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: recordingCaptureRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
     const iotAttachPolicyFn = new nodejs.NodejsFunction(
       this,
       "IotAttachPolicyFn",

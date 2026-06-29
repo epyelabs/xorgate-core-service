@@ -304,6 +304,10 @@ export const recordings = pgTable(
     trigger: text('trigger').default('manual').notNull(), // manual | auto
     startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
     endedAt: timestamp('ended_at', { withTimezone: true }),
+    // Set by the recorder (via an IoT "capturing" signal) on its first received video
+    // frame. NULL while the row is 'recording' but the recorder hasn't captured yet
+    // (cold start) -> the UI shows "Starting…"; non-NULL -> "REC".
+    captureStartedAt: timestamp('capture_started_at', { withTimezone: true }),
     s3Key: text('s3_key'), // media/v1/<deviceId>/<streamKey>/<recordingId>.mp4
     sizeBytes: integer('size_bytes'),
     durationMs: integer('duration_ms'),
