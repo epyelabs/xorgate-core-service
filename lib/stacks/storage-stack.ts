@@ -44,7 +44,12 @@ export class XorgateCoreStorageStack extends cdk.Stack {
       enforceSSL: true,
       cors: [
         {
-          allowedOrigins: ['http://localhost:*', 'https://xorgate.ai'],
+          allowedOrigins: [
+            'http://localhost:*',
+            'https://xorgate.ai',
+            'http://dev.xorgate.io.s3-website-us-east-1.amazonaws.com',
+            'http://www.xorgate.io.s3-website-us-east-1.amazonaws.com',
+          ],
           allowedMethods: [s3.HttpMethods.GET, s3.HttpMethods.PUT, s3.HttpMethods.POST],
           allowedHeaders: ['*'],
           maxAge: 3000,

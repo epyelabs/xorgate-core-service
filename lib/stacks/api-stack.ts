@@ -116,6 +116,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "http://localhost:5174",
       "http://localhost:5175",
       "https://xorgate.ai",
+      "http://dev.xorgate.io.s3-website-us-east-1.amazonaws.com",
+      "http://www.xorgate.io.s3-website-us-east-1.amazonaws.com",
     ];
 
     let lambdaSG: ec2.SecurityGroup | undefined;
