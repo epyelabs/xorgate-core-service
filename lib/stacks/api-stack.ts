@@ -118,6 +118,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "https://xorgate.ai",
       "http://dev.xorgate.io.s3-website-us-east-1.amazonaws.com",
       "http://www.xorgate.io.s3-website-us-east-1.amazonaws.com",
+      "https://d3u971sluio616.cloudfront.net",
+      "https://dev.xorgate.io",
+      "https://www.xorgate.io",
     ];
 
     let lambdaSG: ec2.SecurityGroup | undefined;
