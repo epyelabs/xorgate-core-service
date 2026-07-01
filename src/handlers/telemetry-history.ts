@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, asc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
@@ -10,6 +10,12 @@ import { tsParam } from '../utils/sql';
  *
  *   GET /devices/{id}/telemetry?from&to[&metric][&interval]  — telemetry_readings over [from, to)
  *   GET /devices/{id}/telemetry/latest                        — device_latest rows
+ *   GET /devices/{id}/telemetry/recent[&metric][&limit]       — the most recent N rows
+ *
+ * The /recent variant orders by ts DESC and returns the newest `limit` rows
+ * (chronological in the response), so callers see the latest samples regardless
+ * of when they arrived — even if the device last reported weeks ago. Unlike
+ * /telemetry it takes no time window, so it never misses recent-but-old data.
  *
  * With `interval` (seconds) the range is downsampled server-side by epoch
  * bucketing — floor(extract(epoch from ts)/B)*B GROUP BY (bucket, metric) with
@@ -27,6 +33,8 @@ const BUCKETED_LIMIT = 10_000;
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1000; // one month of partitions per query
 const MAX_METRICS = 20;
 const METRIC_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/i;
+const RECENT_DEFAULT = 500; // rows returned by /recent when no limit is given
+const RECENT_MAX = 5_000;
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
@@ -172,6 +180,59 @@ async function handleLatest(deviceId: string): Promise<APIGatewayProxyResultV2> 
   });
 }
 
+// GET /devices/{id}/telemetry/recent — the newest `limit` rows for the device,
+// optionally filtered to specific metrics. Ordered ts DESC in SQL (so the index
+// on (device_id, ts, metric) drives it and Postgres can stop early across
+// partitions), then reversed to chronological for chart-friendly output.
+async function handleRecent(
+  deviceId: string,
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> {
+  const qs = event.queryStringParameters ?? {};
+
+  let metrics: string[] | null = null;
+  if (qs.metric) {
+    metrics = qs.metric.split(',').map((m) => m.trim()).filter(Boolean);
+    if (metrics.length === 0 || metrics.length > MAX_METRICS) {
+      return badRequest(`"metric" must list 1-${MAX_METRICS} metrics (comma-separated)`);
+    }
+    const bad = metrics.find((m) => !METRIC_RE.test(m));
+    if (bad) return badRequest(`Invalid metric name "${bad}" (expected "group.field")`);
+  }
+
+  let limit = RECENT_DEFAULT;
+  if (qs.limit !== undefined) {
+    if (!/^\d+$/.test(qs.limit)) return badRequest('"limit" must be a positive integer');
+    limit = Number(qs.limit);
+    if (limit < 1 || limit > RECENT_MAX) {
+      return badRequest(`"limit" must be between 1 and ${RECENT_MAX}`);
+    }
+  }
+
+  const t = schema.telemetryReadings;
+  // No ts bind here, so the tsParam timestamptz workaround is unnecessary.
+  const where = and(
+    eq(t.deviceId, deviceId),
+    metrics ? inArray(t.metric, metrics) : undefined,
+  );
+  const rows = await db
+    .select({ ts: t.ts, metric: t.metric, value: t.value, unit: t.unit })
+    .from(t)
+    .where(where)
+    .orderBy(desc(t.ts), asc(t.metric))
+    .limit(limit);
+
+  const truncated = rows.length >= limit;
+  // rows are newest-first; reverse to chronological for the chart.
+  const readings = rows.reverse().map((r) => ({
+    ts: r.ts.toISOString(),
+    metric: r.metric,
+    value: r.value,
+    unit: r.unit,
+  }));
+  return ok({ readings, bucketSeconds: null, truncated });
+}
+
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
@@ -203,7 +264,7 @@ export const handler = async (
   });
   if (!device) return notFound(`Device "${id}" not found`);
 
-  return event.rawPath.endsWith('/telemetry/latest')
-    ? handleLatest(id)
-    : handleHistory(id, event);
+  if (event.rawPath.endsWith('/telemetry/latest')) return handleLatest(id);
+  if (event.rawPath.endsWith('/telemetry/recent')) return handleRecent(id, event);
+  return handleHistory(id, event);
 };

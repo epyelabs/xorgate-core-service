@@ -498,13 +498,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(mediaFinalizeFn)],
     });
 
-    // GET /devices/{id}/telemetry + /devices/{id}/telemetry/latest (P4) — historical
-    // telemetry reads over the partitioned telemetry_readings + device_latest tables.
-    // Reads Postgres only (no new IAM).
+    // GET /devices/{id}/telemetry + /telemetry/latest + /telemetry/recent (P4) —
+    // historical telemetry reads over the partitioned telemetry_readings +
+    // device_latest tables. Reads Postgres only (no new IAM).
     const telemetryHistoryFn = new nodejs.NodejsFunction(this, "TelemetryHistoryFn", {
       ...standardFnProps(
         path.join(entryBase, "telemetry-history.ts"),
-        "GET /devices/{id}/telemetry(+/latest) — historical telemetry reads",
+        "GET /devices/{id}/telemetry(+/latest,/recent) — historical telemetry reads",
       ),
       // Range queries scan monthly partitions; give them more headroom than the default.
       memorySize: 256,
@@ -934,6 +934,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     this.api.addRoutes({
       path: "/devices/{id}/telemetry/latest",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/telemetry/recent",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
