@@ -13,6 +13,7 @@ import * as iot from "aws-cdk-lib/aws-iot";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -50,6 +51,12 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   recorderSecurityGroupId: string;
   recorderSubnets: string; // comma-separated public subnet ids
   recorderContainerName: string;
+  // CV runner (workflows video path) launch config — shares the recorder
+  // cluster/VPC/SG (see recorder-stack.ts). RunTask'd by the dispatch Lambda.
+  cvTaskFamily: string;
+  cvTaskRoleArn: string;
+  cvExecutionRoleArn: string;
+  cvContainerName: string;
 }
 
 export class XorgateCoreApiStack extends cdk.Stack {
@@ -85,6 +92,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       recorderSecurityGroupId,
       recorderSubnets,
       recorderContainerName,
+      cvTaskFamily,
+      cvTaskRoleArn,
+      cvExecutionRoleArn,
+      cvContainerName,
     } = props;
 
     const isProd = stage === "prod";
@@ -240,6 +251,29 @@ export class XorgateCoreApiStack extends cdk.Stack {
         sid: "RecorderPassRole",
         actions: ["iam:PassRole"],
         resources: [recorderTaskRoleArn, recorderExecutionRoleArn],
+        conditions: {
+          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+        },
+      }),
+    );
+
+    // CV runner (workflows video path): launch the CV task + pass its roles. It
+    // shares the recorder cluster, so the RecorderStopTask/DescribeTasks statement
+    // above already covers StopTask on CV tasks (used by the M5 watchdog).
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "CvRunTask",
+        actions: ["ecs:RunTask"],
+        resources: [
+          `arn:aws:ecs:${this.region}:${this.account}:task-definition/${cvTaskFamily}:*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "CvPassRole",
+        actions: ["iam:PassRole"],
+        resources: [cvTaskRoleArn, cvExecutionRoleArn],
         conditions: {
           StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
         },
@@ -482,8 +516,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const mediaFinalizeFn = new nodejs.NodejsFunction(this, "MediaFinalizeFn", {
       ...standardFnProps(
         path.join(entryBase, "media-finalize.ts"),
-        "S3 Object Created(media/v1/*.mp4) -> mark recording completed",
+        "S3 Object Created(media/v1/*.mp4) -> mark recording completed + fire workflows",
       ),
+      // Fires recording_saved workflow triggers via SQS -> bundles client-sqs.
+      bundling: bundlingWithSdk,
     });
     new events.Rule(this, "MediaFinalizeRule", {
       description: "Recorder MP4 uploaded -> finalize recording row",
@@ -664,6 +700,129 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // --- Workflows (user-defined processing pipelines) ---
+    // Org-scoped template CRUD + versioning. Reads/writes Postgres only (no new
+    // IAM). The run-execution Lambdas (dispatch/finalize/scheduler) land with M3–M5.
+    const workflowTemplatesFn = new nodejs.NodejsFunction(
+      this,
+      "WorkflowTemplatesFn",
+      standardFnProps(
+        path.join(entryBase, "workflow-templates.ts"),
+        "CRUD + versioning /workflow-templates",
+      ),
+    );
+
+    // Device attachments (attach/list/enable/detach + Run now). Run now fires a
+    // run via fireWorkflowRun -> SQS, so it bundles the AWS SDK (client-sqs).
+    const deviceWorkflowsFn = new nodejs.NodejsFunction(this, "DeviceWorkflowsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-workflows.ts"),
+        "attach/list/enable/detach/run /devices/{id}/workflows",
+      ),
+      bundling: bundlingWithSdk,
+    });
+
+    // Workflow runs read API (workspace list + detail + per-device list) + rerun
+    // (fires via SQS -> bundles client-sqs).
+    const workflowRunsFn = new nodejs.NodejsFunction(this, "WorkflowRunsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-runs.ts"),
+        "GET /workflow-runs(+/{id}), /devices/{id}/workflow-runs, POST rerun",
+      ),
+      bundling: bundlingWithSdk,
+    });
+
+    // SQS run queue + DLQ. Triggers pre-create a run and enqueue {runId}; the
+    // dispatcher runs telemetry graphs inline and launches Fargate for video.
+    const workflowRunDlq = new sqs.Queue(this, "WorkflowRunDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const workflowRunQueue = new sqs.Queue(this, "WorkflowRunQueue", {
+      // ~6x the dispatcher timeout (120s) so a slow inline run isn't redelivered.
+      visibilityTimeout: cdk.Duration.seconds(720),
+      retentionPeriod: cdk.Duration.days(4),
+      deadLetterQueue: { queue: workflowRunDlq, maxReceiveCount: 3 },
+    });
+    // The shared Lambda role can enqueue runs (telemetry/media/http firing paths).
+    workflowRunQueue.grantSendMessages(lambdaRole);
+
+    // Run dispatcher: SQS-driven, runs telemetry graphs inline in-process and
+    // launches the Fargate CV runner for video graphs. Bundles the AWS SDK
+    // (client-sqs / client-ecs) and gets more time + memory than the default.
+    const workflowDispatchFn = new nodejs.NodejsFunction(this, "WorkflowDispatchFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-dispatch.ts"),
+        "SQS -> dispatch workflow run (inline runner / Fargate)",
+      ),
+      timeout: cdk.Duration.seconds(120),
+      memorySize: 512,
+      bundling: bundlingWithSdk,
+    });
+    workflowDispatchFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(workflowRunQueue, {
+        batchSize: 1,
+        reportBatchItemFailures: true,
+      }),
+    );
+
+    // All firing paths + the dispatcher need the queue URL.
+    workflowDispatchFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    deviceWorkflowsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    workflowRunsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    telemetryIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    mediaFinalizeFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+
+    // The dispatcher launches the CV runner for video graphs (shares the recorder
+    // cluster/VPC/SG). The manifest is written to the core bucket (BUCKET_NAME).
+    workflowDispatchFn.addEnvironment("CV_CLUSTER_ARN", recorderClusterArn);
+    workflowDispatchFn.addEnvironment("CV_TASKDEF", cvTaskFamily);
+    workflowDispatchFn.addEnvironment("CV_SUBNETS", recorderSubnets);
+    workflowDispatchFn.addEnvironment("CV_SG", recorderSecurityGroupId);
+    workflowDispatchFn.addEnvironment("CV_CONTAINER_NAME", cvContainerName);
+
+    // Fargate CV-run finalizer: result.json (S3 Object Created under workflows/v1/)
+    // -> persist steps/events + run status. Same EventBridge->finalize pattern as
+    // media-finalize (the bucket already emits EventBridge notifications).
+    const workflowRunFinalizeFn = new nodejs.NodejsFunction(this, "WorkflowRunFinalizeFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-run-finalize.ts"),
+        "S3 result.json(workflows/v1/*) -> finalize workflow run",
+      ),
+      timeout: cdk.Duration.seconds(30),
+    });
+    new events.Rule(this, "WorkflowRunFinalizeRule", {
+      description: "CV runner result.json uploaded -> finalize workflow run",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ prefix: "workflows/v1/" }] },
+        },
+      },
+      targets: [new targets.LambdaFunction(workflowRunFinalizeFn)],
+    });
+
+    // Workflow scheduler (1-min tick): schedule triggers + the stuck-run watchdog.
+    // Fires runs (SQS) and StopTask's stale Fargate tasks -> bundles the AWS SDK.
+    // Gated by disableScheduledJobs (OFF in dev by default, so the shared sandbox
+    // Aurora can auto-pause); enable in dev with --context scheduledJobs=on.
+    const workflowSchedulerFn = new nodejs.NodejsFunction(this, "WorkflowSchedulerFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-scheduler.ts"),
+        "Schedule (1m) -> fire schedule triggers + watchdog stuck runs",
+      ),
+      timeout: cdk.Duration.seconds(60),
+      bundling: bundlingWithSdk,
+    });
+    workflowSchedulerFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    new events.Rule(this, "WorkflowSchedulerSchedule", {
+      description: "Workflow schedule triggers + stuck-run watchdog",
+      enabled: !props.disableScheduledJobs,
+      schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
+      targets: [new targets.LambdaFunction(workflowSchedulerFn)],
+    });
+
     const docsFn = new nodejs.NodejsFunction(this, "DocsFn", {
       entry: path.join(entryBase, "docs.ts"),
       handler: "handler",
@@ -763,6 +922,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
+    );
+    const workflowTemplatesInt = new apigwv2int.HttpLambdaIntegration(
+      "WorkflowTemplatesInt",
+      workflowTemplatesFn,
+    );
+    const deviceWorkflowsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceWorkflowsInt",
+      deviceWorkflowsFn,
+    );
+    const workflowRunsInt = new apigwv2int.HttpLambdaIntegration(
+      "WorkflowRunsInt",
+      workflowRunsFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
@@ -947,6 +1118,77 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/iot/attach-policy",
       methods: [apigwv2.HttpMethod.POST],
       integration: iotAttachPolicyInt,
+    });
+
+    // Workflow templates (org-scoped) + versioning.
+    this.api.addRoutes({
+      path: "/workflow-templates",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: workflowTemplatesInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
+      integration: workflowTemplatesInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/draft",
+      methods: [apigwv2.HttpMethod.PUT],
+      integration: workflowTemplatesInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/versions/{versionId}/publish",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowTemplatesInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/versions/{versionId}/restore",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowTemplatesInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/usage",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowTemplatesInt,
+    });
+
+    // Device workflow attachments.
+    this.api.addRoutes({
+      path: "/devices/{id}/workflows",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: deviceWorkflowsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/workflows/{attachmentId}",
+      methods: [apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
+      integration: deviceWorkflowsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/workflows/{attachmentId}/run",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceWorkflowsInt,
+    });
+
+    // Workflow runs (read + rerun).
+    this.api.addRoutes({
+      path: "/workflow-runs",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowRunsInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-runs/{id}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowRunsInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-runs/{id}/rerun",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowRunsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/workflow-runs",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowRunsInt,
     });
 
     this.api.addRoutes({

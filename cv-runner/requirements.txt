@@ -1,0 +1,6 @@
+# CV runner runtime deps. Pinned to versions with prebuilt manylinux ARM64
+# (aarch64) wheels so the image builds without a compiler on Fargate Graviton.
+onnxruntime==1.19.2
+numpy==1.26.4
+boto3==1.34.162
+opencv-python-headless==4.10.0.84

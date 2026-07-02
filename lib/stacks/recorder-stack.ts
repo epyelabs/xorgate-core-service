@@ -36,6 +36,13 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
   public readonly taskRoleArn: string;
   public readonly executionRoleArn: string;
   public readonly publicSubnetIds: string[];
+  // CV runner (workflows video path) — reuses this stack's cluster/VPC/SG.
+  public readonly cvRepository: ecr.Repository;
+  public readonly cvTaskDefinition: ecs.FargateTaskDefinition;
+  public readonly cvContainerName = 'cv-runner';
+  public readonly cvTaskFamily: string;
+  public readonly cvTaskRoleArn: string;
+  public readonly cvExecutionRoleArn: string;
 
   constructor(scope: Construct, id: string, props: XorgateCoreRecorderStackProps) {
     super(scope, id, props);
@@ -153,6 +160,68 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     this.executionRoleArn = this.taskDefinition.obtainExecutionRole().roleArn;
     this.publicSubnetIds = vpc.publicSubnets.map((s) => s.subnetId);
 
+    // --- CV runner (workflows video path) ---
+    // Python + ONNX Runtime (CPU) on Fargate ARM64. Reads the run manifest + input
+    // MP4 from S3, runs the graph (decode/detect/track), and writes result.json.
+    // Reuses this stack's cluster/VPC/SG; only the repo, roles, log group, and a
+    // beefier task definition are new. Image built + pushed out-of-band from
+    // xorgate/backend/xorgate-core-service/cv-runner (docker buildx linux/arm64).
+    this.cvRepository = new ecr.Repository(this, 'CvRunnerRepo', {
+      repositoryName: isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev',
+      removalPolicy,
+      emptyOnDelete: !isProd,
+      imageScanOnPush: true,
+    });
+
+    const cvLogGroup = new logs.LogGroup(this, 'CvRunnerLogs', {
+      logGroupName: isProd ? '/xorgate/cv-runner' : '/xorgate/cv-runner-dev',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy,
+    });
+
+    // Task role: read the manifest + input recordings, write result.json + clips.
+    // The DB stays in TypeScript — the CV task holds no API/DB credentials.
+    const cvTaskRole = new iam.Role(this, 'CvRunnerTaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: 'Xorgate CV runner task: read media + workflow manifest, write results',
+    });
+    cvTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'CvReadInputs',
+        actions: ['s3:GetObject'],
+        resources: [bucket.arnForObjects('media/v1/*'), bucket.arnForObjects('workflows/v1/*')],
+      }),
+    );
+    cvTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'CvWriteResults',
+        actions: ['s3:PutObject'],
+        resources: [bucket.arnForObjects('workflows/v1/*')],
+      }),
+    );
+
+    this.cvTaskFamily = isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev';
+    this.cvTaskDefinition = new ecs.FargateTaskDefinition(this, 'CvRunnerTaskDef', {
+      family: this.cvTaskFamily,
+      cpu: 2048, // 2 vCPU — ffmpeg decode + ONNX CPU inference
+      memoryLimitMiB: 4096,
+      taskRole: cvTaskRole,
+      runtimePlatform: {
+        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
+    });
+    this.cvTaskDefinition.addContainer('cv-runner', {
+      containerName: this.cvContainerName,
+      image: ecs.ContainerImage.fromEcrRepository(this.cvRepository, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cv-runner', logGroup: cvLogGroup }),
+      // The runner self-limits via manifest.limits.maxRuntimeSeconds and always
+      // writes result.json on the way out; this is the hard ECS backstop.
+      stopTimeout: cdk.Duration.seconds(120),
+    });
+    this.cvTaskRoleArn = cvTaskRole.roleArn;
+    this.cvExecutionRoleArn = this.cvTaskDefinition.obtainExecutionRole().roleArn;
+
     new cdk.CfnOutput(this, 'RecorderClusterArn', {
       value: this.cluster.clusterArn,
       exportName: `XorgateRecorderClusterArn${suffix}`,
@@ -160,6 +229,10 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RecorderRepoUri', {
       value: this.repository.repositoryUri,
       exportName: `XorgateRecorderRepoUri${suffix}`,
+    });
+    new cdk.CfnOutput(this, 'CvRunnerRepoUri', {
+      value: this.cvRepository.repositoryUri,
+      exportName: `XorgateCvRunnerRepoUri${suffix}`,
     });
   }
 }

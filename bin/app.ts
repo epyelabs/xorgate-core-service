@@ -19,6 +19,11 @@ function recorderProps(rec: XorgateCoreRecorderStack) {
     recorderSecurityGroupId: rec.securityGroup.securityGroupId,
     recorderSubnets: rec.publicSubnetIds.join(','),
     recorderContainerName: rec.containerName,
+    // CV runner (workflows video path) shares the recorder cluster/VPC/SG.
+    cvTaskFamily: rec.cvTaskFamily,
+    cvTaskRoleArn: rec.cvTaskRoleArn,
+    cvExecutionRoleArn: rec.cvExecutionRoleArn,
+    cvContainerName: rec.cvContainerName,
   };
 }
 

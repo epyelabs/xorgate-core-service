@@ -13,6 +13,7 @@ import {
   startRecording,
   stopRecording,
 } from '../services/recordings';
+import { evaluateTelemetryTriggers } from '../services/workflow-triggers';
 
 // Per-device settings (telemetry persistence + auto-record) are opt-in (default
 // off). Cache the flags in the warm Lambda container so the 1 Hz hot path doesn't
@@ -177,5 +178,14 @@ export const handler = async (event: unknown): Promise<void> => {
     await reconcileAutoRecord(payload);
   } catch (err) {
     console.error('telemetry-ingest: auto-record reconcile failed', { deviceId: payload.deviceId, err });
+  }
+
+  // Workflow telemetry-condition triggers (cached, debounced). Best-effort:
+  // steady-state cost is ~zero (devices with no such attachments hit a cached
+  // empty array), and a workflow failure must never break ingestion.
+  try {
+    await evaluateTelemetryTriggers(payload);
+  } catch (err) {
+    console.error('telemetry-ingest: workflow trigger eval failed', { deviceId: payload.deviceId, err });
   }
 };

@@ -1,0 +1,120 @@
+import { z } from 'zod';
+
+/**
+ * Server-side validation for the Workflows feature. These MIRROR the frontend Zod
+ * (xorgate-web/src/lib/workflow-schemas.ts, device-workflow-schemas.ts,
+ * workflow-run-schemas.ts) — the shapes are the API contract. jsonb columns
+ * (definition, triggers, triggerContext) are validated with these before they hit
+ * the DB, and again when re-read into an executor.
+ */
+
+// --- Graph definition (react-flow native) ------------------------------------
+export const workflowNodeSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  position: z.object({ x: z.number(), y: z.number() }),
+  data: z.object({
+    label: z.string(),
+    config: z.record(z.string(), z.unknown()).default({}),
+  }),
+});
+
+export const workflowEdgeSchema = z.object({
+  id: z.string(),
+  source: z.string(),
+  target: z.string(),
+  sourceHandle: z.string().nullish(),
+  targetHandle: z.string().nullish(),
+});
+
+export const workflowDefinitionSchema = z.object({
+  nodes: z.array(workflowNodeSchema),
+  edges: z.array(workflowEdgeSchema),
+});
+
+export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
+export type WorkflowEdge = z.infer<typeof workflowEdgeSchema>;
+export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema>;
+
+// --- Template create / update inputs -----------------------------------------
+export const createWorkflowTemplateSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required').max(80, 'Name is too long'),
+  description: z.string().max(280, 'Description is too long').optional(),
+});
+
+export const updateWorkflowTemplateSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  description: z.string().max(280).nullable().optional(),
+});
+
+export const saveDraftSchema = z.object({
+  definition: workflowDefinitionSchema,
+  message: z.string().max(280).optional(),
+});
+
+// --- Attachment triggers (device_workflows) ----------------------------------
+export const conditionOperatorSchema = z.enum(['gt', 'gte', 'lt', 'lte', 'eq', 'neq']);
+
+export const telemetryConditionSchema = z.object({
+  metric: z.string().min(1),
+  operator: conditionOperatorSchema,
+  value: z.number(),
+});
+
+export const contextWindowSchema = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('sinceLastRun') }),
+  z.object({ mode: z.literal('range'), from: z.string().min(1), to: z.string().min(1) }),
+  z.object({ mode: z.literal('lastN'), n: z.number().int().positive() }),
+]);
+
+export const attachmentTriggerSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('recording_saved'),
+    streamKeys: z.array(z.string()).min(1),
+  }),
+  z.object({
+    type: z.literal('schedule'),
+    cron: z.string().min(1),
+    telemetryContext: contextWindowSchema,
+    mediaContext: contextWindowSchema,
+    // Backend-only dedupe knob, not surfaced in the FE editor.
+    cooldownSeconds: z.number().int().positive().optional(),
+  }),
+  z.object({
+    type: z.literal('telemetry_condition'),
+    combinator: z.enum(['and', 'or']),
+    conditions: z.array(telemetryConditionSchema).min(1),
+    // Backend-only override; default 300s (see workflow-triggers.ts).
+    cooldownSeconds: z.number().int().positive().optional(),
+  }),
+]);
+
+export const attachWorkflowSchema = z.object({
+  templateId: z.string().min(1),
+  pinnedVersion: z.number().int().positive().nullable(),
+  triggers: z.array(attachmentTriggerSchema).min(1),
+});
+
+export type ConditionOperator = z.infer<typeof conditionOperatorSchema>;
+export type TelemetryCondition = z.infer<typeof telemetryConditionSchema>;
+export type ContextWindow = z.infer<typeof contextWindowSchema>;
+export type AttachmentTrigger = z.infer<typeof attachmentTriggerSchema>;
+
+// --- Manual "Run now" context (device-workflows.ts) --------------------------
+export const manualWindowSchema = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('range'), from: z.string().min(1), to: z.string().min(1) }),
+  z.object({ mode: z.literal('lastN'), n: z.number().int().positive() }),
+]);
+
+export const scheduleRunSelectionSchema = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('recordings'), recordingIds: z.array(z.string()).min(1) }),
+  z.object({ mode: z.literal('lastN'), n: z.number().int().positive() }),
+]);
+
+export const manualRunContextSchema = z.discriminatedUnion('triggerType', [
+  z.object({ triggerType: z.literal('recording_saved'), recordingId: z.string().min(1) }),
+  z.object({ triggerType: z.literal('schedule'), selection: scheduleRunSelectionSchema }),
+  z.object({ triggerType: z.literal('telemetry_condition'), window: manualWindowSchema }),
+]);
+
+export type ManualRunContext = z.infer<typeof manualRunContextSchema>;

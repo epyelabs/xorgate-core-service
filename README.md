@@ -123,6 +123,66 @@ TLS (the system CA bundle fails verification in the slim image).
 The recorder **image is built and pushed out-of-band** (not by `cdk deploy`); see
 the deploy steps below and `device/xorgate-kvs-webrtc`.
 
+## Workflows
+
+User-defined processing pipelines that attach to a device, fire on a trigger, and
+produce reviewable runs + events. A **template** is an org-scoped graph of nodes
+(catalog type in `node.type`, knobs in `node.data.config`); an **attachment** binds
+a *published* template to one device with one or more triggers; a **run** is a
+single execution with a step trace and emitted events. Two execution engines sit
+behind one SQS queue: **telemetry-only** graphs run **inline** in the dispatcher
+Lambda; **video** graphs run on a **Fargate CV task** (Python + ONNX Runtime).
+
+```mermaid
+flowchart TD
+  A[recording_saved<br/>media-finalize.ts] --> F
+  B[telemetry_condition<br/>telemetry-ingest.ts<br/>cached + debounced] --> F
+  C[schedule + watchdog<br/>workflow-scheduler.ts<br/>1-min rule, prod-only] --> F
+  D[manual run-now / rerun<br/>HTTP handlers] --> F
+  F[fireWorkflowRun<br/>insert workflow_runs status=running<br/>enqueue runId] --> Q[[WorkflowRunQueue + DLQ]]
+  Q --> DISP[workflow-dispatch.ts<br/>SQS, batchSize 1]
+  DISP -->|telemetry graph| INLINE[runWorkflowInline<br/>topo sort + executors]
+  DISP -->|video graph| MAN[write manifest.json to S3<br/>ECS RunTask]
+  MAN --> CV[cv-runner Fargate ARM64<br/>ffmpeg + YOLOv8n ONNX + IoU tracker]
+  CV -->|result.json to S3| RULE[S3 ObjectCreated<br/>EventBridge]
+  RULE --> FIN[workflow-run-finalize.ts]
+  INLINE --> DB[(workflow_runs / _steps / _events)]
+  FIN --> DB
+```
+
+**Schema** (migration `0009`, `db/schema.ts`): `workflow_templates`,
+`workflow_template_versions` (app-enforced one-draft + one-published invariant),
+`workflow_attachments`, `workflow_trigger_state` (debounce/cooldown + schedule
+cursor), `workflow_runs` (snapshot of the definition that ran),
+`workflow_run_steps`, `workflow_events`.
+
+**Handlers / services:**
+
+| File | Role |
+|---|---|
+| `handlers/workflow-templates.ts` | template CRUD + versioning (save draft / publish / restore) in transactions |
+| `handlers/device-workflows.ts` | attach / list / enable / detach + Run-now; capability compat check |
+| `handlers/workflow-runs.ts` | run list / detail + rerun |
+| `handlers/workflow-dispatch.ts` | SQS consumer → inline runner or Fargate launch (idempotent under redelivery) |
+| `handlers/workflow-run-finalize.ts` | S3 `result.json` → persist steps/events + run status |
+| `handlers/workflow-scheduler.ts` | schedule triggers + stuck-run watchdog (1-min rule, `!disableScheduledJobs`) |
+| `services/workflow-triggers.ts` | `fireWorkflowRun` + telemetry / recording trigger evaluation |
+| `services/workflow-runner.ts` | inline executor registry (telemetry graphs) |
+| `services/workflow-fargate.ts` | manifest writer + ECS RunTask (video graphs) |
+| `services/workflow-capabilities.ts` | required-capabilities vs `device_models.ioCapabilities` |
+
+**CV runner image** — `cv-runner/` is a Python container (Fargate ARM64), built +
+pushed out-of-band like the recorder (the recorder stack holds the ECR repo
+`xorgate-cv-runner[-dev]` + task def). It needs `yolov8n.onnx` baked in; full
+build/push steps are in [`cv-runner/README.md`](cv-runner/README.md). Same
+ECR/ECS/`iam:PassRole` grants as the recorder image (plus `ecr:BatchGetImage`).
+
+**Notes:** new deps `@aws-sdk/client-sqs` + `cron-parser`; the run-firing Lambdas
+bundle the AWS SDK (`bundling: bundlingWithSdk`) since client-sqs isn't guaranteed
+in the runtime. The scheduler/watchdog rule is **off in dev by default** (Aurora
+auto-pause) — enable with `--context scheduledJobs=on`. Apply migration `0009`
+before deploying the new Lambdas.
+
 ## Routes (summary)
 
 | Route | Auth | Notes |

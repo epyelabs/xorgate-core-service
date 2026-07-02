@@ -320,6 +320,198 @@ export const recordings = pgTable(
   ],
 );
 
+// --- Workflows (user-defined processing pipelines) ---
+// A workflow: a graph of nodes (CV / telemetry processors) that attaches to a
+// device, fires on a trigger, and produces reviewable runs + events. `status`
+// columns are text (not pgEnum) to dodge the aws-data-api enum-cast issue — same
+// reasoning as devices.status / recordings.status. All graph/trigger/payload
+// shapes are jsonb, validated app-side against the schemas in src/schemas/workflows.ts.
+
+// Org-scoped template (the reusable definition). `publishedVersion`/`currentVersion`
+// are version NUMBERS (not FKs) to mirror the FE and avoid a circular FK with
+// workflow_template_versions.
+export const workflowTemplates = pgTable(
+  'workflow_templates',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    name: text('name').notNull(),
+    slug: text('slug').notNull(),
+    description: text('description'),
+    status: text('status').default('draft').notNull(), // draft | published
+    currentVersion: integer('current_version').default(1).notNull(),
+    publishedVersion: integer('published_version'), // null until first publish
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    updatedByUserId: text('updated_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('workflow_templates_org_slug_idx').on(t.organizationId, t.slug)],
+);
+
+// One version row per saved definition. App-enforced invariant (see
+// workflow-templates.ts): at most one draft and one published row per template.
+export const workflowTemplateVersions = pgTable(
+  'workflow_template_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    templateId: uuid('template_id')
+      .references(() => workflowTemplates.id, { onDelete: 'cascade' })
+      .notNull(),
+    version: integer('version').notNull(),
+    status: text('status').notNull(), // draft | published | archived
+    message: text('message'),
+    definition: jsonb('definition').notNull(), // { nodes[], edges[] }
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('workflow_template_versions_template_version_idx').on(t.templateId, t.version)],
+);
+
+// A template attached to one device with one or more triggers. Detach keeps run
+// history (workflow_runs.attachmentId is set-null on delete).
+export const workflowAttachments = pgTable(
+  'workflow_attachments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    templateId: uuid('template_id')
+      .references(() => workflowTemplates.id, { onDelete: 'cascade' })
+      .notNull(),
+    pinnedVersion: integer('pinned_version'), // null = follow the published version
+    enabled: boolean('enabled').default(true).notNull(),
+    triggers: jsonb('triggers').notNull(), // attachmentTriggerSchema[]
+    // Denormalized stats (finalizer guards drift with a lastRunAt comparison).
+    lastRunAt: timestamp('last_run_at', { withTimezone: true }),
+    lastRunStatus: text('last_run_status'), // running | succeeded | failed
+    runCount: integer('run_count').default(0).notNull(),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('workflow_attachments_device_template_idx').on(t.deviceId, t.templateId)],
+);
+
+// Debounce/cooldown + schedule cursor, one row per (attachment, trigger index).
+export const workflowTriggerState = pgTable(
+  'workflow_trigger_state',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    attachmentId: uuid('attachment_id')
+      .references(() => workflowAttachments.id, { onDelete: 'cascade' })
+      .notNull(),
+    triggerIndex: integer('trigger_index').notNull(), // index into triggers[]
+    lastFiredAt: timestamp('last_fired_at', { withTimezone: true }),
+    lastConditionMet: boolean('last_condition_met'), // edge detection (telemetry)
+    lastWindowEnd: timestamp('last_window_end', { withTimezone: true }), // schedule sinceLastRun cursor
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('workflow_trigger_state_attachment_trigger_idx').on(
+      t.attachmentId,
+      t.triggerIndex,
+    ),
+  ],
+);
+
+// One execution. `definition` is a SNAPSHOT of the version that ran (detach /
+// republish never rewrites history). No `queued` status in v1 (see plan §11.1).
+export const workflowRuns = pgTable(
+  'workflow_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .references(() => workspaces.id, { onDelete: 'cascade' })
+      .notNull(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    attachmentId: uuid('attachment_id').references(() => workflowAttachments.id, {
+      onDelete: 'set null',
+    }),
+    templateId: uuid('template_id')
+      .references(() => workflowTemplates.id, { onDelete: 'cascade' })
+      .notNull(),
+    templateVersion: integer('template_version').notNull(),
+    definition: jsonb('definition').notNull(), // snapshot of the version that ran
+    trigger: text('trigger').notNull(), // event | schedule | manual
+    triggerContext: jsonb('trigger_context'),
+    status: text('status').default('running').notNull(), // running | succeeded | failed
+    executionMode: text('execution_mode').notNull(), // inline | fargate
+    taskArn: text('task_arn'),
+    startedAt: timestamp('started_at', { withTimezone: true }).defaultNow().notNull(),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    durationMs: integer('duration_ms'),
+    metrics: jsonb('metrics').default({}).notNull(),
+    error: text('error'),
+    failedNodeId: text('failed_node_id'),
+    eventCount: integer('event_count').default(0).notNull(),
+  },
+  (t) => [
+    index('workflow_runs_workspace_started_idx').on(t.workspaceId, t.startedAt),
+    index('workflow_runs_device_started_idx').on(t.deviceId, t.startedAt),
+    index('workflow_runs_status_idx').on(t.status), // watchdog sweep
+    index('workflow_runs_attachment_idx').on(t.attachmentId),
+  ],
+);
+
+// One row per executed node (the step trace rendered in the run detail UI).
+export const workflowRunSteps = pgTable(
+  'workflow_run_steps',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .references(() => workflowRuns.id, { onDelete: 'cascade' })
+      .notNull(),
+    seq: integer('seq').notNull(), // topo order
+    nodeId: text('node_id').notNull(),
+    label: text('label').notNull(),
+    status: text('status').notNull(), // ok | failed | skipped
+    output: text('output').default('').notNull(), // human one-liner, e.g. "37 detections"
+    durationMs: integer('duration_ms').default(0).notNull(),
+    detail: jsonb('detail'),
+  },
+  (t) => [uniqueIndex('workflow_run_steps_run_node_idx').on(t.runId, t.nodeId)],
+);
+
+// A detection/observation emitted by a run. Rendered in the run detail Events tab.
+export const workflowEvents = pgTable(
+  'workflow_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .references(() => workflowRuns.id, { onDelete: 'cascade' })
+      .notNull(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    kind: text('kind').notNull(), // person_at_perimeter | overspeed | ...
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
+    confidence: doublePrecision('confidence'),
+    clip: boolean('clip').default(false).notNull(),
+    clipS3Key: text('clip_s3_key'),
+    payloadSummary: text('payload_summary').default('').notNull(),
+    payload: jsonb('payload'), // bboxes, observed values
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index('workflow_events_run_idx').on(t.runId),
+    index('workflow_events_device_occurred_idx').on(t.deviceId, t.occurredAt),
+  ],
+);
+
 export type User = InferSelectModel<typeof users>;
 export type NewUser = InferInsertModel<typeof users>;
 export type Organization = InferSelectModel<typeof organizations>;
@@ -350,3 +542,17 @@ export type MediaSegment = InferSelectModel<typeof mediaSegments>;
 export type NewMediaSegment = InferInsertModel<typeof mediaSegments>;
 export type Recording = InferSelectModel<typeof recordings>;
 export type NewRecording = InferInsertModel<typeof recordings>;
+export type WorkflowTemplate = InferSelectModel<typeof workflowTemplates>;
+export type NewWorkflowTemplate = InferInsertModel<typeof workflowTemplates>;
+export type WorkflowTemplateVersion = InferSelectModel<typeof workflowTemplateVersions>;
+export type NewWorkflowTemplateVersion = InferInsertModel<typeof workflowTemplateVersions>;
+export type WorkflowAttachment = InferSelectModel<typeof workflowAttachments>;
+export type NewWorkflowAttachment = InferInsertModel<typeof workflowAttachments>;
+export type WorkflowTriggerState = InferSelectModel<typeof workflowTriggerState>;
+export type NewWorkflowTriggerState = InferInsertModel<typeof workflowTriggerState>;
+export type WorkflowRun = InferSelectModel<typeof workflowRuns>;
+export type NewWorkflowRun = InferInsertModel<typeof workflowRuns>;
+export type WorkflowRunStep = InferSelectModel<typeof workflowRunSteps>;
+export type NewWorkflowRunStep = InferInsertModel<typeof workflowRunSteps>;
+export type WorkflowEvent = InferSelectModel<typeof workflowEvents>;
+export type NewWorkflowEvent = InferInsertModel<typeof workflowEvents>;
