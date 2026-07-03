@@ -165,11 +165,13 @@ async function loadUsage(exec: Executor, templateId: string) {
 }
 
 async function buildDetail(exec: Executor, t: TemplateRow) {
-  const [versions, usage, users] = await Promise.all([
-    loadVersions(exec, t.id),
-    loadUsage(exec, t.id),
-    loadUsers(exec, [t.createdByUserId, t.updatedByUserId]),
-  ]);
+  // Run sequentially, not via Promise.all: the aws-data-api driver serializes
+  // statements within a transaction, so concurrent queries on a `tx` handle throw
+  // "Transaction is still running a query". buildDetail runs inside the write-path
+  // transactions (create/draft/publish/restore), so it must not fan out.
+  const versions = await loadVersions(exec, t.id);
+  const usage = await loadUsage(exec, t.id);
+  const users = await loadUsers(exec, [t.createdByUserId, t.updatedByUserId]);
   // Capabilities of the version that would actually run (published, else current).
   const target = t.publishedVersion ?? t.currentVersion;
   const relevant = versions.find((v) => v.version === target) ?? versions.at(-1);
