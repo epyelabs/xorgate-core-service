@@ -1,0 +1,155 @@
+import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import { and, desc, eq, ilike, inArray, or } from 'drizzle-orm';
+import {
+  AuthError,
+  authErrorResponse,
+  requireOrgContext,
+} from '../middleware/auth';
+import { db, schema } from '../db/index';
+import { methodNotAllowed, ok } from '../utils/responses';
+
+// Global cross-resource search. `GET /search?q=<term>` returns a flat, normalized
+// list of results the caller's org can see. The result shape is intentionally
+// generic so the web UI renders any resource type from one code path and adding a
+// new searchable resource is a single query block here (+ one FE registry entry):
+//
+//   { type, id, title, subtitle }
+//
+// Tenant isolation mirrors the other handlers: org-scoped tables (workflow
+// templates) filter by organizationId; workspace-owned tables (devices, runs)
+// filter by workspaceId IN <the org's workspaces>.
+
+type SearchResultType = 'device' | 'workflow-template' | 'workflow-instance';
+
+interface SearchResult {
+  type: SearchResultType;
+  id: string;
+  title: string;
+  subtitle: string | null;
+}
+
+// Max hits returned per resource type. Keeps the palette snappy and the payload
+// small; the UI is a jump-to-detail navigator, not a full result browser.
+const PER_TYPE_LIMIT = 6;
+
+async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
+  const rows = await db.query.workspaces.findMany({
+    where: eq(schema.workspaces.organizationId, organizationId),
+    columns: { id: true },
+  });
+  return rows.map((r) => r.id);
+}
+
+// Escape LIKE/ILIKE wildcards so a user typing "%" or "_" matches literally
+// (default ESCAPE is backslash).
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+export const handler = async (
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> => {
+  const method = event.requestContext.http.method;
+  if (method !== 'GET') return methodNotAllowed(method, 'GET');
+
+  let auth;
+  try {
+    auth = await requireOrgContext(event);
+  } catch (err) {
+    if (err instanceof AuthError) return authErrorResponse(err);
+    throw err;
+  }
+
+  const q = event.queryStringParameters?.q?.trim();
+  if (!q || q.length < 2) return ok({ results: [] });
+  const pat = `%${escapeLike(q)}%`;
+
+  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const hasWorkspaces = orgWorkspaceIds.length > 0;
+
+  const [devices, templates, runs] = await Promise.all([
+    // Devices (workspace-owned): match name or serial.
+    hasWorkspaces
+      ? db.query.devices.findMany({
+          where: and(
+            inArray(schema.devices.workspaceId, orgWorkspaceIds),
+            or(ilike(schema.devices.name, pat), ilike(schema.devices.serial, pat)),
+          ),
+          columns: { id: true, name: true, serial: true },
+          orderBy: [desc(schema.devices.updatedAt)],
+          limit: PER_TYPE_LIMIT,
+        })
+      : Promise.resolve([]),
+
+    // Workflow templates (org-scoped): match name, slug, or description.
+    db.query.workflowTemplates.findMany({
+      where: and(
+        eq(schema.workflowTemplates.organizationId, auth.organizationId),
+        or(
+          ilike(schema.workflowTemplates.name, pat),
+          ilike(schema.workflowTemplates.slug, pat),
+          ilike(schema.workflowTemplates.description, pat),
+        ),
+      ),
+      columns: { id: true, name: true, slug: true },
+      orderBy: [desc(schema.workflowTemplates.updatedAt)],
+      limit: PER_TYPE_LIMIT,
+    }),
+
+    // Workflow runs (workspace-owned, joined): match template name, device name,
+    // or device serial. Reuses the join shape from workflow-runs.ts.
+    hasWorkspaces
+      ? db
+          .select({
+            id: schema.workflowRuns.id,
+            templateName: schema.workflowTemplates.name,
+            deviceName: schema.devices.name,
+            serial: schema.devices.serial,
+          })
+          .from(schema.workflowRuns)
+          .innerJoin(
+            schema.workflowTemplates,
+            eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
+          )
+          .innerJoin(
+            schema.devices,
+            eq(schema.devices.id, schema.workflowRuns.deviceId),
+          )
+          .where(
+            and(
+              inArray(schema.workflowRuns.workspaceId, orgWorkspaceIds),
+              or(
+                ilike(schema.workflowTemplates.name, pat),
+                ilike(schema.devices.name, pat),
+                ilike(schema.devices.serial, pat),
+              ),
+            ),
+          )
+          .orderBy(desc(schema.workflowRuns.startedAt))
+          .limit(PER_TYPE_LIMIT)
+      : Promise.resolve([]),
+  ]);
+
+  const results: SearchResult[] = [
+    ...devices.map((d): SearchResult => ({
+      type: 'device',
+      id: d.id,
+      title: d.name ?? d.serial,
+      subtitle: d.serial,
+    })),
+    ...templates.map((t): SearchResult => ({
+      type: 'workflow-template',
+      id: t.id,
+      title: t.name,
+      subtitle: t.slug,
+    })),
+    ...runs.map((r): SearchResult => ({
+      type: 'workflow-instance',
+      id: r.id,
+      title: r.templateName,
+      subtitle: r.deviceName ?? r.serial,
+    })),
+  ];
+
+  return ok({ results });
+};

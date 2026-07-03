@@ -439,6 +439,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
       standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
     );
 
+    const searchFn = new nodejs.NodejsFunction(
+      this,
+      "SearchFn",
+      standardFnProps(
+        path.join(entryBase, "search.ts"),
+        "GET /search — global cross-resource search",
+      ),
+    );
+
     const deviceProvisioningFn = new nodejs.NodejsFunction(this, "DeviceProvisioningFn", {
       ...standardFnProps(
         path.join(entryBase, "device-provisioning.ts"),
@@ -891,6 +900,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DevicesInt",
       devicesFn,
     );
+    const searchInt = new apigwv2int.HttpLambdaIntegration(
+      "SearchInt",
+      searchFn,
+    );
     const deviceProvisioningInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceProvisioningInt",
       deviceProvisioningFn,
@@ -1024,6 +1037,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.DELETE,
       ],
       integration: deviceModelsInt,
+    });
+
+    this.api.addRoutes({
+      path: "/search",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: searchInt,
     });
 
     this.api.addRoutes({
