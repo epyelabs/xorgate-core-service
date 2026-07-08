@@ -1418,6 +1418,93 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
     },
+    '/devices/{id}/telemetry/readings': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getDeviceTelemetryReadings',
+        summary: 'Paginated raw telemetry readings for the history table',
+        description:
+          'Returns raw (un-averaged) telemetry_readings rows for one page, paginated over DISTINCT ' +
+          'timestamps so a page boundary never splits a sample. Defaults to the latest samples ' +
+          '(`order=desc`) with no time window. `limit`/`offset` count timestamps (samples), not rows. ' +
+          'The `page.total` field is the total distinct-timestamp count matching the filter.',
+        tags: ['Devices'],
+        parameters: [
+          {
+            name: 'limit',
+            in: 'query',
+            required: false,
+            schema: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
+            description: 'Timestamps (samples) per page.',
+          },
+          {
+            name: 'offset',
+            in: 'query',
+            required: false,
+            schema: { type: 'integer', minimum: 0, default: 0 },
+            description: 'Timestamps to skip (page offset).',
+          },
+          {
+            name: 'order',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['asc', 'desc'], default: 'desc' },
+            description: 'Sort direction by ts.',
+          },
+          {
+            name: 'from',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', format: 'date-time' },
+            description: 'Optional range start (inclusive), ISO-8601.',
+          },
+          {
+            name: 'to',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', format: 'date-time' },
+            description: 'Optional range end (exclusive), ISO-8601.',
+          },
+          {
+            name: 'metric',
+            in: 'query',
+            required: false,
+            schema: { type: 'string' },
+            description: 'Comma-separated metric filter (max 20), e.g. `imu.accel_x,gps.lat`.',
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'One page of raw readings, ordered by ts then metric.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['readings', 'page'],
+                  properties: {
+                    readings: { type: 'array', items: { $ref: '#/components/schemas/TelemetryReading' } },
+                    page: {
+                      type: 'object',
+                      required: ['limit', 'offset', 'order', 'total'],
+                      properties: {
+                        limit: { type: 'integer' },
+                        offset: { type: 'integer' },
+                        order: { type: 'string', enum: ['asc', 'desc'] },
+                        total: { type: 'integer', description: 'Total distinct timestamps matching the filter.' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
   },
 });
 

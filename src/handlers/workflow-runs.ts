@@ -1,13 +1,14 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { tsParam } from '../utils/sql';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
 
-const DEFAULT_LIMIT = 100;
-const MAX_LIMIT = 500;
+const RUN_STATUSES = ['running', 'succeeded', 'failed'] as const;
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
@@ -70,6 +71,16 @@ function toSummary(r: SummaryRow) {
   };
 }
 
+// Total runs matching a filter, for the list `page.total`. Counted directly on
+// workflow_runs (the list's inner joins are on required FKs, so the count matches).
+async function countRuns(where: SQL | undefined): Promise<number> {
+  const rows = await db
+    .select({ total: sql<number>`count(*)::int` })
+    .from(schema.workflowRuns)
+    .where(where);
+  return Number(rows[0]?.total ?? 0);
+}
+
 // A short human label for what fired the run, from its trigger + context.
 function deriveTriggeredBy(trigger: string, ctx: unknown): string {
   const c = (ctx ?? {}) as Record<string, unknown>;
@@ -83,13 +94,6 @@ function deriveTriggeredBy(trigger: string, ctx: unknown): string {
   }
   if (type === 'schedule' && typeof c.cron === 'string') return `schedule · ${c.cron}`;
   return type;
-}
-
-function parseLimit(event: APIGatewayProxyEventV2): number {
-  const raw = event.queryStringParameters?.limit;
-  const n = raw ? Number.parseInt(raw, 10) : DEFAULT_LIMIT;
-  if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
-  return Math.min(n, MAX_LIMIT);
 }
 
 /**
@@ -115,18 +119,35 @@ export const handler = async (
   }
 
   const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
-  const limit = parseLimit(event);
 
   switch (routeKey) {
     case 'GET /workflow-runs': {
-      if (orgWorkspaceIds.length === 0) return ok({ runs: [] });
+      const parsed = parseListParams(event, {
+        sortable: ['startedAt'],
+        defaultSort: 'startedAt',
+        statusValues: RUN_STATUSES,
+      });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, status, from, to } = parsed;
+
+      const emptyPage = ok({ runs: [], page: pageMeta(parsed, 0) });
+      if (orgWorkspaceIds.length === 0) return emptyPage;
       const headerWorkspaceId =
         event.headers['x-workspace-id'] ?? event.headers['X-Workspace-Id'];
       let wsFilter = orgWorkspaceIds;
       if (headerWorkspaceId) {
-        if (!orgWorkspaceIds.includes(headerWorkspaceId)) return ok({ runs: [] });
+        if (!orgWorkspaceIds.includes(headerWorkspaceId)) return emptyPage;
         wsFilter = [headerWorkspaceId];
       }
+
+      const where = and(
+        inArray(schema.workflowRuns.workspaceId, wsFilter),
+        status ? eq(schema.workflowRuns.status, status) : undefined,
+        from ? sql`${schema.workflowRuns.startedAt} >= ${tsParam(from)}` : undefined,
+        to ? sql`${schema.workflowRuns.startedAt} < ${tsParam(to)}` : undefined,
+      );
+      const total = await countRuns(where);
+
       const rows = await db
         .select(summaryColumns)
         .from(schema.workflowRuns)
@@ -135,10 +156,15 @@ export const handler = async (
           eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
         )
         .innerJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
-        .where(inArray(schema.workflowRuns.workspaceId, wsFilter))
-        .orderBy(desc(schema.workflowRuns.startedAt))
-        .limit(limit);
-      return ok({ runs: rows.map(toSummary) });
+        .where(where)
+        .orderBy(
+          order === 'asc'
+            ? asc(schema.workflowRuns.startedAt)
+            : desc(schema.workflowRuns.startedAt),
+        )
+        .limit(limit)
+        .offset(offset);
+      return ok({ runs: rows.map(toSummary), page: pageMeta(parsed, total) });
     }
 
     case 'GET /workflow-runs/{id}': {
@@ -213,6 +239,14 @@ export const handler = async (
     case 'GET /devices/{id}/workflow-runs': {
       const deviceId = event.pathParameters?.id;
       if (!deviceId) return badRequest('device id required');
+      const parsed = parseListParams(event, {
+        sortable: ['startedAt'],
+        defaultSort: 'startedAt',
+        statusValues: RUN_STATUSES,
+      });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, status, from, to } = parsed;
+
       if (orgWorkspaceIds.length === 0) return notFound(`Device "${deviceId}" not found`);
       // Ownership: the device must belong to a workspace in the caller's org.
       const device = await db.query.devices.findFirst({
@@ -223,6 +257,15 @@ export const handler = async (
         columns: { id: true },
       });
       if (!device) return notFound(`Device "${deviceId}" not found`);
+
+      const where = and(
+        eq(schema.workflowRuns.deviceId, deviceId),
+        status ? eq(schema.workflowRuns.status, status) : undefined,
+        from ? sql`${schema.workflowRuns.startedAt} >= ${tsParam(from)}` : undefined,
+        to ? sql`${schema.workflowRuns.startedAt} < ${tsParam(to)}` : undefined,
+      );
+      const total = await countRuns(where);
+
       const rows = await db
         .select(summaryColumns)
         .from(schema.workflowRuns)
@@ -231,10 +274,15 @@ export const handler = async (
           eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
         )
         .innerJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
-        .where(eq(schema.workflowRuns.deviceId, deviceId))
-        .orderBy(desc(schema.workflowRuns.startedAt))
-        .limit(limit);
-      return ok({ runs: rows.map(toSummary) });
+        .where(where)
+        .orderBy(
+          order === 'asc'
+            ? asc(schema.workflowRuns.startedAt)
+            : desc(schema.workflowRuns.startedAt),
+        )
+        .limit(limit)
+        .offset(offset);
+      return ok({ runs: rows.map(toSummary), page: pageMeta(parsed, total) });
     }
 
     case 'POST /workflow-runs/{id}/rerun': {

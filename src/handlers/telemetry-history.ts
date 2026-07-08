@@ -11,6 +11,14 @@ import { tsParam } from '../utils/sql';
  *   GET /devices/{id}/telemetry?from&to[&metric][&interval]  — telemetry_readings over [from, to)
  *   GET /devices/{id}/telemetry/latest                        — device_latest rows
  *   GET /devices/{id}/telemetry/recent[&metric][&limit]       — the most recent N rows
+ *   GET /devices/{id}/telemetry/readings[&...]                — raw rows, paginated by ts
+ *
+ * The /readings variant backs the Telemetry History table: raw (un-averaged)
+ * rows paginated over DISTINCT timestamps (one sample = one display row), so a
+ * page boundary never splits a sample's metrics across two pages. It accepts
+ * `limit`/`offset` (in timestamps), `order` (asc|desc by ts), and optional
+ * `from`/`to`/`metric` filters, and returns a `page` block with the total
+ * distinct-timestamp count for proper pagination.
  *
  * The /recent variant orders by ts DESC and returns the newest `limit` rows
  * (chronological in the response), so callers see the latest samples regardless
@@ -35,6 +43,8 @@ const MAX_METRICS = 20;
 const METRIC_RE = /^[a-z0-9_]+\.[a-z0-9_]+$/i;
 const RECENT_DEFAULT = 500; // rows returned by /recent when no limit is given
 const RECENT_MAX = 5_000;
+const READINGS_DEFAULT_LIMIT = 100; // timestamps per page for /readings
+const READINGS_MAX_LIMIT = 500;
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
@@ -233,6 +243,121 @@ async function handleRecent(
   return ok({ readings, bucketSeconds: null, truncated });
 }
 
+// GET /devices/{id}/telemetry/readings — raw rows for one page of the history
+// table, paginated over DISTINCT timestamps. We first pull the page's distinct
+// timestamps (ordered, limit/offset), then fetch every row within that page's
+// [minTs, maxTs] window: because the page is a contiguous ordered slice of the
+// distinct-ts set, no other matching timestamp falls between its bounds, so this
+// returns exactly the page's samples without splitting one across pages.
+async function handleReadings(
+  deviceId: string,
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> {
+  const qs = event.queryStringParameters ?? {};
+
+  let limit = READINGS_DEFAULT_LIMIT;
+  if (qs.limit !== undefined) {
+    if (!/^\d+$/.test(qs.limit)) return badRequest('"limit" must be a positive integer');
+    limit = Number(qs.limit);
+    if (limit < 1 || limit > READINGS_MAX_LIMIT) {
+      return badRequest(`"limit" must be between 1 and ${READINGS_MAX_LIMIT}`);
+    }
+  }
+
+  let offset = 0;
+  if (qs.offset !== undefined) {
+    if (!/^\d+$/.test(qs.offset)) return badRequest('"offset" must be a non-negative integer');
+    offset = Number(qs.offset);
+  }
+
+  let order: 'asc' | 'desc' = 'desc';
+  if (qs.order !== undefined) {
+    if (qs.order !== 'asc' && qs.order !== 'desc') return badRequest('"order" must be "asc" or "desc"');
+    order = qs.order;
+  }
+
+  let metrics: string[] | null = null;
+  if (qs.metric) {
+    metrics = qs.metric.split(',').map((m) => m.trim()).filter(Boolean);
+    if (metrics.length === 0 || metrics.length > MAX_METRICS) {
+      return badRequest(`"metric" must list 1-${MAX_METRICS} metrics (comma-separated)`);
+    }
+    const bad = metrics.find((m) => !METRIC_RE.test(m));
+    if (bad) return badRequest(`Invalid metric name "${bad}" (expected "group.field")`);
+  }
+
+  // from/to are both optional here (default = latest, no time window).
+  let fromIso: string | null = null;
+  let toIso: string | null = null;
+  if (qs.from !== undefined) {
+    const ms = Date.parse(qs.from);
+    if (Number.isNaN(ms)) return badRequest('Query param "from" must be a valid ISO-8601 timestamp');
+    fromIso = new Date(ms).toISOString();
+  }
+  if (qs.to !== undefined) {
+    const ms = Date.parse(qs.to);
+    if (Number.isNaN(ms)) return badRequest('Query param "to" must be a valid ISO-8601 timestamp');
+    toIso = new Date(ms).toISOString();
+  }
+  if (fromIso && toIso && Date.parse(fromIso) >= Date.parse(toIso)) {
+    return badRequest('"from" must be earlier than "to"');
+  }
+
+  const t = schema.telemetryReadings;
+  // tsParam casts are load-bearing on the Data API — see the header comment.
+  const where = and(
+    eq(t.deviceId, deviceId),
+    fromIso ? sql`${t.ts} >= ${tsParam(fromIso)}` : undefined,
+    toIso ? sql`${t.ts} < ${tsParam(toIso)}` : undefined,
+    metrics ? inArray(t.metric, metrics) : undefined,
+  );
+  const orderTs = order === 'asc' ? asc(t.ts) : desc(t.ts);
+
+  // Total distinct timestamps matching the filter (drives page count).
+  const totalRows = await db
+    .select({ total: sql<number>`count(distinct ${t.ts})::int` })
+    .from(t)
+    .where(where);
+  const total = Number(totalRows[0]?.total ?? 0);
+
+  // The page's distinct timestamps.
+  const tsRows = await db
+    .selectDistinct({ ts: t.ts })
+    .from(t)
+    .where(where)
+    .orderBy(orderTs)
+    .limit(limit)
+    .offset(offset);
+
+  if (tsRows.length === 0) {
+    return ok({ readings: [], page: { limit, offset, order, total } });
+  }
+
+  const epochs = tsRows.map((r) => r.ts.getTime());
+  const minTs = new Date(Math.min(...epochs)).toISOString();
+  const maxTs = new Date(Math.max(...epochs)).toISOString();
+
+  const rows = await db
+    .select({ ts: t.ts, metric: t.metric, value: t.value, unit: t.unit })
+    .from(t)
+    .where(
+      and(
+        eq(t.deviceId, deviceId),
+        sql`${t.ts} >= ${tsParam(minTs)} and ${t.ts} <= ${tsParam(maxTs)}`,
+        metrics ? inArray(t.metric, metrics) : undefined,
+      ),
+    )
+    .orderBy(orderTs, asc(t.metric));
+
+  const readings = rows.map((r) => ({
+    ts: r.ts.toISOString(),
+    metric: r.metric,
+    value: r.value,
+    unit: r.unit,
+  }));
+  return ok({ readings, page: { limit, offset, order, total } });
+}
+
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
@@ -266,5 +391,6 @@ export const handler = async (
 
   if (event.rawPath.endsWith('/telemetry/latest')) return handleLatest(id);
   if (event.rawPath.endsWith('/telemetry/recent')) return handleRecent(id, event);
+  if (event.rawPath.endsWith('/telemetry/readings')) return handleReadings(id, event);
   return handleHistory(id, event);
 };

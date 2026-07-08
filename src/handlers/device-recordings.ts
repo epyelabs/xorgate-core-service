@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -16,6 +16,8 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { tsParam } from '../utils/sql';
 import {
   ACTIVE_STATUS,
   RecordingError,
@@ -93,11 +95,45 @@ export const handler = async (
 
   switch (routeKey) {
     case 'GET /devices/{id}/recordings': {
-      const rows = await db.query.recordings.findMany({
-        where: eq(schema.recordings.deviceId, deviceId),
-        orderBy: [desc(schema.recordings.createdAt)],
+      const parsed = parseListParams(event, {
+        sortable: ['createdAt', 'startedAt', 'durationMs', 'sizeBytes'],
+        defaultSort: 'createdAt',
+        statusValues: ['recording', 'stopping', 'completed', 'failed'],
       });
-      return ok({ recordings: rows });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy, status, from, to } = parsed;
+
+      const sortCol =
+        sortBy === 'startedAt'
+          ? schema.recordings.startedAt
+          : sortBy === 'durationMs'
+            ? schema.recordings.durationMs
+            : sortBy === 'sizeBytes'
+              ? schema.recordings.sizeBytes
+              : schema.recordings.createdAt;
+
+      // Time range filters on startedAt (the recording's visible time), cast via
+      // tsParam for the Data API.
+      const where = and(
+        eq(schema.recordings.deviceId, deviceId),
+        status ? eq(schema.recordings.status, status) : undefined,
+        from ? sql`${schema.recordings.startedAt} >= ${tsParam(from)}` : undefined,
+        to ? sql`${schema.recordings.startedAt} < ${tsParam(to)}` : undefined,
+      );
+
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.recordings)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+
+      const rows = await db.query.recordings.findMany({
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
+      });
+      return ok({ recordings: rows, page: pageMeta(parsed, total) });
     }
 
     case 'POST /devices/{id}/recordings': {
