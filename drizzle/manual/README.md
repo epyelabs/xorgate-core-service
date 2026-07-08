@@ -27,6 +27,10 @@ Apply after the latest generated migration, in filename order:
    richer BNO085 `sensors.imu` block (idempotent).
 5. `manual/004_gps_extended_fields.sql` — re-upserts the same model with
    `satellites` + `fix_quality` added to `comm.gps.fields` (idempotent).
+6. `manual/005_telemetry_default_partition.sql` — adds a catch-all `DEFAULT`
+   partition to `telemetry_readings` so a `ts` outside every monthly partition still
+   lands rather than hard-failing the insert (kvs-webrtc-lts §13 T2). Idempotent
+   (guarded). Apply after the generated `0010_*` migration.
 
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster; re-running all

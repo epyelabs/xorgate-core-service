@@ -5,6 +5,7 @@ import {
   jsonb,
   timestamp,
   integer,
+  bigint,
   boolean,
   doublePrecision,
   index,
@@ -119,6 +120,10 @@ export const devices = pgTable(
     // cloud viewer-recorder (Fargate) whenever a media stream becomes active, and
     // stops it when the stream drops. Off by default.
     autoRecord: boolean('auto_record').default(false).notNull(),
+    // Per-device override for the recording max-duration cap (ms). NULL falls back
+    // to the stack default (MAX_RECORDING_MS). The watchdog stops any recording that
+    // runs longer than this. See kvs-webrtc-lts plan Phase 2 / §6.
+    maxRecordingMs: integer('max_recording_ms'),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
@@ -300,17 +305,35 @@ export const recordings = pgTable(
       .references(() => devices.id, { onDelete: 'cascade' })
       .notNull(),
     streamKey: text('stream_key').notNull(), // cam0 | cam1 | ...
-    status: text('status').default('recording').notNull(), // recording | completed | failed
+    status: text('status').default('recording').notNull(), // recording | stopping | completed | failed
     trigger: text('trigger').default('manual').notNull(), // manual | auto
+    // Why the recording ended, stamped by whichever path terminated it. NULL while
+    // still recording or for a natural EOS with no explicit reason. Values:
+    // user_stop | device_offline | stream_ended | max_duration | task_lost | error.
+    // See kvs-webrtc-lts plan §4.1 / Phase 3.
+    endReason: text('end_reason'),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
     endedAt: timestamp('ended_at', { withTimezone: true }),
     // Set by the recorder (via an IoT "capturing" signal) on its first received video
     // frame. NULL while the row is 'recording' but the recorder hasn't captured yet
     // (cold start) -> the UI shows "Starting…"; non-NULL -> "REC".
     captureStartedAt: timestamp('capture_started_at', { withTimezone: true }),
+    // Media-plane liveness: bumped by the recorder's periodic capture heartbeat
+    // (every RECORDER_HEARTBEAT_MS while frames actually arrive). The offline-stop
+    // corroboration (§4.5) and the orphan reconciler check this against
+    // CAPTURE_STALE_MS: a recording is only stopped on device-offline if this is
+    // stale, so a control-plane false positive never truncates a healthy recording.
+    captureHeartbeatAt: timestamp('capture_heartbeat_at', { withTimezone: true }),
     s3Key: text('s3_key'), // media/v1/<deviceId>/<streamKey>/<recordingId>.mp4
-    sizeBytes: integer('size_bytes'),
-    durationMs: integer('duration_ms'),
+    // bigint (not int4): a 4h recording at the new MAX_RECORDING_MS default is many
+    // GB, which overflows int4 (~2.1 GB) and would throw on the finalize write. mode
+    // 'number' keeps the JS/API type a plain number (values stay well under 2^53).
+    sizeBytes: bigint('size_bytes', { mode: 'number' }),
+    durationMs: bigint('duration_ms', { mode: 'number' }),
+    // How many times the recorder rode through a recoverable outage (re-offer loop)
+    // during this recording. Observability for tuning the ride-through window. See
+    // Phase 4.
+    reconnectCount: integer('reconnect_count').default(0).notNull(),
     taskArn: text('task_arn'), // Fargate task ARN, for StopTask
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },

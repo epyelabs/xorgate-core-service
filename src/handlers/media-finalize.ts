@@ -1,5 +1,5 @@
 import type { EventBridgeEvent } from 'aws-lambda';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { evaluateRecordingSavedTriggers } from '../services/workflow-triggers';
 
@@ -36,7 +36,18 @@ export const handler = async (
     .set({
       status: 'completed',
       sizeBytes,
-      endedAt: new Date(),
+      // Preserve an ended_at already stamped by stopRecording (user_stop /
+      // device_offline / max_duration); only a natural dead-air EOS lands here with
+      // no ended_at, so fall back to now().
+      endedAt: sql`COALESCE(${schema.recordings.endedAt}, now())`,
+      // A natural EOS (recorder dead-air, no backend stop) carries no reason -> label
+      // it stream_ended; an explicit reason set by stopRecording is kept.
+      endReason: sql`COALESCE(${schema.recordings.endReason}, 'stream_ended')`,
+      // Actual captured length: from first frame (capture_started_at) to end. In a
+      // single UPDATE, column refs read the pre-update row, so this uses the old
+      // ended_at (the real stop time) when present, else now(). GREATEST guards a
+      // skewed clock; ::bigint matches the widened column (no overflow).
+      durationMs: sql`GREATEST(0, floor(extract(epoch from (COALESCE(${schema.recordings.endedAt}, now()) - COALESCE(${schema.recordings.captureStartedAt}, ${schema.recordings.startedAt}))) * 1000))::bigint`,
     })
     .where(
       and(

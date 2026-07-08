@@ -14,6 +14,7 @@ import {
   stopRecording,
 } from '../services/recordings';
 import { evaluateTelemetryTriggers } from '../services/workflow-triggers';
+import { recordingConfig } from '../config/recording';
 
 // Per-device settings (telemetry persistence + auto-record) are opt-in (default
 // off). Cache the flags in the warm Lambda container so the 1 Hz hot path doesn't
@@ -45,8 +46,9 @@ async function deviceFlags(deviceId: string): Promise<DeviceFlags> {
 // Auto-record reconcile is throttled per device (the existence checks already make
 // it idempotent; this just bounds DB/ECS calls). Stops use a grace window so a
 // brief stream restart (cred refresh) doesn't chop the recording into fragments.
-const RECONCILE_INTERVAL_MS = 8_000;
-const STOP_GRACE_MS = 30_000;
+// Both thresholds are configurable (kvs-webrtc-lts §6).
+const RECONCILE_INTERVAL_MS = recordingConfig.autoRecordReconcileMs;
+const STOP_GRACE_MS = recordingConfig.autoRecordStopGraceMs;
 const nextReconcileAt = new Map<string, number>();
 const streamMissingSince = new Map<string, number>(); // `${deviceId}:${streamKey}` -> first-missing ts
 
@@ -95,7 +97,7 @@ async function reconcileAutoRecord(payload: TelemetryPayload): Promise<void> {
     if (now - missingSince >= STOP_GRACE_MS) {
       streamMissingSince.delete(k);
       try {
-        await stopRecording(r.id);
+        await stopRecording(r.id, { endReason: 'stream_ended', expectedTrigger: 'auto' });
       } catch (err) {
         console.error('auto-record: stop failed', { id: r.id, err });
       }
@@ -148,15 +150,30 @@ export const handler = async (event: unknown): Promise<void> => {
 
   // DB persistence is opt-in per device. When disabled (default) we still run the
   // heartbeat below so status tracking is unaffected, but write no telemetry.
+  //
+  // Isolated (kvs-webrtc-lts §13 T1): a persist failure (DB blip, Data API throttle,
+  // a partition miss) must NOT cascade into the heartbeat below — otherwise
+  // last_seen_at stops bumping and the offline-sweeper wrongly flips an actively
+  // publishing device to 'offline'. Same control-plane/critical-path isolation
+  // principle as §4.5. Log + continue; the heartbeat, auto-record and workflow
+  // triggers still run. A persistent DB outage still surfaces via the heartbeat
+  // UPDATE throwing (which drives the async-retry / DLQ path).
   if (rows.length > 0 && (await deviceFlags(payload.deviceId)).persistTelemetry) {
-    // Batched insert. Typed columns give `ts` (a Date) the correct typeHint, and
-    // Postgres routes the row to the right monthly partition automatically.
-    await db.insert(schema.telemetryReadings).values(rows);
+    try {
+      // Batched insert. Typed columns give `ts` (a Date) the correct typeHint, and
+      // Postgres routes the row to the right monthly partition automatically.
+      await db.insert(schema.telemetryReadings).values(rows);
 
-    // Last-writer-wins per (device_id, metric).
-    const tsIso = new Date(payload.ts).toISOString();
-    const upsert = buildDeviceLatestUpsert(payload.deviceId, tsIso, rows);
-    if (upsert) await db.execute(upsert);
+      // Last-writer-wins per (device_id, metric).
+      const tsIso = new Date(payload.ts).toISOString();
+      const upsert = buildDeviceLatestUpsert(payload.deviceId, tsIso, rows);
+      if (upsert) await db.execute(upsert);
+    } catch (err) {
+      console.error('telemetry-ingest: persist failed (continuing to heartbeat)', {
+        deviceId: payload.deviceId,
+        err,
+      });
+    }
   }
 
   // Throttled heartbeat: re-assert online + bump last_seen at most every ~15s,

@@ -9,6 +9,10 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2int from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as cwActions from "aws-cdk-lib/aws-cloudwatch-actions";
+import * as sns from "aws-cdk-lib/aws-sns";
+import * as snsSubs from "aws-cdk-lib/aws-sns-subscriptions";
+import * as lambdaDestinations from "aws-cdk-lib/aws-lambda-destinations";
 import * as iot from "aws-cdk-lib/aws-iot";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
@@ -307,6 +311,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // Read a recording-threshold override from CDK context, else use the default.
+    // Lets an operator retune any threshold at deploy (`--context key=value`)
+    // without a code edit (kvs-webrtc-lts G5).
+    const recCtx = (key: string, def: string): string => {
+      const v = this.node.tryGetContext(key);
+      return v === undefined || v === null ? def : String(v);
+    };
+
     const commonEnv: Record<string, string> = {
       NODE_ENV: isProd ? "production" : "development",
       DB_CLUSTER_ARN: clusterArn,
@@ -328,6 +340,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
       RECORDER_SUBNETS: recorderSubnets,
       RECORDER_SG: recorderSecurityGroupId,
       RECORDER_CONTAINER_NAME: recorderContainerName,
+      // Recording-lifecycle thresholds (kvs-webrtc-lts §6), read by src/config/recording.ts.
+      // Defaults preserve today's behavior; override any at deploy via `--context <key>=<val>`.
+      MAX_RECORDING_MS: recCtx("maxRecordingMs", String(4 * 60 * 60 * 1000)),
+      RECONCILE_STUCK_MS: recCtx("reconcileStuckMs", String(5 * 60 * 1000)),
+      STATUS_FLAP_GUARD_MS: recCtx("statusFlapGuardMs", "10000"),
+      CAPTURE_STALE_MS: recCtx("captureStaleMs", "36000"),
+      DEVICE_OFFLINE_STALE_MS: recCtx("deviceOfflineStaleMs", "60000"),
+      AUTORECORD_STOP_GRACE_MS: recCtx("autorecordStopGraceMs", "30000"),
+      AUTORECORD_RECONCILE_MS: recCtx("autorecordReconcileMs", "8000"),
+      // R6 gate: keep off until the recorder heartbeat (Phase 4) is deployed. Then
+      // enable with `--context offlineStopEnabled=true` (rollout §9 step 4).
+      OFFLINE_STOP_ENABLED: recCtx("offlineStopEnabled", "false"),
+      // Passed through to the recorder container via RunTask overrides.
+      RECORDER_HEARTBEAT_MS: recCtx("recorderHeartbeatMs", "12000"),
+      RECORDER_RECONNECT_WINDOW_MS: recCtx("recorderReconnectWindowMs", "90000"),
+      RECORDER_REOFFER_INTERVAL_MS: recCtx("recorderReofferIntervalMs", "2000"),
     };
 
     const commonBundling: nodejs.BundlingOptions = {
@@ -556,6 +584,27 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(15),
     });
 
+    // SNS topic for operational alarms (kvs-webrtc-lts §13 T3). Alarms that fire on a
+    // real ingestion failure (DLQ depth) publish here. Add an email subscriber with
+    // `--context alarmEmail=you@example.com`; otherwise the topic still records the
+    // alarm state transition for dashboards / future subscribers.
+    const alarmTopic = new sns.Topic(this, "OpsAlarmTopic", {
+      displayName: isProd ? "xorgate ops alarms" : "xorgate ops alarms (dev)",
+    });
+    const alarmEmail = this.node.tryGetContext("alarmEmail");
+    if (typeof alarmEmail === "string" && alarmEmail.length > 0) {
+      alarmTopic.addSubscription(new snsSubs.EmailSubscription(alarmEmail));
+    }
+
+    // Function-level async on-failure DLQ for TelemetryIngestFn (kvs-webrtc-lts §13
+    // T3). Distinct from the IoT RULE DLQ below: the rule DLQ only catches action-
+    // INVOCATION failures (rule can't reach the Lambda), NOT a Lambda that runs and
+    // throws (DB down, partition miss). Without this, a throwing async invoke retries
+    // twice then is DROPPED silently. This captures it.
+    const telemetryFnDlq = new sqs.Queue(this, "TelemetryIngestFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     // --- Live telemetry ingestion (P2): IoT Topic Rule -> Lambda -> Postgres ---
     // The ingestion Lambda has NO HTTP route; it is invoked directly by the IoT
     // rule below. The rule MUST be created in this (api) stack — iot-stack is
@@ -570,19 +619,25 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(15),
       // Bundles client-ecs for the auto-record path (RunTask/StopTask).
       bundling: bundlingWithSdk,
+      // Capture async-invoke failures that survive Lambda's own retries (T3).
+      onFailure: new lambdaDestinations.SqsDestination(telemetryFnDlq),
     });
 
-    // EventBridge ~1 min -> flip stale `online` devices to `offline`.
-    const offlineSweeperFn = new nodejs.NodejsFunction(
-      this,
-      "OfflineSweeperFn",
-      standardFnProps(
+    // EventBridge ~1 min -> housekeeping tick: flip stale `online` devices to
+    // `offline`, corroborated offline-stop of their recordings, and the recording
+    // watchdog (max-duration cap + orphan/stuck reconcile). Bundles client-ecs
+    // (StopTask/DescribeTasks via services/recordings). Reuses THIS existing tick —
+    // no new schedule -> no new Aurora wake source (kvs-webrtc-lts §7.3).
+    const offlineSweeperFn = new nodejs.NodejsFunction(this, "OfflineSweeperFn", {
+      ...standardFnProps(
         path.join(entryBase, "offline-sweeper.ts"),
-        "Schedule (1m) -> flip stale online devices to offline",
+        "Schedule (1m) -> offline sweep + corroborated offline-stop + recording watchdog",
       ),
-    );
+      timeout: cdk.Duration.seconds(30),
+      bundling: bundlingWithSdk,
+    });
     new events.Rule(this, "OfflineSweeperSchedule", {
-      description: "Flip stale online devices to offline (P2 telemetry)",
+      description: "Housekeeping: offline sweep + recording watchdog (P2 telemetry / kvs-webrtc-lts)",
       enabled: !props.disableScheduledJobs,
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
       targets: [new targets.LambdaFunction(offlineSweeperFn)],
@@ -617,10 +672,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     telemetryDlq.grantSendMessages(telemetryRuleRole);
 
-    // Any message in the DLQ means ingestion is failing (e.g. a missing month
-    // partition). No SNS topic exists yet, so the alarm has no action — it
-    // surfaces in the CloudWatch console/dashboards.
-    new cloudwatch.Alarm(this, "TelemetryDlqDepthAlarm", {
+    // A message in the RULE DLQ means the IoT rule couldn't invoke the Lambda
+    // (action-level failure). Now wired to the ops SNS topic (kvs-webrtc-lts §13 T3).
+    const telemetryRuleDlqAlarm = new cloudwatch.Alarm(this, "TelemetryDlqDepthAlarm", {
       metric: telemetryDlq.metricApproximateNumberOfMessagesVisible({
         period: cdk.Duration.minutes(5),
       }),
@@ -632,6 +686,24 @@ export class XorgateCoreApiStack extends cdk.Stack {
       alarmDescription:
         "Telemetry ingest IoT rule wrote failed messages to the DLQ",
     });
+    telemetryRuleDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+
+    // A message in the FUNCTION DLQ means the Lambda ran and threw past its retries
+    // (DB down, partition miss) — the common failure the rule DLQ does NOT catch.
+    // This is the one that actually protects telemetry persistence (T3).
+    const telemetryFnDlqAlarm = new cloudwatch.Alarm(this, "TelemetryFnDlqDepthAlarm", {
+      metric: telemetryFnDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "TelemetryIngestFn async invoke failed past retries (DB / partition miss)",
+    });
+    telemetryFnDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
 
     const telemetryRule = new iot.CfnTopicRule(this, "TelemetryIngestRule", {
       // IoT rule names allow only [A-Za-z0-9_] — underscores, not the kebab convention.
@@ -696,6 +768,47 @@ export class XorgateCoreApiStack extends cdk.Stack {
     recordingCaptureFn.addPermission("AllowIotRuleInvoke", {
       principal: new iam.ServicePrincipal("iot.amazonaws.com"),
       sourceArn: recordingCaptureRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
+    // --- Device status / Last-Will (kvs-webrtc-lts Phase 1): IoT Topic Rule -> Lambda ---
+    // The device agent publishes {online} to xorgate/devices/<id>/status on connect,
+    // on graceful shutdown, and via MQTT Last-Will on ungraceful disconnect (power-
+    // off). This flips the device badge immediately and — once OFFLINE_STOP_ENABLED —
+    // does the §4.5 corroborated stop of active recordings. Bundles client-ecs
+    // (StopTask via services/recordings). DB-only IAM otherwise; the shared
+    // lambdaRole already grants ecs:StopTask on the recorder cluster.
+    const deviceStatusFn = new nodejs.NodejsFunction(this, "DeviceStatusFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-status.ts"),
+        "IoT rule -> device status (LWT) + corroborated recording offline-stop",
+      ),
+      timeout: cdk.Duration.seconds(20),
+      bundling: bundlingWithSdk,
+    });
+
+    const deviceStatusRule = new iot.CfnTopicRule(this, "DeviceStatusRule", {
+      ruleName: isProd ? "xorgate_device_status" : "xorgate_device_status_dev",
+      topicRulePayload: {
+        sql: "SELECT *, topic(3) AS topicDeviceId FROM 'xorgate/devices/+/status'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: deviceStatusFn.functionArn } }],
+        // Reuse the low-volume telemetry DLQ + role (one error sink, one alarm).
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    deviceStatusFn.addPermission("AllowIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: deviceStatusRule.attrArn,
       sourceAccount: this.account,
       action: "lambda:InvokeFunction",
     });

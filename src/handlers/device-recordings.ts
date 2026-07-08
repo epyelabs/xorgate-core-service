@@ -135,7 +135,7 @@ export const handler = async (
     case 'POST /devices/{id}/recordings/{recordingId}/stop': {
       const row = await loadRecording();
       if (!row) return notFound(`Recording "${recordingId}" not found`);
-      await stopRecording(row.id);
+      await stopRecording(row.id, { endReason: 'user_stop' });
       return ok({ recording: { ...row, status: row.status } });
     }
 
