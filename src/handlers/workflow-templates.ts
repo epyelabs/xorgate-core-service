@@ -1,9 +1,10 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, asc, eq, inArray, like, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
 import { badRequest, created, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
   createWorkflowTemplateSchema,
@@ -227,11 +228,44 @@ export const handler = async (
 
   switch (routeKey) {
     case 'GET /workflow-templates': {
-      const templates = await db.query.workflowTemplates.findMany({
-        where: eq(schema.workflowTemplates.organizationId, orgId),
-        orderBy: (t, { desc }) => [desc(t.updatedAt)],
+      // Standardized list dialect (utils/list-params): limit/offset/order/sort/
+      // status, plus a `page` block. Default order preserves the prior behaviour
+      // (most-recently-updated first).
+      const parsed = parseListParams(event, {
+        sortable: ['updatedAt', 'createdAt', 'name'],
+        defaultSort: 'updatedAt',
+        statusValues: ['draft', 'published'],
       });
-      if (templates.length === 0) return ok({ templates: [] });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy, status } = parsed;
+
+      const where = and(
+        eq(schema.workflowTemplates.organizationId, orgId),
+        status ? eq(schema.workflowTemplates.status, status) : undefined,
+      );
+
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.workflowTemplates)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+      const page = pageMeta(parsed, total);
+      if (total === 0) return ok({ templates: [], page });
+
+      const sortCol =
+        sortBy === 'createdAt'
+          ? schema.workflowTemplates.createdAt
+          : sortBy === 'name'
+            ? schema.workflowTemplates.name
+            : schema.workflowTemplates.updatedAt;
+
+      const templates = await db.query.workflowTemplates.findMany({
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
+      });
+      if (templates.length === 0) return ok({ templates: [], page });
 
       const ids = templates.map((t) => t.id);
       const [counts, users, versionRows] = await Promise.all([
@@ -268,6 +302,7 @@ export const handler = async (
           const def = defByTemplate.get(t.id)?.get(target);
           return toSummary(t, countByTemplate.get(t.id) ?? 0, users, safeRequiredCaps(def));
         }),
+        page,
       });
     }
 

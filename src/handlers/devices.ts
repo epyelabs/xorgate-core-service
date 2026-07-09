@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
@@ -13,6 +13,7 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
@@ -57,24 +58,59 @@ export const handler = async (
         if (!row) return notFound(`Device "${id}" not found`);
         return ok({ device: row });
       }
-      if (orgWorkspaceIds.length === 0) return ok({ devices: [] });
+      // Standardized list dialect (utils/list-params): limit/offset/order/sort/
+      // status, plus a `page` block. Default order preserves the prior behaviour
+      // (most-recently-updated first).
+      const parsed = parseListParams(event, {
+        sortable: ['updatedAt', 'createdAt', 'lastSeenAt', 'serial', 'name'],
+        defaultSort: 'updatedAt',
+        statusValues: VALID_STATUSES,
+      });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy, status } = parsed;
+
+      const emptyPage = ok({ devices: [], page: pageMeta(parsed, 0) });
+      if (orgWorkspaceIds.length === 0) return emptyPage;
+
+      // Scope to the active workspace when the header is present (and valid),
+      // else the whole org.
       const headerWorkspaceId =
         event.headers['x-workspace-id'] ?? event.headers['X-Workspace-Id'];
+      let wsFilter = orgWorkspaceIds;
       if (headerWorkspaceId) {
-        if (!orgWorkspaceIds.includes(headerWorkspaceId)) {
-          return ok({ devices: [] });
-        }
-        const rows = await db.query.devices.findMany({
-          where: eq(schema.devices.workspaceId, headerWorkspaceId),
-          orderBy: [desc(schema.devices.updatedAt)],
-        });
-        return ok({ devices: rows });
+        if (!orgWorkspaceIds.includes(headerWorkspaceId)) return emptyPage;
+        wsFilter = [headerWorkspaceId];
       }
+
+      const where = and(
+        inArray(schema.devices.workspaceId, wsFilter),
+        status ? eq(schema.devices.status, status) : undefined,
+      );
+
+      const sortCol =
+        sortBy === 'createdAt'
+          ? schema.devices.createdAt
+          : sortBy === 'lastSeenAt'
+            ? schema.devices.lastSeenAt
+            : sortBy === 'serial'
+              ? schema.devices.serial
+              : sortBy === 'name'
+                ? schema.devices.name
+                : schema.devices.updatedAt;
+
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.devices)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+
       const rows = await db.query.devices.findMany({
-        where: inArray(schema.devices.workspaceId, orgWorkspaceIds),
-        orderBy: [desc(schema.devices.updatedAt)],
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
       });
-      return ok({ devices: rows });
+      return ok({ devices: rows, page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: {
