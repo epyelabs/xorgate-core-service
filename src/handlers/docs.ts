@@ -189,6 +189,11 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             type: 'boolean',
             description: 'Opt-in: when true, streams are auto-recorded while live (default false).',
           },
+          activeStreamsViewType: {
+            type: 'string',
+            enum: ['card', 'map'],
+            description: 'Layout for the Active Streams tab: card grid (default) or location-first map view.',
+          },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
@@ -1102,6 +1107,10 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   lastSeenAt: { type: 'string', format: 'date-time' },
                   persistTelemetry: { type: 'boolean' },
                   autoRecord: { type: 'boolean' },
+                  activeStreamsViewType: {
+                    type: 'string',
+                    enum: ['card', 'map'],
+                  },
                 },
               },
             },

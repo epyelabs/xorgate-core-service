@@ -120,6 +120,10 @@ export const devices = pgTable(
     // cloud viewer-recorder (Fargate) whenever a media stream becomes active, and
     // stops it when the stream drops. Off by default.
     autoRecord: boolean('auto_record').default(false).notNull(),
+    // Which pre-made layout the Active Streams tab renders for this device.
+    // 'card' (default) is the media-over-telemetry grid; 'map' is the location-first
+    // map view. text (not pgEnum) + app-side allowlist, per the enum-cast convention.
+    activeStreamsViewType: text('active_streams_view_type').default('card').notNull(),
     // Per-device override for the recording max-duration cap (ms). NULL falls back
     // to the stack default (MAX_RECORDING_MS). The watchdog stops any recording that
     // runs longer than this. See kvs-webrtc-lts plan Phase 2 / §6.

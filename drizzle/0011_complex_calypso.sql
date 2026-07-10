@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "active_streams_view_type" text DEFAULT 'card' NOT NULL;

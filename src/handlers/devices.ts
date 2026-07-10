@@ -16,6 +16,7 @@ import {
 import { pageMeta, parseListParams } from '../utils/list-params';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
+const VALID_VIEW_TYPES = ['card', 'map'] as const;
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
@@ -160,6 +161,7 @@ export const handler = async (
         lastSeenAt?: string;
         persistTelemetry?: boolean;
         autoRecord?: boolean;
+        activeStreamsViewType?: string;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -181,6 +183,11 @@ export const handler = async (
         return badRequest('autoRecord must be a boolean');
       }
 
+      if (body.activeStreamsViewType !== undefined &&
+          !VALID_VIEW_TYPES.includes(body.activeStreamsViewType as (typeof VALID_VIEW_TYPES)[number])) {
+        return badRequest(`activeStreamsViewType must be one of: ${VALID_VIEW_TYPES.join(', ')}`);
+      }
+
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
@@ -188,6 +195,7 @@ export const handler = async (
       if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
       if (body.persistTelemetry !== undefined) updates.persistTelemetry = body.persistTelemetry;
       if (body.autoRecord !== undefined) updates.autoRecord = body.autoRecord;
+      if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
