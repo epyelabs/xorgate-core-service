@@ -96,6 +96,30 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           createdAt: { type: 'string', format: 'date-time' },
         },
       },
+      // A membership enriched with its member's identity, as returned by the
+      // GET /memberships roster. `user` is null only if the referenced user row
+      // is missing (normally impossible — a membership cascades with its user).
+      MembershipWithUser: {
+        type: 'object',
+        required: ['id', 'userId', 'organizationId', 'role', 'user'],
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          userId: { type: 'string' },
+          organizationId: { type: 'string', format: 'uuid' },
+          role: { type: 'string', enum: ['owner', 'admin', 'member', 'viewer'] },
+          createdAt: { type: 'string', format: 'date-time' },
+          user: {
+            type: 'object',
+            nullable: true,
+            required: ['id', 'email', 'name'],
+            properties: {
+              id: { type: 'string' },
+              email: { type: 'string', format: 'email' },
+              name: { type: 'string', nullable: true },
+            },
+          },
+        },
+      },
       ApiKey: {
         type: 'object',
         required: ['id', 'organizationId', 'name', 'scope'],
@@ -517,14 +541,14 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         tags: ['Memberships'],
         responses: {
           '200': {
-            description: 'List of memberships',
+            description: 'List of memberships, each enriched with its member’s identity',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
                   required: ['memberships'],
                   properties: {
-                    memberships: { type: 'array', items: { $ref: '#/components/schemas/Membership' } },
+                    memberships: { type: 'array', items: { $ref: '#/components/schemas/MembershipWithUser' } },
                   },
                 },
               },
@@ -537,6 +561,11 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       post: {
         operationId: 'addMembership',
         summary: 'Add a user to the active organization (owner/admin only)',
+        description:
+          'Adds a member by `userId` or `email`. If an `email` has no account yet, a ' +
+          'Cognito account is provisioned and the invitee is emailed a temporary ' +
+          'password to set on first sign-in. `invited` is true when a new account was ' +
+          'created and emailed.',
         tags: ['Memberships'],
         requestBody: {
           required: true,
@@ -556,13 +585,19 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
         responses: {
           '201': {
-            description: 'Membership created',
+            description: 'Membership created (invitee provisioned + emailed when `invited` is true)',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['membership'],
-                  properties: { membership: { $ref: '#/components/schemas/Membership' } },
+                  required: ['membership', 'invited'],
+                  properties: {
+                    membership: { $ref: '#/components/schemas/Membership' },
+                    invited: {
+                      type: 'boolean',
+                      description: 'True when a new Cognito account was created and emailed an invitation.',
+                    },
+                  },
                 },
               },
             },

@@ -305,6 +305,19 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // Invited-member provisioning: admin-create a Cognito account for an email
+    // that has no user yet (POST /memberships), and look one up on the
+    // already-exists path. Cognito emails the invitee a temporary password.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "CognitoAdminInviteUser",
+        actions: ["cognito-idp:AdminCreateUser", "cognito-idp:AdminGetUser"],
+        resources: [
+          `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${userPoolId}`,
+        ],
+      }),
+    );
+
     lambdaRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName(
         "service-role/AWSLambdaBasicExecutionRole",
@@ -431,14 +444,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
-    const membershipsFn = new nodejs.NodejsFunction(
-      this,
-      "MembershipsFn",
-      standardFnProps(
+    const membershipsFn = new nodejs.NodejsFunction(this, "MembershipsFn", {
+      ...standardFnProps(
         path.join(entryBase, "memberships.ts"),
         "CRUD /memberships",
       ),
-    );
+      // Bundles @aws-sdk/client-cognito-identity-provider for the invite path
+      // (AdminCreateUser), which isn't guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
 
     const apiKeysFn = new nodejs.NodejsFunction(
       this,
