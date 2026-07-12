@@ -31,10 +31,15 @@ Apply after the latest generated migration, in filename order:
    partition to `telemetry_readings` so a `ts` outside every monthly partition still
    lands rather than hard-failing the insert (kvs-webrtc-lts §13 T2). Idempotent
    (guarded). Apply after the generated `0010_*` migration.
+7. `manual/006_gps_quality_fields.sql` — in-place `jsonb_set` adding
+   `satellites_in_view` + `hdop` to the model's `comm.gps.fields` (idempotent).
+   Deliberately not a re-upsert: the live row has drifted from the seed (model
+   renamed, camera labels changed), so it only touches the gps fields list.
 
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
-forward, so applying only the latest is enough on a fresh cluster; re-running all
-in order is safe.
+forward, so applying only the latest is enough on a fresh cluster (then 006 on
+top); re-running all in order is safe — but note 004 re-seeds the original
+name/labels, so on the live cluster prefer 006 alone.
 
 Going forward, future monthly partitions are created by the P4
 `partition-maintenance` Lambda; these bootstrap files only cover the first two months.
