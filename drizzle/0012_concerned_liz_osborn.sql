@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "gnss_ant_bias" boolean DEFAULT false NOT NULL;

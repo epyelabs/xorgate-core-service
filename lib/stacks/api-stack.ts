@@ -220,6 +220,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
         resources: ["*"],
       }),
     );
+    // Device config delivery: the devices handler publishes a retained config
+    // message (e.g. the GNSS antenna-bias toggle) to the per-device config topic
+    // after a successful update. DescribeEndpoint (needed to resolve the ATS data
+    // endpoint) is already granted above.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "IotPublishDeviceConfig",
+        // RetainPublish is required IN ADDITION to Publish when the RETAIN
+        // flag is set (the config message is retained so offline devices
+        // receive it on next connect).
+        actions: ["iot:Publish", "iot:RetainPublish"],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:topic/xorgate/devices/*/config`,
+        ],
+      }),
+    );
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "KvsChannels",
@@ -475,11 +491,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
-    const devicesFn = new nodejs.NodejsFunction(
-      this,
-      "DevicesFn",
-      standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
-    );
+    const devicesFn = new nodejs.NodejsFunction(this, "DevicesFn", {
+      ...standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
+      // Bundles @aws-sdk/client-iot-data-plane (retained device-config publish),
+      // which isn't guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
 
     const searchFn = new nodejs.NodejsFunction(
       this,

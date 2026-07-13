@@ -9,11 +9,13 @@ import { db, schema } from '../db/index';
 import {
   badRequest,
   created,
+  errorResponse,
   methodNotAllowed,
   notFound,
   ok,
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
+import { publishDeviceConfig } from '../services/device-config';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 const VALID_VIEW_TYPES = ['card', 'map'] as const;
@@ -161,6 +163,7 @@ export const handler = async (
         lastSeenAt?: string;
         persistTelemetry?: boolean;
         autoRecord?: boolean;
+        gnssAntBias?: boolean;
         activeStreamsViewType?: string;
       };
       try {
@@ -183,6 +186,10 @@ export const handler = async (
         return badRequest('autoRecord must be a boolean');
       }
 
+      if (body.gnssAntBias !== undefined && typeof body.gnssAntBias !== 'boolean') {
+        return badRequest('gnssAntBias must be a boolean');
+      }
+
       if (body.activeStreamsViewType !== undefined &&
           !VALID_VIEW_TYPES.includes(body.activeStreamsViewType as (typeof VALID_VIEW_TYPES)[number])) {
         return badRequest(`activeStreamsViewType must be one of: ${VALID_VIEW_TYPES.join(', ')}`);
@@ -195,6 +202,7 @@ export const handler = async (
       if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
       if (body.persistTelemetry !== undefined) updates.persistTelemetry = body.persistTelemetry;
       if (body.autoRecord !== undefined) updates.autoRecord = body.autoRecord;
+      if (body.gnssAntBias !== undefined) updates.gnssAntBias = body.gnssAntBias;
       if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
@@ -211,6 +219,24 @@ export const handler = async (
         )
         .returning();
       if (updated.length === 0) return notFound(`Device "${id}" not found`);
+
+      // Deliver the new GNSS antenna setting to the device as a retained MQTT
+      // config message (thing name = device id). Retained means an offline
+      // device picks it up on next connect. Publish failure is surfaced as a
+      // 502 so the operator knows the device was NOT told — the DB row is
+      // already updated; re-saving the toggle retries the publish.
+      if (body.gnssAntBias !== undefined) {
+        try {
+          await publishDeviceConfig(id, { gnssAntBias: updated[0].gnssAntBias });
+        } catch (err) {
+          console.error('device config publish failed', { deviceId: id, err });
+          return errorResponse(
+            502,
+            'CONFIG_PUBLISH_FAILED',
+            'Setting saved, but delivering it to the device failed. Re-save to retry.',
+          );
+        }
+      }
       return ok({ device: updated[0] });
     }
     case 'DELETE': {

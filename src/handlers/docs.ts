@@ -189,6 +189,12 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             type: 'boolean',
             description: 'Opt-in: when true, streams are auto-recorded while live (default false).',
           },
+          gnssAntBias: {
+            type: 'boolean',
+            description:
+              'GPS antenna mode: true powers an active antenna (DC bias over the coax), false (default) = passive antenna, bias off. ' +
+              'Changes are delivered to the device via a retained MQTT config message.',
+          },
           activeStreamsViewType: {
             type: 'string',
             enum: ['card', 'map'],
@@ -1107,6 +1113,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   lastSeenAt: { type: 'string', format: 'date-time' },
                   persistTelemetry: { type: 'boolean' },
                   autoRecord: { type: 'boolean' },
+                  gnssAntBias: { type: 'boolean' },
                   activeStreamsViewType: {
                     type: 'string',
                     enum: ['card', 'map'],
