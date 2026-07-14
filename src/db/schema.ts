@@ -482,6 +482,11 @@ export const workflowRuns = pgTable(
     triggerContext: jsonb('trigger_context'),
     status: text('status').default('running').notNull(), // running | succeeded | failed
     executionMode: text('execution_mode').notNull(), // inline | fargate
+    // production | simulation (M3 simulator runs; architecture.md §7).
+    mode: text('mode').default('production').notNull(),
+    // Which engine ran it: null/1 = PoC inline runner or Python cv-runner,
+    // 2 = the v2 TS engine (stamped by the v2 finalize path, session 2).
+    engineVersion: integer('engine_version'),
     taskArn: text('task_arn'),
     startedAt: timestamp('started_at', { withTimezone: true }).defaultNow().notNull(),
     endedAt: timestamp('ended_at', { withTimezone: true }),

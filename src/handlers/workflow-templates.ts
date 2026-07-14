@@ -3,15 +3,18 @@ import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
-import { badRequest, created, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { badRequest, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
   createWorkflowTemplateSchema,
   saveDraftSchema,
   updateWorkflowTemplateSchema,
+  workflowDefinitionSchema,
 } from '../schemas/workflows';
 import { computeRequiredCapabilities } from '../services/workflow-capabilities';
+import { upgradeDefinitionSafe } from '../workflows/compat';
+import { validateDefinitionForPublish } from '../workflows/validate';
 
 // Any executor that exposes the drizzle query-builder surface: the root db or a
 // transaction handle (both share .select/.insert/.update/.delete signatures).
@@ -129,7 +132,8 @@ async function loadVersions(exec: Executor, templateId: string) {
     version: r.version,
     status: r.status,
     message: r.message ?? null,
-    definition: r.definition,
+    // Read-path v1 -> v2 upgrade (pure; the stored row is not rewritten).
+    definition: upgradeDefinitionSafe(r.definition),
     createdBy: authorFrom(
       r.authorId ? { id: r.authorId, name: r.authorName, email: r.authorEmail as string } : null,
     ),
@@ -435,6 +439,29 @@ export const handler = async (
       const template = await loadTemplate(orgId, id);
       if (!template) return notFound(`Workflow template "${id}" not found`);
 
+      // Strict catalog validation before anything is mutated (drafts stay
+      // shape-valid only; publish is the enforcement point). Validates the
+      // upgraded v2 view; the stored definition is not rewritten.
+      const candidate = await db.query.workflowTemplateVersions.findFirst({
+        where: and(
+          eq(schema.workflowTemplateVersions.id, versionId),
+          eq(schema.workflowTemplateVersions.templateId, id),
+        ),
+      });
+      if (!candidate) return notFound(`Version "${versionId}" not found`);
+      const shape = workflowDefinitionSchema.safeParse(candidate.definition);
+      if (!shape.success) {
+        return errorResponse(400, 'WORKFLOW_VALIDATION_FAILED', 'Workflow definition failed publish validation', {
+          issues: [{ code: 'INVALID_SHAPE', message: 'Definition is not a valid node/edge graph' }],
+        });
+      }
+      const { issues } = validateDefinitionForPublish(shape.data);
+      if (issues.length > 0) {
+        return errorResponse(400, 'WORKFLOW_VALIDATION_FAILED', 'Workflow definition failed publish validation', {
+          issues,
+        });
+      }
+
       const detail = await db.transaction(async (tx) => {
         const [target] = await tx
           .select()
@@ -510,7 +537,8 @@ export const handler = async (
             version: nextVersion,
             status: 'draft',
             message: `Restored from v${source.version}`,
-            definition: source.definition,
+            // Restore seeds the new draft with the upgraded (v2) definition.
+            definition: upgradeDefinitionSafe(source.definition),
             createdByUserId: auth.userId,
           })
           .returning({ id: schema.workflowTemplateVersions.id });

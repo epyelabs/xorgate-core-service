@@ -1,17 +1,20 @@
 import type { WorkflowDefinition } from '../schemas/workflows';
+import { capabilityTokensForNode, getNodeType } from '../workflows/catalog/index';
+import { upgradeDefinition } from '../workflows/compat';
 
 /**
  * Capability compatibility between a workflow definition and a device model.
  *
- * A template declares abstract input needs (video, gps, imu, specific telemetry
- * metrics) derived from its node graph; an attachment binds it to a concrete
- * device. This module computes the required capabilities and checks them against
- * the device model's `io_capabilities` (see src/schemas/capabilities.ts and the
- * FE capability-metrics.ts, which this mirrors). Required tokens:
- *   "video"            — the graph consumes a camera stream
- *   "gps"              — the graph consumes GPS
- *   "imu"              — the graph consumes the IMU
- *   "metric:<key>"     — a source.telemetry node names a specific metric key
+ * A template declares abstract input needs (video, specific telemetry metrics)
+ * derived from its node graph; an attachment binds it to a concrete device.
+ * Required tokens are computed from the catalog's declarative `requires` rules
+ * (v1 definitions are upgraded first, so PoC node types resolve through their
+ * compat aliases), then checked against the device model's `io_capabilities`
+ * (see src/schemas/capabilities.ts and the FE capability-metrics.ts, which this
+ * mirrors). Token vocabulary:
+ *   "video"            — the graph consumes a device camera stream
+ *   "gps" / "imu"      — legacy group tokens (still satisfiable, no longer emitted)
+ *   "metric:<key>"     — a telemetry source names a specific metric key
  */
 
 // Loose structural view of the stored jsonb (may predate the current schema).
@@ -32,28 +35,15 @@ type Caps = {
   system?: { fields?: string[] | null } | null;
 } | null | undefined;
 
-const VIDEO_NODES = new Set([
-  'source.video',
-  'processor.decode_sample',
-  'processor.object_detection',
-]);
-const GPS_NODES = new Set([
-  'source.gps',
-  'processor.speed_from_gps',
-  'processor.speed_limit_check',
-]);
-const IMU_NODES = new Set(['source.imu', 'processor.imu_decel']);
-
 /** Distinct capability tokens a definition requires, in a stable order. */
 export function computeRequiredCapabilities(def: WorkflowDefinition): string[] {
+  const upgraded = upgradeDefinition(def);
   const reqs = new Set<string>();
-  for (const node of def.nodes) {
-    if (VIDEO_NODES.has(node.type)) reqs.add('video');
-    else if (GPS_NODES.has(node.type)) reqs.add('gps');
-    else if (IMU_NODES.has(node.type)) reqs.add('imu');
-    else if (node.type === 'source.telemetry') {
-      const metric = node.data?.config?.metric;
-      if (typeof metric === 'string' && metric.trim()) reqs.add(`metric:${metric.trim()}`);
+  for (const node of upgraded.nodes) {
+    const typeDef = getNodeType(node.type);
+    if (!typeDef) continue; // unknown types are a publish-validation concern
+    for (const token of capabilityTokensForNode(typeDef, node.data?.config ?? {})) {
+      reqs.add(token);
     }
   }
   return [...reqs].sort();

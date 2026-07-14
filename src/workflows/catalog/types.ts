@@ -1,0 +1,232 @@
+import { z } from 'zod';
+
+/**
+ * NodeTypeDef: the declarative half of a catalog node type (architecture.md §3.2,
+ * the authoritative contract). One module per node type under ./nodes colocates
+ * this def with its executor (stubbed until M2's engine core). Everything else —
+ * the served catalog, publish validation, edge typing, capability computation,
+ * dispatch routing — derives from these defs.
+ */
+
+// --- Channels (architecture.md §3.3) -----------------------------------------
+// `json` ports additionally carry a `tag` ("detections", "depth", ...). An edge
+// is valid iff base channels match and, when the input port declares a tag, the
+// tags match; an untagged json input accepts any json:<tag>.
+export const CHANNELS = ['video', 'frames', 'telemetry', 'json', 'condition', 'event'] as const;
+export type Channel = (typeof CHANNELS)[number];
+
+export const portDefSchema = z
+  .object({
+    id: z.string().min(1),
+    label: z.string().min(1),
+    channel: z.enum(CHANNELS),
+    // json channels only; on outputs the tag is what the port produces, on
+    // inputs it is what the port accepts (absent = any json tag).
+    tag: z.string().min(1).optional(),
+    cardinality: z.enum(['one', 'many']),
+    required: z.boolean(),
+  })
+  .refine((p) => p.tag === undefined || p.channel === 'json', {
+    message: 'tag is only valid on json ports',
+  });
+export type PortDef = z.infer<typeof portDefSchema>;
+
+/** True iff an edge from `out` may enter `inp` (channel + json-tag rules). */
+export function channelsCompatible(out: PortDef, inp: PortDef): boolean {
+  if (out.channel !== inp.channel) return false;
+  if (inp.channel === 'json' && inp.tag !== undefined) return out.tag === inp.tag;
+  return true;
+}
+
+/** Wire label for a port's channel, e.g. "json:detections". */
+export function channelLabel(port: PortDef): string {
+  return port.channel === 'json' && port.tag ? `json:${port.tag}` : port.channel;
+}
+
+// --- Capability rules ---------------------------------------------------------
+// { token } contributes a fixed token; { tokenTemplate } substitutes a config
+// value ("metric:{config.metric}"). When the referenced config value is a string
+// array, one token is emitted per element (e.g. telemetry_history metrics).
+export const capabilityRuleSchema = z.union([
+  z.object({ token: z.string().min(1) }),
+  z.object({
+    tokenTemplate: z
+      .string()
+      .regex(/^[^{}]*\{config\.[a-zA-Z0-9_.]+\}[^{}]*$/, 'exactly one {config.<path>} placeholder'),
+  }),
+]);
+export type CapabilityRule = z.infer<typeof capabilityRuleSchema>;
+
+// --- NodeTypeDef ----------------------------------------------------------------
+export const NODE_GROUPS = [
+  'source',
+  'video',
+  'telemetry',
+  'model',
+  'logic',
+  'output',
+  'custom',
+] as const;
+export type NodeGroup = (typeof NODE_GROUPS)[number];
+
+// Cross-port publish constraints that single-port `required` flags cannot
+// express (e.g. visualization: at least one of its overlay inputs connected).
+export const nodeConstraintSchema = z.object({
+  kind: z.literal('atLeastOneOf'),
+  ports: z.array(z.string().min(1)).min(2), // input port ids
+});
+export type NodeConstraint = z.infer<typeof nodeConstraintSchema>;
+
+// Declarative fields, zod-validated at registry build time. `config` is a live
+// zod schema and is validated structurally (instanceof) rather than by shape.
+export const nodeTypeDefSchema = z.object({
+  type: z.string().regex(/^[a-z0-9_]+\.[a-z0-9_]+$/, 'namespaced lowercase type id'),
+  version: z.number().int().positive(),
+  group: z.enum(NODE_GROUPS),
+  label: z.string().min(1),
+  description: z.string().min(1),
+  ui: z.object({
+    icon: z.string().min(1), // lucide icon name (kebab-case)
+    editor: z.enum(['prompt', 'geofence', 'expression']).optional(),
+  }),
+  inputs: z.array(portDefSchema),
+  outputs: z.array(portDefSchema),
+  config: z.custom<z.ZodTypeAny>((v) => v instanceof z.ZodType, 'config must be a zod schema'),
+  requires: z.array(capabilityRuleSchema),
+  runtime: z.object({
+    target: z.enum(['any', 'media']), // "media" forces the Fargate engine
+    gpuPreferred: z.boolean().optional(), // routes model backend, not engine
+    modelRef: z.object({ family: z.string().min(1) }).optional(),
+  }),
+  constraints: z.array(nodeConstraintSchema).optional(),
+});
+export type NodeTypeDef = z.infer<typeof nodeTypeDefSchema>;
+
+/** Identity helper so node modules get inference + a build-time parse. */
+export function defineNode(def: NodeTypeDef): NodeTypeDef {
+  return def;
+}
+
+// --- Executor contract (architecture.md §4.1, refined in M2) -------------------
+// Executors are async generators wired together by the engine core
+// (src/workflows/engine/). Each yielded message is routed to the bounded
+// channels of every edge leaving the resolved output port; awaiting the yield
+// is what gives batch sources natural backpressure.
+
+export type EngineMode = 'batch' | 'live' | 'simulation';
+
+/** One message on a channel. `ts` is epoch milliseconds. */
+export interface EngineMessage {
+  ch: Channel;
+  /** json channels only: the tag the payload carries (e.g. "detections"). */
+  tag?: string;
+  /**
+   * Output port the message leaves on. May be omitted when the node has exactly
+   * one output port (or a single port whose channel matches `ch`).
+   */
+  port?: string;
+  ts: number;
+  /** Per-node monotonic sequence, stamped by the engine. */
+  seq: number;
+  payload: unknown;
+}
+
+/** What executors yield: `seq` is optional and overwritten by the engine. */
+export type EngineEmit = Omit<EngineMessage, 'seq'> & { seq?: number };
+
+// Payload contracts per channel (json payloads are tag-specific).
+export interface TelemetryPayload {
+  signals: Record<string, number>;
+}
+export interface ConditionPayload {
+  value: boolean;
+  /** Which signal/comparison produced this value, for event payloads. */
+  meta?: Record<string, unknown>;
+}
+
+/** One input connection: `port` is this node's input port id; one entry per edge. */
+export interface EngineInChannel {
+  port: string;
+  from: { nodeId: string; port: string };
+  messages: AsyncIterable<EngineMessage>;
+}
+
+/** A grouped telemetry sample as read from a source feed. */
+export interface TelemetrySample {
+  ts: number; // epoch ms
+  signals: Record<string, number>;
+}
+
+/**
+ * Data-access seam for source nodes. The engine core is storage-free; each
+ * deploy target supplies an implementation (the Lambda target reads
+ * telemetry_readings via drizzle, tests read from memory, CSV lands in M3).
+ */
+export interface EngineSourceReader {
+  readTelemetryWindow(query: {
+    deviceId: string;
+    metrics: string[];
+    window: { fromMs: number; toMs: number };
+  }): Promise<TelemetrySample[]>;
+}
+
+/**
+ * A source node's input binding from the run manifest. Deliberately loose here:
+ * each source executor owns (and zod-parses) its binding kinds, so new kinds
+ * never touch this contract. source.telemetry accepts `telemetry_history`
+ * (metrics/window, defaulted from config and the run window), and
+ * `telemetry_inline` ({ samples }) for tests; `telemetry_csv` arrives in M3.
+ */
+export type EngineSourceBinding = { kind: string } & Record<string, unknown>;
+
+/** An event record collected by output.event, persisted by the finalize path. */
+export interface EngineEventRecord {
+  kind: string;
+  occurredAt: string; // ISO-8601
+  confidence: number;
+  payloadSummary: string;
+  payload?: unknown;
+}
+
+/**
+ * Per-node run context. Constructed by the engine core; the collector callbacks
+ * feed the run outcome (events.jsonl, outputs/<nodeId>/records.jsonl, step
+ * summaries) without giving executors any storage access.
+ */
+export interface EngineRunCtx {
+  runId: string;
+  mode: EngineMode;
+  deviceId: string | null;
+  /** The run's data window (epoch ms), when the trigger context provides one. */
+  window: { fromMs: number; toMs: number } | null;
+  /** The executing node's instance id. */
+  nodeId: string;
+  /** Manifest input binding for this node (source nodes), if any. */
+  binding: EngineSourceBinding | null;
+  sources: EngineSourceReader;
+  /** Collect an event (output.event). */
+  emitEvent(event: EngineEventRecord): void;
+  /** Collect a captured record (output.data_capture). */
+  captureRecord(record: unknown): void;
+  /** Human one-liner for the node's step row (last call wins). */
+  setSummary(summary: string): void;
+  log(message: string): void;
+}
+
+/**
+ * One executor per node type, colocated with its def. `config` arrives already
+ * parsed through the def's zod schema (defaults applied); executors re-parse
+ * with their local schema constant to regain the inferred type.
+ */
+export type NodeExecutor = (
+  inputs: EngineInChannel[],
+  config: unknown,
+  ctx: EngineRunCtx,
+) => AsyncIterable<EngineEmit>;
+
+/** Throwing placeholder for node types this engine build does not execute yet. */
+export function stubExecutor(type: string): NodeExecutor {
+  return async function* stub(): AsyncIterable<EngineEmit> {
+    throw new Error(`Executor for "${type}" is not implemented in this engine build`);
+  };
+}

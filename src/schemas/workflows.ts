@@ -28,6 +28,9 @@ export const workflowEdgeSchema = z.object({
 });
 
 export const workflowDefinitionSchema = z.object({
+  // Absent = v1 (PoC node types). v2 = catalog node types; see
+  // src/workflows/compat.ts (upgradeDefinition) and the catalog registry.
+  schemaVersion: z.number().int().positive().optional(),
   nodes: z.array(workflowNodeSchema),
   edges: z.array(workflowEdgeSchema),
 });

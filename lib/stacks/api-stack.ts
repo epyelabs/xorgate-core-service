@@ -865,6 +865,17 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // Served node catalog (M1): the declarative NodeTypeDef registry as JSON
+    // Schema. Static per deployment; needs auth (org membership) hence DB/VPC.
+    const workflowCatalogFn = new nodejs.NodejsFunction(
+      this,
+      "WorkflowCatalogFn",
+      standardFnProps(
+        path.join(entryBase, "workflow-catalog.ts"),
+        "GET /workflow-catalog — served node type catalog",
+      ),
+    );
+
     // Device attachments (attach/list/enable/detach + Run now). Run now fires a
     // run via fireWorkflowRun -> SQS, so it bundles the AWS SDK (client-sqs).
     const deviceWorkflowsFn = new nodejs.NodejsFunction(this, "DeviceWorkflowsFn", {
@@ -955,6 +966,44 @@ export class XorgateCoreApiStack extends cdk.Stack {
       },
       targets: [new targets.LambdaFunction(workflowRunFinalizeFn)],
     });
+
+    // v2 TS engine, Lambda target (M2): direct-invoked with {runId}; reads the
+    // workflows/v2/runs/<runId>/manifest.json run spec and writes events/records/
+    // result.json back under the same prefix. The dispatcher does NOT route to it
+    // yet (PoC inline runner + cv-runner stay until M6); the invoke grant and env
+    // var are pre-wired so cutover is a dispatcher-code-only change. S3 access
+    // comes from the shared lambdaRole's bucket grant; DB access is the telemetry
+    // read seam only.
+    //
+    // The function name is explicit so the invoke grant and the dispatcher env
+    // var can be literal strings: grantInvoke(lambdaRole) would put this
+    // function's ARN into the shared role's default policy, and every function
+    // on that role (this one included) DependsOn that policy — a CFN circular
+    // dependency.
+    const workflowEngineFnName = `xorgate-workflow-engine-${stage}`;
+    new nodejs.NodejsFunction(this, "WorkflowEngineFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-engine.ts"),
+        "v2 engine (Lambda target): workflows/v2 manifest -> run graph -> result.json",
+      ),
+      functionName: workflowEngineFnName,
+      timeout: cdk.Duration.minutes(5),
+      memorySize: 512,
+    });
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:InvokeFunction"],
+        resources: [
+          this.formatArn({
+            service: "lambda",
+            resource: "function",
+            resourceName: workflowEngineFnName,
+            arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+          }),
+        ],
+      }),
+    );
+    workflowDispatchFn.addEnvironment("WORKFLOW_ENGINE_FN", workflowEngineFnName);
 
     // Workflow scheduler (1-min tick): schedule triggers + the stuck-run watchdog.
     // Fires runs (SQS) and StopTask's stale Fargate tasks -> bundles the AWS SDK.
@@ -1083,6 +1132,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowTemplatesInt = new apigwv2int.HttpLambdaIntegration(
       "WorkflowTemplatesInt",
       workflowTemplatesFn,
+    );
+    const workflowCatalogInt = new apigwv2int.HttpLambdaIntegration(
+      "WorkflowCatalogInt",
+      workflowCatalogFn,
     );
     const deviceWorkflowsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceWorkflowsInt",
@@ -1318,6 +1371,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-templates/{id}/usage",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowTemplatesInt,
+    });
+
+    // Served node catalog (static per deployment, ETag cached).
+    this.api.addRoutes({
+      path: "/workflow-catalog",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowCatalogInt,
     });
 
     // Device workflow attachments.
