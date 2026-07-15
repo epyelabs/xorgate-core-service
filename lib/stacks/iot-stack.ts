@@ -139,13 +139,22 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Sid: 'Subscribe',
             Effect: 'Allow',
             Action: 'iot:Subscribe',
-            Resource: `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
+            Resource: [
+              `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
+              // Workflow simulator progress plane (M3): wf/sim/<orgId>/<runId>/...
+              // Same v1 broad-but-authenticated stance as telemetry; per-org
+              // scoping via policy variables is the P7 hardening hook.
+              `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
+            ],
           },
           {
             Sid: 'Receive',
             Effect: 'Allow',
             Action: 'iot:Receive',
-            Resource: `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
+            Resource: [
+              `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
+              `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
+            ],
           },
         ],
       },
@@ -191,12 +200,15 @@ export class XorgateCoreIotStack extends cdk.Stack {
       new iam.PolicyStatement({
         sid: 'IotTelemetrySubscribe',
         actions: ['iot:Connect', 'iot:Subscribe', 'iot:Receive'],
-        // v1: any authenticated user can subscribe to any device's telemetry. Per-tenant
-        // scoping (policy variables / identity-scoped topics) is the P7 hardening hook.
+        // v1: any authenticated user can subscribe to any device's telemetry
+        // and any simulator progress topic. Per-tenant scoping (policy
+        // variables / identity-scoped topics) is the P7 hardening hook.
         resources: [
           `arn:aws:iot:${region}:${account}:client/*`,
           `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
+          `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
+          `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
         ],
       }),
     );

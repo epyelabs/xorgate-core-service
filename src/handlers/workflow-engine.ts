@@ -9,6 +9,9 @@ import {
   captureFormats,
   failureOutcome,
   loadRunManifest,
+  manifestProgress,
+  s3FetchText,
+  secretsManagerReader,
   writeRunArtifacts,
 } from '../workflows/engine/target';
 import { upgradeDefinition } from '../workflows/compat';
@@ -45,7 +48,12 @@ export interface WorkflowEngineEvent {
   manifestKey?: string;
 }
 
-const telemetrySources: EngineSourceReader = {
+// `bucket` is the run's output bucket: CSV uploads default to it when the
+// binding names no bucket.
+const telemetrySources = (bucket: string): EngineSourceReader => ({
+  async fetchText({ bucket: refBucket, key }): Promise<string> {
+    return s3FetchText(refBucket ?? bucket, key);
+  },
   async readTelemetryWindow({ deviceId, metrics, window }): Promise<TelemetrySample[]> {
     const rows = await db
       .select({
@@ -78,7 +86,7 @@ const telemetrySources: EngineSourceReader = {
       .sort((a, b) => a[0] - b[0])
       .map(([ts, signals]) => ({ ts, signals }));
   },
-};
+});
 
 export const handler = async (
   event: WorkflowEngineEvent,
@@ -122,6 +130,11 @@ export const handler = async (
     }
   }
 
+  // Live progress (M3 simulations): present only when the manifest carries a
+  // progress block; production/batch manifests stay silent, exactly as in M2.
+  const progress = manifestProgress(manifest, (m) => console.log(`workflow-engine: ${m}`));
+  progress?.runStatus({ status: 'running' });
+
   const outcome: EngineRunOutcome = refusal
     ? failureOutcome(definition.nodes.length, refusal.nodeId, refusal.error)
     : await runGraph(
@@ -136,12 +149,20 @@ export const handler = async (
           bindings: Object.fromEntries(manifest.inputs.map((i) => [i.nodeId, i.binding])),
         },
         {
-          sources: telemetrySources,
+          sources: telemetrySources(bucket),
+          secrets: secretsManagerReader(),
+          ...(progress ? { progress } : {}),
           deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
         },
       );
 
   await writeRunArtifacts(bucket, manifest.runId, outcome, captureFormats(definition));
+  // Final status goes out AFTER artifacts are durable, so a subscriber that
+  // reacts to "succeeded" can immediately fetch records/frames.
+  if (progress) {
+    progress.runStatus({ status: outcome.status, error: outcome.error, failedNodeId: outcome.failedNodeId });
+    await progress.flush();
+  }
   console.log('workflow-engine: run complete', {
     runId: manifest.runId,
     status: outcome.status,

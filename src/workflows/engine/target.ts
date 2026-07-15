@@ -1,5 +1,8 @@
+import { DescribeEndpointCommand, IoTClient } from '@aws-sdk/client-iot';
+import { IoTDataPlaneClient, PublishCommand } from '@aws-sdk/client-iot-data-plane';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import type { EngineArtifactSink } from '../catalog/types';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import type { EngineArtifactSink, EngineSecretReader } from '../catalog/types';
 import type { WorkflowDefinition } from '../../schemas/workflows';
 import type { EngineRunOutcome } from './index';
 import {
@@ -12,6 +15,7 @@ import {
   type EngineResult,
   type RunManifest,
 } from './manifest';
+import { IotRunProgress } from './progress';
 
 /**
  * The shared half of every DEPLOYED engine target (Lambda handler, Fargate
@@ -112,6 +116,90 @@ export function s3ArtifactSink(bucket: string, runId: string): EngineArtifactSin
         new PutObjectCommand({ Bucket: bucket, Key: key, Body: jpegBuf, ContentType: 'image/jpeg' }),
       );
       return key;
+    },
+  };
+}
+
+/** Small text objects (telemetry CSV uploads) for the fetchText source seam. */
+export async function s3FetchText(bucket: string, key: string): Promise<string> {
+  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = await res.Body?.transformToString();
+  if (body === undefined) throw new Error(`Empty object at s3://${bucket}/${key}`);
+  return body;
+}
+
+// The default IoTDataPlaneClient endpoint is the legacy (non-ATS) data
+// endpoint; resolve the account's ATS endpoint once per process, same pattern
+// as services/device-config.ts. Both the Lambda role and the engine task role
+// carry iot:DescribeEndpoint + iot:Publish on wf/sim/*.
+let iotDataClientPromise: Promise<IoTDataPlaneClient> | undefined;
+async function iotDataClient(): Promise<IoTDataPlaneClient> {
+  if (!iotDataClientPromise) {
+    iotDataClientPromise = (async () => {
+      const iot = new IoTClient({});
+      const res = await iot.send(new DescribeEndpointCommand({ endpointType: 'iot:Data-ATS' }));
+      if (!res.endpointAddress) throw new Error('DescribeEndpoint returned no iot:Data-ATS address');
+      return new IoTDataPlaneClient({ endpoint: `https://${res.endpointAddress}` });
+    })();
+    iotDataClientPromise.catch(() => {
+      iotDataClientPromise = undefined;
+    });
+  }
+  return iotDataClientPromise;
+}
+
+/**
+ * Builds the progress publisher for a manifest, or null when the manifest has
+ * no progress block (every production/batch run today). Shared by the Lambda
+ * handler and the container main so the transport cannot drift.
+ */
+export function manifestProgress(manifest: RunManifest, log?: (m: string) => void): IotRunProgress | null {
+  if (!manifest.progress) return null;
+  const { topicPrefix } = manifest.progress;
+  return new IotRunProgress({
+    runId: manifest.runId,
+    topicPrefix,
+    publish: async (topic, payload) => {
+      const client = await iotDataClient();
+      await client.send(new PublishCommand({ topic, qos: 0, payload: Buffer.from(payload) }));
+    },
+    log,
+  });
+}
+
+/**
+ * Secrets seam implementation over Secrets Manager. Logical names map to
+ * physical secret names via env (GOOGLE_ROADS_SECRET_NAME today); values are
+ * cached for the process lifetime, so per-sample connector lookups never
+ * re-hit the API.
+ */
+const SECRET_ENV_BY_LOGICAL_NAME: Record<string, string> = {
+  'google-roads-api-key': 'GOOGLE_ROADS_SECRET_NAME',
+};
+const secretCache = new Map<string, Promise<string>>();
+export function secretsManagerReader(): EngineSecretReader {
+  const client = new SecretsManagerClient({});
+  return {
+    getSecret(logicalName: string): Promise<string> {
+      const envVar = SECRET_ENV_BY_LOGICAL_NAME[logicalName];
+      if (!envVar) return Promise.reject(new Error(`Unknown secret "${logicalName}"`));
+      const secretName = process.env[envVar];
+      if (!secretName) {
+        return Promise.reject(
+          new Error(`Secret "${logicalName}" is not configured on this engine target (${envVar} unset)`),
+        );
+      }
+      let entry = secretCache.get(secretName);
+      if (!entry) {
+        entry = (async () => {
+          const res = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
+          if (!res.SecretString) throw new Error(`Secret "${secretName}" has no string value`);
+          return res.SecretString;
+        })();
+        entry.catch(() => secretCache.delete(secretName));
+        secretCache.set(secretName, entry);
+      }
+      return entry;
     },
   };
 }

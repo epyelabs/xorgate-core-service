@@ -33,7 +33,9 @@ export const def = defineNode({
 
 // Binding kinds this source accepts (EngineSourceBinding is deliberately loose;
 // the union lives here, with the executor). No binding defaults to a history
-// read over the run window.
+// read over the run window. telemetry_csv (M3): an uploaded CSV fetched through
+// the fetchText seam and parsed executor-side, so manifests stay small and the
+// same binding works on both engine targets.
 const bindingSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('telemetry_history'),
@@ -44,8 +46,57 @@ const bindingSchema = z.discriminatedUnion('kind', [
     kind: z.literal('telemetry_inline'),
     samples: z.array(z.object({ ts: z.number(), signals: z.record(z.string(), z.number()) })),
   }),
-  z.object({ kind: z.literal('telemetry_csv') }).passthrough(), // M3
+  z.object({
+    kind: z.literal('telemetry_csv'),
+    s3Key: z.string().min(1),
+    bucket: z.string().min(1).optional(), // default: the run's output bucket
+    metrics: z.array(z.string().min(1)).min(1).optional(), // default: every numeric column
+  }),
 ]);
+
+// CSV format (FROZEN for the M3 uploads): a header row with a `ts` column
+// (epoch ms or ISO-8601) plus one column per signal; every other cell must be
+// numeric (non-numeric cells are skipped). Plain commas only, no quoting.
+const MAX_CSV_ROWS = 200_000;
+
+export function parseTelemetryCsv(
+  text: string,
+  metricsFilter?: string[],
+): { samples: TelemetrySample[]; skippedCells: number } {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) throw new Error('CSV needs a header row and at least one data row');
+  const header = lines[0].split(',').map((h) => h.trim());
+  const tsIndex = header.findIndex((h) => h === 'ts');
+  if (tsIndex === -1) throw new Error('CSV header must include a "ts" column');
+  const wanted = metricsFilter ? new Set(metricsFilter) : null;
+  const signalColumns = header
+    .map((name, index) => ({ name, index }))
+    .filter((c) => c.index !== tsIndex && c.name.length > 0 && (!wanted || wanted.has(c.name)));
+  if (signalColumns.length === 0) throw new Error('CSV has no signal columns (after the metrics filter)');
+  if (lines.length - 1 > MAX_CSV_ROWS) {
+    throw new Error(`CSV has ${lines.length - 1} rows; the limit is ${MAX_CSV_ROWS}`);
+  }
+  const samples: TelemetrySample[] = [];
+  let skippedCells = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(',');
+    const rawTs = (cells[tsIndex] ?? '').trim();
+    const asNumber = Number(rawTs);
+    const ts = rawTs !== '' && Number.isFinite(asNumber) ? asNumber : Date.parse(rawTs);
+    if (!Number.isFinite(ts)) throw new Error(`CSV row ${i + 1}: unparseable ts "${rawTs}"`);
+    const signals: Record<string, number> = {};
+    for (const col of signalColumns) {
+      const raw = (cells[col.index] ?? '').trim();
+      if (raw === '') continue;
+      const value = Number(raw);
+      if (Number.isFinite(value)) signals[col.name] = value;
+      else skippedCells += 1;
+    }
+    if (Object.keys(signals).length > 0) samples.push({ ts, signals });
+  }
+  samples.sort((a, b) => a.ts - b.ts);
+  return { samples, skippedCells };
+}
 
 async function readSamples(
   cfg: z.infer<typeof configSchema>,
@@ -59,8 +110,15 @@ async function readSamples(
   switch (binding.kind) {
     case 'telemetry_inline':
       return { samples: [...binding.samples].sort((a, b) => a.ts - b.ts), feed: 'inline' };
-    case 'telemetry_csv':
-      throw new Error('CSV telemetry bindings are not implemented until M3');
+    case 'telemetry_csv': {
+      if (!ctx.sources.fetchText) {
+        throw new Error('This engine target cannot fetch CSV inputs (no fetchText seam)');
+      }
+      const text = await ctx.sources.fetchText({ bucket: binding.bucket ?? null, key: binding.s3Key });
+      const { samples, skippedCells } = parseTelemetryCsv(text, binding.metrics);
+      if (skippedCells > 0) ctx.log(`CSV: skipped ${skippedCells} non-numeric cell(s)`);
+      return { samples, feed: 'csv' };
+    }
     case 'telemetry_history': {
       const metrics = binding.metrics ?? cfg.metrics;
       const window = binding.window

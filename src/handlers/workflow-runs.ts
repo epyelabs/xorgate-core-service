@@ -1,5 +1,7 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
@@ -7,6 +9,11 @@ import { pageMeta, parseListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
+import { runPrefix } from '../workflows/engine/manifest';
+
+const s3 = new S3Client({});
+const BUCKET = process.env.BUCKET_NAME;
+const ARTIFACT_URL_EXPIRES_SECONDS = 300;
 
 const RUN_STATUSES = ['running', 'succeeded', 'failed'] as const;
 
@@ -29,6 +36,7 @@ const summaryColumns = {
   deviceName: schema.devices.name,
   serial: schema.devices.serial,
   trigger: schema.workflowRuns.trigger,
+  mode: schema.workflowRuns.mode,
   status: schema.workflowRuns.status,
   startedAt: schema.workflowRuns.startedAt,
   endedAt: schema.workflowRuns.endedAt,
@@ -36,16 +44,19 @@ const summaryColumns = {
   eventCount: schema.workflowRuns.eventCount,
 };
 
+// workspaceId/deviceId/deviceName are null on device-less simulation runs
+// (migration 0015); the devices join is a LEFT join for the same reason.
 type SummaryRow = {
   id: string;
-  workspaceId: string;
+  workspaceId: string | null;
   templateId: string;
   templateName: string;
   templateVersion: number;
-  deviceId: string;
+  deviceId: string | null;
   deviceName: string | null;
-  serial: string;
+  serial: string | null;
   trigger: string;
+  mode: string;
   status: string;
   startedAt: Date;
   endedAt: Date | null;
@@ -63,6 +74,7 @@ function toSummary(r: SummaryRow) {
     deviceId: r.deviceId,
     deviceName: r.deviceName ?? r.serial,
     trigger: r.trigger,
+    mode: r.mode,
     status: r.status,
     startedAt: r.startedAt.toISOString(),
     endedAt: r.endedAt ? r.endedAt.toISOString() : null,
@@ -155,7 +167,7 @@ export const handler = async (
           schema.workflowTemplates,
           eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
         )
-        .innerJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
+        .leftJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
         .where(where)
         .orderBy(
           order === 'asc'
@@ -170,7 +182,10 @@ export const handler = async (
     case 'GET /workflow-runs/{id}': {
       const id = event.pathParameters?.id;
       if (!id) return badRequest('run id required');
-      if (orgWorkspaceIds.length === 0) return notFound(`Run "${id}" not found`);
+      // Detail is scoped through the template's org (every run has a template;
+      // its org equals the run's workspace org for production runs). This is
+      // what lets device-less simulation runs (null workspace/device, 0015)
+      // resolve; devices/workspaces are LEFT joins for the same reason.
       const [row] = await db
         .select({
           run: schema.workflowRuns,
@@ -184,12 +199,12 @@ export const handler = async (
           schema.workflowTemplates,
           eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
         )
-        .innerJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
-        .innerJoin(schema.workspaces, eq(schema.workspaces.id, schema.workflowRuns.workspaceId))
+        .leftJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
+        .leftJoin(schema.workspaces, eq(schema.workspaces.id, schema.workflowRuns.workspaceId))
         .where(
           and(
             eq(schema.workflowRuns.id, id),
-            inArray(schema.workflowRuns.workspaceId, orgWorkspaceIds),
+            eq(schema.workflowTemplates.organizationId, auth.organizationId),
           ),
         );
       if (!row) return notFound(`Run "${id}" not found`);
@@ -301,6 +316,11 @@ export const handler = async (
         ),
       });
       if (!source) return notFound(`Run "${id}" not found`);
+      // Simulation runs re-run through the simulator (their bindings and
+      // dispatch path live there), and may have no workspace/device at all.
+      if (source.mode === 'simulation' || !source.workspaceId || !source.deviceId) {
+        return badRequest('Simulation runs cannot be rerun; start a new simulation from the editor');
+      }
 
       // Clone the snapshot definition + trigger context into a fresh manual run.
       const run = await fireWorkflowRun({
@@ -320,6 +340,38 @@ export const handler = async (
           run: { id: run.id, status: run.status, startedAt: run.startedAt.toISOString() },
         }),
       };
+    }
+
+    case 'GET /workflow-runs/{id}/artifact-url': {
+      // Presigned GET for a v2 run artifact (Data Capture records, events.jsonl,
+      // visualization frames). The key must live under THIS run's v2 prefix, so
+      // a caller can never presign outside runs their org can already read.
+      const id = event.pathParameters?.id;
+      if (!id) return badRequest('run id required');
+      const key = event.queryStringParameters?.key;
+      if (!key) return badRequest('key query parameter required');
+      if (!BUCKET) throw new Error('workflow-runs: BUCKET_NAME is not configured');
+      if (!key.startsWith(runPrefix(id))) {
+        return badRequest(`key must start with ${runPrefix(id)}`);
+      }
+      const [row] = await db
+        .select({ id: schema.workflowRuns.id })
+        .from(schema.workflowRuns)
+        .innerJoin(
+          schema.workflowTemplates,
+          eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
+        )
+        .where(
+          and(
+            eq(schema.workflowRuns.id, id),
+            eq(schema.workflowTemplates.organizationId, auth.organizationId),
+          ),
+        );
+      if (!row) return notFound(`Run "${id}" not found`);
+      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: key }), {
+        expiresIn: ARTIFACT_URL_EXPIRES_SECONDS,
+      });
+      return ok({ url, expiresInSeconds: ARTIFACT_URL_EXPIRES_SECONDS });
     }
 
     default:

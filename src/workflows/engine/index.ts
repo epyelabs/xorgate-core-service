@@ -6,7 +6,9 @@ import type {
   EngineInChannel,
   EngineMessage,
   EngineMode,
+  EngineProgressSink,
   EngineRunCtx,
+  EngineSecretReader,
   EngineSourceBinding,
   EngineSourceReader,
   NodeTypeDef,
@@ -47,6 +49,16 @@ export interface EngineRunDeps {
   sources: EngineSourceReader;
   /** Binary-artifact sink (visualization JPEGs); omit on media-less targets. */
   artifacts?: EngineArtifactSink;
+  /** Secret access for connector executors; omit on targets without it. */
+  secrets?: EngineSecretReader;
+  /** HTTP layer for connector executors (default: global fetch). */
+  httpFetch?: typeof fetch;
+  /**
+   * Live progress sink (M3 simulator). The core reports step completions,
+   * events, and json-channel messages as they happen; the target owns the
+   * transport (IoT topics) and run-status transitions.
+   */
+  progress?: EngineProgressSink;
   channelCapacity?: number;
   /** Wall-clock budget; on expiry everything is cancelled and the run fails. */
   deadlineMs?: number;
@@ -149,6 +161,7 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
   if (!order) return failedOutcome(spec, null, 'Workflow graph contains a cycle');
 
   const nodesById = new Map(def.nodes.map((n) => [n.id, n]));
+  const orderIndex = new Map(order.map((id, i) => [id, i]));
 
   // Wire one bounded channel per edge. Live-mode frames edges drop oldest.
   const inChannelsByNode = new Map<string, Array<EngineInChannel & { channel: BoundedChannel<EngineMessage> }>>();
@@ -195,6 +208,28 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
   let firstFailure: { nodeId: string; error: string } | null = null;
   let timedOut = false;
 
+  // One step row per node, used both for live progress (on node completion)
+  // and the final outcome, so the two can never disagree.
+  const stepFor = (nodeId: string): EngineStep => {
+    const node = nodesById.get(nodeId)!;
+    const state = states.get(nodeId)!;
+    const status = state.status === 'running' ? 'skipped' : state.status;
+    const output =
+      status === 'failed'
+        ? state.error ?? 'failed'
+        : status === 'skipped'
+          ? 'skipped (upstream failure)'
+          : state.summary ?? `${state.emitted} message(s)`;
+    return {
+      seq: orderIndex.get(nodeId) ?? 0,
+      nodeId,
+      label: node.data.label,
+      status,
+      output,
+      durationMs: state.durationMs,
+    };
+  };
+
   const cancelNodeChannels = (nodeId: string): void => {
     for (const input of inChannelsByNode.get(nodeId) ?? []) input.channel.cancel();
     for (const channels of outChannelsByNode.get(nodeId)?.values() ?? []) {
@@ -235,6 +270,12 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
     const portDef = typeDef.outputs.find((p) => p.id === portId);
     if (!portDef) throw new Error(`emitted on unknown output port "${portId}"`);
     if (msg.tag === undefined && portDef.tag !== undefined) msg.tag = portDef.tag;
+    // Tee json-channel messages (detections, speed limits) to the progress
+    // sink so the simulator's client-side overlay gets them live. Fire-and-
+    // forget: the sink queues internally and must never slow the graph.
+    if (msg.ch === 'json' && deps.progress?.record) {
+      deps.progress.record({ nodeId, port: portId, tag: msg.tag, ts: msg.ts, seq: msg.seq, payload: msg.payload });
+    }
     const channels = outChannelsByNode.get(nodeId)?.get(portId);
     if (!channels || channels.length === 0) return; // unconnected output: drop
     await Promise.all(channels.map((c) => c.push(msg)));
@@ -267,7 +308,10 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
         sources: deps.sources,
         artifacts: deps.artifacts ?? null,
         emitEvent: (event) => {
-          if (!state.aborted) events.push(event);
+          if (!state.aborted) {
+            events.push(event);
+            deps.progress?.event(event);
+          }
         },
         captureRecord: (record) => {
           if (!state.aborted) (captures[nodeId] ??= []).push(record);
@@ -275,6 +319,8 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
         setSummary: (summary) => {
           state.summary = summary;
         },
+        secrets: deps.secrets ?? null,
+        http: deps.httpFetch ?? fetch,
         log: (message) => log(`${nodeId}: ${message}`),
       };
 
@@ -313,6 +359,7 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
       for (const channels of outChannelsByNode.get(nodeId)?.values() ?? []) {
         for (const c of channels) c.close();
       }
+      deps.progress?.step(stepFor(nodeId));
     }
   };
 
@@ -335,25 +382,7 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
   }
 
-  const steps: EngineStep[] = order.map((nodeId, index) => {
-    const node = nodesById.get(nodeId)!;
-    const state = states.get(nodeId)!;
-    const status = state.status === 'running' ? 'skipped' : state.status;
-    const output =
-      status === 'failed'
-        ? state.error ?? 'failed'
-        : status === 'skipped'
-          ? 'skipped (upstream failure)'
-          : state.summary ?? `${state.emitted} message(s)`;
-    return {
-      seq: index,
-      nodeId,
-      label: node.data.label,
-      status,
-      output,
-      durationMs: state.durationMs,
-    };
-  });
+  const steps: EngineStep[] = order.map((nodeId) => stepFor(nodeId));
 
   const okSteps = steps.filter((s) => s.status === 'ok').length;
   const failed = firstFailure as { nodeId: string; error: string } | null;

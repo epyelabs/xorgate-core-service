@@ -460,16 +460,15 @@ export const workflowTriggerState = pgTable(
 
 // One execution. `definition` is a SNAPSHOT of the version that ran (detach /
 // republish never rewrites history). No `queued` status in v1 (see plan §11.1).
+// workspace_id / device_id are NULLABLE since migration 0015: simulation runs
+// (mode='simulation') that execute only uploaded inputs have no device and
+// therefore no workspace; org scoping for such rows goes through template_id.
 export const workflowRuns = pgTable(
   'workflow_runs',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    workspaceId: uuid('workspace_id')
-      .references(() => workspaces.id, { onDelete: 'cascade' })
-      .notNull(),
-    deviceId: uuid('device_id')
-      .references(() => devices.id, { onDelete: 'cascade' })
-      .notNull(),
+    workspaceId: uuid('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
+    deviceId: uuid('device_id').references(() => devices.id, { onDelete: 'cascade' }),
     attachmentId: uuid('attachment_id').references(() => workflowAttachments.id, {
       onDelete: 'set null',
     }),
@@ -478,10 +477,12 @@ export const workflowRuns = pgTable(
       .notNull(),
     templateVersion: integer('template_version').notNull(),
     definition: jsonb('definition').notNull(), // snapshot of the version that ran
-    trigger: text('trigger').notNull(), // event | schedule | manual
+    trigger: text('trigger').notNull(), // event | schedule | manual | simulation
     triggerContext: jsonb('trigger_context'),
     status: text('status').default('running').notNull(), // running | succeeded | failed
-    executionMode: text('execution_mode').notNull(), // inline | fargate
+    // v1 (PoC) values: inline | fargate. v2 engine runs stamp the dispatch
+    // target instead: lambda | fargate (simulation rows use these today).
+    executionMode: text('execution_mode').notNull(),
     // production | simulation (M3 simulator runs; architecture.md §7).
     mode: text('mode').default('production').notNull(),
     // Which engine ran it: null/1 = PoC inline runner or Python cv-runner,
@@ -528,6 +529,7 @@ export const workflowRunSteps = pgTable(
 );
 
 // A detection/observation emitted by a run. Rendered in the run detail Events tab.
+// device_id NULLABLE since migration 0015 (events from device-less simulation runs).
 export const workflowEvents = pgTable(
   'workflow_events',
   {
@@ -535,9 +537,7 @@ export const workflowEvents = pgTable(
     runId: uuid('run_id')
       .references(() => workflowRuns.id, { onDelete: 'cascade' })
       .notNull(),
-    deviceId: uuid('device_id')
-      .references(() => devices.id, { onDelete: 'cascade' })
-      .notNull(),
+    deviceId: uuid('device_id').references(() => devices.id, { onDelete: 'cascade' }),
     kind: text('kind').notNull(), // person_at_perimeter | overspeed | ...
     occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
     confidence: doublePrecision('confidence'),

@@ -5,6 +5,7 @@ import * as connectorThirdParty from './nodes/connector-third-party';
 import * as logicBoolean from './nodes/logic-boolean';
 import * as logicComparator from './nodes/logic-comparator';
 import * as logicDebounce from './nodes/logic-debounce';
+import * as logicDetectionGate from './nodes/logic-detection-gate';
 import * as logicThreshold from './nodes/logic-threshold';
 import * as modelDepth from './nodes/model-depth';
 import * as modelObjectDetection from './nodes/model-object-detection';
@@ -53,6 +54,7 @@ const MODULES: Array<{ def: NodeTypeDef; executor: NodeExecutor }> = [
   logicComparator,
   logicBoolean,
   logicDebounce,
+  logicDetectionGate,
   outputDataCapture,
   outputEvent,
   outputVisualization,

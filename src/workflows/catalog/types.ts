@@ -218,6 +218,11 @@ export interface EngineSourceReader {
   /** Fetches a video object to local disk (Fargate target: S3 download). */
   fetchVideo?(ref: { bucket: string | null; key: string }): Promise<{ path: string }>;
   /**
+   * Fetches a small text object (telemetry CSV uploads, M3). Both deployed
+   * targets implement it with S3 GetObject; tests read from memory.
+   */
+  fetchText?(ref: { bucket: string | null; key: string }): Promise<string>;
+  /**
    * Resolves a registry model to a validated manifest plus a local model.onnx
    * (src/workflows/models/). Targets cache per (family, name).
    */
@@ -236,6 +241,47 @@ export interface EngineSourceReader {
 export interface EngineArtifactSink {
   /** Writes frames/<nodeId>/<frameSeq>.jpg; returns the key/path written. */
   putFrame(nodeId: string, frameSeq: number, jpeg: Buffer): Promise<string>;
+}
+
+/**
+ * Secret-access seam for executors that call third-party APIs (the Roads
+ * connector). Names are LOGICAL ("google-roads-api-key"); each deploy target
+ * maps them to physical Secrets Manager names via its own env and caches the
+ * values for the container/task lifetime. Absent (null on ctx) when a target
+ * has no secret access.
+ */
+export interface EngineSecretReader {
+  getSecret(logicalName: string): Promise<string>;
+}
+
+/**
+ * Progress sink (M3 simulator, architecture §5). Supplied by the deploy target
+ * when the run manifest carries a `progress` block; the engine core calls
+ * `step`/`event` as they happen and json-channel messages tee through
+ * `record`. All methods are fire-and-forget: implementations queue internally,
+ * never throw into the engine, and the target flushes after the run. `preview`
+ * is called by the target-side artifact-sink tee, not by the core.
+ */
+export interface EngineProgressStep {
+  seq: number;
+  nodeId: string;
+  label: string;
+  status: 'ok' | 'failed' | 'skipped';
+  output: string;
+  durationMs: number;
+}
+export interface EngineProgressSink {
+  runStatus(update: {
+    status: 'running' | 'succeeded' | 'failed';
+    error?: string | null;
+    failedNodeId?: string | null;
+  }): void;
+  step(step: EngineProgressStep): void;
+  event(event: EngineEventRecord): void;
+  /** A json-channel message leaving `nodeId` (detections, speed limits, ...). */
+  record?(rec: { nodeId: string; port: string; tag?: string; ts: number; seq: number; payload: unknown }): void;
+  /** Downscaled preview JPEG for a node (fed by the artifact-sink tee). */
+  preview?(nodeId: string, frameSeq: number, jpeg: Buffer): void;
 }
 
 /**
@@ -274,6 +320,10 @@ export interface EngineRunCtx {
   sources: EngineSourceReader;
   /** Binary-artifact sink; null on targets without media support. */
   artifacts: EngineArtifactSink | null;
+  /** Secret access; null on targets without it (connector nodes then fail). */
+  secrets: EngineSecretReader | null;
+  /** HTTP layer for connector executors; injectable so tests run offline. */
+  http: typeof fetch;
   /** Collect an event (output.event). */
   emitEvent(event: EngineEventRecord): void;
   /** Collect a captured record (output.data_capture). */

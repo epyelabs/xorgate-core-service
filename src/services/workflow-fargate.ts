@@ -38,8 +38,11 @@ type VideoInput = {
   captureStartedAt: string | null;
 };
 
-// Resolve the MP4 input(s) for a video run from its trigger context.
-async function resolveVideoInputs(run: WorkflowRun): Promise<VideoInput[]> {
+// Resolve the MP4 input(s) for a video run from its trigger context. Only
+// device-triggered production runs reach this dispatcher, so deviceId is
+// always set here (nullable since migration 0015 for simulation rows, which
+// dispatch through workflow-engine-v2.ts instead).
+async function resolveVideoInputs(run: WorkflowRun & { deviceId: string }): Promise<VideoInput[]> {
   const ctx = (run.triggerContext ?? {}) as Record<string, unknown>;
 
   // recording_saved (auto or manual): a single s3Key is already in the context.
@@ -109,8 +112,11 @@ export async function dispatchFargateRun(run: WorkflowRun): Promise<void> {
     console.error('workflow-fargate: CV runner not configured (missing CV_* env)', { runId: run.id });
     return failRun(run, 'Video workflow runner is not configured');
   }
+  if (!run.deviceId) {
+    return failRun(run, 'Video workflow runs need a device');
+  }
 
-  const inputs = await resolveVideoInputs(run);
+  const inputs = await resolveVideoInputs({ ...run, deviceId: run.deviceId });
   if (inputs.length === 0) {
     return failRun(run, 'No video input (recording) available for this run');
   }

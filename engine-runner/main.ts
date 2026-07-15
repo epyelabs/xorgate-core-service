@@ -14,9 +14,13 @@ import {
   captureFormats,
   failureOutcome,
   loadRunManifest,
+  manifestProgress,
   s3ArtifactSink,
+  s3FetchText,
+  secretsManagerReader,
   writeRunArtifacts,
 } from '../src/workflows/engine/target';
+import { teeArtifactSink, type IotRunProgress } from '../src/workflows/engine/progress';
 import { upgradeDefinition } from '../src/workflows/compat';
 
 /**
@@ -59,6 +63,9 @@ function buildSources(bucket: string, workDir: string): EngineSourceReader {
         'Device telemetry history is not available on the media engine target; use an inline/CSV binding or a telemetry-only (Lambda) graph',
       );
     },
+    async fetchText({ bucket: refBucket, key }) {
+      return s3FetchText(refBucket ?? bucket, key);
+    },
     async fetchVideo({ bucket: refBucket, key }) {
       const localPath = path.join(workDir, `input-${videoSeq++}${path.extname(key) || '.mp4'}`);
       const res = await s3.send(
@@ -99,11 +106,17 @@ async function main(): Promise<number> {
   let manifest: RunManifest | null = null;
   let outcome: EngineRunOutcome;
   let formats: Record<string, 'jsonl' | 'json'> = {};
+  let progress: IotRunProgress | null = null;
   try {
     manifest = await loadRunManifest(bucket, manifestKey);
     const definition = upgradeDefinition(manifest.definition);
     formats = captureFormats(definition);
     const workDir = await mkdtemp(path.join(tmpdir(), 'engine-runner-'));
+    // Live progress (M3 simulations): only when the manifest asks for it.
+    // Visualization JPEGs tee into the preview topic, downscaled.
+    progress = manifestProgress(manifest, log);
+    progress?.runStatus({ status: 'running' });
+    const artifacts = s3ArtifactSink(bucket, manifest.runId);
     outcome = await runGraph(
       {
         runId: manifest.runId,
@@ -117,7 +130,9 @@ async function main(): Promise<number> {
       },
       {
         sources: buildSources(bucket, workDir),
-        artifacts: s3ArtifactSink(bucket, manifest.runId),
+        artifacts: progress ? teeArtifactSink(artifacts, progress) : artifacts,
+        secrets: secretsManagerReader(),
+        ...(progress ? { progress } : {}),
         deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
         log,
       },
@@ -143,6 +158,15 @@ async function main(): Promise<number> {
   } catch (err) {
     console.error(`[engine-runner] FATAL: failed to upload result.json: ${String(err)}`);
     return 1;
+  }
+  // Final status after artifacts are durable; progress errors never fail the task.
+  if (progress) {
+    try {
+      progress.runStatus({ status: outcome.status, error: outcome.error, failedNodeId: outcome.failedNodeId });
+      await progress.flush();
+    } catch (err) {
+      console.error(`[engine-runner] progress flush failed: ${String(err)}`);
+    }
   }
   return 0;
 }

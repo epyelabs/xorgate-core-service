@@ -58,6 +58,17 @@ export class XorgateCoreStorageStack extends cdk.Stack {
           maxAge: 3000,
         },
       ],
+      lifecycleRules: [
+        {
+          // Simulator input uploads (video/CSV via presigned POST) are
+          // transient: the manifest snapshots what ran, and re-simulating
+          // re-uploads. 7 days covers a demo/editing cycle.
+          id: 'ExpireWorkflowUploads',
+          prefix: 'workflows/v2/uploads/',
+          expiration: cdk.Duration.days(7),
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
+        },
+      ],
       removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: !isProd,
     });

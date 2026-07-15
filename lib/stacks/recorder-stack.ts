@@ -283,6 +283,36 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         resources: [bucket.arnForObjects('workflows/v2/*')],
       }),
     );
+    // M3 simulator progress plane: publish to wf/sim/<orgId>/<runId>/* over the
+    // resolved ATS data endpoint (DescribeEndpoint has no resource scoping).
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineSimProgressPublish',
+        actions: ['iot:Publish'],
+        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`],
+      }),
+    );
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineIotDescribeEndpoint',
+        actions: ['iot:DescribeEndpoint'],
+        resources: ['*'],
+      }),
+    );
+    // Google Roads connector API key (created OUT-OF-BAND, deploy constraint):
+    // name-based ARN wildcard because Secrets Manager appends a random suffix.
+    const googleRoadsSecretName = isProd
+      ? 'xorgate-google-roads-api-key'
+      : 'xorgate-google-roads-api-key-dev';
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineGoogleRoadsSecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${googleRoadsSecretName}*`,
+        ],
+      }),
+    );
 
     this.engineTaskFamily = isProd ? 'xorgate-engine-runner' : 'xorgate-engine-runner-dev';
     this.engineTaskDefinition = new ecs.FargateTaskDefinition(this, 'EngineRunnerTaskDef', {
@@ -299,6 +329,10 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
       containerName: this.engineContainerName,
       image: ecs.ContainerImage.fromEcrRepository(this.engineRepository, 'latest'),
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'engine-runner', logGroup: engineLogGroup }),
+      // Static env, deliberately NOT part of the frozen per-run RunTask
+      // override contract (RUN_ID/MANIFEST_BUCKET/MANIFEST_KEY/AWS_REGION):
+      // the secrets seam maps logical secret names through it.
+      environment: { GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName },
       // The runner self-limits via manifest.limits.maxRuntimeSeconds and always
       // writes result.json on the way out; this is the hard ECS backstop.
       stopTimeout: cdk.Duration.seconds(120),

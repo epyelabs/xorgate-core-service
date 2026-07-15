@@ -30,7 +30,7 @@ export function v2StepRows(runId: string, result: EngineResult): V2StepRow[] {
 
 export interface V2EventRow {
   runId: string;
-  deviceId: string;
+  deviceId: string | null; // null on device-less simulation runs (migration 0015)
   kind: string;
   occurredAt: Date;
   confidence: number;
@@ -41,7 +41,7 @@ export interface V2EventRow {
 }
 
 export function v2EventRows(
-  run: { id: string; deviceId: string },
+  run: { id: string; deviceId: string | null },
   result: EngineResult,
 ): V2EventRow[] {
   return result.events.map((e) => ({

@@ -19,10 +19,24 @@
  *   8. v2 finalize row mapping against a synthetic (schema-valid) result.json
  *   9. scenario 1 (person detect on a video file): source.video (video_local)
  *      -> ffmpeg decode -> onnxruntime detection -> data_capture +
- *      visualization JPEGs, using the ffmpeg-static devDependency and the
- *      cv-runner's baked yolov8n.onnx as a local registry. (The events leg of
- *      scenario 1 needs a detections->condition node that is not in the frozen
- *      M1 catalog; records + visualization are the asserted outputs.)
+ *      visualization JPEGs + the M3 events leg (detection_gate -> emit event;
+ *      testsrc contains no people, so the leg runs ok with zero events here),
+ *      using the ffmpeg-static devDependency and the cv-runner's baked
+ *      yolov8n.onnx as a local registry
+ *  10. video.scale unit (persistent ffmpeg rawvideo pipe)
+ *  11. scenario 1 events leg, deterministic: real detection_gate + output.event
+ *      executors chained over synthetic detections -> exactly one rising-edge
+ *      event (M3's sanctioned catalog addition)
+ *  12. scenario 2 (overspeed): telemetry -> Roads connector (mocked HTTP +
+ *      fake secrets) -> comparator -> debounce -> event, end to end through
+ *      runGraph, with cache-hit lookup counting and live progress records
+ *  13. telemetry_csv binding: CSV via the fetchText seam, metrics filter,
+ *      non-numeric cell skipping
+ *  14. progress plane: IotRunProgress against a fake transport during a real
+ *      run (status/steps/events payloads parse against the frozen schemas) +
+ *      preview downscale (640 -> 480, base64 under the IoT cap)
+ *  15. simulations module: request schema, binding validation issues, API ->
+ *      executor binding mapping, schema-valid simulation manifest
  */
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
@@ -35,13 +49,33 @@ import type {
   EngineArtifactSink,
   EngineMessage,
   EngineRunCtx,
+  EngineSecretReader,
   EngineSourceReader,
 } from '../src/workflows/catalog/types';
+import { parseTelemetryCsv } from '../src/workflows/catalog/nodes/source-telemetry';
 import { BoundedChannel } from '../src/workflows/engine/channel';
-import { decodeJpegToRgba } from '../src/workflows/engine/media';
+import { decodeJpegToRgba, encodeRgbaToJpeg } from '../src/workflows/engine/media';
 import { runGraph } from '../src/workflows/engine/index';
-import { buildEngineResult, engineResultSchema } from '../src/workflows/engine/manifest';
+import { buildEngineResult, engineResultSchema, runManifestSchema } from '../src/workflows/engine/manifest';
 import { v2EventRows, v2RunUpdate, v2StepRows } from '../src/workflows/engine/finalize';
+import {
+  IotRunProgress,
+  simEventPayloadSchema,
+  simPreviewPayloadSchema,
+  simRecordPayloadSchema,
+  simStatusPayloadSchema,
+  simStepPayloadSchema,
+  simTopicPrefix,
+} from '../src/workflows/engine/progress';
+import {
+  buildSimulationManifest,
+  createSimulationSchema,
+  engineTargetForDefinition,
+  simulationWindow,
+  toManifestInputs,
+  validateSimulationBindings,
+  type SimulationBinding,
+} from '../src/workflows/simulations';
 import {
   classColor,
   drawDetections,
@@ -63,8 +97,13 @@ const failingSources: EngineSourceReader = {
   },
 };
 
-function stubCtx(overrides: Partial<EngineRunCtx> = {}): EngineRunCtx & { captured: unknown[]; summary: string | null } {
+const failingFetch: typeof fetch = async () => {
+  throw new Error('smoke test must not reach the network');
+};
+
+function stubCtx(overrides: Partial<EngineRunCtx> = {}): EngineRunCtx & { captured: unknown[]; summary: string | null; events: unknown[] } {
   const captured: unknown[] = [];
+  const events: unknown[] = [];
   const ctx = {
     runId: 'smoke',
     mode: 'batch' as const,
@@ -73,13 +112,17 @@ function stubCtx(overrides: Partial<EngineRunCtx> = {}): EngineRunCtx & { captur
     nodeId: 'unit',
     binding: null,
     sources: failingSources,
-    emitEvent: () => {},
+    artifacts: null,
+    secrets: null,
+    http: failingFetch,
+    emitEvent: (e: unknown) => events.push(e),
     captureRecord: (r: unknown) => captured.push(r),
     setSummary: (s: string) => {
       ctx.summary = s;
     },
     log: () => {},
     captured,
+    events,
     summary: null as string | null,
     ...overrides,
   };
@@ -540,6 +583,15 @@ async function testScenario1(): Promise<void> {
       }),
       node('cap', 'output.data_capture', 'Data Capture', { format: 'jsonl' }),
       node('viz', 'output.visualization', 'Video Visualization', { overlays: ['boxes', 'labels'] }),
+      // M3 events leg: detections -> gate -> event. testsrc has no people, so
+      // this asserts the leg RUNS (steps ok, zero events); the deterministic
+      // event assertion is testDetectionGateEventsLeg.
+      node('gate', 'logic.detection_gate', 'Detection Gate', {
+        classes: ['person'],
+        minConfidence: 0.5,
+        minCount: 1,
+      }),
+      node('evt', 'output.event', 'Emit Event', { kind: 'person_at_perimeter' }),
     ],
     edges: [
       edge('src', 'dec', 'video', 'video'),
@@ -547,6 +599,8 @@ async function testScenario1(): Promise<void> {
       edge('det', 'cap', 'detections', 'records'),
       edge('dec', 'viz', 'frames', 'frames'),
       edge('det', 'viz', 'detections', 'detections'),
+      edge('det', 'gate', 'detections', 'detections'),
+      edge('gate', 'evt', 'condition', 'condition'),
     ],
   };
 
@@ -617,9 +671,12 @@ async function testScenario1(): Promise<void> {
   // Freeze check: the outcome assembles into a schema-valid v2 result.json.
   const result = engineResultSchema.parse(buildEngineResult('run-scenario1', outcome, { cap: 'jsonl' }));
   assert.strictEqual(result.artifacts.outputs['cap'].count, frames);
+  const gateStep = outcome.steps.find((s) => s.nodeId === 'gate')!;
+  assert.strictEqual(gateStep.status, 'ok', `gate step: ${gateStep.output}`);
+  assert.match(gateStep.output, /detection frame\(s\)/);
   const detStep = outcome.steps.find((s) => s.nodeId === 'det')!;
   console.log(
-    `ok: scenario 1 (video decode -> onnx detection -> capture + visualization) — ${frames} frames, det: ${detStep.output}`,
+    `ok: scenario 1 (video decode -> onnx detection -> capture + visualization + events leg) — ${frames} frames, det: ${detStep.output}`,
   );
 }
 
@@ -654,6 +711,399 @@ async function testVideoScale(): Promise<void> {
   console.log('ok: video.scale (persistent ffmpeg rawvideo pipe, 3 frames)');
 }
 
+// --- 11. Scenario 1 events leg, deterministic (detection_gate -> output.event) -------
+async function testDetectionGateEventsLeg(): Promise<void> {
+  const gate = getExecutor('logic.detection_gate')!;
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const detections = new BoundedChannel<EngineMessage>(16);
+  const frame = (seq: number, boxes: Array<{ cls: string; confidence: number }>) => ({
+    ch: 'json' as const,
+    tag: 'detections',
+    ts: t0 + seq * 500,
+    seq,
+    payload: {
+      ts: t0 + seq * 500,
+      frameSeq: seq,
+      width: 640,
+      height: 480,
+      boxes: boxes.map((b) => ({ ...b, xyxy: [10, 10, 50, 90] as [number, number, number, number] })),
+    },
+  });
+  await detections.push(frame(0, []));
+  await detections.push(frame(1, [{ cls: 'person', confidence: 0.3 }])); // below minConfidence
+  await detections.push(frame(2, [{ cls: 'car', confidence: 0.9 }])); // wrong class
+  await detections.push(frame(3, [{ cls: 'person', confidence: 0.9 }])); // fires
+  await detections.push(frame(4, [{ cls: 'person', confidence: 0.9 }])); // still true, no re-fire
+  detections.close();
+
+  const gateCtx = stubCtx({ nodeId: 'gate' });
+  const gateOut = new BoundedChannel<EngineMessage>(16);
+  let seq = 0;
+  for await (const msg of gate(
+    [{ port: 'detections', from: { nodeId: 'det', port: 'detections' }, messages: detections }],
+    { classes: ['person'], minConfidence: 0.5, minCount: 1 },
+    gateCtx,
+  )) {
+    await gateOut.push({ ...msg, seq: seq++ } as EngineMessage);
+  }
+  gateOut.close();
+  assert.strictEqual(gateCtx.summary, 'true on 2/5 detection frame(s)');
+
+  const eventExec = getExecutor('output.event')!;
+  const evtCtx = stubCtx({ nodeId: 'evt' });
+  for await (const _msg of eventExec(
+    [{ port: 'condition', from: { nodeId: 'gate', port: 'condition' }, messages: gateOut }],
+    { kind: 'person_at_perimeter' },
+    evtCtx,
+  )) {
+    assert.fail('output.event must not emit messages');
+  }
+  const events = evtCtx.events as Array<{ kind: string; occurredAt: string; payload: { observed: number; boxes: unknown[] } }>;
+  assert.strictEqual(events.length, 1, `expected 1 rising-edge event, got ${events.length}`);
+  assert.strictEqual(events[0].kind, 'person_at_perimeter');
+  assert.strictEqual(Date.parse(events[0].occurredAt), t0 + 3 * 500, 'event must fire on frame 3');
+  assert.strictEqual(events[0].payload.observed, 1);
+  assert.strictEqual(events[0].payload.boxes.length, 1, 'event payload carries the matching boxes');
+  console.log('ok: scenario 1 events leg (detection_gate -> output.event, one rising-edge event)');
+}
+
+// --- 12. Scenario 2: overspeed via the Roads connector -------------------------------
+async function testScenario2(): Promise<void> {
+  const node = (id: string, type: string, label: string, config: Record<string, unknown>) => ({
+    id,
+    type,
+    position: { x: 0, y: 0 },
+    data: { label, config },
+  });
+  const edge = (source: string, target: string, sourceHandle: string, targetHandle: string) => ({
+    id: `${source}-${target}`,
+    source,
+    target,
+    sourceHandle,
+    targetHandle,
+  });
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      node('src', 'source.telemetry', 'Telemetry', {
+        metrics: ['speed_kph', 'gps.latitude', 'gps.longitude'],
+      }),
+      node('roads', 'connector.third_party', 'Connector', { provider: 'google_roads' }),
+      node('cmp', 'logic.comparator', 'Comparator', {
+        signal: 'speed_kph',
+        operator: 'gt',
+        field: 'speedLimitKph',
+      }),
+      node('deb', 'logic.debounce', 'Debounce', { minDurationMs: 5000, cooldownMs: 0 }),
+      node('evt', 'output.event', 'Emit Event', { kind: 'overspeed' }),
+    ],
+    edges: [
+      edge('src', 'roads', 'telemetry', 'positions'),
+      edge('src', 'cmp', 'telemetry', 'signal'),
+      edge('roads', 'cmp', 'speed_limit', 'reference'),
+      edge('cmp', 'deb', 'condition', 'condition'),
+      edge('deb', 'evt', 'condition', 'condition'),
+    ],
+  };
+
+  // 100 s at 1 Hz: 40 s at 40 kph, then 60 s at 80 kph against a 50 kph limit.
+  // The track moves to a new rounded position every 10 s -> 10 unique lookups.
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const samples = [...Array(100).keys()].map((i) => ({
+    ts: t0 + i * 1000,
+    signals: {
+      speed_kph: i < 40 ? 40 : 80,
+      'gps.latitude': 45.5017,
+      'gps.longitude': -73.5673 + Math.floor(i / 10) * 0.001,
+    },
+  }));
+
+  let requests = 0;
+  const mockFetch = (async (input: unknown) => {
+    const url = String(input);
+    assert.ok(url.startsWith('https://roads.googleapis.com/v1/speedLimits?'), url);
+    assert.ok(url.includes('units=KPH'), 'Roads request must ask for KPH');
+    assert.ok(url.includes('key=test-roads-key'), 'Roads request must carry the secret key');
+    requests += 1;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        speedLimits: [{ placeId: `p${requests}`, speedLimit: 50, units: 'KPH' }],
+        snappedPoints: [{ placeId: `p${requests}`, originalIndex: 0 }],
+      }),
+      text: async () => '',
+    };
+  }) as unknown as typeof fetch;
+  const secrets: EngineSecretReader = {
+    getSecret: async (name) => {
+      assert.strictEqual(name, 'google-roads-api-key');
+      return 'test-roads-key';
+    },
+  };
+
+  // Progress records tee: json-channel messages (the connector's speed limits)
+  // must reach the records/<nodeId> topic for the client-side overlay plane.
+  const published: Array<{ topic: string; payload: string }> = [];
+  const progress = new IotRunProgress({
+    runId: 'run-scenario2',
+    topicPrefix: simTopicPrefix('org-1', 'run-scenario2'),
+    publish: async (topic, payload) => {
+      published.push({ topic, payload });
+    },
+    log: () => {},
+  });
+
+  const outcome = await runGraph(
+    {
+      runId: 'run-scenario2',
+      mode: 'simulation',
+      deviceId: null,
+      window: null,
+      definition,
+      bindings: { src: { kind: 'telemetry_inline', samples } },
+    },
+    { sources: failingSources, secrets, httpFetch: mockFetch, progress },
+  );
+  await progress.flush();
+
+  assert.strictEqual(outcome.status, 'succeeded', `run failed: ${outcome.error}`);
+  for (const step of outcome.steps) {
+    assert.strictEqual(step.status, 'ok', `step ${step.nodeId}: ${step.output}`);
+  }
+  assert.strictEqual(requests, 10, `expected 10 cache-cold lookups, got ${requests}`);
+  assert.strictEqual(outcome.events.length, 1, `expected 1 overspeed event, got ${outcome.events.length}`);
+  assert.strictEqual(outcome.events[0].kind, 'overspeed');
+  // Overspeed starts at t0+40s; debounce passes after 5 s sustained.
+  assert.strictEqual(Date.parse(outcome.events[0].occurredAt), t0 + 45_000, outcome.events[0].occurredAt);
+
+  const recordMsgs = published.filter((p) => p.topic.endsWith('/records/roads'));
+  assert.ok(recordMsgs.length >= 1, 'connector records must reach the records topic');
+  const rec = simRecordPayloadSchema.parse(JSON.parse(recordMsgs[0].payload));
+  assert.strictEqual(rec.tag, 'speed_limit');
+  assert.strictEqual((rec.payload as { speedLimitKph: number }).speedLimitKph, 50);
+  const stepMsgs = published.filter((p) => p.topic.endsWith('/steps'));
+  assert.strictEqual(stepMsgs.length, 5, 'one steps message per node');
+  console.log(
+    `ok: scenario 2 (overspeed via Roads connector) — event at +45s, ${requests} lookups, ${recordMsgs.length} live record(s)`,
+  );
+}
+
+// --- 13. telemetry_csv binding through the fetchText seam ----------------------------
+async function testTelemetryCsv(): Promise<void> {
+  const csv = [
+    'ts,vehicle.speed,cabin.temp,note',
+    '2026-01-01T12:00:02Z,3,21.5,warm',
+    '2026-01-01T12:00:00Z,1,20.0,',
+    '2026-01-01T12:00:01Z,2,,cold',
+  ].join('\n');
+
+  // Unit: parser semantics (ordering, metrics filter, non-numeric skipping).
+  const parsed = parseTelemetryCsv(csv);
+  assert.strictEqual(parsed.samples.length, 3);
+  assert.deepStrictEqual(
+    parsed.samples.map((s) => s.signals['vehicle.speed']),
+    [1, 2, 3],
+    'samples must be ts-sorted',
+  );
+  assert.strictEqual(parsed.samples[0].signals['cabin.temp'], 20);
+  assert.strictEqual(parsed.skippedCells, 2, 'both "warm"/"cold" note cells skip');
+  const filtered = parseTelemetryCsv(csv, ['vehicle.speed']);
+  assert.deepStrictEqual(Object.keys(filtered.samples[0].signals), ['vehicle.speed']);
+
+  // Through the executor + fetchText seam (the run-path shape).
+  const executor = getExecutor('source.telemetry')!;
+  const sources: EngineSourceReader = {
+    readTelemetryWindow: async () => {
+      throw new Error('CSV binding must not read the telemetry store');
+    },
+    fetchText: async ({ bucket, key }) => {
+      assert.strictEqual(bucket, null);
+      assert.strictEqual(key, 'workflows/v2/uploads/org-1/2026-07-15/u1/drive.csv');
+      return csv;
+    },
+  };
+  const ctx = stubCtx({
+    nodeId: 'src',
+    sources,
+    binding: { kind: 'telemetry_csv', s3Key: 'workflows/v2/uploads/org-1/2026-07-15/u1/drive.csv' },
+  });
+  const out: number[] = [];
+  for await (const msg of executor([], { metrics: ['vehicle.speed'] }, ctx)) {
+    out.push((msg.payload as { signals: Record<string, number> }).signals['vehicle.speed']);
+  }
+  assert.deepStrictEqual(out, [1, 2, 3]);
+  assert.match(ctx.summary ?? '', /csv/);
+  console.log('ok: telemetry_csv (parser + fetchText seam through source.telemetry)');
+}
+
+// --- 14. Progress plane: publisher during a real run + preview downscale -------------
+async function testProgressPlane(): Promise<void> {
+  const published: Array<{ topic: string; payload: string }> = [];
+  const progress = new IotRunProgress({
+    runId: 'run-progress',
+    topicPrefix: simTopicPrefix('org-1', 'run-progress'),
+    publish: async (topic, payload) => {
+      published.push({ topic, payload });
+    },
+    log: () => {},
+  });
+
+  // Target-shaped lifecycle: running -> graph -> final status -> flush.
+  progress.runStatus({ status: 'running' });
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const samples = [...Array(120).keys()].map((i) => ({
+    ts: t0 + i * 1000,
+    signals: { 'vehicle.speed': i < 30 ? 20 : 0.3 },
+  }));
+  const definition = scenario5Definition();
+  const outcome = await runGraph(
+    {
+      runId: 'run-progress',
+      mode: 'simulation',
+      deviceId: null,
+      window: null,
+      definition,
+      bindings: { src: { kind: 'telemetry_inline', samples } },
+    },
+    { sources: failingSources, progress },
+  );
+  progress.runStatus({ status: outcome.status, error: outcome.error, failedNodeId: outcome.failedNodeId });
+  await progress.flush();
+
+  const prefix = 'wf/sim/org-1/run-progress';
+  const byTopic = (suffix: string) => published.filter((p) => p.topic === `${prefix}${suffix}`);
+  const statusMsgs = byTopic('/status').map((p) => simStatusPayloadSchema.parse(JSON.parse(p.payload)));
+  assert.strictEqual(statusMsgs.length, 2);
+  assert.strictEqual(statusMsgs[0].status, 'running');
+  assert.strictEqual(statusMsgs[1].status, 'succeeded');
+  const stepMsgs = byTopic('/steps').map((p) => simStepPayloadSchema.parse(JSON.parse(p.payload)));
+  assert.strictEqual(stepMsgs.length, definition.nodes.length, 'one steps message per node');
+  assert.ok(stepMsgs.every((m) => m.step.status === 'ok'));
+  const eventMsgs = byTopic('/events').map((p) => simEventPayloadSchema.parse(JSON.parse(p.payload)));
+  assert.strictEqual(eventMsgs.length, 1);
+  assert.strictEqual(eventMsgs[0].event.kind, 'idle_detect');
+
+  // Preview: a 640x480 frame downscales to 480 wide, base64 under the cap.
+  const wide = Buffer.alloc(640 * 480 * 4);
+  for (let i = 0; i < wide.length; i += 4) {
+    wide[i] = (i / 4) % 256;
+    wide[i + 3] = 255;
+  }
+  progress.preview('viz', 7, encodeRgbaToJpeg(wide, 640, 480, 80));
+  await progress.flush();
+  const previewMsgs = byTopic('/preview/viz').map((p) => simPreviewPayloadSchema.parse(JSON.parse(p.payload)));
+  assert.strictEqual(previewMsgs.length, 1);
+  assert.strictEqual(previewMsgs[0].width, 480);
+  assert.strictEqual(previewMsgs[0].frameSeq, 7);
+  assert.ok(previewMsgs[0].jpegBase64.length < 110_000, `preview base64 ${previewMsgs[0].jpegBase64.length}`);
+  const decoded = decodeJpegToRgba(Buffer.from(previewMsgs[0].jpegBase64, 'base64'));
+  assert.strictEqual(decoded.width, 480);
+  console.log(
+    `ok: progress plane (status/steps/events schemas, preview downscale ${previewMsgs[0].width}x${previewMsgs[0].height})`,
+  );
+}
+
+// --- 15. Simulations module: request schema, binding validation, manifest ------------
+function testSimulationsModule(): void {
+  const node = (id: string, type: string, config: Record<string, unknown> = {}) => ({
+    id,
+    type,
+    position: { x: 0, y: 0 },
+    data: { label: id, config },
+  });
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      node('vid', 'source.video'),
+      node('tel', 'source.telemetry', { metrics: ['gps.speed'] }),
+      node('dec', 'video.decode_sample', { fps: 2 }),
+      node('evt', 'output.event', { kind: 'x' }),
+    ],
+    edges: [],
+  };
+  const orgId = '9f9e0cf2-0000-4000-8000-000000000001';
+  const deviceId = '9f9e0cf2-0000-4000-8000-000000000002';
+  const recordingId = '9f9e0cf2-0000-4000-8000-000000000003';
+
+  // Request wire shape parses (the FROZEN simulations POST body).
+  const request = createSimulationSchema.parse({
+    definition,
+    bindings: {
+      vid: { kind: 'recording', recordingId },
+      tel: {
+        kind: 'device_telemetry',
+        deviceId,
+        window: { from: '2026-01-01T12:00:00Z', to: '2026-01-01T12:10:00Z' },
+      },
+    },
+  });
+
+  // Binding validation: happy path, then each failure class.
+  assert.deepStrictEqual(validateSimulationBindings(definition, request.bindings, orgId), []);
+  const missing = validateSimulationBindings(definition, { vid: request.bindings.vid }, orgId);
+  assert.strictEqual(missing.length, 1);
+  assert.strictEqual(missing[0].nodeId, 'tel');
+  const wrongKind = validateSimulationBindings(
+    definition,
+    { ...request.bindings, vid: request.bindings.tel },
+    orgId,
+  );
+  assert.ok(wrongKind.some((i) => i.nodeId === 'vid' && /does not fit/.test(i.message)));
+  const foreignUpload = validateSimulationBindings(
+    definition,
+    {
+      ...request.bindings,
+      vid: { kind: 'video_file', uploadKey: 'workflows/v2/uploads/other-org/x/v.mp4' } as SimulationBinding,
+    },
+    orgId,
+  );
+  assert.ok(foreignUpload.some((i) => /upload endpoint/.test(i.message)));
+
+  // Engine target: media graph -> fargate; telemetry-only -> lambda.
+  assert.strictEqual(engineTargetForDefinition(definition), 'fargate');
+  assert.strictEqual(engineTargetForDefinition(scenario5Definition()), 'lambda');
+
+  // API bindings -> executor bindings -> schema-valid manifest.
+  const inputs = toManifestInputs(request.bindings, new Map([[
+    recordingId,
+    {
+      s3Key: 'media/v1/dev/cam0/rec.mp4',
+      recordingId,
+      recordingStartedAt: '2026-01-01T12:00:00Z',
+      captureStartedAt: '2026-01-01T12:00:03Z',
+    },
+  ]]));
+  const manifest = buildSimulationManifest({
+    runId: 'run-sim-1',
+    orgId,
+    bucket: 'test-bucket',
+    definition,
+    deviceId,
+    inputs,
+    window: simulationWindow(request.bindings),
+    target: 'fargate',
+  });
+  runManifestSchema.parse(manifest); // freeze check (buildSimulationManifest already parses)
+  assert.strictEqual(manifest.mode, 'simulation');
+  assert.strictEqual(manifest.progress?.topicPrefix, `wf/sim/${orgId}/run-sim-1`);
+  assert.strictEqual(manifest.window?.from, '2026-01-01T12:00:00.000Z');
+  assert.strictEqual(manifest.limits.maxRuntimeSeconds, 900);
+  const byNode = new Map(manifest.inputs.map((i) => [i.nodeId, i.binding]));
+  assert.deepStrictEqual(byNode.get('vid'), {
+    kind: 'recording',
+    s3Key: 'media/v1/dev/cam0/rec.mp4',
+    recordingId,
+    recordingStartedAt: '2026-01-01T12:00:00Z',
+    captureStartedAt: '2026-01-01T12:00:03Z',
+  });
+  assert.deepStrictEqual(byNode.get('tel'), {
+    kind: 'telemetry_history',
+    window: { from: '2026-01-01T12:00:00Z', to: '2026-01-01T12:10:00Z' },
+  });
+  console.log('ok: simulations module (request schema, binding validation, manifest mapping)');
+}
+
 async function main(): Promise<void> {
   await testBackpressure();
   await testDropOldest();
@@ -665,6 +1115,11 @@ async function main(): Promise<void> {
   testFinalizeV2Mapping();
   await testScenario1();
   await testVideoScale();
+  await testDetectionGateEventsLeg();
+  await testScenario2();
+  await testTelemetryCsv();
+  await testProgressPlane();
+  testSimulationsModule();
   console.log('\nengine smoke: all checks passed');
 }
 

@@ -333,6 +333,31 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // M3 simulator progress plane: the v2 Lambda engine publishes run progress
+    // to wf/sim/<orgId>/<runId>/* (the engine TASK role gets the same grant in
+    // recorder-stack.ts). Literal ARN, no construct references (shared-role rule).
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "IotPublishSimProgress",
+        actions: ["iot:Publish"],
+        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`],
+      }),
+    );
+    // Google Roads connector API key (secret created OUT-OF-BAND; deploy
+    // constraint). Name-based wildcard: Secrets Manager suffixes the ARN.
+    const googleRoadsSecretName = isProd
+      ? "xorgate-google-roads-api-key"
+      : "xorgate-google-roads-api-key-dev";
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "GoogleRoadsSecretRead",
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${googleRoadsSecretName}*`,
+        ],
+      }),
+    );
+
     // Browser live-telemetry (P2): attach the AWS IoT policy to a caller's Cognito
     // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
     // authorizes against the *target* (a Cognito identity id, not an ARN) → resource "*";
@@ -1069,6 +1094,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       functionName: workflowEngineFnName,
       timeout: cdk.Duration.minutes(5),
       memorySize: 512,
+      // M3: publishes simulator progress (client-iot-data-plane) and reads the
+      // Roads key (client-secrets-manager); neither is guaranteed in the Lambda
+      // runtime SDK, so bundle the SDK like the other IoT/ECS-calling Lambdas.
+      bundling: bundlingWithSdk,
+      environment: { ...commonEnv, GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName },
     });
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
@@ -1084,6 +1114,28 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
     workflowDispatchFn.addEnvironment("WORKFLOW_ENGINE_FN", workflowEngineFnName);
+
+    // Simulator API (M3): creates mode='simulation' runs from the editor's
+    // draft, presigns input uploads, and dispatches the v2 engine DIRECTLY
+    // (Lambda invoke / RunTask; no SQS hop — interactive callers want dispatch
+    // errors synchronously). Bundles the SDK (client-ecs, client-lambda,
+    // s3-presigned-post). The invoke grant and ECS Run/PassRole grants already
+    // exist on the shared lambdaRole (literal ARNs).
+    const workflowSimulationsFn = new nodejs.NodejsFunction(this, "WorkflowSimulationsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workflow-simulations.ts"),
+        "POST /workflow-templates/{id}/simulations(+/uploads) — simulator runs",
+      ),
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      bundling: bundlingWithSdk,
+    });
+    workflowSimulationsFn.addEnvironment("WORKFLOW_ENGINE_FN", workflowEngineFnName);
+    workflowSimulationsFn.addEnvironment("ENGINE_CLUSTER_ARN", recorderClusterArn);
+    workflowSimulationsFn.addEnvironment("ENGINE_TASKDEF", engineTaskFamily);
+    workflowSimulationsFn.addEnvironment("ENGINE_SUBNETS", recorderSubnets);
+    workflowSimulationsFn.addEnvironment("ENGINE_SG", recorderSecurityGroupId);
+    workflowSimulationsFn.addEnvironment("ENGINE_CONTAINER_NAME", engineContainerName);
 
     // Workflow scheduler (1-min tick): schedule triggers + the stuck-run watchdog.
     // Fires runs (SQS) and StopTask's stale Fargate tasks -> bundles the AWS SDK.
@@ -1228,6 +1280,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowRunsInt = new apigwv2int.HttpLambdaIntegration(
       "WorkflowRunsInt",
       workflowRunsFn,
+    );
+    const workflowSimulationsInt = new apigwv2int.HttpLambdaIntegration(
+      "WorkflowSimulationsInt",
+      workflowSimulationsFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
@@ -1457,6 +1513,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       integration: workflowTemplatesInt,
     });
 
+    // Simulator (M3): create a simulation run / presign an input upload.
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/simulations",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowSimulationsInt,
+    });
+    this.api.addRoutes({
+      path: "/workflow-templates/{id}/simulations/uploads",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowSimulationsInt,
+    });
+
     // Served node catalog (static per deployment, ETag cached).
     this.api.addRoutes({
       path: "/workflow-catalog",
@@ -1502,6 +1570,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
     this.api.addRoutes({
       path: "/workflow-runs/{id}/rerun",
       methods: [apigwv2.HttpMethod.POST],
+      integration: workflowRunsInt,
+    });
+    // Presigned GET for v2 run artifacts (Data Capture downloads etc., M3).
+    this.api.addRoutes({
+      path: "/workflow-runs/{id}/artifact-url",
+      methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
     });
     this.api.addRoutes({

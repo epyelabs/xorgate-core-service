@@ -400,6 +400,11 @@ export async function runWorkflowInline(run: WorkflowRun): Promise<void> {
   if (!order) {
     return finalizeFailed(run, null, 'Workflow graph contains a cycle', startMs);
   }
+  // Only device-triggered production runs reach this runner (deviceId is
+  // nullable since migration 0015 for simulation rows, which never do).
+  if (!run.deviceId) {
+    return finalizeFailed(run, null, 'Run has no device', startMs);
+  }
 
   const ctx: RunCtx = { deviceId: run.deviceId, window: resolveWindow(run) };
   const results = new Map<string, NodeResult>();

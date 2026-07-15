@@ -58,6 +58,15 @@ export const runManifestSchema = z.object({
     bucket: z.string().min(1),
     prefix: z.string().min(1), // runPrefix(runId)
   }),
+  // ADDITIVE (M3, optional; absent on every pre-M3 manifest): when present the
+  // target publishes live progress to IoT topics under topicPrefix
+  // (wf/sim/<orgId>/<runId>). Absent = silent run, exactly the M2 behavior.
+  progress: z
+    .object({
+      channel: z.literal('iot'),
+      topicPrefix: z.string().min(1),
+    })
+    .optional(),
   limits: z.object({ maxRuntimeSeconds: z.number().positive().optional() }).default({}),
 });
 export type RunManifest = z.infer<typeof runManifestSchema>;

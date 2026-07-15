@@ -1,0 +1,287 @@
+import { z } from 'zod';
+import type { WorkflowDefinition } from '../schemas/workflows';
+import { workflowDefinitionSchema } from '../schemas/workflows';
+import { getNodeType } from './catalog/index';
+import { runManifestSchema, runPrefix, type RunManifest } from './engine/manifest';
+import { simTopicPrefix } from './engine/progress';
+
+/**
+ * Pure half of the simulations API (M3): request wire schemas, binding
+ * validation, and the API-binding -> executor-binding -> v2 manifest mapping.
+ * No DB or AWS imports so the headless smoke script exercises all of it; the
+ * handler (src/handlers/workflow-simulations.ts) owns auth, row resolution,
+ * and dispatch.
+ *
+ * FROZEN wire contracts for the M3 frontend session:
+ *
+ * POST /workflow-templates/{id}/simulations
+ *   { "definition": { nodes, edges, schemaVersion? },     // the editor's DRAFT
+ *     "bindings": { "<sourceNodeId>": SimulationBinding } }
+ *   SimulationBinding (API union; maps onto the M2-frozen executor unions):
+ *     { kind: "recording", recordingId }                  // source.video
+ *     { kind: "video_file", uploadKey }                   // source.video (uploaded)
+ *     { kind: "device_telemetry", deviceId,
+ *       window: { from, to }, metrics? }                  // source.telemetry
+ *     { kind: "telemetry_csv", uploadKey, metrics? }      // source.telemetry (uploaded)
+ *   201 -> { run: { id, status: "running", mode: "simulation", startedAt,
+ *                   templateId, templateVersion, engineTarget: "lambda"|"fargate",
+ *                   deviceId, workspaceId },
+ *            progress: { topicPrefix, topics: { status, steps, events,
+ *                        previewPrefix, recordsPrefix } } }
+ *   400 WORKFLOW_VALIDATION_FAILED   same issue shape as publish
+ *   400 SIMULATION_BINDING_INVALID   { details: { issues: [{ nodeId?, message }] } }
+ *   502 SIMULATION_DISPATCH_FAILED   run row already flipped to failed
+ *
+ * POST /workflow-templates/{id}/simulations/uploads
+ *   { "kind": "video" | "csv", "filename", "contentType"? }
+ *   201 -> { upload: { key, url, fields, expiresInSeconds, maxBytes } }
+ *   (S3 presigned POST; the browser then binds the returned `key` as
+ *   uploadKey. Keys live under workflows/v2/uploads/<orgId>/... and expire via
+ *   a 7-day lifecycle rule.)
+ */
+
+export const SIM_UPLOAD_PREFIX = 'workflows/v2/uploads/';
+export const SIM_UPLOAD_EXPIRES_SECONDS = 900;
+export const SIM_UPLOAD_MAX_BYTES: Record<'video' | 'csv', number> = {
+  video: 1024 * 1024 * 1024, // 1 GiB
+  csv: 25 * 1024 * 1024, // 25 MiB
+};
+// Engine budget per simulation target. Lambda mirrors the M2 default (under
+// its 300 s function timeout); Fargate simulations get 15 minutes, well under
+// the cv-runner's 30-minute production cap (demo-scale batch inputs).
+export const SIM_MAX_RUNTIME_SECONDS: Record<'lambda' | 'fargate', number> = {
+  lambda: 240,
+  fargate: 900,
+};
+
+export function uploadPrefixForOrg(orgId: string): string {
+  return `${SIM_UPLOAD_PREFIX}${orgId}/`;
+}
+
+export const simulationBindingSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('recording'), recordingId: z.string().uuid() }),
+  z.object({ kind: z.literal('video_file'), uploadKey: z.string().min(1) }),
+  z.object({
+    kind: z.literal('device_telemetry'),
+    deviceId: z.string().uuid(),
+    window: z.object({ from: z.string().min(1), to: z.string().min(1) }),
+    metrics: z.array(z.string().min(1)).min(1).optional(), // default: the node's config.metrics
+  }),
+  z.object({
+    kind: z.literal('telemetry_csv'),
+    uploadKey: z.string().min(1),
+    metrics: z.array(z.string().min(1)).min(1).optional(), // default: every numeric CSV column
+  }),
+]);
+export type SimulationBinding = z.infer<typeof simulationBindingSchema>;
+
+export const createSimulationSchema = z.object({
+  definition: workflowDefinitionSchema,
+  bindings: z.record(z.string(), simulationBindingSchema).default({}),
+});
+export type CreateSimulationRequest = z.infer<typeof createSimulationSchema>;
+
+export const createSimulationUploadSchema = z.object({
+  kind: z.enum(['video', 'csv']),
+  filename: z.string().min(1).max(200),
+  contentType: z.string().min(1).max(120).optional(),
+});
+
+export interface SimulationBindingIssue {
+  nodeId?: string;
+  message: string;
+}
+
+const KINDS_BY_NODE_TYPE: Record<string, ReadonlyArray<SimulationBinding['kind']>> = {
+  'source.video': ['recording', 'video_file'],
+  'source.telemetry': ['device_telemetry', 'telemetry_csv'],
+};
+
+/**
+ * Structural binding validation over the UPGRADED (v2) definition. Every
+ * source.video / source.telemetry node needs a binding of a matching kind,
+ * upload keys must live under the caller org's upload prefix, and all
+ * device_telemetry bindings must reference one device (the run-level deviceId
+ * feeds the telemetry_history executor). Row existence (recordings, devices)
+ * is the handler's job.
+ */
+export function validateSimulationBindings(
+  definition: WorkflowDefinition,
+  bindings: Record<string, SimulationBinding>,
+  orgId: string,
+): SimulationBindingIssue[] {
+  const issues: SimulationBindingIssue[] = [];
+  const nodeIds = new Set(definition.nodes.map((n) => n.id));
+  for (const nodeId of Object.keys(bindings)) {
+    if (!nodeIds.has(nodeId)) issues.push({ nodeId, message: `Binding references unknown node "${nodeId}"` });
+  }
+  const telemetryDevices = new Set<string>();
+  for (const node of definition.nodes) {
+    const allowed = KINDS_BY_NODE_TYPE[node.type];
+    if (!allowed) continue;
+    const binding = bindings[node.id];
+    if (!binding) {
+      issues.push({ nodeId: node.id, message: `Source node "${node.data.label}" needs an input binding` });
+      continue;
+    }
+    if (!allowed.includes(binding.kind)) {
+      issues.push({
+        nodeId: node.id,
+        message: `Binding kind "${binding.kind}" does not fit ${node.type} (expected ${allowed.join(' or ')})`,
+      });
+      continue;
+    }
+    if (binding.kind === 'video_file' || binding.kind === 'telemetry_csv') {
+      if (!binding.uploadKey.startsWith(uploadPrefixForOrg(orgId))) {
+        issues.push({
+          nodeId: node.id,
+          message: 'uploadKey must come from this organization\'s upload endpoint',
+        });
+      }
+    }
+    if (binding.kind === 'device_telemetry') {
+      const fromMs = Date.parse(binding.window.from);
+      const toMs = Date.parse(binding.window.to);
+      if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) {
+        issues.push({ nodeId: node.id, message: 'device_telemetry window must be a valid from < to range' });
+      }
+      telemetryDevices.add(binding.deviceId);
+    }
+  }
+  if (telemetryDevices.size > 1) {
+    issues.push({
+      message: 'All device telemetry bindings in one simulation must reference the same device',
+    });
+  }
+  return issues;
+}
+
+/** Engine target for a v2 definition: Fargate iff any node is media-bound. */
+export function engineTargetForDefinition(definition: WorkflowDefinition): 'lambda' | 'fargate' {
+  for (const node of definition.nodes) {
+    if (getNodeType(node.type)?.runtime.target === 'media') return 'fargate';
+  }
+  return 'lambda';
+}
+
+/** A recordings-table row reduced to what the executor binding needs. */
+export interface ResolvedRecording {
+  s3Key: string;
+  recordingId: string;
+  recordingStartedAt: string | null;
+  captureStartedAt: string | null;
+}
+
+/**
+ * Maps API bindings to the M2-frozen executor binding unions. `recordings` is
+ * the handler's recordingId -> row resolution; upload keys pass through as
+ * s3Key on the run's output bucket.
+ */
+export function toManifestInputs(
+  bindings: Record<string, SimulationBinding>,
+  recordings: Map<string, ResolvedRecording>,
+): RunManifest['inputs'] {
+  const inputs: RunManifest['inputs'] = [];
+  for (const [nodeId, binding] of Object.entries(bindings)) {
+    switch (binding.kind) {
+      case 'recording': {
+        const rec = recordings.get(binding.recordingId);
+        if (!rec) throw new Error(`Recording "${binding.recordingId}" was not resolved`);
+        inputs.push({
+          nodeId,
+          binding: {
+            kind: 'recording',
+            s3Key: rec.s3Key,
+            recordingId: rec.recordingId,
+            ...(rec.recordingStartedAt ? { recordingStartedAt: rec.recordingStartedAt } : {}),
+            ...(rec.captureStartedAt ? { captureStartedAt: rec.captureStartedAt } : {}),
+          },
+        });
+        break;
+      }
+      case 'video_file':
+        inputs.push({ nodeId, binding: { kind: 'video_file', s3Key: binding.uploadKey } });
+        break;
+      case 'device_telemetry':
+        inputs.push({
+          nodeId,
+          binding: {
+            kind: 'telemetry_history',
+            window: binding.window,
+            ...(binding.metrics ? { metrics: binding.metrics } : {}),
+          },
+        });
+        break;
+      case 'telemetry_csv':
+        inputs.push({
+          nodeId,
+          binding: {
+            kind: 'telemetry_csv',
+            s3Key: binding.uploadKey,
+            ...(binding.metrics ? { metrics: binding.metrics } : {}),
+          },
+        });
+        break;
+    }
+  }
+  return inputs;
+}
+
+/**
+ * The run's data window: the union of device_telemetry binding windows (video
+ * sources fall back to it as a frame-timestamp anchor). Null for upload-only
+ * simulations, which anchor at recording/upload metadata or wall clock.
+ */
+export function simulationWindow(
+  bindings: Record<string, SimulationBinding>,
+): { from: string; to: string } | null {
+  let fromMs = Infinity;
+  let toMs = -Infinity;
+  for (const binding of Object.values(bindings)) {
+    if (binding.kind !== 'device_telemetry') continue;
+    fromMs = Math.min(fromMs, Date.parse(binding.window.from));
+    toMs = Math.max(toMs, Date.parse(binding.window.to));
+  }
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) return null;
+  return { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() };
+}
+
+/** Assembles and schema-validates the v2 manifest for a simulation run. */
+export function buildSimulationManifest(args: {
+  runId: string;
+  orgId: string;
+  bucket: string;
+  definition: WorkflowDefinition; // already upgraded to v2
+  deviceId: string | null;
+  inputs: RunManifest['inputs'];
+  window: { from: string; to: string } | null;
+  target: 'lambda' | 'fargate';
+}): RunManifest {
+  return runManifestSchema.parse({
+    manifestVersion: 2,
+    runId: args.runId,
+    mode: 'simulation',
+    deviceId: args.deviceId,
+    window: args.window,
+    definition: args.definition,
+    inputs: args.inputs,
+    output: { bucket: args.bucket, prefix: runPrefix(args.runId) },
+    progress: { channel: 'iot', topicPrefix: simTopicPrefix(args.orgId, args.runId) },
+    limits: { maxRuntimeSeconds: SIM_MAX_RUNTIME_SECONDS[args.target] },
+  });
+}
+
+/** The `progress` block of the simulations API response. */
+export function simulationProgressResponse(orgId: string, runId: string) {
+  const topicPrefix = simTopicPrefix(orgId, runId);
+  return {
+    topicPrefix,
+    topics: {
+      status: `${topicPrefix}/status`,
+      steps: `${topicPrefix}/steps`,
+      events: `${topicPrefix}/events`,
+      previewPrefix: `${topicPrefix}/preview/`,
+      recordsPrefix: `${topicPrefix}/records/`,
+    },
+  };
+}
