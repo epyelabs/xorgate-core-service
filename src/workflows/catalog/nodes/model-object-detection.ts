@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { requireInput } from '../../engine/helpers';
+import { loadOrt } from '../../engine/ort';
 import { letterboxToTensor, postprocessYoloV8 } from '../../engine/vision';
 import type {
   DetectionsPayload,
@@ -47,35 +48,6 @@ export const def = defineNode({
   requires: [],
   runtime: { target: 'media', modelRef: { family: 'detection' } },
 });
-
-// onnxruntime-node is a native module present only on media-capable targets
-// (the engine-runner image and dev machines). It is marked external in every
-// Lambda bundle and required lazily HERE, at executor run time, so importing
-// this module (catalog registry, publish validation, serialized catalog) never
-// touches it.
-interface OrtTensor {
-  data: Float32Array;
-  dims: readonly number[];
-}
-interface OrtSession {
-  inputNames: string[];
-  run(feeds: Record<string, unknown>): Promise<Record<string, OrtTensor>>;
-}
-interface OrtModule {
-  Tensor: new (type: 'float32', data: Float32Array, dims: number[]) => unknown;
-  InferenceSession: { create(path: string): Promise<OrtSession> };
-}
-
-function loadOrt(): OrtModule {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require('onnxruntime-node') as OrtModule;
-  } catch {
-    throw new Error(
-      'onnxruntime-node is not available on this engine target; model nodes need the media (Fargate) engine',
-    );
-  }
-}
 
 export const executor = async function* modelObjectDetection(
   inputs: EngineInChannel[],

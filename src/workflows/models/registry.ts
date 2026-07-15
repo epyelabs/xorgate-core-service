@@ -53,8 +53,13 @@ export const modelManifestSchema = z.object({
   classNames: z.array(z.string().min(1)).default([]),
   postprocess: z.object({
     // yolov8: output (1, 4 + numClasses, N) = [cx,cy,w,h, class scores]
-    kind: z.enum(['yolov8', 'rtdetr']),
+    // yolov8-seg: detection head (1, 4 + numClasses + 32, N) + proto (1, 32, mh, mw)
+    // depth-anything: single map output (1, H, W) of relative inverse depth
+    // (M4 additions are ADDITIVE enum values: every pre-M4 manifest still parses)
+    kind: z.enum(['yolov8', 'rtdetr', 'yolov8-seg', 'depth-anything']),
     nmsIouThreshold: z.number().min(0).max(1).default(0.45),
+    // yolov8-seg only: sigmoid cutoff when binarizing instance masks.
+    maskThreshold: z.number().min(0).max(1).default(0.5),
   }),
   quantization: z.enum(['fp32', 'fp16', 'int8']).optional(),
 });

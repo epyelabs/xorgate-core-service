@@ -6,9 +6,11 @@ import * as logicBoolean from './nodes/logic-boolean';
 import * as logicComparator from './nodes/logic-comparator';
 import * as logicDebounce from './nodes/logic-debounce';
 import * as logicDetectionGate from './nodes/logic-detection-gate';
+import * as logicProximityGate from './nodes/logic-proximity-gate';
 import * as logicThreshold from './nodes/logic-threshold';
 import * as modelDepth from './nodes/model-depth';
 import * as modelObjectDetection from './nodes/model-object-detection';
+import * as modelSegmentation from './nodes/model-segmentation';
 import * as outputDataCapture from './nodes/output-data-capture';
 import * as outputEvent from './nodes/output-event';
 import * as outputVisualization from './nodes/output-visualization';
@@ -16,6 +18,7 @@ import * as sourceTelemetry from './nodes/source-telemetry';
 import * as sourceVideo from './nodes/source-video';
 import * as telemetryDerivative from './nodes/telemetry-derivative';
 import * as telemetryEma from './nodes/telemetry-ema';
+import * as telemetryGeofence from './nodes/telemetry-geofence';
 import * as telemetryKalman from './nodes/telemetry-kalman';
 import * as telemetryOutlierRemoval from './nodes/telemetry-outlier-removal';
 import * as telemetryResample from './nodes/telemetry-resample';
@@ -48,13 +51,16 @@ const MODULES: Array<{ def: NodeTypeDef; executor: NodeExecutor }> = [
   telemetryResample,
   telemetryTimeAlign,
   telemetryOutlierRemoval,
+  telemetryGeofence,
   modelObjectDetection,
+  modelSegmentation,
   modelDepth,
   logicThreshold,
   logicComparator,
   logicBoolean,
   logicDebounce,
   logicDetectionGate,
+  logicProximityGate,
   outputDataCapture,
   outputEvent,
   outputVisualization,

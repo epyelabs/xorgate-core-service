@@ -183,6 +183,67 @@ export interface DetectionsPayload {
   height: number;
   boxes: DetectionBox[];
 }
+/**
+ * json:depth payload (M4): one message per frame. The full-resolution float map
+ * never leaves the depth executor; the payload embeds a DOWNSAMPLED uint8 map
+ * (base64, <= DEPTH_MAP_MAX_WIDTH wide) so records stay JSON-friendly on every
+ * plane that serializes them (data capture, IoT records topic) while still
+ * carrying enough signal for visualization blending and per-box statistics.
+ * Values are per-frame normalized inverse depth: 255/1.0 = nearest. `boxes` is
+ * present when a json:detections input is wired into the depth node; per-box
+ * `proximity` (median normalized inverse depth inside the box, 0..1, higher =
+ * closer) is the distance-from-depth-plus-bbox derivation.
+ */
+export interface DepthMapEmbed {
+  width: number;
+  height: number;
+  /** Raw min/max of the model output before normalization (per frame). */
+  min: number;
+  max: number;
+  encoding: 'u8';
+  /** base64 of width*height uint8 normalized inverse-depth values. */
+  data: string;
+}
+export interface DepthBox extends DetectionBox {
+  /** Median normalized inverse depth inside the box (0..1, higher = closer). */
+  proximity: number;
+}
+export interface DepthPayload {
+  ts: number;
+  frameSeq: number;
+  width: number;
+  height: number;
+  stats: { min: number; max: number; mean: number; median: number };
+  map: DepthMapEmbed;
+  boxes?: DepthBox[];
+}
+/**
+ * json:segments payload (M4): one message per frame, empty `instances`
+ * included. Each instance mask is binarized at the model's proto resolution,
+ * cropped to the box, and packed 1 bit per pixel (row-major, MSB first) so a
+ * typical instance is a few hundred base64 bytes.
+ */
+export interface SegmentInstance {
+  cls: string;
+  confidence: number;
+  /** [x1, y1, x2, y2] in source-frame pixels. */
+  xyxy: [number, number, number, number];
+  mask: {
+    /** Mask grid size (the box region sampled at proto resolution). */
+    width: number;
+    height: number;
+    encoding: 'bitpack';
+    /** base64 of ceil(width*height/8) bytes, row-major, MSB = leftmost. */
+    data: string;
+  };
+}
+export interface SegmentsPayload {
+  ts: number;
+  frameSeq: number;
+  width: number;
+  height: number;
+  instances: SegmentInstance[];
+}
 
 /** One input connection: `port` is this node's input port id; one entry per edge. */
 export interface EngineInChannel {

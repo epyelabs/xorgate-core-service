@@ -39,6 +39,10 @@ export function recordsKey(runId: string, nodeId: string, format: 'jsonl' | 'jso
 export function frameKey(runId: string, nodeId: string, frameSeq: number): string {
   return `${runPrefix(runId)}frames/${nodeId}/${frameSeq}.jpg`;
 }
+/** Dispatcher-materialized source inputs (M4 telemetry seam). */
+export function inputRecordsKey(runId: string, nodeId: string): string {
+  return `${runPrefix(runId)}inputs/${nodeId}/records.jsonl`;
+}
 
 // Source bindings stay opaque here; each source executor zod-parses its own
 // kinds (catalog/types.ts, EngineSourceBinding). New kinds never touch this.

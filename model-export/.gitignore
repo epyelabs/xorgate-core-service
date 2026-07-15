@@ -1,0 +1,5 @@
+# Export outputs are published to the S3 registry, never committed.
+out/
+.venv/
+*.pt
+*.onnx

@@ -37,22 +37,45 @@
  *      preview downscale (640 -> 480, base64 under the IoT cap)
  *  15. simulations module: request schema, binding validation issues, API ->
  *      executor binding mapping, schema-valid simulation manifest
+ *  16. telemetry.geofence: point-in-polygon + executor semantics (inside /
+ *      outside modes, missing-position samples skipped)
+ *  17. depth + segmentation vision units: map normalization/stats/downsample,
+ *      median-in-box, bit packing, synthetic yolov8-seg decode, mask/depth
+ *      drawing
+ *  18. proximity gate + boolean fusion, deterministic: synthetic depth records
+ *      (per-box proximity) -> proximity_gate -> boolean AND with a braking
+ *      condition -> output.event fires exactly once
+ *  19. telemetry_materialized binding (the M4 container telemetry seam):
+ *      dispatcher-written records.jsonl through the fetchText seam
+ *  20. scenario 3 (sudden stops, fusion): gps + imu -> time_align ->
+ *      outlier_removal -> kalman -> derivative -> threshold; video -> decode
+ *      -> detection -> depth (frames + detections) -> proximity_gate; boolean
+ *      AND -> event. Real yolov8n + depth-anything-v2-small ONNX; testsrc has
+ *      no vehicles, so the deterministic event assertion is check 18.
+ *  21. scenario 8 (road scene segmentation): video -> decode -> segmentation
+ *      (+ depth) -> visualization masks/depth_map overlays + captured
+ *      json:segments records. Real yolov8n-seg ONNX.
+ *
+ * Checks 20/21 need the M4 model exports on disk (model-export/out/...); run
+ * model-export/export_depth.py and export_yolo.py --name yolov8n-seg first.
  */
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { getExecutor } from '../src/workflows/catalog/index';
 import type {
+  DepthPayload,
   EngineArtifactSink,
   EngineMessage,
   EngineRunCtx,
   EngineSecretReader,
   EngineSourceReader,
 } from '../src/workflows/catalog/types';
-import { parseTelemetryCsv } from '../src/workflows/catalog/nodes/source-telemetry';
+import { parseTelemetryCsv, parseTelemetryJsonl } from '../src/workflows/catalog/nodes/source-telemetry';
+import { pointInPolygon } from '../src/workflows/catalog/nodes/telemetry-geofence';
 import { BoundedChannel } from '../src/workflows/engine/channel';
 import { decodeJpegToRgba, encodeRgbaToJpeg } from '../src/workflows/engine/media';
 import { runGraph } from '../src/workflows/engine/index';
@@ -77,10 +100,19 @@ import {
   type SimulationBinding,
 } from '../src/workflows/simulations';
 import {
+  blendDepthOverlay,
   classColor,
+  depthMapStats,
+  downsampleDepthMap,
   drawDetections,
+  drawSegments,
   letterboxToTensor,
+  medianDepthInBox,
+  normalizeDepthMap,
+  packBits,
   postprocessYoloV8,
+  postprocessYoloV8Seg,
+  unpackBit,
 } from '../src/workflows/engine/vision';
 import { modelManifestSchema, type ModelManifest } from '../src/workflows/models/registry';
 import type { WorkflowDefinition } from '../src/schemas/workflows';
@@ -1104,6 +1136,567 @@ function testSimulationsModule(): void {
   console.log('ok: simulations module (request schema, binding validation, manifest mapping)');
 }
 
+// --- 16. telemetry.geofence -----------------------------------------------------------
+async function testGeofence(): Promise<void> {
+  // Unit: square fence around (45.50, -73.60).
+  const square = [
+    { lat: 45.49, lng: -73.61 },
+    { lat: 45.51, lng: -73.61 },
+    { lat: 45.51, lng: -73.59 },
+    { lat: 45.49, lng: -73.59 },
+  ];
+  assert.ok(pointInPolygon(45.5, -73.6, square), 'center must be inside');
+  assert.ok(!pointInPolygon(45.6, -73.6, square), 'north point must be outside');
+  assert.ok(!pointInPolygon(45.5, -73.7, square), 'west point must be outside');
+
+  const executor = getExecutor('telemetry.geofence')!;
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const channel = new BoundedChannel<EngineMessage>(16);
+  const feed = [
+    { ts: t0, signals: { 'gps.latitude': 45.5, 'gps.longitude': -73.6 } }, // inside
+    { ts: t0 + 1000, signals: { 'gps.latitude': 45.6, 'gps.longitude': -73.6 } }, // outside
+    { ts: t0 + 2000, signals: { 'gps.latitude': 45.5 } }, // no lng: skipped
+    { ts: t0 + 3000, signals: { 'gps.latitude': 45.505, 'gps.longitude': -73.595 } }, // inside
+  ];
+  let seq = 0;
+  for (const s of feed) await channel.push({ ch: 'telemetry', ts: s.ts, seq: seq++, payload: { signals: s.signals } });
+  channel.close();
+  const ctx = stubCtx({ nodeId: 'fence' });
+  const out: boolean[] = [];
+  for await (const msg of executor(
+    [{ port: 'telemetry', from: { nodeId: 'src', port: 'telemetry' }, messages: channel }],
+    { polygon: square, mode: 'inside' },
+    ctx,
+  )) {
+    out.push((msg.payload as { value: boolean }).value);
+  }
+  assert.deepStrictEqual(out, [true, false, true], 'inside/outside sequence (positionless sample skipped)');
+  assert.match(ctx.summary ?? '', /1 without a position skipped/);
+
+  // Outside mode flips values.
+  const channel2 = new BoundedChannel<EngineMessage>(4);
+  await channel2.push({ ch: 'telemetry', ts: t0, seq: 0, payload: { signals: feed[1].signals } });
+  channel2.close();
+  const ctx2 = stubCtx({ nodeId: 'fence2' });
+  for await (const msg of executor(
+    [{ port: 'telemetry', from: { nodeId: 'src', port: 'telemetry' }, messages: channel2 }],
+    { polygon: square, mode: 'outside' },
+    ctx2,
+  )) {
+    assert.strictEqual((msg.payload as { value: boolean }).value, true, 'outside mode must flip');
+  }
+  console.log('ok: telemetry.geofence (point-in-polygon, inside/outside, skip without position)');
+}
+
+// --- 17. Depth + segmentation vision units --------------------------------------------
+function testDepthSegVisionUnits(): void {
+  // Depth map normalization: raw 2x2 [1, 2, 3, 5] -> u8 [0, 64, 128, 255].
+  const map = normalizeDepthMap(new Float32Array([1, 2, 3, 5]), 2, 2);
+  assert.strictEqual(map.min, 1);
+  assert.strictEqual(map.max, 5);
+  assert.deepStrictEqual([...map.values], [0, 64, 128, 255]);
+  const stats = depthMapStats(map);
+  assert.strictEqual(stats.min, 1);
+  assert.strictEqual(stats.max, 5);
+  assert.ok(Math.abs(stats.mean - (0 + 64 + 128 + 255) / 4 / 255) < 1e-3, `mean ${stats.mean}`);
+
+  // Downsample keeps aspect and nearest values.
+  const wide = normalizeDepthMap(new Float32Array([...Array(8).keys()]), 4, 2);
+  const down = downsampleDepthMap(wide, 2);
+  assert.strictEqual(down.width, 2);
+  assert.strictEqual(down.height, 1);
+  assert.strictEqual(down.values.length, 2);
+
+  // Median-in-box: 4x4 map, right half hot (255), left half cold (0); a box
+  // over the right half of a 100x100 source frame must read ~1.
+  const raw = new Float32Array(16);
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) raw[y * 4 + x] = x < 2 ? 0 : 10;
+  const halfMap = normalizeDepthMap(raw, 4, 4);
+  assert.strictEqual(medianDepthInBox(halfMap, [50, 0, 100, 100], 100, 100), 1);
+  assert.strictEqual(medianDepthInBox(halfMap, [0, 0, 50, 100], 100, 100), 0);
+
+  // Bit packing roundtrip.
+  const flags = new Uint8Array([1, 0, 1, 1, 0, 0, 0, 1, 1]); // 9 bits -> 2 bytes
+  const bits = packBits(flags);
+  assert.strictEqual(bits.length, 2);
+  for (let i = 0; i < flags.length; i++) {
+    assert.strictEqual(unpackBit(bits, i), flags[i] === 1, `bit ${i}`);
+  }
+
+  // Synthetic yolov8-seg decode: 1 class, 2 protos, 2 anchors; anchor 0's
+  // coeffs select proto 0 (top half positive), so the mask's top rows are set.
+  const anchors = 2;
+  const channels = 4 + 1 + 2; // cxcywh + 1 class + 2 mask coeffs
+  const head = new Float32Array(channels * anchors);
+  const put = (c: number, j: number, v: number): void => {
+    head[c * anchors + j] = v;
+  };
+  // anchor 0: box covering the whole 8x8 input, class score 0.9, coeffs [4, 0]
+  put(0, 0, 4); put(1, 0, 4); put(2, 0, 8); put(3, 0, 8); put(4, 0, 0.9); put(5, 0, 4); put(6, 0, 0);
+  // anchor 1: below confidence
+  put(4, 1, 0.1);
+  const pw = 4;
+  const ph = 4;
+  const proto = new Float32Array(2 * ph * pw);
+  for (let y = 0; y < ph; y++) {
+    for (let x = 0; x < pw; x++) {
+      proto[(0 * ph + y) * pw + x] = y < 2 ? 1 : -1; // proto 0: top half on
+      proto[(1 * ph + y) * pw + x] = 5; // proto 1: everywhere (must be ignored, coeff 0)
+    }
+  }
+  const instances = postprocessYoloV8Seg(head, [1, channels, anchors], proto, [1, 2, ph, pw], {
+    classNames: ['road'],
+    minConfidence: 0.5,
+    iouThreshold: 0.45,
+    maskThreshold: 0.5,
+    scale: 1,
+    padX: 0,
+    padY: 0,
+    sourceWidth: 8,
+    sourceHeight: 8,
+    inputWidth: 8,
+    inputHeight: 8,
+  });
+  assert.strictEqual(instances.length, 1);
+  const inst = instances[0];
+  assert.strictEqual(inst.cls, 'road');
+  assert.strictEqual(inst.maskWidth, 4);
+  assert.strictEqual(inst.maskHeight, 4);
+  for (let y = 0; y < 4; y++) {
+    for (let x = 0; x < 4; x++) {
+      assert.strictEqual(unpackBit(inst.maskBits, y * 4 + x), y < 2, `mask (${x},${y})`);
+    }
+  }
+
+  // Mask drawing blends only masked pixels; depth overlay blends everywhere.
+  const w = 8;
+  const h = 8;
+  const canvas = Buffer.alloc(w * h * 4, 64);
+  drawSegments(canvas, w, h, [inst], false);
+  // Canvas rows 0-3 map to mask rows 0-1 (top half, set); rows 4-7 to mask
+  // rows 2-3 (clear). Row 5 col 3 avoids the 1 px box outline.
+  assert.notStrictEqual(canvas[(0 * w + 3) * 4], 64, 'masked pixel must be tinted');
+  assert.strictEqual(canvas[(5 * w + 3) * 4 + 2], 64, 'unmasked interior blue channel untouched');
+  const canvas2 = Buffer.alloc(4 * 4 * 4, 64);
+  blendDepthOverlay(canvas2, 4, 4, halfMap);
+  assert.notStrictEqual(canvas2[0], 64, 'depth overlay must tint the frame');
+  console.log('ok: depth/segmentation vision units (normalize, median-in-box, seg decode, drawing)');
+}
+
+// --- 18. Fusion events leg, deterministic (proximity_gate + boolean -> event) ---------
+async function testProximityFusionLeg(): Promise<void> {
+  const gate = getExecutor('logic.proximity_gate')!;
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const emptyMap = { width: 1, height: 1, min: 0, max: 1, encoding: 'u8' as const, data: Buffer.from([0]).toString('base64') };
+  const depthMsg = (seq: number, boxes: Array<{ cls: string; confidence: number; proximity: number }>) => ({
+    ch: 'json' as const,
+    tag: 'depth',
+    ts: t0 + seq * 500,
+    seq,
+    payload: {
+      ts: t0 + seq * 500,
+      frameSeq: seq,
+      width: 640,
+      height: 480,
+      stats: { min: 0, max: 1, mean: 0.5, median: 0.5 },
+      map: emptyMap,
+      boxes: boxes.map((b) => ({ ...b, xyxy: [10, 10, 50, 90] as [number, number, number, number] })),
+    } satisfies DepthPayload,
+  });
+
+  // Guard: depth records WITHOUT boxes (no detections wired) fail the gate.
+  const bare = new BoundedChannel<EngineMessage>(4);
+  const noBoxes = depthMsg(0, []);
+  delete (noBoxes.payload as { boxes?: unknown }).boxes;
+  await bare.push(noBoxes);
+  bare.close();
+  await assert.rejects(
+    async () => {
+      const ctx = stubCtx({ nodeId: 'prox0' });
+      for await (const _m of gate(
+        [{ port: 'depth', from: { nodeId: 'dep', port: 'depth' }, messages: bare }],
+        {},
+        ctx,
+      )) {
+        /* consume */
+      }
+    },
+    /Detections input/,
+    'boxless depth records must fail the gate loudly',
+  );
+
+  // Gate: far car -> false; near car -> true; near person filtered by class.
+  const depthCh = new BoundedChannel<EngineMessage>(16);
+  await depthCh.push(depthMsg(0, []));
+  await depthCh.push(depthMsg(1, [{ cls: 'car', confidence: 0.9, proximity: 0.3 }]));
+  await depthCh.push(depthMsg(2, [{ cls: 'person', confidence: 0.9, proximity: 0.95 }]));
+  await depthCh.push(depthMsg(3, [{ cls: 'car', confidence: 0.9, proximity: 0.85 }]));
+  await depthCh.push(depthMsg(4, [{ cls: 'car', confidence: 0.9, proximity: 0.88 }]));
+  depthCh.close();
+  const gateCtx = stubCtx({ nodeId: 'prox' });
+  const gateOut = new BoundedChannel<EngineMessage>(16);
+  let seq = 0;
+  for await (const msg of gate(
+    [{ port: 'depth', from: { nodeId: 'dep', port: 'depth' }, messages: depthCh }],
+    { classes: ['car', 'truck'], minProximity: 0.6 },
+    gateCtx,
+  )) {
+    await gateOut.push({ ...msg, seq: seq++ } as EngineMessage);
+  }
+  gateOut.close();
+  assert.strictEqual(gateCtx.summary, 'true on 2/5 depth frame(s)');
+
+  // Boolean AND with a braking condition that is true from t0+1000 on; the
+  // fused stream first turns true at the near-car frame (t0+1500).
+  const boolExec = getExecutor('logic.boolean')!;
+  const brakeCh = new BoundedChannel<EngineMessage>(16);
+  for (let i = 0; i < 5; i++) {
+    await brakeCh.push({ ch: 'condition', ts: t0 + i * 500 + 1, seq: i, payload: { value: i >= 2 } });
+  }
+  brakeCh.close();
+  const boolCtx = stubCtx({ nodeId: 'fuse' });
+  const fused = new BoundedChannel<EngineMessage>(32);
+  seq = 0;
+  for await (const msg of boolExec(
+    [
+      { port: 'conditions', from: { nodeId: 'prox', port: 'condition' }, messages: gateOut },
+      { port: 'conditions', from: { nodeId: 'thr', port: 'condition' }, messages: brakeCh },
+    ],
+    { op: 'and' },
+    boolCtx,
+  )) {
+    await fused.push({ ...msg, seq: seq++ } as EngineMessage);
+  }
+  fused.close();
+
+  const eventExec = getExecutor('output.event')!;
+  const evtCtx = stubCtx({ nodeId: 'evt' });
+  for await (const _msg of eventExec(
+    [{ port: 'condition', from: { nodeId: 'fuse', port: 'condition' }, messages: fused }],
+    { kind: 'sudden_stop_behind_vehicle' },
+    evtCtx,
+  )) {
+    assert.fail('output.event must not emit messages');
+  }
+  const events = evtCtx.events as Array<{ kind: string; occurredAt: string }>;
+  assert.strictEqual(events.length, 1, `expected 1 fused event, got ${events.length}`);
+  assert.strictEqual(events[0].kind, 'sudden_stop_behind_vehicle');
+  assert.strictEqual(Date.parse(events[0].occurredAt), t0 + 3 * 500, 'event fires on the near-car frame');
+  console.log('ok: fusion events leg (proximity_gate -> boolean AND -> one rising-edge event)');
+}
+
+// --- 19. telemetry_materialized binding (M4 container telemetry seam) -----------------
+async function testMaterializedTelemetry(): Promise<void> {
+  // Parser: unordered lines sort by ts; bad lines fail loudly.
+  const jsonl =
+    JSON.stringify({ ts: 2000, signals: { 'gps.speed': 12 } }) +
+    '\n' +
+    JSON.stringify({ ts: 1000, signals: { 'gps.speed': 11, 'imu.accel_x': -0.2 } }) +
+    '\n';
+  const samples = parseTelemetryJsonl(jsonl);
+  assert.deepStrictEqual(
+    samples.map((s) => s.ts),
+    [1000, 2000],
+  );
+  assert.strictEqual(samples[0].signals['imu.accel_x'], -0.2);
+  assert.throws(() => parseTelemetryJsonl('not json\n'), /not JSON/);
+  assert.throws(() => parseTelemetryJsonl('{"ts":"x"}\n'), /sample/);
+
+  // Through the executor + fetchText seam, exactly like the dispatcher writes it.
+  const executor = getExecutor('source.telemetry')!;
+  const key = 'workflows/v2/runs/run-m/inputs/src/records.jsonl';
+  const sources: EngineSourceReader = {
+    readTelemetryWindow: async () => {
+      throw new Error('materialized binding must not read the telemetry store');
+    },
+    fetchText: async (ref) => {
+      assert.strictEqual(ref.bucket, null);
+      assert.strictEqual(ref.key, key);
+      return jsonl;
+    },
+  };
+  const ctx = stubCtx({
+    nodeId: 'src',
+    sources,
+    binding: { kind: 'telemetry_materialized', s3Key: key },
+  });
+  const speeds: number[] = [];
+  for await (const msg of executor([], { metrics: ['gps.speed'] }, ctx)) {
+    speeds.push((msg.payload as { signals: Record<string, number> }).signals['gps.speed']);
+  }
+  assert.deepStrictEqual(speeds, [11, 12]);
+  assert.match(ctx.summary ?? '', /materialized history/);
+  console.log('ok: telemetry_materialized (jsonl parser + fetchText seam through source.telemetry)');
+}
+
+// --- 20/21. Scenario 3 + 8: local model registry over the M4 exports -------------------
+const EXPORT_OUT = path.resolve(__dirname, '../model-export/out');
+const DEPTH_MODEL_DIR = path.join(EXPORT_OUT, 'depth/depth-anything-v2-small/1');
+const SEG_MODEL_DIR = path.join(EXPORT_OUT, 'segmentation/yolov8n-seg/1');
+
+function localRegistrySources(): EngineSourceReader {
+  return {
+    readTelemetryWindow: async () => {
+      throw new Error('media scenarios must not read a telemetry store');
+    },
+    fetchVideo: async () => {
+      throw new Error('video_local bindings must not hit fetchVideo');
+    },
+    fetchModel: async ({ family, name }) => {
+      if (family === 'detection') {
+        assert.strictEqual(name, 'yolov8n');
+        return { manifest: localDetectionManifest(), modelPath: YOLO_MODEL_PATH };
+      }
+      const dir = family === 'depth' ? DEPTH_MODEL_DIR : SEG_MODEL_DIR;
+      if (!existsSync(path.join(dir, 'model.onnx'))) {
+        throw new Error(
+          `scenario needs ${dir}/model.onnx; run the model-export/ scripts first (export_depth.py / export_yolo.py --name yolov8n-seg)`,
+        );
+      }
+      const manifest = modelManifestSchema.parse(
+        JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8')),
+      );
+      assert.strictEqual(manifest.name, name);
+      return { manifest, modelPath: path.join(dir, 'model.onnx') };
+    },
+  };
+}
+
+function collectingArtifacts(): { sink: EngineArtifactSink; frames: Map<string, Buffer> } {
+  const frames = new Map<string, Buffer>();
+  return {
+    frames,
+    sink: {
+      async putFrame(nodeId, frameSeq, jpegBuf) {
+        const artifactKey = `frames/${nodeId}/${frameSeq}.jpg`;
+        frames.set(artifactKey, jpegBuf);
+        return artifactKey;
+      },
+    },
+  };
+}
+
+const graphNode = (id: string, type: string, label: string, config: Record<string, unknown>) => ({
+  id,
+  type,
+  position: { x: 0, y: 0 },
+  data: { label, config },
+});
+const graphEdge = (source: string, target: string, sourceHandle: string, targetHandle: string) => ({
+  id: `${source}-${target}`,
+  source,
+  target,
+  sourceHandle,
+  targetHandle,
+});
+
+async function testScenario3(): Promise<void> {
+  const workDir = await mkdtemp(path.join(tmpdir(), 'engine-smoke-s3-'));
+  const mp4Path = path.join(workDir, 'road.mp4');
+  await synthesizeMp4(mp4Path);
+
+  const t0 = Date.parse('2026-01-01T12:00:00Z');
+  // 30 s at 1 Hz: cruise at 40 kph, brake hard 40 -> 0 between t+15 and t+18,
+  // then stopped. One wild outlier at t+5 for outlier_removal to eat.
+  const gpsSamples = [...Array(30).keys()].map((i) => ({
+    ts: t0 + i * 1000,
+    signals: {
+      'gps.speed': i === 5 ? 400 : i < 15 ? 40 : i < 18 ? 40 - (i - 14) * 13.3 : 0,
+    },
+  }));
+  const imuSamples = [...Array(30).keys()].map((i) => ({
+    ts: t0 + i * 1000 + 50, // slightly offset clock: time_align merges these
+    signals: { 'imu.accel_x': i >= 15 && i < 18 ? -3.7 : 0.05 },
+  }));
+
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      graphNode('gps', 'source.telemetry', 'GPS', { metrics: ['gps.speed'] }),
+      graphNode('imu', 'source.telemetry', 'IMU', { metrics: ['imu.accel_x'] }),
+      graphNode('align', 'telemetry.time_align', 'Time Align', { toleranceMs: 200 }),
+      graphNode('clean', 'telemetry.outlier_removal', 'Outlier Removal', {
+        signal: 'gps.speed',
+        method: 'zscore',
+        threshold: 3,
+      }),
+      graphNode('kal', 'telemetry.kalman', 'Kalman Filter', {
+        signal: 'gps.speed',
+        processNoise: 1,
+        measurementNoise: 0.05,
+      }),
+      graphNode('rate', 'telemetry.derivative', 'Derivative', {
+        mode: 'rate',
+        signal: 'gps.speed',
+        outputSignal: 'speed_rate',
+      }),
+      graphNode('thr', 'logic.threshold', 'Hard Braking', {
+        signal: 'speed_rate',
+        operator: 'lt',
+        value: -8,
+      }),
+      graphNode('vid', 'source.video', 'Video', {}),
+      graphNode('dec', 'video.decode_sample', 'Decode & Sample', { fps: 2 }),
+      graphNode('det', 'model.object_detection', 'Object Detection', {
+        model: 'yolov8n',
+        minConfidence: 0.5,
+        classes: ['car', 'truck', 'bus'],
+      }),
+      graphNode('dep', 'model.depth', 'Depth Estimation', { model: 'depth-anything-v2-small' }),
+      graphNode('prox', 'logic.proximity_gate', 'Proximity Gate', {
+        classes: ['car', 'truck', 'bus'],
+        minProximity: 0.6,
+      }),
+      graphNode('fuse', 'logic.boolean', 'Boolean Combine', { op: 'and' }),
+      graphNode('evt', 'output.event', 'Emit Event', { kind: 'sudden_stop_behind_vehicle' }),
+      graphNode('capd', 'output.data_capture', 'Depth Capture', { format: 'jsonl' }),
+    ],
+    edges: [
+      graphEdge('gps', 'align', 'telemetry', 'telemetry'),
+      graphEdge('imu', 'align', 'telemetry', 'telemetry'),
+      graphEdge('align', 'clean', 'telemetry', 'telemetry'),
+      graphEdge('clean', 'kal', 'telemetry', 'telemetry'),
+      graphEdge('kal', 'rate', 'telemetry', 'telemetry'),
+      graphEdge('rate', 'thr', 'telemetry', 'telemetry'),
+      graphEdge('thr', 'fuse', 'condition', 'conditions'),
+      graphEdge('vid', 'dec', 'video', 'video'),
+      graphEdge('dec', 'det', 'frames', 'frames'),
+      graphEdge('dec', 'dep', 'frames', 'frames'),
+      graphEdge('det', 'dep', 'detections', 'detections'),
+      graphEdge('dep', 'prox', 'depth', 'depth'),
+      graphEdge('dep', 'capd', 'depth', 'records'),
+      graphEdge('prox', 'fuse', 'condition', 'conditions'),
+      graphEdge('fuse', 'evt', 'condition', 'condition'),
+    ],
+  };
+
+  const { sink, frames } = collectingArtifacts();
+  const outcome = await runGraph(
+    {
+      runId: 'run-scenario3',
+      mode: 'batch',
+      deviceId: null,
+      window: null,
+      definition,
+      bindings: {
+        gps: { kind: 'telemetry_inline', samples: gpsSamples },
+        imu: { kind: 'telemetry_inline', samples: imuSamples },
+        vid: { kind: 'video_local', path: mp4Path, startedAt: '2026-01-01T12:00:00Z' },
+      },
+    },
+    { sources: localRegistrySources(), artifacts: sink, channelCapacity: 8 },
+  );
+
+  assert.strictEqual(outcome.status, 'succeeded', `run failed: ${outcome.error} (${outcome.failedNodeId})`);
+  for (const step of outcome.steps) {
+    assert.strictEqual(step.status, 'ok', `step ${step.nodeId}: ${step.output}`);
+  }
+  const byNode = new Map(outcome.steps.map((s) => [s.nodeId, s]));
+  // The telemetry leg: outlier eaten, braking detected.
+  assert.match(byNode.get('clean')!.output, /dropped 1 outlier/);
+  assert.match(byNode.get('thr')!.output, /true on [1-9]/, byNode.get('thr')!.output);
+  // The video leg: depth records captured with maps, stats, and (empty) boxes;
+  // testsrc has no vehicles, so the fused event count is zero BY DESIGN (the
+  // deterministic event assertion is the fusion-leg unit).
+  const depthRecords = (outcome.captures['capd'] ?? []) as Array<{ tag: string; record: DepthPayload }>;
+  assert.ok(depthRecords.length >= 4, `expected sampled depth records, got ${depthRecords.length}`);
+  assert.strictEqual(depthRecords[0].tag, 'depth');
+  const rec = depthRecords[0].record;
+  assert.ok(rec.stats.max > rec.stats.min, 'raw depth range must be non-degenerate');
+  assert.ok(rec.map.width <= 160 && rec.map.width >= 2, `embedded map width ${rec.map.width}`);
+  const mapBytes = Buffer.from(rec.map.data, 'base64');
+  assert.strictEqual(mapBytes.length, rec.map.width * rec.map.height, 'embedded map length matches dims');
+  assert.ok(Array.isArray(rec.boxes), 'depth records carry per-box proximity (detections wired)');
+  assert.match(byNode.get('prox')!.output, /depth frame\(s\)/);
+  assert.strictEqual(outcome.events.length, 0, 'testsrc has no vehicles: fused event must not fire');
+  // Depth preview renders (colormap JPEGs through the artifact sink).
+  const depFrames = [...frames.keys()].filter((k) => k.startsWith('frames/dep/'));
+  assert.strictEqual(depFrames.length, depthRecords.length, 'one rendered depth frame per record');
+  const jpeg = frames.get(depFrames[0])!;
+  assert.strictEqual(jpeg[0], 0xff);
+  assert.strictEqual(jpeg[1], 0xd8, 'depth preview must be a JPEG');
+  const decoded = decodeJpegToRgba(jpeg);
+  assert.strictEqual(decoded.width, 320, 'depth preview renders at source frame size');
+  console.log(
+    `ok: scenario 3 (fusion: time_align/outlier/kalman/derivative/threshold + detection/depth/proximity -> boolean) — ${depthRecords.length} depth records, dep: ${byNode.get('dep')!.output}`,
+  );
+}
+
+async function testScenario8(): Promise<void> {
+  const workDir = await mkdtemp(path.join(tmpdir(), 'engine-smoke-s8-'));
+  const mp4Path = path.join(workDir, 'scene.mp4');
+  await synthesizeMp4(mp4Path);
+
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      graphNode('vid', 'source.video', 'Video', {}),
+      graphNode('dec', 'video.decode_sample', 'Decode & Sample', { fps: 2 }),
+      graphNode('seg', 'model.segmentation', 'Segmentation', { model: 'yolov8n-seg', minConfidence: 0.4 }),
+      graphNode('dep', 'model.depth', 'Depth Estimation', {
+        model: 'depth-anything-v2-small',
+        renderPreview: false,
+      }),
+      graphNode('viz', 'output.visualization', 'Video Visualization', {
+        overlays: ['masks', 'labels', 'depth_map'],
+      }),
+      graphNode('caps', 'output.data_capture', 'Segments Capture', { format: 'jsonl' }),
+    ],
+    edges: [
+      graphEdge('vid', 'dec', 'video', 'video'),
+      graphEdge('dec', 'seg', 'frames', 'frames'),
+      graphEdge('dec', 'dep', 'frames', 'frames'),
+      graphEdge('dec', 'viz', 'frames', 'frames'),
+      graphEdge('seg', 'viz', 'segments', 'segments'),
+      graphEdge('dep', 'viz', 'depth', 'depth'),
+      graphEdge('seg', 'caps', 'segments', 'records'),
+    ],
+  };
+
+  const { sink, frames } = collectingArtifacts();
+  const outcome = await runGraph(
+    {
+      runId: 'run-scenario8',
+      mode: 'batch',
+      deviceId: null,
+      window: null,
+      definition,
+      bindings: { vid: { kind: 'video_local', path: mp4Path, startedAt: '2026-01-01T12:00:00Z' } },
+    },
+    { sources: localRegistrySources(), artifacts: sink, channelCapacity: 8 },
+  );
+
+  assert.strictEqual(outcome.status, 'succeeded', `run failed: ${outcome.error} (${outcome.failedNodeId})`);
+  for (const step of outcome.steps) {
+    assert.strictEqual(step.status, 'ok', `step ${step.nodeId}: ${step.output}`);
+  }
+  const segRecords = (outcome.captures['caps'] ?? []) as Array<{
+    tag: string;
+    record: { frameSeq: number; instances: unknown[] };
+  }>;
+  assert.ok(segRecords.length >= 4, `expected sampled segment records, got ${segRecords.length}`);
+  assert.strictEqual(segRecords[0].tag, 'segments');
+  for (const r of segRecords) {
+    assert.ok(Array.isArray(r.record.instances), 'each segments record carries an instances array');
+  }
+  const vizFrames = [...frames.keys()].filter((k) => k.startsWith('frames/viz/'));
+  assert.strictEqual(vizFrames.length, segRecords.length, 'one visualization JPEG per frame');
+  const decoded = decodeJpegToRgba(frames.get(vizFrames[0])!);
+  assert.strictEqual(decoded.width, 320);
+  assert.strictEqual(decoded.height, 240);
+  // renderPreview: false on the depth node must suppress its own frames while
+  // the visualization (depth_map overlay) still renders.
+  assert.strictEqual(
+    [...frames.keys()].filter((k) => k.startsWith('frames/dep/')).length,
+    0,
+    'renderPreview: false suppresses depth preview frames',
+  );
+  const byNode = new Map(outcome.steps.map((s) => [s.nodeId, s]));
+  console.log(
+    `ok: scenario 8 (recording -> segmentation (+depth) -> masks/depth visualization) — ${vizFrames.length} frames, seg: ${byNode.get('seg')!.output}`,
+  );
+}
+
 async function main(): Promise<void> {
   await testBackpressure();
   await testDropOldest();
@@ -1120,6 +1713,12 @@ async function main(): Promise<void> {
   await testTelemetryCsv();
   await testProgressPlane();
   testSimulationsModule();
+  await testGeofence();
+  testDepthSegVisionUnits();
+  await testProximityFusionLeg();
+  await testMaterializedTelemetry();
+  await testScenario3();
+  await testScenario8();
   console.log('\nengine smoke: all checks passed');
 }
 

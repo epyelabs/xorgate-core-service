@@ -5,8 +5,9 @@ import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import type { WorkflowDefinition } from '../schemas/workflows';
+import { readTelemetryWindow } from './telemetry-window';
 import { getNodeType } from '../workflows/catalog/index';
-import { manifestKey, runPrefix, type RunManifest } from '../workflows/engine/manifest';
+import { inputRecordsKey, manifestKey, runPrefix, type RunManifest } from '../workflows/engine/manifest';
 
 /**
  * v2 engine dispatch: write the v2 manifest to S3, then either async-invoke
@@ -74,6 +75,75 @@ async function failRun(runId: string, error: string): Promise<void> {
     .update(schema.workflowRuns)
     .set({ status: 'failed', endedAt: new Date(), error })
     .where(eq(schema.workflowRuns.id, runId));
+}
+
+/**
+ * The M4 container telemetry seam: dispatcher-materialized inputs. The engine
+ * task role is deliberately DB-free, so before a FARGATE dispatch every
+ * telemetry_history binding is resolved HERE (same drizzle reader as the
+ * Lambda engine, services/telemetry-window.ts), written to
+ * inputs/<nodeId>/records.jsonl under the run prefix, and swapped for a
+ * telemetry_materialized binding the executor reads through its existing
+ * fetchText seam. Lambda dispatches keep reading history directly (cheaper,
+ * no double storage). Inputs without a telemetry_history binding pass through
+ * untouched.
+ *
+ * `metrics` default comes from the source node's config (same rule the
+ * executor applies), `window` from the binding else the run window.
+ */
+export async function materializeHistoryInputs(args: {
+  runId: string;
+  definition: WorkflowDefinition;
+  inputs: RunManifest['inputs'];
+  deviceId: string | null;
+  window: { from: string; to: string } | null;
+}): Promise<RunManifest['inputs']> {
+  if (!BUCKET) throw new Error('v2 engine is not configured (BUCKET_NAME unset)');
+  const nodesById = new Map(args.definition.nodes.map((n) => [n.id, n]));
+  const out: RunManifest['inputs'] = [];
+  for (const input of args.inputs) {
+    if (input.binding.kind !== 'telemetry_history') {
+      out.push(input);
+      continue;
+    }
+    const node = nodesById.get(input.nodeId);
+    const binding = input.binding as {
+      kind: 'telemetry_history';
+      metrics?: string[];
+      window?: { from: string; to: string };
+    };
+    const configMetrics = (node?.data.config as { metrics?: unknown } | undefined)?.metrics;
+    const metrics =
+      binding.metrics ??
+      (Array.isArray(configMetrics) ? configMetrics.filter((m): m is string => typeof m === 'string') : []);
+    if (metrics.length === 0) {
+      throw new Error(`Telemetry source "${input.nodeId}" has no metrics to materialize`);
+    }
+    const window = binding.window ?? args.window;
+    if (!window) throw new Error(`Telemetry source "${input.nodeId}" has no data window to materialize`);
+    if (!args.deviceId) throw new Error(`Telemetry source "${input.nodeId}" needs a device on the run`);
+    const samples = await readTelemetryWindow({
+      deviceId: args.deviceId,
+      metrics,
+      window: { fromMs: Date.parse(window.from), toMs: Date.parse(window.to) },
+    });
+    const key = inputRecordsKey(args.runId, input.nodeId);
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+        Body: samples.map((s) => JSON.stringify(s)).join('\n') + '\n',
+        ContentType: 'application/x-ndjson',
+      }),
+    );
+    console.log('workflow-engine-v2: materialized telemetry input', {
+      runId: args.runId,
+      nodeId: input.nodeId,
+      samples: samples.length,
+    });
+    out.push({ nodeId: input.nodeId, binding: { kind: 'telemetry_materialized', s3Key: key } });
+  }
+  return out;
 }
 
 export interface DispatchV2Options {

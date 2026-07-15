@@ -1,10 +1,14 @@
-"""Export a YOLO detection model to the S3 model registry layout.
+"""Export a YOLO detection or segmentation model to the S3 model registry layout.
 
 Produces, under --out/<family>/<name>/<version>/:
   model.onnx                exported with ultralytics (opset 12, static 640x640)
   manifest.json             the registry manifest (src/workflows/models/registry.ts)
   fixtures/fixture_0.png    deterministic synthetic parity image
-  fixtures/expected_0.json  decoded detections + raw-output stats for engine CI
+  fixtures/expected_0.json  raw-output stats (+ top head rows) for engine CI
+
+Segmentation names (yolov8n-seg) publish under family "segmentation" with
+postprocess kind "yolov8-seg" (detection head + prototype masks; the TS
+decoder is src/workflows/engine/vision.ts postprocessYoloV8Seg).
 
 Upload with `aws s3 cp --recursive` (see README.md). Versions are immutable:
 bump --version instead of overwriting.
@@ -25,15 +29,28 @@ NMS_IOU = 0.45
 ULTRALYTICS_IDS = {
     "yolov8n": "yolov8n.pt",
     "yolov8s": "yolov8s.pt",
+    "yolov8n-seg": "yolov8n-seg.pt",
     "rtdetr": "rtdetr-l.pt",
 }
+
+
+def family_for(name: str) -> str:
+    return "segmentation" if name.endswith("-seg") else "detection"
+
+
+def postprocess_for(name: str) -> dict:
+    if name.endswith("-seg"):
+        return {"kind": "yolov8-seg", "nmsIouThreshold": NMS_IOU, "maskThreshold": 0.5}
+    if name == "rtdetr":
+        return {"kind": "rtdetr", "nmsIouThreshold": NMS_IOU}
+    return {"kind": "yolov8", "nmsIouThreshold": NMS_IOU}
 
 
 def build_manifest(name: str, version: int, class_names: list[str]) -> dict:
     """Mirror of modelManifestSchema in src/workflows/models/registry.ts."""
     return {
         "manifestVersion": 1,
-        "family": "detection",
+        "family": family_for(name),
         "name": name,
         "version": version,
         "label": name,
@@ -47,10 +64,7 @@ def build_manifest(name: str, version: int, class_names: list[str]) -> dict:
             "letterbox": {"enabled": True, "padValue": 114},
         },
         "classNames": class_names,
-        "postprocess": {
-            "kind": "rtdetr" if name == "rtdetr" else "yolov8",
-            "nmsIouThreshold": NMS_IOU,
-        },
+        "postprocess": postprocess_for(name),
         "quantization": "fp32",
     }
 
@@ -91,7 +105,7 @@ def main() -> None:
 
     from ultralytics import YOLO  # heavy import, keep local
 
-    dest = args.out / "detection" / args.name / str(args.version)
+    dest = args.out / family_for(args.name) / args.name / str(args.version)
     fixtures = dest / "fixtures"
     fixtures.mkdir(parents=True, exist_ok=True)
 
@@ -111,23 +125,30 @@ def main() -> None:
     Image.fromarray(img).save(fixtures / "fixture_0.png")
     blob, scale, pad_x, pad_y = letterbox(img)
     session = ort.InferenceSession(str(dest / "model.onnx"), providers=["CPUExecutionProvider"])
-    (output,) = session.run(None, {session.get_inputs()[0].name: blob})
+    outputs = session.run(None, {session.get_inputs()[0].name: blob})
+    # Detection exports one output; -seg exports the head + prototype masks.
+    head = next(o for o in outputs if o.ndim == 3)
 
-    preds = output[0].T  # (N, 4 + classes)
-    confs = preds[:, 4:].max(axis=1)
+    n_classes = len(class_names)
+    preds = head[0].T  # (N, 4 + classes [+ mask coeffs])
+    confs = preds[:, 4 : 4 + n_classes].max(axis=1)
     top = preds[confs.argsort()[::-1][:10]]
     expected = {
         "input": {"scale": scale, "padX": pad_x, "padY": pad_y},
-        "outputShape": list(output.shape),
+        "outputShape": list(head.shape),
         "outputStats": {
-            "mean": float(output.mean()),
-            "max": float(output.max()),
+            "mean": float(head.mean()),
+            "max": float(head.max()),
             "maxClassScore": float(confs.max()),
         },
         # Raw top rows (letterboxed pixels) so the TS decode can be asserted
         # end to end without re-running inference in CI.
         "topRows": [[float(v) for v in row] for row in top],
     }
+    proto = next((o for o in outputs if o.ndim == 4), None)
+    if proto is not None:
+        expected["protoShape"] = list(proto.shape)
+        expected["protoStats"] = {"mean": float(proto.mean()), "max": float(proto.max())}
     (fixtures / "expected_0.json").write_text(json.dumps(expected, indent=2) + "\n")
     print(f"exported {args.name} v{args.version} -> {dest}")
 

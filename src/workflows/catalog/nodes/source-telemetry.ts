@@ -52,6 +52,15 @@ const bindingSchema = z.discriminatedUnion('kind', [
     bucket: z.string().min(1).optional(), // default: the run's output bucket
     metrics: z.array(z.string().min(1)).min(1).optional(), // default: every numeric column
   }),
+  // M4 (container telemetry seam): the DISPATCHER pre-read a history window
+  // and wrote it to inputs/<nodeId>/records.jsonl under the run prefix; the
+  // executor fetches it through the same fetchText seam CSV uses. This is how
+  // fusion graphs get device history on the DB-less Fargate target.
+  z.object({
+    kind: z.literal('telemetry_materialized'),
+    s3Key: z.string().min(1),
+    bucket: z.string().min(1).optional(), // default: the run's output bucket
+  }),
 ]);
 
 // CSV format (FROZEN for the M3 uploads): a header row with a `ts` column
@@ -98,6 +107,33 @@ export function parseTelemetryCsv(
   return { samples, skippedCells };
 }
 
+/**
+ * Materialized-history format (M4, written by the dispatcher): one
+ * `{ ts, signals }` JSON object per line, ts-ordered epoch ms. Bad lines fail
+ * the node: the writer is first-party, so a parse error means a real bug.
+ */
+export function parseTelemetryJsonl(text: string): TelemetrySample[] {
+  const samples: TelemetrySample[] = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line === '') continue;
+    let row: unknown;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      throw new Error(`materialized telemetry line ${i + 1} is not JSON`);
+    }
+    const sample = row as TelemetrySample;
+    if (typeof sample?.ts !== 'number' || typeof sample?.signals !== 'object' || sample.signals === null) {
+      throw new Error(`materialized telemetry line ${i + 1} is not a { ts, signals } sample`);
+    }
+    samples.push({ ts: sample.ts, signals: sample.signals });
+  }
+  samples.sort((a, b) => a.ts - b.ts);
+  return samples;
+}
+
 async function readSamples(
   cfg: z.infer<typeof configSchema>,
   ctx: EngineRunCtx,
@@ -118,6 +154,13 @@ async function readSamples(
       const { samples, skippedCells } = parseTelemetryCsv(text, binding.metrics);
       if (skippedCells > 0) ctx.log(`CSV: skipped ${skippedCells} non-numeric cell(s)`);
       return { samples, feed: 'csv' };
+    }
+    case 'telemetry_materialized': {
+      if (!ctx.sources.fetchText) {
+        throw new Error('This engine target cannot fetch materialized inputs (no fetchText seam)');
+      }
+      const text = await ctx.sources.fetchText({ bucket: binding.bucket ?? null, key: binding.s3Key });
+      return { samples: parseTelemetryJsonl(text), feed: 'materialized history' };
     }
     case 'telemetry_history': {
       const metrics = binding.metrics ?? cfg.metrics;

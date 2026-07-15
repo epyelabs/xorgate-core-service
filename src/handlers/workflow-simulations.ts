@@ -6,7 +6,7 @@ import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, created, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
-import { dispatchV2Run } from '../services/workflow-engine-v2';
+import { dispatchV2Run, materializeHistoryInputs } from '../services/workflow-engine-v2';
 import { validateDefinitionForPublish } from '../workflows/validate';
 import {
   buildSimulationManifest,
@@ -225,14 +225,41 @@ export const handler = async (
         })
         .returning();
 
+      const window = simulationWindow(bindings);
+      let inputs = toManifestInputs(bindings, recordings);
+      if (target === 'fargate') {
+        // M4 container telemetry seam: the engine task role is DB-free, so
+        // history bindings are pre-read here and swapped for materialized
+        // inputs/<nodeId>/records.jsonl objects (Lambda runs read directly).
+        try {
+          inputs = await materializeHistoryInputs({
+            runId: run.id,
+            definition,
+            inputs,
+            deviceId,
+            window,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await db
+            .update(schema.workflowRuns)
+            .set({ status: 'failed', endedAt: new Date(), error: `Failed to materialize inputs: ${message}` })
+            .where(eq(schema.workflowRuns.id, run.id));
+          return errorResponse(502, 'SIMULATION_DISPATCH_FAILED', 'Failed to start the simulation engine', {
+            runId: run.id,
+            message,
+          });
+        }
+      }
+
       const manifest = buildSimulationManifest({
         runId: run.id,
         orgId,
         bucket: BUCKET,
         definition,
         deviceId,
-        inputs: toManifestInputs(bindings, recordings),
-        window: simulationWindow(bindings),
+        inputs,
+        window,
         target,
       });
 

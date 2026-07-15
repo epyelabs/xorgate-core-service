@@ -1,8 +1,6 @@
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
-import { db, schema } from '../db/index';
-import { tsParam } from '../utils/sql';
+import { readTelemetryWindow } from '../services/telemetry-window';
 import { getNodeType } from '../workflows/catalog/index';
-import type { EngineSourceReader, TelemetrySample } from '../workflows/catalog/types';
+import type { EngineSourceReader } from '../workflows/catalog/types';
 import { runGraph, type EngineRunOutcome } from '../workflows/engine/index';
 import { manifestKey, resultKey, type RunManifest } from '../workflows/engine/manifest';
 import {
@@ -37,9 +35,6 @@ import { upgradeDefinition } from '../workflows/compat';
 
 const BUCKET = process.env.BUCKET_NAME;
 
-// Memory guard for the in-process run; the history API serves at most 5k rows,
-// so this is generous headroom, not a tuning knob.
-const MAX_TELEMETRY_ROWS = 100_000;
 const DEFAULT_MAX_RUNTIME_SECONDS = 240; // < the Lambda timeout, so the engine fails runs itself
 
 export interface WorkflowEngineEvent {
@@ -54,38 +49,8 @@ const telemetrySources = (bucket: string): EngineSourceReader => ({
   async fetchText({ bucket: refBucket, key }): Promise<string> {
     return s3FetchText(refBucket ?? bucket, key);
   },
-  async readTelemetryWindow({ deviceId, metrics, window }): Promise<TelemetrySample[]> {
-    const rows = await db
-      .select({
-        ts: schema.telemetryReadings.ts,
-        metric: schema.telemetryReadings.metric,
-        value: schema.telemetryReadings.value,
-      })
-      .from(schema.telemetryReadings)
-      .where(
-        and(
-          eq(schema.telemetryReadings.deviceId, deviceId),
-          inArray(schema.telemetryReadings.metric, metrics),
-          sql`${schema.telemetryReadings.ts} >= ${tsParam(new Date(window.fromMs).toISOString())}`,
-          sql`${schema.telemetryReadings.ts} < ${tsParam(new Date(window.toMs).toISOString())}`,
-        ),
-      )
-      .orderBy(asc(schema.telemetryReadings.ts))
-      .limit(MAX_TELEMETRY_ROWS);
-    if (rows.length === MAX_TELEMETRY_ROWS) {
-      console.warn('workflow-engine: telemetry window truncated', { deviceId, metrics });
-    }
-    // Rows are per-metric; group them into one sample per timestamp.
-    const byTs = new Map<number, Record<string, number>>();
-    for (const row of rows) {
-      if (row.value === null) continue;
-      const ts = row.ts.getTime();
-      (byTs.get(ts) ?? byTs.set(ts, {}).get(ts)!)[row.metric] = row.value;
-    }
-    return [...byTs.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([ts, signals]) => ({ ts, signals }));
-  },
+  // Shared with the M4 dispatcher-side materialization (services/telemetry-window.ts).
+  readTelemetryWindow,
 });
 
 export const handler = async (

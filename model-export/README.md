@@ -12,10 +12,11 @@ s3://<core-bucket>/models/<family>/<name>/<version>/manifest.json
 
 The manifest schema is authoritative in
 `src/workflows/models/registry.ts` (zod). Registry names are pinned to the catalog
-defaults: `yolov8n` (default), `yolov8s`, `rtdetr` for family `detection`, and
-`depth-anything-v2-small` for family `depth` (M4). The TS engine implements the
-`yolov8` post-processing head today; `rtdetr` manifests can be published but will be
-refused by the executor until its decoder lands.
+defaults: `yolov8n` (default), `yolov8s`, `rtdetr` for family `detection`,
+`yolov8n-seg` for family `segmentation`, and `depth-anything-v2-small` for family
+`depth`. The TS engine implements the `yolov8`, `yolov8-seg`, and `depth-anything`
+post-processing today; `rtdetr` manifests can be published but will be refused by
+the executor until its decoder lands.
 
 ## Usage
 
@@ -26,9 +27,19 @@ pip install -r requirements.txt
 # Export yolov8n at registry version 1 into ./out/detection/yolov8n/1/
 python export_yolo.py --name yolov8n --version 1 --out ./out
 
+# Instance segmentation (family segmentation, postprocess yolov8-seg)
+python export_yolo.py --name yolov8n-seg --version 1 --out ./out
+
+# Depth Anything V2 Small (family depth, HF checkpoint via torch.onnx)
+python export_depth.py --version 1 --out ./out
+
 # Publish (dev bucket example)
 aws s3 cp --recursive ./out/detection/yolov8n/1/ \
   s3://<core-bucket>/models/detection/yolov8n/1/
+aws s3 cp --recursive ./out/segmentation/yolov8n-seg/1/ \
+  s3://<core-bucket>/models/segmentation/yolov8n-seg/1/
+aws s3 cp --recursive ./out/depth/depth-anything-v2-small/1/ \
+  s3://<core-bucket>/models/depth/depth-anything-v2-small/1/
 ```
 
 ## Parity fixtures
