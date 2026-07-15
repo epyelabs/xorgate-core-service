@@ -1,8 +1,14 @@
 import type { SQSEvent, SQSBatchResponse } from 'aws-lambda';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index';
+import type { WorkflowDefinition } from '../schemas/workflows';
 import { runWorkflowInline } from '../services/workflow-runner';
 import { dispatchFargateRun } from '../services/workflow-fargate';
+import {
+  dispatchV2LambdaRun,
+  isV2TelemetryOnly,
+  v2ExperimentEnabled,
+} from '../services/workflow-engine-v2';
 
 /**
  * Run dispatcher. SQS event source (batchSize 1, reportBatchItemFailures). The
@@ -12,6 +18,10 @@ import { dispatchFargateRun } from '../services/workflow-fargate';
  *   - run already has a taskArn / steps -> ack (already dispatched/processed)
  *   - inline graph  -> runWorkflowInline() in this invocation
  *   - video graph   -> launch the Fargate CV runner (result.json -> finalize Lambda)
+ *
+ * EXPERIMENTAL (WORKFLOW_V2_EXPERIMENT=on, default off): schemaVersion-2
+ * telemetry-only definitions route to the v2 Lambda engine instead. Production
+ * routing is otherwise unchanged until M6.
  */
 export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
   const batchItemFailures: { itemIdentifier: string }[] = [];
@@ -51,6 +61,11 @@ async function dispatchRun(runId: string): Promise<void> {
     .where(eq(schema.workflowRunSteps.runId, runId))
     .limit(1);
   if (existingStep) return; // inline run already persisted steps
+
+  if (v2ExperimentEnabled() && isV2TelemetryOnly(run.definition as WorkflowDefinition)) {
+    await dispatchV2LambdaRun(run);
+    return;
+  }
 
   if (run.executionMode === 'inline') {
     await runWorkflowInline(run);

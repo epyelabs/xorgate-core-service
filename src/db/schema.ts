@@ -492,6 +492,10 @@ export const workflowRuns = pgTable(
     endedAt: timestamp('ended_at', { withTimezone: true }),
     durationMs: integer('duration_ms'),
     metrics: jsonb('metrics').default({}).notNull(),
+    // v2 engine result artifacts ({ eventsKey, outputs: { <nodeId>: { recordsKey,
+    // count, format } } }), stamped by the v2 finalize path so the run detail UI
+    // can link Data Capture downloads. Null on PoC-engine runs.
+    artifacts: jsonb('artifacts'),
     error: text('error'),
     failedNodeId: text('failed_node_id'),
     eventCount: integer('event_count').default(0).notNull(),

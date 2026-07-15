@@ -61,6 +61,13 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   cvTaskRoleArn: string;
   cvExecutionRoleArn: string;
   cvContainerName: string;
+  // v2 engine runner (M2) launch config — same wiring pattern as the CV runner.
+  // Pre-wired on the dispatch Lambda (ENGINE_*); nothing routes to it until the
+  // experimental flag / M6 cutover.
+  engineTaskFamily: string;
+  engineTaskRoleArn: string;
+  engineExecutionRoleArn: string;
+  engineContainerName: string;
 }
 
 export class XorgateCoreApiStack extends cdk.Stack {
@@ -100,6 +107,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       cvTaskRoleArn,
       cvExecutionRoleArn,
       cvContainerName,
+      engineTaskFamily,
+      engineTaskRoleArn,
+      engineExecutionRoleArn,
+      engineContainerName,
     } = props;
 
     const isProd = stage === "prod";
@@ -300,6 +311,28 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // v2 engine runner (M2): same launch pattern as the CV runner, same shared
+    // cluster (StopTask/DescribeTasks already covered by RecorderStopTask).
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "EngineRunTask",
+        actions: ["ecs:RunTask"],
+        resources: [
+          `arn:aws:ecs:${this.region}:${this.account}:task-definition/${engineTaskFamily}:*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "EnginePassRole",
+        actions: ["iam:PassRole"],
+        resources: [engineTaskRoleArn, engineExecutionRoleArn],
+        conditions: {
+          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+        },
+      }),
+    );
+
     // Browser live-telemetry (P2): attach the AWS IoT policy to a caller's Cognito
     // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
     // authorizes against the *target* (a Cognito identity id, not an ARN) → resource "*";
@@ -387,11 +420,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
       RECORDER_REOFFER_INTERVAL_MS: recCtx("recorderReofferIntervalMs", "2000"),
     };
 
+    // onnxruntime-node (native, media targets only) is required lazily inside
+    // the object-detection executor; it must be external in EVERY Lambda bundle
+    // (the catalog registry pulls the node module in) and is never reached at
+    // Lambda runtime (the Lambda engine refuses media graphs pre-flight).
     const commonBundling: nodejs.BundlingOptions = {
       minify: true,
       sourceMap: true,
       target: "node20",
-      externalModules: ["@aws-sdk/*"],
+      externalModules: ["@aws-sdk/*", "onnxruntime-node"],
       forceDockerBundling: false,
     };
 
@@ -400,7 +437,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // bundle the SDK rather than externalize it.
     const bundlingWithSdk: nodejs.BundlingOptions = {
       ...commonBundling,
-      externalModules: [],
+      externalModules: ["onnxruntime-node"],
     };
 
     const vpcProps: Pick<
@@ -876,6 +913,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // Model registry (M2): lists models/<family>/<name>/<version>/manifest.json
+    // from the core bucket for the model pickers. S3 read comes from the shared
+    // lambdaRole bucket grant.
+    const modelRegistryFn = new nodejs.NodejsFunction(
+      this,
+      "ModelRegistryFn",
+      standardFnProps(
+        path.join(entryBase, "model-registry.ts"),
+        "GET /model-registry — S3 model registry listing",
+      ),
+    );
+
     // Device attachments (attach/list/enable/detach + Run now). Run now fires a
     // run via fireWorkflowRun -> SQS, so it bundles the AWS SDK (client-sqs).
     const deviceWorkflowsFn = new nodejs.NodejsFunction(this, "DeviceWorkflowsFn", {
@@ -944,6 +993,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
     workflowDispatchFn.addEnvironment("CV_SG", recorderSecurityGroupId);
     workflowDispatchFn.addEnvironment("CV_CONTAINER_NAME", cvContainerName);
 
+    // v2 engine runner launch config (M2), pre-wired alongside CV_* so cutover
+    // (or the experimental flag) is dispatcher-code-only. Same cluster/VPC/SG.
+    workflowDispatchFn.addEnvironment("ENGINE_CLUSTER_ARN", recorderClusterArn);
+    workflowDispatchFn.addEnvironment("ENGINE_TASKDEF", engineTaskFamily);
+    workflowDispatchFn.addEnvironment("ENGINE_SUBNETS", recorderSubnets);
+    workflowDispatchFn.addEnvironment("ENGINE_SG", recorderSecurityGroupId);
+    workflowDispatchFn.addEnvironment("ENGINE_CONTAINER_NAME", engineContainerName);
+    // Experimental v2 dispatch (default OFF): stored schemaVersion-2
+    // telemetry-only definitions run on the Lambda engine when set to "on".
+    // Production routing stays PoC until M6 either way. Flip at deploy with
+    // --context workflowV2Experiment=on.
+    workflowDispatchFn.addEnvironment(
+      "WORKFLOW_V2_EXPERIMENT",
+      recCtx("workflowV2Experiment", "off"),
+    );
+
     // Fargate CV-run finalizer: result.json (S3 Object Created under workflows/v1/)
     // -> persist steps/events + run status. Same EventBridge->finalize pattern as
     // media-finalize (the bucket already emits EventBridge notifications).
@@ -962,6 +1027,21 @@ export class XorgateCoreApiStack extends cdk.Stack {
         detail: {
           bucket: { name: [bucket.bucketName] },
           object: { key: [{ prefix: "workflows/v1/" }] },
+        },
+      },
+      targets: [new targets.LambdaFunction(workflowRunFinalizeFn)],
+    });
+    // v2 TS-engine results (workflows/v2/) go to the same finalizer, which
+    // branches on resultVersion and still acts only on keys ending in
+    // /result.json (manifests, frames, and records are ignored).
+    new events.Rule(this, "WorkflowRunFinalizeV2Rule", {
+      description: "v2 engine result.json uploaded -> finalize workflow run",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ prefix: "workflows/v2/" }] },
         },
       },
       targets: [new targets.LambdaFunction(workflowRunFinalizeFn)],
@@ -1136,6 +1216,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowCatalogInt = new apigwv2int.HttpLambdaIntegration(
       "WorkflowCatalogInt",
       workflowCatalogFn,
+    );
+    const modelRegistryInt = new apigwv2int.HttpLambdaIntegration(
+      "ModelRegistryInt",
+      modelRegistryFn,
     );
     const deviceWorkflowsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceWorkflowsInt",
@@ -1378,6 +1462,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-catalog",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowCatalogInt,
+    });
+
+    // Model registry (model pickers in node config forms).
+    this.api.addRoutes({
+      path: "/model-registry",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: modelRegistryInt,
     });
 
     // Device workflow attachments.

@@ -230,6 +230,10 @@ export const handler = async (
             payloadSummary: e.payloadSummary,
           })),
           metrics: run.metrics,
+          // v2 engine runs only (null on PoC runs): which engine produced the
+          // result and where its Data Capture / events artifacts live in S3.
+          engineVersion: run.engineVersion ?? null,
+          artifacts: run.artifacts ?? null,
           error: run.error ?? null,
           failedNodeId: run.failedNodeId ?? null,
         },

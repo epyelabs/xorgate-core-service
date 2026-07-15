@@ -36,6 +36,9 @@ export function eventsKey(runId: string): string {
 export function recordsKey(runId: string, nodeId: string, format: 'jsonl' | 'json'): string {
   return `${runPrefix(runId)}outputs/${nodeId}/records.${format}`;
 }
+export function frameKey(runId: string, nodeId: string, frameSeq: number): string {
+  return `${runPrefix(runId)}frames/${nodeId}/${frameSeq}.jpg`;
+}
 
 // Source bindings stay opaque here; each source executor zod-parses its own
 // kinds (catalog/types.ts, EngineSourceBinding). New kinds never touch this.

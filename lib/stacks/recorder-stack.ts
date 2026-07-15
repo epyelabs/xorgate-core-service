@@ -43,6 +43,13 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
   public readonly cvTaskFamily: string;
   public readonly cvTaskRoleArn: string;
   public readonly cvExecutionRoleArn: string;
+  // v2 TS engine runner (M2) — reuses this stack's cluster/VPC/SG.
+  public readonly engineRepository: ecr.Repository;
+  public readonly engineTaskDefinition: ecs.FargateTaskDefinition;
+  public readonly engineContainerName = 'engine-runner';
+  public readonly engineTaskFamily: string;
+  public readonly engineTaskRoleArn: string;
+  public readonly engineExecutionRoleArn: string;
 
   constructor(scope: Construct, id: string, props: XorgateCoreRecorderStackProps) {
     super(scope, id, props);
@@ -222,6 +229,83 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     this.cvTaskRoleArn = cvTaskRole.roleArn;
     this.cvExecutionRoleArn = this.cvTaskDefinition.obtainExecutionRole().roleArn;
 
+    // --- v2 engine runner (M2: TS streaming engine, Fargate target) ---
+    // Node 20 + ffmpeg + onnxruntime-node on Fargate ARM64. Reads the v2 run
+    // manifest + input media from S3, runs the SAME engine core as the Lambda
+    // target, and writes frames/records/result.json under workflows/v2/runs/.
+    // Reuses this stack's cluster/VPC/SG. Image built + pushed out-of-band from
+    // the SERVICE ROOT (the build needs src/):
+    //   docker build --platform linux/arm64 -f engine-runner/Dockerfile .
+    this.engineRepository = new ecr.Repository(this, 'EngineRunnerRepo', {
+      repositoryName: isProd ? 'xorgate-engine-runner' : 'xorgate-engine-runner-dev',
+      removalPolicy,
+      emptyOnDelete: !isProd,
+      imageScanOnPush: true,
+    });
+
+    const engineLogGroup = new logs.LogGroup(this, 'EngineRunnerLogs', {
+      logGroupName: isProd ? '/xorgate/engine-runner' : '/xorgate/engine-runner-dev',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy,
+    });
+
+    // Task role: read inputs (recordings, v2 manifests, the model registry),
+    // write v2 run artifacts. ListBucket is needed to resolve the latest model
+    // version, scoped to the registry prefix. NO DB credentials by design: a
+    // media graph that needs device telemetry history fails that source.
+    const engineTaskRole = new iam.Role(this, 'EngineRunnerTaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: 'Xorgate v2 engine task: read media/manifests/models, write v2 run artifacts',
+    });
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineReadInputs',
+        actions: ['s3:GetObject'],
+        resources: [
+          bucket.arnForObjects('media/v1/*'),
+          bucket.arnForObjects('workflows/v2/*'),
+          bucket.arnForObjects('models/*'),
+        ],
+      }),
+    );
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineListModelRegistry',
+        actions: ['s3:ListBucket'],
+        resources: [bucket.bucketArn],
+        conditions: { StringLike: { 's3:prefix': 'models/*' } },
+      }),
+    );
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineWriteResults',
+        actions: ['s3:PutObject'],
+        resources: [bucket.arnForObjects('workflows/v2/*')],
+      }),
+    );
+
+    this.engineTaskFamily = isProd ? 'xorgate-engine-runner' : 'xorgate-engine-runner-dev';
+    this.engineTaskDefinition = new ecs.FargateTaskDefinition(this, 'EngineRunnerTaskDef', {
+      family: this.engineTaskFamily,
+      cpu: 2048, // 2 vCPU — ffmpeg decode + ONNX CPU inference (same as cv-runner)
+      memoryLimitMiB: 4096,
+      taskRole: engineTaskRole,
+      runtimePlatform: {
+        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+      },
+    });
+    this.engineTaskDefinition.addContainer('engine-runner', {
+      containerName: this.engineContainerName,
+      image: ecs.ContainerImage.fromEcrRepository(this.engineRepository, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'engine-runner', logGroup: engineLogGroup }),
+      // The runner self-limits via manifest.limits.maxRuntimeSeconds and always
+      // writes result.json on the way out; this is the hard ECS backstop.
+      stopTimeout: cdk.Duration.seconds(120),
+    });
+    this.engineTaskRoleArn = engineTaskRole.roleArn;
+    this.engineExecutionRoleArn = this.engineTaskDefinition.obtainExecutionRole().roleArn;
+
     new cdk.CfnOutput(this, 'RecorderClusterArn', {
       value: this.cluster.clusterArn,
       exportName: `XorgateRecorderClusterArn${suffix}`,
@@ -233,6 +317,10 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'CvRunnerRepoUri', {
       value: this.cvRepository.repositoryUri,
       exportName: `XorgateCvRunnerRepoUri${suffix}`,
+    });
+    new cdk.CfnOutput(this, 'EngineRunnerRepoUri', {
+      value: this.engineRepository.repositoryUri,
+      exportName: `XorgateEngineRunnerRepoUri${suffix}`,
     });
   }
 }

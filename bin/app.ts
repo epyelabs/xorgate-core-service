@@ -24,6 +24,11 @@ function recorderProps(rec: XorgateCoreRecorderStack) {
     cvTaskRoleArn: rec.cvTaskRoleArn,
     cvExecutionRoleArn: rec.cvExecutionRoleArn,
     cvContainerName: rec.cvContainerName,
+    // v2 engine runner (M2) shares the same cluster/VPC/SG.
+    engineTaskFamily: rec.engineTaskFamily,
+    engineTaskRoleArn: rec.engineTaskRoleArn,
+    engineExecutionRoleArn: rec.engineExecutionRoleArn,
+    engineContainerName: rec.engineContainerName,
   };
 }
 

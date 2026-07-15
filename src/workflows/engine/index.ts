@@ -1,6 +1,7 @@
 import type { WorkflowDefinition } from '../../schemas/workflows';
 import { getExecutor, getNodeType } from '../catalog/index';
 import type {
+  EngineArtifactSink,
   EngineEventRecord,
   EngineInChannel,
   EngineMessage,
@@ -44,6 +45,8 @@ export interface EngineGraphSpec {
 
 export interface EngineRunDeps {
   sources: EngineSourceReader;
+  /** Binary-artifact sink (visualization JPEGs); omit on media-less targets. */
+  artifacts?: EngineArtifactSink;
   channelCapacity?: number;
   /** Wall-clock budget; on expiry everything is cancelled and the run fails. */
   deadlineMs?: number;
@@ -262,6 +265,7 @@ export async function runGraph(spec: EngineGraphSpec, deps: EngineRunDeps): Prom
         nodeId,
         binding: spec.bindings[nodeId] ?? null,
         sources: deps.sources,
+        artifacts: deps.artifacts ?? null,
         emitEvent: (event) => {
           if (!state.aborted) events.push(event);
         },

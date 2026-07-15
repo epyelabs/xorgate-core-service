@@ -1,0 +1,6 @@
+# Export-time deps only; nothing here ships to a runtime target.
+ultralytics>=8.2,<9
+onnx>=1.16
+onnxruntime==1.19.2
+numpy==1.26.4
+pillow>=10

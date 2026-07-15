@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { ModelManifest } from '../models/registry';
 
 /**
  * NodeTypeDef: the declarative half of a catalog node type (architecture.md §3.2,
@@ -143,6 +144,45 @@ export interface ConditionPayload {
   /** Which signal/comparison produced this value, for event payloads. */
   meta?: Record<string, unknown>;
 }
+/**
+ * `video` channel payload: a reference to media the TARGET has already made
+ * local (source.video resolves its binding through ctx.sources.fetchVideo).
+ * `startedAtMs` anchors frame timestamps to wall-clock time.
+ */
+export interface VideoPayload {
+  path: string;
+  startedAtMs: number;
+  recordingId?: string | null;
+}
+/**
+ * `frames` channel payload (M2 session 2). `image` is a SHARED raw RGBA buffer
+ * (zero serialization between nodes, architecture §4.1) — consumers must copy
+ * before mutating. `seq` is the decoder frame index within the source stream
+ * (distinct from the engine's per-node message seq) so detections, evidence,
+ * and visualization artifacts can reference the same frame.
+ */
+export interface FramePayload {
+  seq: number;
+  ts: number;
+  image: Buffer;
+  width: number;
+  height: number;
+  format: 'rgba';
+}
+/** json:detections payload: one message per frame, boxes in original pixels. */
+export interface DetectionBox {
+  cls: string;
+  confidence: number;
+  /** [x1, y1, x2, y2] in source-frame pixels. */
+  xyxy: [number, number, number, number];
+}
+export interface DetectionsPayload {
+  ts: number;
+  frameSeq: number;
+  width: number;
+  height: number;
+  boxes: DetectionBox[];
+}
 
 /** One input connection: `port` is this node's input port id; one entry per edge. */
 export interface EngineInChannel {
@@ -158,9 +198,16 @@ export interface TelemetrySample {
 }
 
 /**
- * Data-access seam for source nodes. The engine core is storage-free; each
- * deploy target supplies an implementation (the Lambda target reads
- * telemetry_readings via drizzle, tests read from memory, CSV lands in M3).
+ * Data-access seam for source and model nodes. The engine core is storage-free;
+ * each deploy target supplies an implementation (the Lambda target reads
+ * telemetry_readings via drizzle, the Fargate target downloads S3 media/models,
+ * tests read from memory/local files, CSV lands in M3).
+ *
+ * The media methods are optional: a target that does not supply them cannot
+ * run the executors that need them (source.video, model.*), which fail with a
+ * clear error instead of misbehaving. Conversely the Fargate target supplies
+ * NO telemetry reader (its task role has no DB access): a media graph that
+ * needs device telemetry history fails that source explicitly.
  */
 export interface EngineSourceReader {
   readTelemetryWindow(query: {
@@ -168,6 +215,27 @@ export interface EngineSourceReader {
     metrics: string[];
     window: { fromMs: number; toMs: number };
   }): Promise<TelemetrySample[]>;
+  /** Fetches a video object to local disk (Fargate target: S3 download). */
+  fetchVideo?(ref: { bucket: string | null; key: string }): Promise<{ path: string }>;
+  /**
+   * Resolves a registry model to a validated manifest plus a local model.onnx
+   * (src/workflows/models/). Targets cache per (family, name).
+   */
+  fetchModel?(ref: {
+    family: string;
+    name: string;
+  }): Promise<{ manifest: ModelManifest; modelPath: string }>;
+}
+
+/**
+ * Artifact sink for executors that produce binary outputs (annotated
+ * visualization JPEGs today; depth maps / clips later). Supplied by the deploy
+ * target (S3 under the run prefix; a temp dir in tests); absent on targets
+ * with no media support.
+ */
+export interface EngineArtifactSink {
+  /** Writes frames/<nodeId>/<frameSeq>.jpg; returns the key/path written. */
+  putFrame(nodeId: string, frameSeq: number, jpeg: Buffer): Promise<string>;
 }
 
 /**
@@ -204,6 +272,8 @@ export interface EngineRunCtx {
   /** Manifest input binding for this node (source nodes), if any. */
   binding: EngineSourceBinding | null;
   sources: EngineSourceReader;
+  /** Binary-artifact sink; null on targets without media support. */
+  artifacts: EngineArtifactSink | null;
   /** Collect an event (output.event). */
   emitEvent(event: EngineEventRecord): void;
   /** Collect a captured record (output.data_capture). */

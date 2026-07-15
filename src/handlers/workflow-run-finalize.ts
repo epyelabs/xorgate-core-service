@@ -4,6 +4,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
 import { updateAttachmentStatusIfLatest } from '../services/workflow-runner';
+import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/engine/finalize';
+import { engineResultSchema } from '../workflows/engine/manifest';
 
 const s3 = new S3Client({});
 
@@ -41,10 +43,17 @@ const resultSchema = z.object({
 });
 
 /**
- * Fargate CV-run finalizer. Invoked by an EventBridge rule on S3 "Object Created"
- * under workflows/v1/; acts only on `.../result.json`. The Python runner ALWAYS
- * writes a result.json (even on failure/timeout), so this is the single place run
- * status is resolved for video runs — the same proven pattern as media-finalize.
+ * Workflow-run finalizer. Invoked by EventBridge rules on S3 "Object Created"
+ * under workflows/v1/ (Python cv-runner results) and workflows/v2/ (TS engine
+ * results); acts only on `.../result.json`. Both engines ALWAYS write a
+ * result.json (even on failure/timeout), so this is the single place run
+ * status is resolved for S3-results runs — the same proven pattern as
+ * media-finalize.
+ *
+ * The two result shapes are versioned: `resultVersion: 2` routes to the v2
+ * branch (engineResultSchema from workflows/engine/manifest.ts, stamps
+ * engine_version + artifacts); anything else is the unchanged v1 cv-runner
+ * path.
  *
  * Idempotent: skips if the run is no longer 'running' (a redelivered event or the
  * watchdog having already failed the run).
@@ -58,17 +67,29 @@ export const handler = async (
     console.warn('workflow-run-finalize: event missing bucket/key', { id: event.id });
     return;
   }
-  if (!key.endsWith('/result.json')) return; // manifest.json, clips, etc.
+  if (!key.endsWith('/result.json')) return; // manifest.json, clips, frames, etc.
 
-  // Fetch + validate result.json.
-  let parsed;
+  // Fetch result.json and route on its resultVersion.
+  let raw: unknown;
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = await res.Body?.transformToString();
-    parsed = resultSchema.parse(JSON.parse(body ?? '{}'));
+    raw = JSON.parse(body ?? '{}');
   } catch (err) {
-    console.error('workflow-run-finalize: unreadable/invalid result.json', { key, err });
+    console.error('workflow-run-finalize: unreadable result.json', { key, err });
     return; // nothing actionable
+  }
+  if ((raw as { resultVersion?: unknown })?.resultVersion === 2) {
+    return finalizeV2(raw, key);
+  }
+
+  // --- v1 (cv-runner) path, unchanged ---
+  let parsed;
+  try {
+    parsed = resultSchema.parse(raw);
+  } catch (err) {
+    console.error('workflow-run-finalize: invalid v1 result.json', { key, err });
+    return;
   }
 
   const run = await db.query.workflowRuns.findFirst({
@@ -138,3 +159,58 @@ export const handler = async (
     events: parsed.events.length,
   });
 };
+
+// --- v2 (TS engine) path ---
+// Same lifecycle as v1 (idempotency guard, best-effort steps/events, run row
+// last) with the v2-only stamps: engine_version = 2 and the result's artifacts
+// map (Data Capture keys) on the run row. Row mapping lives in
+// workflows/engine/finalize.ts so the smoke script can unit-test it.
+// Deploy note: needs migrations 0013 (engine_version) and 0014 (artifacts)
+// applied before any v2 producer is enabled.
+async function finalizeV2(raw: unknown, key: string): Promise<void> {
+  let result;
+  try {
+    result = engineResultSchema.parse(raw);
+  } catch (err) {
+    console.error('workflow-run-finalize: invalid v2 result.json', { key, err });
+    return;
+  }
+
+  const run = await db.query.workflowRuns.findFirst({
+    where: eq(schema.workflowRuns.id, result.runId),
+  });
+  if (!run) {
+    console.warn('workflow-run-finalize: v2 run not found', { runId: result.runId, key });
+    return;
+  }
+  if (run.status !== 'running') {
+    console.log('workflow-run-finalize: v2 run already finalized, skipping', {
+      runId: run.id,
+      status: run.status,
+    });
+    return;
+  }
+
+  // Sequential awaits throughout: the RDS Data API forbids concurrent statements.
+  const stepRows = v2StepRows(run.id, result);
+  if (stepRows.length > 0) {
+    await db.insert(schema.workflowRunSteps).values(stepRows);
+  }
+  const eventRows = v2EventRows(run, result);
+  if (eventRows.length > 0) {
+    await db.insert(schema.workflowEvents).values(eventRows);
+  }
+
+  await db
+    .update(schema.workflowRuns)
+    .set(v2RunUpdate(result, run.startedAt, new Date()))
+    .where(eq(schema.workflowRuns.id, run.id));
+
+  await updateAttachmentStatusIfLatest(run, result.status);
+  console.log('workflow-run-finalize: v2 run finalized', {
+    runId: run.id,
+    status: result.status,
+    events: result.events.length,
+    outputs: Object.keys(result.artifacts.outputs).length,
+  });
+}

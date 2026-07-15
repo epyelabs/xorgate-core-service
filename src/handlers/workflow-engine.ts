@@ -1,19 +1,16 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { db, schema } from '../db/index';
 import { tsParam } from '../utils/sql';
 import { getNodeType } from '../workflows/catalog/index';
 import type { EngineSourceReader, TelemetrySample } from '../workflows/catalog/types';
 import { runGraph, type EngineRunOutcome } from '../workflows/engine/index';
+import { manifestKey, resultKey, type RunManifest } from '../workflows/engine/manifest';
 import {
-  buildEngineResult,
-  eventsKey,
-  manifestKey,
-  recordsKey,
-  resultKey,
-  runManifestSchema,
-  type RunManifest,
-} from '../workflows/engine/manifest';
+  captureFormats,
+  failureOutcome,
+  loadRunManifest,
+  writeRunArtifacts,
+} from '../workflows/engine/target';
 import { upgradeDefinition } from '../workflows/compat';
 
 /**
@@ -21,19 +18,20 @@ import { upgradeDefinition } from '../workflows/compat';
  * §4.1). Direct-invoked with { runId } (or an explicit bucket/manifestKey);
  * reads workflows/v2/runs/<runId>/manifest.json, streams the graph in-process,
  * and writes events.jsonl / outputs/<nodeId>/records.jsonl / result.json back
- * under the same prefix. result.json is ALWAYS written, even on failure, so
- * the (session 2) finalize path is the single place run status is resolved.
+ * under the same prefix (manifest-load and artifact-write halves shared with
+ * the Fargate container main via workflows/engine/target.ts). result.json is
+ * ALWAYS written, even on failure, so the finalize path is the single place
+ * run status is resolved.
  *
  * The engine core is storage-free; this handler supplies the one sanctioned
  * seam: telemetry history reads from telemetry_readings via drizzle. Media
  * graphs (any node with runtime.target === "media") are refused here and
- * belong to the Fargate engine target (session 2).
+ * belong to the Fargate engine target (engine-runner/).
  *
  * Not routed to yet: workflow-dispatch.ts still drives the PoC inline runner
- * and cv-runner until the M6 cutover.
+ * and cv-runner until the M6 cutover (or the experimental env-gated v2 path).
  */
 
-const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
 
 // Memory guard for the in-process run; the history API serves at most 5k rows,
@@ -82,63 +80,6 @@ const telemetrySources: EngineSourceReader = {
   },
 };
 
-async function putJson(bucket: string, key: string, body: string, contentType: string): Promise<void> {
-  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
-}
-
-async function writeArtifacts(
-  bucket: string,
-  manifest: RunManifest,
-  outcome: EngineRunOutcome,
-): Promise<void> {
-  const runId = manifest.runId;
-  const captureFormats: Record<string, 'jsonl' | 'json'> = {};
-  for (const node of manifest.definition.nodes) {
-    if (node.type === 'output.data_capture') {
-      captureFormats[node.id] = node.data.config?.format === 'json' ? 'json' : 'jsonl';
-    }
-  }
-  const puts: Array<Promise<void>> = [];
-  if (outcome.events.length > 0) {
-    puts.push(
-      putJson(
-        bucket,
-        eventsKey(runId),
-        outcome.events.map((e) => JSON.stringify(e)).join('\n') + '\n',
-        'application/x-ndjson',
-      ),
-    );
-  }
-  for (const [nodeId, records] of Object.entries(outcome.captures)) {
-    const format = captureFormats[nodeId] ?? 'jsonl';
-    puts.push(
-      format === 'json'
-        ? putJson(bucket, recordsKey(runId, nodeId, 'json'), JSON.stringify(records), 'application/json')
-        : putJson(
-            bucket,
-            recordsKey(runId, nodeId, 'jsonl'),
-            records.map((r) => JSON.stringify(r)).join('\n') + '\n',
-            'application/x-ndjson',
-          ),
-    );
-  }
-  const result = buildEngineResult(runId, outcome, captureFormats);
-  puts.push(putJson(bucket, resultKey(runId), JSON.stringify(result), 'application/json'));
-  await Promise.all(puts);
-}
-
-function failureOutcome(nodeCount: number, failedNodeId: string | null, error: string): EngineRunOutcome {
-  return {
-    status: 'failed',
-    error,
-    failedNodeId,
-    steps: [],
-    events: [],
-    captures: {},
-    metrics: { nodes: nodeCount, okSteps: 0, events: 0, messages: 0 },
-  };
-}
-
 export const handler = async (
   event: WorkflowEngineEvent,
 ): Promise<{ runId: string; status: 'succeeded' | 'failed'; resultKey: string }> => {
@@ -151,19 +92,12 @@ export const handler = async (
 
   let manifest: RunManifest;
   try {
-    const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-    const body = await res.Body?.transformToString();
-    manifest = runManifestSchema.parse(JSON.parse(body ?? '{}'));
+    manifest = await loadRunManifest(bucket, key);
   } catch (err) {
     const message = `Unreadable or invalid run manifest at ${key}: ${err instanceof Error ? err.message : String(err)}`;
     // With a known runId a failed result.json still lets the run finalize.
     if (event.runId) {
-      await putJson(
-        bucket,
-        resultKey(event.runId),
-        JSON.stringify(buildEngineResult(event.runId, failureOutcome(0, null, message))),
-        'application/json',
-      );
+      await writeRunArtifacts(bucket, event.runId, failureOutcome(0, null, message));
       return { runId: event.runId, status: 'failed', resultKey: resultKey(event.runId) };
     }
     throw new Error(message);
@@ -207,7 +141,7 @@ export const handler = async (
         },
       );
 
-  await writeArtifacts(bucket, { ...manifest, definition }, outcome);
+  await writeRunArtifacts(bucket, manifest.runId, outcome, captureFormats(definition));
   console.log('workflow-engine: run complete', {
     runId: manifest.runId,
     status: outcome.status,
