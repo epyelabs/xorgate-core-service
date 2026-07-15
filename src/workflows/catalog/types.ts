@@ -153,6 +153,29 @@ export interface VideoPayload {
   path: string;
   startedAtMs: number;
   recordingId?: string | null;
+  /**
+   * M5 live plane: when set, `path` is a placeholder and the video is a live
+   * frame stream the target exposes through ctx.sources.openLiveFrames
+   * (webcam-over-MQTT today). video.decode_sample becomes a sampling
+   * pass-through for these (M1 decision 10): frames arrive pre-encoded as
+   * JPEGs from the browser, so no ffmpeg decode is spawned. In-process
+   * contract only; never serialized.
+   */
+  live?: LiveVideoRef;
+}
+export interface LiveVideoRef {
+  /** The SOURCE node id; the target derives the ingest topic from it. */
+  nodeId: string;
+  /** Hard stop for the live stream; the run then drains and succeeds. */
+  maxDurationMs: number;
+  /** No frames for this long ends the stream cleanly (browser went away). */
+  idleTimeoutMs: number;
+}
+/** One live ingest frame as delivered by the target's transport. */
+export interface LiveIngestFrame {
+  seq: number;
+  ts: number;
+  jpeg: Buffer;
 }
 /**
  * `frames` channel payload (M2 session 2). `image` is a SHARED raw RGBA buffer
@@ -244,6 +267,21 @@ export interface SegmentsPayload {
   height: number;
   instances: SegmentInstance[];
 }
+/**
+ * json:vlm payload (M5): one message per SAMPLED frame (model.vlm samples well
+ * below the frame rate; vision tokens scale with fps and resolution). The
+ * verdict is enforced with Claude structured outputs, so `verdict` /
+ * `confidence` / `reason` are clean values, never parsed prose.
+ */
+export interface VlmPayload {
+  ts: number;
+  frameSeq: number;
+  verdict: boolean;
+  /** Model self-reported confidence in the verdict, clamped to 0..1. */
+  confidence: number;
+  reason: string;
+  model: string;
+}
 
 /** One input connection: `port` is this node's input port id; one entry per edge. */
 export interface EngineInChannel {
@@ -291,6 +329,18 @@ export interface EngineSourceReader {
     family: string;
     name: string;
   }): Promise<{ manifest: ModelManifest; modelPath: string }>;
+  /**
+   * Opens the live ingest frame stream for a source node (M5 webcam-over-MQTT).
+   * The container target subscribes to the run's ingest topic
+   * (<topicPrefix>/ingest/<nodeId>); tests inject synthetic frames. The
+   * iterable ends cleanly on an explicit end message, maxDurationMs, or
+   * idleTimeoutMs without frames. Absent on targets without a live plane.
+   */
+  openLiveFrames?(ref: {
+    nodeId: string;
+    maxDurationMs: number;
+    idleTimeoutMs: number;
+  }): AsyncIterable<LiveIngestFrame>;
 }
 
 /**

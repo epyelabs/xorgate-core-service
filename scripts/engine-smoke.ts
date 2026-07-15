@@ -55,6 +55,18 @@
  *  21. scenario 8 (road scene segmentation): video -> decode -> segmentation
  *      (+ depth) -> visualization masks/depth_map overlays + captured
  *      json:segments records. Real yolov8n-seg ONNX.
+ *  22. model.vlm unit (M5): sampled frames through the REAL Anthropic SDK
+ *      request path against a mocked fetch — fps/downscale guardrails,
+ *      structured-output verdict parsing, confidence clamping, refusal
+ *      handling, secrets seam
+ *  23. scenario 4/7 live plane (M5): webcam binding -> source.video ->
+ *      decode_sample live pass-through -> model.vlm (mocked Claude) -> event +
+ *      capture, end to end through runGraph in live mode with synthetic JPEG
+ *      ingest frames via a mocked openLiveFrames seam
+ *  24. warm session loop (M5): jobs run serially, a job failure does not kill
+ *      the session, idle timeout ends it
+ *  25. simulations module M5 additions: webcam API binding validation +
+ *      manifest mapping, live manifest mode, session key/queue naming
  *
  * Checks 20/21 need the M4 model exports on disk (model-export/out/...); run
  * model-export/export_depth.py and export_yolo.py --name yolov8n-seg first.
@@ -73,7 +85,10 @@ import type {
   EngineRunCtx,
   EngineSecretReader,
   EngineSourceReader,
+  FramePayload,
+  LiveIngestFrame,
 } from '../src/workflows/catalog/types';
+import { runSessionLoop } from '../src/workflows/engine/session';
 import { parseTelemetryCsv, parseTelemetryJsonl } from '../src/workflows/catalog/nodes/source-telemetry';
 import { pointInPolygon } from '../src/workflows/catalog/nodes/telemetry-geofence';
 import { BoundedChannel } from '../src/workflows/engine/channel';
@@ -94,6 +109,9 @@ import {
   buildSimulationManifest,
   createSimulationSchema,
   engineTargetForDefinition,
+  hasLiveBindings,
+  sessionQueueName,
+  simulationSessionKey,
   simulationWindow,
   toManifestInputs,
   validateSimulationBindings,
@@ -1697,6 +1715,322 @@ async function testScenario8(): Promise<void> {
   );
 }
 
+// --- 22. model.vlm unit: real SDK path against a mocked Messages API ------------------
+function rgbaFrame(seq: number, ts: number, width = 64, height = 48): EngineMessage {
+  const image = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < image.length; i += 4) {
+    image[i] = (seq * 37) % 256;
+    image[i + 1] = 128;
+    image[i + 2] = 255 - ((seq * 37) % 256);
+    image[i + 3] = 255;
+  }
+  const payload: FramePayload = { seq, ts, image, width, height, format: 'rgba' };
+  return { ch: 'frames', ts, seq, payload };
+}
+
+/** A fetch mock speaking just enough Messages API for the real Anthropic SDK. */
+function mockClaudeFetch(
+  respond: (requestBody: Record<string, unknown>, n: number) => { verdict: boolean; confidence: number; reason: string } | 'refusal',
+): { fetch: typeof fetch; requests: Array<Record<string, unknown>> } {
+  const requests: Array<Record<string, unknown>> = [];
+  const fetchImpl = (async (input: unknown, init?: { method?: string; body?: unknown }) => {
+    const url = String(input instanceof Request ? input.url : input);
+    assert.ok(url.includes('/v1/messages'), `unexpected SDK request URL: ${url}`);
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    requests.push(body);
+    const out = respond(body, requests.length);
+    const message =
+      out === 'refusal'
+        ? {
+            id: 'msg_smoke',
+            type: 'message',
+            role: 'assistant',
+            model: body.model,
+            content: [],
+            stop_reason: 'refusal',
+            stop_sequence: null,
+            usage: { input_tokens: 10, output_tokens: 0 },
+          }
+        : {
+            id: 'msg_smoke',
+            type: 'message',
+            role: 'assistant',
+            model: body.model,
+            content: [{ type: 'text', text: JSON.stringify(out) }],
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+            usage: { input_tokens: 10, output_tokens: 20 },
+          };
+    return new Response(JSON.stringify(message), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'request-id': 'req_smoke' },
+    });
+  }) as unknown as typeof fetch;
+  return { fetch: fetchImpl, requests };
+}
+
+async function testVlmUnit(): Promise<void> {
+  const exec = getExecutor('model.vlm')!;
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const frames = new BoundedChannel<EngineMessage>(16);
+  // 5 frames 500 ms apart with maxFps 1 -> frames 0 / 2 / 4 are analyzed.
+  for (let i = 0; i < 5; i++) await frames.push(rgbaFrame(i, t0 + i * 500, 800, 600));
+  frames.close();
+
+  const { fetch: mocked, requests } = mockClaudeFetch((_body, n) =>
+    n === 2 ? { verdict: true, confidence: 1.7, reason: 'clearly distracted' } : n === 3 ? 'refusal' : { verdict: false, confidence: 0.9, reason: 'eyes on road' },
+  );
+  let secretAsked: string | null = null;
+  const secrets: EngineSecretReader = {
+    getSecret: async (name) => {
+      secretAsked = name;
+      return 'sk-ant-test';
+    },
+  };
+  const ctx = stubCtx({ nodeId: 'vlm', secrets, http: mocked });
+  const out: EngineMessage[] = [];
+  let seq = 0;
+  for await (const msg of exec(
+    [{ port: 'frames', from: { nodeId: 'dec', port: 'frames' }, messages: frames }],
+    { prompt: 'Is the driver looking away from the road?', maxFps: 1, maxWidth: 320, minConfidence: 0.5 },
+    ctx,
+  )) {
+    out.push({ ...msg, seq: seq++ } as EngineMessage);
+  }
+
+  assert.strictEqual(secretAsked, 'anthropic-api-key');
+  assert.strictEqual(requests.length, 3, `maxFps sampling: expected 3 API calls, got ${requests.length}`);
+  const req = requests[0] as {
+    model: string;
+    system: string;
+    thinking: { type: string };
+    output_config: { format: { type: string; schema: { required: string[] } } };
+    messages: Array<{ role: string; content: Array<{ type: string; source?: { type: string; media_type: string; data: string } }> }>;
+  };
+  assert.strictEqual(req.model, 'claude-sonnet-5', 'default model');
+  assert.strictEqual(req.thinking.type, 'disabled');
+  assert.strictEqual(req.output_config.format.type, 'json_schema');
+  assert.deepStrictEqual(req.output_config.format.schema.required, ['verdict', 'confidence', 'reason']);
+  const [img, txt] = req.messages[0].content;
+  assert.strictEqual(img.type, 'image');
+  assert.strictEqual(img.source!.media_type, 'image/jpeg');
+  // 800-wide frame downscaled to maxWidth 320 before encoding.
+  const decoded = decodeJpegToRgba(Buffer.from(img.source!.data, 'base64'));
+  assert.strictEqual(decoded.width, 320, `frame must be downscaled (got ${decoded.width})`);
+  assert.strictEqual(txt.type, 'text');
+
+  const conditions = out.filter((m) => m.ch === 'condition');
+  const records = out.filter((m) => m.ch === 'json');
+  assert.strictEqual(conditions.length, 3);
+  assert.strictEqual(records.length, 3);
+  assert.ok(records.every((m) => m.tag === 'vlm'));
+  const values = conditions.map((m) => (m.payload as { value: boolean }).value);
+  assert.deepStrictEqual(values, [false, true, false], 'verdict #2 true; refusal (#3) is false');
+  const rec2 = records[1].payload as { verdict: boolean; confidence: number; reason: string; model: string };
+  assert.strictEqual(rec2.verdict, true);
+  assert.strictEqual(rec2.confidence, 1, 'confidence must clamp to 1');
+  const rec3 = records[2].payload as { confidence: number; reason: string };
+  assert.strictEqual(rec3.confidence, 0);
+  assert.ok(rec3.reason.includes('declined'), rec3.reason);
+  assert.match(
+    ctx.summary ?? '',
+    /^verdict true on 1\/3 analyzed frame\(s\) of 5 \(claude-sonnet-5, ~\d+ ms\/frame\)$/,
+  );
+  console.log('ok: model.vlm unit (mocked Claude API through the real SDK, sampling + downscale + refusal)');
+}
+
+// --- 23. scenario 4/7 live plane: webcam -> decode pass-through -> vlm ---------------
+async function testLiveWebcamVlmGraph(): Promise<void> {
+  const node = (id: string, type: string, label: string, config: Record<string, unknown>) => ({
+    id,
+    type,
+    position: { x: 0, y: 0 },
+    data: { label, config },
+  });
+  const edge = (source: string, target: string, sourceHandle: string, targetHandle: string) => ({
+    id: `${source}-${target}`,
+    source,
+    target,
+    sourceHandle,
+    targetHandle,
+  });
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      node('src', 'source.video', 'Video', {}),
+      node('dec', 'video.decode_sample', 'Decode & Sample', { fps: 2 }),
+      node('vlm', 'model.vlm', 'VLM Analysis', {
+        prompt: 'Is a person visible?',
+        maxFps: 2,
+        maxWidth: 320,
+      }),
+      node('evt', 'output.event', 'Emit Event', { kind: 'driver_distraction' }),
+      node('cap', 'output.data_capture', 'Data Capture', { format: 'jsonl' }),
+    ],
+    edges: [
+      edge('src', 'dec', 'video', 'video'),
+      edge('dec', 'vlm', 'frames', 'frames'),
+      edge('vlm', 'evt', 'condition', 'condition'),
+      edge('vlm', 'cap', 'analysis', 'records'),
+    ],
+  };
+
+  // 10 synthetic browser frames, 250 ms apart: decode at fps 2 keeps every
+  // other one (500 ms interval) -> 5 frames reach the VLM.
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  let liveRef: { nodeId: string; maxDurationMs: number; idleTimeoutMs: number } | null = null;
+  const sources: EngineSourceReader = {
+    readTelemetryWindow: async () => {
+      throw new Error('not used');
+    },
+    openLiveFrames(ref) {
+      liveRef = ref;
+      return (async function* frames(): AsyncGenerator<LiveIngestFrame> {
+        for (let i = 0; i < 10; i++) {
+          const f = rgbaFrame(i, t0 + i * 250, 64, 48).payload as FramePayload;
+          yield { seq: i, ts: f.ts, jpeg: encodeRgbaToJpeg(f.image, f.width, f.height, 85) };
+        }
+      })();
+    },
+  };
+  // Verdict true from the 3rd analyzed frame on -> exactly one rising edge.
+  const { fetch: mocked, requests } = mockClaudeFetch((_body, n) =>
+    n >= 3 ? { verdict: true, confidence: 0.95, reason: 'person visible' } : { verdict: false, confidence: 0.9, reason: 'empty scene' },
+  );
+  const secrets: EngineSecretReader = { getSecret: async () => 'sk-ant-test' };
+
+  const outcome = await runGraph(
+    {
+      runId: 'run-live-vlm',
+      mode: 'live',
+      deviceId: null,
+      window: null,
+      definition,
+      bindings: { src: { kind: 'webcam', maxDurationSeconds: 30 } },
+    },
+    { sources, secrets, httpFetch: mocked },
+  );
+
+  assert.strictEqual(outcome.status, 'succeeded', `run failed: ${outcome.error}`);
+  for (const step of outcome.steps) {
+    assert.strictEqual(step.status, 'ok', `step ${step.nodeId}: ${step.output}`);
+  }
+  assert.ok(liveRef, 'source.video must open the live seam');
+  assert.strictEqual(liveRef!.nodeId, 'src');
+  assert.strictEqual(liveRef!.maxDurationMs, 30_000);
+  assert.strictEqual(liveRef!.idleTimeoutMs, 60_000);
+  assert.strictEqual(requests.length, 5, `expected 5 analyzed frames, got ${requests.length}`);
+  assert.strictEqual(outcome.captures['cap']?.length, 5, 'every analyzed frame lands in Data Capture');
+  assert.strictEqual(outcome.events.length, 1, `one rising-edge event, got ${outcome.events.length}`);
+  assert.strictEqual(outcome.events[0].kind, 'driver_distraction');
+  const dec = outcome.steps.find((s) => s.nodeId === 'dec')!;
+  assert.ok(dec.output.includes('5 frame(s)'), dec.output);
+  console.log(
+    `ok: scenario 4/7 live plane (webcam ingest -> decode pass-through -> vlm -> event) — ${requests.length} Claude calls, 1 event`,
+  );
+}
+
+// --- 24. warm session loop ------------------------------------------------------------
+async function testSessionLoop(): Promise<void> {
+  const jobs: Array<{ runId: string } | null> = [{ runId: 'r1' }, null, { runId: 'r2' }, { runId: 'r3' }];
+  const ran: string[] = [];
+  let clock = 0;
+  const outcome = await runSessionLoop({
+    idleTimeoutMs: 100,
+    log: () => {},
+    now: () => clock,
+    receive: async () => {
+      clock += 30; // each poll (empty or not) advances 30 "ms"
+      return jobs.shift() ?? null;
+    },
+    runJob: async (job) => {
+      ran.push(job.runId);
+      if (job.runId === 'r2') throw new Error('boom');
+    },
+  });
+  assert.deepStrictEqual(ran, ['r1', 'r2', 'r3'], 'jobs run serially; a failure does not kill the loop');
+  assert.strictEqual(outcome.jobsRun, 3);
+  assert.strictEqual(outcome.jobFailures, 1);
+  assert.strictEqual(outcome.endedReason, 'idle');
+  console.log('ok: warm session loop (serial jobs, failure tolerance, idle-out)');
+}
+
+// --- 25. simulations module M5 additions -----------------------------------------------
+function testSimulationsM5(): void {
+  const definition: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      { id: 'v', type: 'source.video', position: { x: 0, y: 0 }, data: { label: 'Video', config: {} } },
+      { id: 'd', type: 'video.decode_sample', position: { x: 0, y: 0 }, data: { label: 'Decode', config: {} } },
+      {
+        id: 'vlm',
+        type: 'model.vlm',
+        position: { x: 0, y: 0 },
+        data: { label: 'VLM', config: { prompt: 'Is a person visible?' } },
+      },
+      { id: 'e', type: 'output.event', position: { x: 0, y: 0 }, data: { label: 'Event', config: { kind: 'x' } } },
+    ],
+    edges: [
+      { id: 'e1', source: 'v', target: 'd', sourceHandle: 'video', targetHandle: 'video' },
+      { id: 'e2', source: 'd', target: 'vlm', sourceHandle: 'frames', targetHandle: 'frames' },
+      { id: 'e3', source: 'vlm', target: 'e', sourceHandle: 'condition', targetHandle: 'condition' },
+    ],
+  };
+  const bindings: Record<string, SimulationBinding> = { v: { kind: 'webcam', maxDurationSeconds: 120 } };
+  assert.deepStrictEqual(validateSimulationBindings(definition, bindings, 'org-1'), []);
+  assert.ok(hasLiveBindings(bindings));
+  assert.strictEqual(engineTargetForDefinition(definition), 'fargate', 'vlm/decode are media-bound');
+
+  // A webcam binding on a telemetry source is rejected.
+  const telemetryDef: WorkflowDefinition = {
+    schemaVersion: 2,
+    nodes: [
+      { id: 't', type: 'source.telemetry', position: { x: 0, y: 0 }, data: { label: 'T', config: { metrics: ['a'] } } },
+    ],
+    edges: [],
+  };
+  const bad = validateSimulationBindings(telemetryDef, { t: { kind: 'webcam' } }, 'org-1');
+  assert.strictEqual(bad.length, 1);
+  assert.ok(bad[0].message.includes('does not fit source.telemetry'), bad[0].message);
+
+  const inputs = toManifestInputs(bindings, new Map());
+  assert.deepStrictEqual(inputs, [{ nodeId: 'v', binding: { kind: 'webcam', maxDurationSeconds: 120 } }]);
+
+  const manifest = buildSimulationManifest({
+    runId: 'run-m5',
+    orgId: 'org-1',
+    bucket: 'bucket',
+    definition,
+    deviceId: null,
+    inputs,
+    window: simulationWindow(bindings),
+    target: 'fargate',
+  });
+  assert.strictEqual(manifest.mode, 'live', 'live bindings flip the manifest to live mode');
+  assert.strictEqual(manifest.limits.maxRuntimeSeconds, 900);
+
+  // Batch simulations keep mode simulation.
+  const batchManifest = buildSimulationManifest({
+    runId: 'run-m5b',
+    orgId: 'org-1',
+    bucket: 'bucket',
+    definition,
+    deviceId: null,
+    inputs: [{ nodeId: 'v', binding: { kind: 'video_file', s3Key: 'workflows/v2/uploads/org-1/x.mp4' } }],
+    window: null,
+    target: 'fargate',
+  });
+  assert.strictEqual(batchManifest.mode, 'simulation');
+
+  const key = simulationSessionKey('org-1', 'template-1');
+  assert.match(key, /^[0-9a-f]{32}$/);
+  assert.strictEqual(key, simulationSessionKey('org-1', 'template-1'), 'session key is stable');
+  assert.notStrictEqual(key, simulationSessionKey('org-1', 'template-2'));
+  assert.strictEqual(sessionQueueName('xorgate-wfsim-dev-', key), `xorgate-wfsim-dev-${key}`);
+  assert.ok(sessionQueueName('xorgate-wfsim-dev-', key).length <= 80, 'SQS queue name limit');
+  console.log('ok: simulations module M5 additions (webcam binding, live mode, session naming)');
+}
+
 async function main(): Promise<void> {
   await testBackpressure();
   await testDropOldest();
@@ -1719,6 +2053,10 @@ async function main(): Promise<void> {
   await testMaterializedTelemetry();
   await testScenario3();
   await testScenario8();
+  await testVlmUnit();
+  await testLiveWebcamVlmGraph();
+  await testSessionLoop();
+  testSimulationsM5();
   console.log('\nengine smoke: all checks passed');
 }
 

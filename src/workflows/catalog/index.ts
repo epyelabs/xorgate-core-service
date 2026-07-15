@@ -11,6 +11,7 @@ import * as logicThreshold from './nodes/logic-threshold';
 import * as modelDepth from './nodes/model-depth';
 import * as modelObjectDetection from './nodes/model-object-detection';
 import * as modelSegmentation from './nodes/model-segmentation';
+import * as modelVlm from './nodes/model-vlm';
 import * as outputDataCapture from './nodes/output-data-capture';
 import * as outputEvent from './nodes/output-event';
 import * as outputVisualization from './nodes/output-visualization';
@@ -55,6 +56,7 @@ const MODULES: Array<{ def: NodeTypeDef; executor: NodeExecutor }> = [
   modelObjectDetection,
   modelSegmentation,
   modelDepth,
+  modelVlm,
   logicThreshold,
   logicComparator,
   logicBoolean,

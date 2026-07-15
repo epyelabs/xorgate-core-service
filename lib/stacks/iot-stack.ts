@@ -156,6 +156,18 @@ export class XorgateCoreIotStack extends cdk.Stack {
               `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
             ],
           },
+          {
+            // M5 webcam ingest: the browser PUBLISHES sampled JPEG frames to
+            // wf/sim/<orgId>/<runId>/ingest/<nodeId>. Publish is scoped to the
+            // ingest suffix only, so a browser can never spoof the run's
+            // status/steps/records topics.
+            Sid: 'PublishIngest',
+            Effect: 'Allow',
+            Action: 'iot:Publish',
+            Resource: [
+              `arn:aws:iot:${region}:${account}:topic/wf/sim/*/ingest/*`,
+            ],
+          },
         ],
       },
     });
@@ -210,6 +222,15 @@ export class XorgateCoreIotStack extends cdk.Stack {
           `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
           `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
         ],
+      }),
+    );
+    browserAuthRole.addToPolicy(
+      new iam.PolicyStatement({
+        // M5 webcam ingest publish (mirrors the IoT browser policy's
+        // PublishIngest statement; both layers must allow it).
+        sid: 'IotSimIngestPublish',
+        actions: ['iot:Publish'],
+        resources: [`arn:aws:iot:${region}:${account}:topic/wf/sim/*/ingest/*`],
       }),
     );
 

@@ -30,8 +30,14 @@ export const def = defineNode({
 // Binding kinds this source accepts (executor-owned union, session 1 pattern).
 // Batch kinds resolve to an object the target fetches to local disk through
 // ctx.sources.fetchVideo; `video_local` short-circuits to a path already on
-// disk (tests, and the M3 simulator's warm-session cache). `webcam` and
-// `device_live` are reserved for the live plane (M3/M5) and throw until then.
+// disk (tests, and the M3 simulator's warm-session cache). `webcam` (M5) is
+// the live plane: the browser publishes sampled JPEG frames to the run's
+// ingest topic and the target exposes them through ctx.sources.openLiveFrames;
+// this executor emits a live VideoPayload that video.decode_sample consumes as
+// a sampling pass-through. `device_live` (device-side frame publish, symmetric
+// with webcam) remains reserved and throws.
+const WEBCAM_DEFAULT_MAX_DURATION_SECONDS = 300;
+const WEBCAM_IDLE_TIMEOUT_SECONDS = 60;
 const bindingSchema = z.discriminatedUnion('kind', [
   z.object({
     kind: z.literal('recording'),
@@ -52,8 +58,11 @@ const bindingSchema = z.discriminatedUnion('kind', [
     path: z.string().min(1),
     startedAt: z.string().min(1).optional(),
   }),
-  z.object({ kind: z.literal('device_live') }).passthrough(), // M5
-  z.object({ kind: z.literal('webcam') }).passthrough(), // M3/M5
+  z.object({ kind: z.literal('device_live') }).passthrough(), // reserved (M5 stretch not taken)
+  z.object({
+    kind: z.literal('webcam'),
+    maxDurationSeconds: z.number().positive().max(1800).optional(),
+  }),
 ]);
 
 function parseMs(iso: string | undefined): number | null {
@@ -73,8 +82,28 @@ export const executor = async function* sourceVideo(
     throw new Error(`Unsupported video binding "${String(ctx.binding.kind)}"`);
   }
   const binding = parsed.data;
-  if (binding.kind === 'device_live' || binding.kind === 'webcam') {
-    throw new Error(`Live video bindings ("${binding.kind}") are not implemented until M3/M5`);
+  if (binding.kind === 'device_live') {
+    throw new Error('Live device streams are not available yet (device-side frame publish is not enabled)');
+  }
+  if (binding.kind === 'webcam') {
+    if (!ctx.sources.openLiveFrames) {
+      throw new Error('This engine target has no live ingest support (webcam bindings need the media engine)');
+    }
+    const maxDurationMs = (binding.maxDurationSeconds ?? WEBCAM_DEFAULT_MAX_DURATION_SECONDS) * 1000;
+    const anchor = Date.now(); // live frames carry their own browser-stamped ts
+    ctx.setSummary(`live webcam ingest (max ${Math.round(maxDurationMs / 1000)}s)`);
+    const payload: VideoPayload = {
+      path: `live:${ctx.nodeId}`,
+      startedAtMs: anchor,
+      recordingId: null,
+      live: {
+        nodeId: ctx.nodeId,
+        maxDurationMs,
+        idleTimeoutMs: WEBCAM_IDLE_TIMEOUT_SECONDS * 1000,
+      },
+    };
+    yield { ch: 'video' as const, ts: anchor, payload };
+    return;
   }
 
   let path: string;

@@ -357,6 +357,46 @@ export class XorgateCoreApiStack extends cdk.Stack {
         ],
       }),
     );
+    // Anthropic API key for model.vlm (M5): same out-of-band-secret pattern as
+    // the Roads key, readable by both engine roles (the task role gets it in
+    // recorder-stack.ts). The Lambda engine never runs media graphs, but the
+    // grant keeps the two targets symmetric per the M5 plan.
+    const anthropicSecretName = isProd
+      ? "xorgate-anthropic-api-key"
+      : "xorgate-anthropic-api-key-dev";
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "AnthropicSecretRead",
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${anthropicSecretName}*`,
+        ],
+      }),
+    );
+    // Warm simulator sessions (M5): the simulations handler creates/sends to
+    // per-editing-session SQS queues and looks for a running session task
+    // before launching one (ecs:ListTasks is cluster-conditioned; its resource
+    // type is container-instance, so the resource must stay "*").
+    const sessionQueuePrefix = isProd ? "xorgate-wfsim-prod-" : "xorgate-wfsim-dev-";
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "WfSessionQueues",
+        actions: ["sqs:CreateQueue", "sqs:SendMessage", "sqs:GetQueueUrl"],
+        resources: [
+          `arn:aws:sqs:${this.region}:${this.account}:${sessionQueuePrefix}*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "WfSessionListTasks",
+        actions: ["ecs:ListTasks"],
+        resources: ["*"], // resource type is container-instance; scope by cluster
+        conditions: {
+          ArnEquals: { "ecs:cluster": recorderClusterArn },
+        },
+      }),
+    );
 
     // Browser live-telemetry (P2): attach the AWS IoT policy to a caller's Cognito
     // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
@@ -453,7 +493,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       minify: true,
       sourceMap: true,
       target: "node20",
-      externalModules: ["@aws-sdk/*", "onnxruntime-node"],
+      // @anthropic-ai/sdk mirrors onnxruntime-node: required lazily by the
+      // model.vlm executor (engine/anthropic.ts), which only ever runs on the
+      // media (Fargate) target; keeping it external keeps every Lambda bundle
+      // free of it.
+      externalModules: ["@aws-sdk/*", "onnxruntime-node", "@anthropic-ai/sdk", "mqtt"],
       forceDockerBundling: false,
     };
 
@@ -462,7 +506,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // bundle the SDK rather than externalize it.
     const bundlingWithSdk: nodejs.BundlingOptions = {
       ...commonBundling,
-      externalModules: ["onnxruntime-node"],
+      externalModules: ["onnxruntime-node", "@anthropic-ai/sdk", "mqtt"],
     };
 
     const vpcProps: Pick<
@@ -1098,7 +1142,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // Roads key (client-secrets-manager); neither is guaranteed in the Lambda
       // runtime SDK, so bundle the SDK like the other IoT/ECS-calling Lambdas.
       bundling: bundlingWithSdk,
-      environment: { ...commonEnv, GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName },
+      environment: {
+        ...commonEnv,
+        GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName,
+        ANTHROPIC_SECRET_NAME: anthropicSecretName,
+      },
     });
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
@@ -1136,6 +1184,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
     workflowSimulationsFn.addEnvironment("ENGINE_SUBNETS", recorderSubnets);
     workflowSimulationsFn.addEnvironment("ENGINE_SG", recorderSecurityGroupId);
     workflowSimulationsFn.addEnvironment("ENGINE_CONTAINER_NAME", engineContainerName);
+    // Warm simulator sessions (M5): per-(org, template) SQS queues under this
+    // prefix; unset would disable the warm path (cold RunTask per run).
+    workflowSimulationsFn.addEnvironment("WF_SESSION_QUEUE_PREFIX", sessionQueuePrefix);
 
     // Workflow scheduler (1-min tick): schedule triggers + the stuck-run watchdog.
     // Fires runs (SQS) and StopTask's stale Fargate tasks -> bundles the AWS SDK.

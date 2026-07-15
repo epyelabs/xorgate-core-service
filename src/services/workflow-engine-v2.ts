@@ -1,12 +1,14 @@
 import { eq } from 'drizzle-orm';
-import { ECSClient, RunTaskCommand } from '@aws-sdk/client-ecs';
+import { ECSClient, ListTasksCommand, RunTaskCommand } from '@aws-sdk/client-ecs';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { CreateQueueCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { readTelemetryWindow } from './telemetry-window';
 import { getNodeType } from '../workflows/catalog/index';
+import { sessionQueueName } from '../workflows/simulations';
 import { inputRecordsKey, manifestKey, runPrefix, type RunManifest } from '../workflows/engine/manifest';
 
 /**
@@ -36,6 +38,7 @@ import { inputRecordsKey, manifestKey, runPrefix, type RunManifest } from '../wo
 const s3 = new S3Client({});
 const lambda = new LambdaClient({});
 const ecs = new ECSClient({});
+const sqs = new SQSClient({});
 
 const BUCKET = process.env.BUCKET_NAME;
 const ENGINE_FN = process.env.WORKFLOW_ENGINE_FN;
@@ -44,6 +47,18 @@ const ENGINE_TASKDEF = process.env.ENGINE_TASKDEF;
 const ENGINE_SUBNETS = (process.env.ENGINE_SUBNETS ?? '').split(',').filter(Boolean);
 const ENGINE_SG = process.env.ENGINE_SG;
 const ENGINE_CONTAINER = process.env.ENGINE_CONTAINER_NAME ?? 'engine-runner';
+// Warm simulator sessions (M5): per-(org, template) SQS queues under this name
+// prefix. Unset = warm sessions disabled, every fargate dispatch is a cold
+// RunTask (the M2-M4 behavior).
+const SESSION_QUEUE_PREFIX = process.env.WF_SESSION_QUEUE_PREFIX;
+// Stale-message guard: a job nobody picked up within this window dies with the
+// queue retention, instead of a later session task re-running a watchdog-failed
+// run. 15 minutes covers the longest simulation budget (900 s).
+const SESSION_QUEUE_ATTRIBUTES = {
+  MessageRetentionPeriod: '900',
+  VisibilityTimeout: '60',
+  ReceiveMessageWaitTimeSeconds: '20',
+};
 
 export function v2ExperimentEnabled(): boolean {
   return process.env.WORKFLOW_V2_EXPERIMENT === 'on';
@@ -150,6 +165,84 @@ export interface DispatchV2Options {
   target: 'lambda' | 'fargate';
   /** Full v2 manifest to write. Callers build it (simulations use buildSimulationManifest). */
   manifest: RunManifest;
+  /**
+   * Warm simulator session routing (M5, fargate simulations only): the
+   * editing-session key (simulationSessionKey). When set and the session
+   * infrastructure is configured, the run is enqueued to the per-session SQS
+   * queue and served by a lingering engine task instead of a cold RunTask;
+   * any warm-path failure falls back to the cold path.
+   */
+  sessionKey?: string;
+}
+
+/**
+ * Warm-session dispatch: ensure the per-session queue exists, enqueue the job,
+ * then ensure a session task is polling it. Send-before-check ordering closes
+ * most of the exit race: a task that is still RUNNING when we look will drain
+ * the message we just sent; a task that exited between our send and its final
+ * poll leaves the message for the replacement task we then launch. The one
+ * residual window (task exits AFTER we saw it RUNNING, message unread until
+ * the 15-minute queue retention drops it) strands the run for the watchdog —
+ * accepted, same backstop as a lost cold task.
+ */
+async function dispatchToWarmSession(runId: string, sessionKey: string): Promise<string> {
+  if (!SESSION_QUEUE_PREFIX) throw new Error('warm sessions are not configured (WF_SESSION_QUEUE_PREFIX unset)');
+  if (!ENGINE_CLUSTER || !ENGINE_TASKDEF || ENGINE_SUBNETS.length === 0 || !ENGINE_SG) {
+    throw new Error('v2 media engine is not configured (missing ENGINE_* env)');
+  }
+  const queueName = sessionQueueName(SESSION_QUEUE_PREFIX, sessionKey);
+  // CreateQueue is idempotent for an existing queue with identical attributes.
+  const created = await sqs.send(
+    new CreateQueueCommand({ QueueName: queueName, Attributes: SESSION_QUEUE_ATTRIBUTES }),
+  );
+  const queueUrl = created.QueueUrl;
+  if (!queueUrl) throw new Error(`CreateQueue returned no URL for ${queueName}`);
+  await sqs.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: JSON.stringify({ runId }) }));
+
+  const running = await ecs.send(
+    new ListTasksCommand({ cluster: ENGINE_CLUSTER, startedBy: sessionKey, desiredStatus: 'RUNNING' }),
+  );
+  const existing = running.taskArns?.[0];
+  if (existing) {
+    console.log('workflow-engine-v2: warm session reused', { runId, sessionKey, taskArn: existing });
+    return existing;
+  }
+
+  const res = await ecs.send(
+    new RunTaskCommand({
+      cluster: ENGINE_CLUSTER,
+      taskDefinition: ENGINE_TASKDEF,
+      launchType: 'FARGATE',
+      count: 1,
+      startedBy: sessionKey, // 32-hex session key; how warm tasks are found
+      networkConfiguration: {
+        awsvpcConfiguration: {
+          subnets: ENGINE_SUBNETS,
+          securityGroups: [ENGINE_SG],
+          assignPublicIp: 'ENABLED',
+        },
+      },
+      overrides: {
+        containerOverrides: [
+          {
+            name: ENGINE_CONTAINER,
+            // The SESSION launch contract (additive beside the frozen
+            // single-run contract): the queue URL flips main.ts into session
+            // mode; manifests are located by runId from each job message.
+            environment: [
+              { name: 'ENGINE_SESSION_QUEUE_URL', value: queueUrl },
+              { name: 'MANIFEST_BUCKET', value: BUCKET! },
+              { name: 'AWS_REGION', value: process.env.AWS_REGION ?? 'us-east-1' },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  const taskArn = res.tasks?.[0]?.taskArn;
+  if (!taskArn) throw new Error(`Session RunTask failed: ${res.failures?.[0]?.reason ?? 'no task returned'}`);
+  console.log('workflow-engine-v2: warm session launched', { runId, sessionKey, taskArn });
+  return taskArn;
 }
 
 /**
@@ -190,6 +283,24 @@ export async function dispatchV2Run(runId: string, opts: DispatchV2Options): Pro
     await failRun(runId, 'v2 media engine is not configured (missing ENGINE_* env)');
     throw new Error('v2 media engine is not configured (missing ENGINE_* env)');
   }
+
+  // Warm simulator session first (M5); any warm-path failure falls back to a
+  // cold per-run task so the simulation still runs, just with the cold start.
+  if (opts.sessionKey && SESSION_QUEUE_PREFIX) {
+    try {
+      const sessionTaskArn = await dispatchToWarmSession(runId, opts.sessionKey);
+      // Stamp the session task so the watchdog can StopTask a hung session
+      // (the engine's own maxRuntimeSeconds deadline fires long before).
+      await db.update(schema.workflowRuns).set({ taskArn: sessionTaskArn }).where(eq(schema.workflowRuns.id, runId));
+      return;
+    } catch (err) {
+      console.error('workflow-engine-v2: warm session dispatch failed; falling back to cold RunTask', {
+        runId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   let taskArn: string | undefined;
   try {
     const res = await ecs.send(

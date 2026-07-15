@@ -16,6 +16,7 @@ import {
   SIM_UPLOAD_EXPIRES_SECONDS,
   SIM_UPLOAD_MAX_BYTES,
   simulationProgressResponse,
+  simulationSessionKey,
   simulationWindow,
   toManifestInputs,
   uploadPrefixForOrg,
@@ -264,7 +265,15 @@ export const handler = async (
       });
 
       try {
-        await dispatchV2Run(run.id, { target, manifest });
+        // Fargate simulations route through the warm session for this
+        // editing session (org+template); Lambda runs are sub-second and
+        // never need one. Warm-path failures fall back to a cold task
+        // inside dispatchV2Run.
+        await dispatchV2Run(run.id, {
+          target,
+          manifest,
+          ...(target === 'fargate' ? { sessionKey: simulationSessionKey(orgId, template.id) } : {}),
+        });
       } catch (err) {
         // dispatchV2Run already flipped the run row to failed.
         return errorResponse(502, 'SIMULATION_DISPATCH_FAILED', 'Failed to start the simulation engine', {

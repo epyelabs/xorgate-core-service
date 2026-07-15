@@ -36,6 +36,13 @@ export const def = defineNode({
 // timestamps anchor at the source's startedAtMs + i/fps. Backpressure reaches
 // ffmpeg through the stdout pipe; live-mode drop-oldest applies because this
 // is a `frames` channel.
+//
+// LIVE pass-through (M5, M1 decision 10): a live VideoPayload (webcam-over-
+// MQTT) carries pre-encoded JPEG frames from the browser, so no ffmpeg is
+// spawned; frames are jpeg-decoded and re-emitted, downsampled to cfg.fps by
+// dropping frames that arrive faster (the browser publish rate is the true
+// ceiling). cfg.maxWidth is ignored on live streams (the browser already caps
+// capture at <= 480p to fit the IoT message limit).
 export const executor = async function* videoDecodeSample(
   inputs: EngineInChannel[],
   config: unknown,
@@ -48,6 +55,39 @@ export const executor = async function* videoDecodeSample(
     if (msg.ch !== 'video') continue;
     const video = msg.payload as VideoPayload;
     videos += 1;
+    if (video.live) {
+      if (!ctx.sources.openLiveFrames) {
+        throw new Error('This engine target has no live ingest support');
+      }
+      if (cfg.maxWidth !== undefined) {
+        ctx.log('maxWidth is ignored for live streams (browser capture is pre-scaled)');
+      }
+      const minIntervalMs = 1000 / cfg.fps;
+      let lastEmittedTs = -Infinity;
+      let received = 0;
+      let dropped = 0;
+      for await (const ingest of ctx.sources.openLiveFrames(video.live)) {
+        received += 1;
+        if (ingest.ts - lastEmittedTs < minIntervalMs) {
+          dropped += 1;
+          continue;
+        }
+        const { width, height, data } = decodeJpegToRgba(ingest.jpeg);
+        lastEmittedTs = ingest.ts;
+        const payload: FramePayload = {
+          seq: frameSeq,
+          ts: ingest.ts,
+          image: data,
+          width,
+          height,
+          format: 'rgba',
+        };
+        frameSeq += 1;
+        yield { ch: 'frames' as const, ts: ingest.ts, payload };
+      }
+      ctx.log(`live ingest ended: ${received} frame(s) received, ${dropped} dropped by fps sampling`);
+      continue;
+    }
     const filters = [`fps=${cfg.fps}`];
     if (cfg.maxWidth !== undefined) filters.push(`scale='min(iw,${cfg.maxWidth})':-2`);
     const args = [

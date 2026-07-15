@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { workflowDefinitionSchema } from '../schemas/workflows';
@@ -72,6 +73,13 @@ export const simulationBindingSchema = z.discriminatedUnion('kind', [
     uploadKey: z.string().min(1),
     metrics: z.array(z.string().min(1)).min(1).optional(), // default: every numeric CSV column
   }),
+  // M5 live plane (SANCTIONED ADDITION to the M3-frozen union): the browser
+  // publishes sampled JPEG frames to <topicPrefix>/ingest/<nodeId> during the
+  // run; the engine consumes them over MQTT. No upload, no S3 key.
+  z.object({
+    kind: z.literal('webcam'),
+    maxDurationSeconds: z.number().positive().max(1800).optional(), // default: executor's 300 s
+  }),
 ]);
 export type SimulationBinding = z.infer<typeof simulationBindingSchema>;
 
@@ -93,9 +101,14 @@ export interface SimulationBindingIssue {
 }
 
 const KINDS_BY_NODE_TYPE: Record<string, ReadonlyArray<SimulationBinding['kind']>> = {
-  'source.video': ['recording', 'video_file'],
+  'source.video': ['recording', 'video_file', 'webcam'],
   'source.telemetry': ['device_telemetry', 'telemetry_csv'],
 };
+
+/** True when any binding is a live one (webcam today, device_live later). */
+export function hasLiveBindings(bindings: Record<string, SimulationBinding>): boolean {
+  return Object.values(bindings).some((b) => b.kind === 'webcam');
+}
 
 /**
  * Structural binding validation over the UPGRADED (v2) definition. Every
@@ -222,6 +235,17 @@ export function toManifestInputs(
           },
         });
         break;
+      case 'webcam':
+        inputs.push({
+          nodeId,
+          binding: {
+            kind: 'webcam',
+            ...(binding.maxDurationSeconds !== undefined
+              ? { maxDurationSeconds: binding.maxDurationSeconds }
+              : {}),
+          },
+        });
+        break;
     }
   }
   return inputs;
@@ -246,7 +270,14 @@ export function simulationWindow(
   return { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() };
 }
 
-/** Assembles and schema-validates the v2 manifest for a simulation run. */
+/**
+ * Assembles and schema-validates the v2 manifest for a simulation run.
+ * Simulations with a live binding get manifest mode "live" (already a legal
+ * enum value on the frozen schema): the engine's frames channels switch to
+ * drop-oldest so a slow consumer sees the LATEST webcam frames, never a
+ * growing backlog. The run ROW keeps mode='simulation' either way — manifest
+ * mode is engine channel policy, not run taxonomy.
+ */
 export function buildSimulationManifest(args: {
   runId: string;
   orgId: string;
@@ -257,10 +288,11 @@ export function buildSimulationManifest(args: {
   window: { from: string; to: string } | null;
   target: 'lambda' | 'fargate';
 }): RunManifest {
+  const live = args.inputs.some((i) => i.binding.kind === 'webcam');
   return runManifestSchema.parse({
     manifestVersion: 2,
     runId: args.runId,
-    mode: 'simulation',
+    mode: live ? 'live' : 'simulation',
     deviceId: args.deviceId,
     window: args.window,
     definition: args.definition,
@@ -269,6 +301,21 @@ export function buildSimulationManifest(args: {
     progress: { channel: 'iot', topicPrefix: simTopicPrefix(args.orgId, args.runId) },
     limits: { maxRuntimeSeconds: SIM_MAX_RUNTIME_SECONDS[args.target] },
   });
+}
+
+// --- Warm simulator session naming (M5, architecture §5) ----------------------
+// An "editing session" is one (org, template) pair: everyone tweak-and-
+// rerunning a template shares one warm task and one queue. The key is a stable
+// 32-hex digest so it fits ECS's 36-char startedBy field and SQS's 80-char
+// queue-name limit with the stage prefix.
+
+export function simulationSessionKey(orgId: string, templateId: string): string {
+  return createHash('sha256').update(`${orgId}:${templateId}`).digest('hex').slice(0, 32);
+}
+
+/** Queue name under the stage prefix (e.g. "xorgate-wfsim-dev-<key>"). */
+export function sessionQueueName(prefix: string, sessionKey: string): string {
+  return `${prefix}${sessionKey}`;
 }
 
 /** The `progress` block of the simulations API response. */

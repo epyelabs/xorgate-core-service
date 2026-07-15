@@ -292,6 +292,32 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         resources: [`arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`],
       }),
     );
+    // M5 live ingest plane: the engine subscribes (MQTT-over-WSS, SigV4) to
+    // wf/sim/<orgId>/<runId>/ingest/<nodeId> for browser-published webcam
+    // frames. Broad wf/sim/* filter matches the publish stance above.
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineSimIngestSubscribe',
+        actions: ['iot:Connect', 'iot:Subscribe', 'iot:Receive'],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:client/engine-ingest-*`,
+          `arn:aws:iot:${this.region}:${this.account}:topicfilter/wf/sim/*`,
+          `arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`,
+        ],
+      }),
+    );
+    // M5 warm simulator sessions: a session task long-polls (and drains) its
+    // per-editing-session queue. Name-pattern grant, matching the api-stack's
+    // create/send grant on the shared Lambda role.
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineSessionQueuePoll',
+        actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes'],
+        resources: [
+          `arn:aws:sqs:${this.region}:${this.account}:xorgate-wfsim-${stage}-*`,
+        ],
+      }),
+    );
     engineTaskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'EngineIotDescribeEndpoint',
@@ -310,6 +336,19 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         actions: ['secretsmanager:GetSecretValue'],
         resources: [
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${googleRoadsSecretName}*`,
+        ],
+      }),
+    );
+    // Anthropic API key for model.vlm (M5) — same out-of-band-secret pattern.
+    const anthropicSecretName = isProd
+      ? 'xorgate-anthropic-api-key'
+      : 'xorgate-anthropic-api-key-dev';
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineAnthropicSecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${anthropicSecretName}*`,
         ],
       }),
     );
@@ -332,7 +371,10 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
       // Static env, deliberately NOT part of the frozen per-run RunTask
       // override contract (RUN_ID/MANIFEST_BUCKET/MANIFEST_KEY/AWS_REGION):
       // the secrets seam maps logical secret names through it.
-      environment: { GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName },
+      environment: {
+        GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName,
+        ANTHROPIC_SECRET_NAME: anthropicSecretName,
+      },
       // The runner self-limits via manifest.limits.maxRuntimeSeconds and always
       // writes result.json on the way out; this is the hard ECS backstop.
       stopTimeout: cdk.Duration.seconds(120),

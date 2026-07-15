@@ -132,14 +132,29 @@ export async function s3FetchText(bucket: string, key: string): Promise<string> 
 // endpoint; resolve the account's ATS endpoint once per process, same pattern
 // as services/device-config.ts. Both the Lambda role and the engine task role
 // carry iot:DescribeEndpoint + iot:Publish on wf/sim/*.
+let iotAtsEndpointPromise: Promise<string> | undefined;
+/** The account's iot:Data-ATS endpoint hostname, resolved once per process. */
+export async function iotAtsEndpoint(): Promise<string> {
+  if (!iotAtsEndpointPromise) {
+    iotAtsEndpointPromise = (async () => {
+      const iot = new IoTClient({});
+      const res = await iot.send(new DescribeEndpointCommand({ endpointType: 'iot:Data-ATS' }));
+      if (!res.endpointAddress) throw new Error('DescribeEndpoint returned no iot:Data-ATS address');
+      return res.endpointAddress;
+    })();
+    iotAtsEndpointPromise.catch(() => {
+      iotAtsEndpointPromise = undefined;
+    });
+  }
+  return iotAtsEndpointPromise;
+}
+
 let iotDataClientPromise: Promise<IoTDataPlaneClient> | undefined;
 async function iotDataClient(): Promise<IoTDataPlaneClient> {
   if (!iotDataClientPromise) {
     iotDataClientPromise = (async () => {
-      const iot = new IoTClient({});
-      const res = await iot.send(new DescribeEndpointCommand({ endpointType: 'iot:Data-ATS' }));
-      if (!res.endpointAddress) throw new Error('DescribeEndpoint returned no iot:Data-ATS address');
-      return new IoTDataPlaneClient({ endpoint: `https://${res.endpointAddress}` });
+      const endpointAddress = await iotAtsEndpoint();
+      return new IoTDataPlaneClient({ endpoint: `https://${endpointAddress}` });
     })();
     iotDataClientPromise.catch(() => {
       iotDataClientPromise = undefined;
@@ -175,6 +190,7 @@ export function manifestProgress(manifest: RunManifest, log?: (m: string) => voi
  */
 const SECRET_ENV_BY_LOGICAL_NAME: Record<string, string> = {
   'google-roads-api-key': 'GOOGLE_ROADS_SECRET_NAME',
+  'anthropic-api-key': 'ANTHROPIC_SECRET_NAME', // model.vlm (M5)
 };
 const secretCache = new Map<string, Promise<string>>();
 export function secretsManagerReader(): EngineSecretReader {
