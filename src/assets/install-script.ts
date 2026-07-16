@@ -234,6 +234,24 @@ User=$SVC_USER
 Group=$SVC_GROUP
 EOF
 
+# Let the agent run the two privileged actions the cloud can trigger, and only
+# those. Without this the reboot/power-off commands depend on the distro's
+# stock \`010_pi-nopasswd\` (NOPASSWD: ALL for the \`pi\` user), which grants far
+# more than we need and is absent entirely when provisioning as any other user.
+# validate before install: a malformed sudoers file locks out sudo machine-wide.
+SUDOERS_TMP="\$(mktemp)"
+cat > "\$SUDOERS_TMP" <<EOF
+# Installed by xorgate. Allows the agent (running as $SVC_USER) to act on
+# cloud-issued reboot / power-off commands. See device-agent src/agent/commands.ts.
+$SVC_USER ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff
+EOF
+if visudo -cf "\$SUDOERS_TMP" >/dev/null 2>&1; then
+  install -m 0440 -o root -g root "\$SUDOERS_TMP" /etc/sudoers.d/020_xorgate-power
+else
+  log "WARN: sudoers drop-in failed validation; reboot/power-off commands will not work"
+fi
+rm -f "\$SUDOERS_TMP"
+
 systemctl daemon-reload
 systemctl enable --now xorgate-agent
 

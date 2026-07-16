@@ -354,6 +354,36 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
       },
       NoContent: { description: 'No content' },
+      DeviceCommandAccepted: {
+        description:
+          'Command published to the device. Delivery to the broker only — the device may still ' +
+          'reject it as expired or already-executed, and the real outcome is observed via device status.',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['requestId', 'command', 'expiresAt'],
+              properties: {
+                requestId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description: 'Replay key. The device refuses to execute the same one twice.',
+                },
+                command: { type: 'string', enum: ['reboot', 'power_off'] },
+                expiresAt: {
+                  type: 'integer',
+                  format: 'int64',
+                  description: 'Epoch ms after which the device refuses the command.',
+                },
+              },
+            },
+          },
+        },
+      },
+      DeviceCommandPublishFailed: {
+        description: 'Delivering the command to the device failed (COMMAND_PUBLISH_FAILED). Retry.',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+      },
     },
   },
   paths: {
@@ -1179,6 +1209,49 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
           '409': { $ref: '#/components/responses/Conflict' },
+        },
+      },
+    },
+    '/devices/{id}/reboot': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      post: {
+        operationId: 'rebootDevice',
+        summary: 'Reboot a device (owner/admin only)',
+        description:
+          'Publishes a one-shot reboot command to the device over MQTT and returns immediately — 202 means the ' +
+          'command was delivered to the broker, not that the device has rebooted. Observe the outcome via the ' +
+          'device status: it goes offline, then back online. The device must be online (409 otherwise): commands ' +
+          'are not retained, so there is nothing for an offline device to pick up later. The command expires ' +
+          '60 seconds after issue and carries a request id the device refuses to execute twice, so a stale or ' +
+          'redelivered command cannot cause a surprise reboot.',
+        tags: ['Devices'],
+        responses: {
+          '202': { $ref: '#/components/responses/DeviceCommandAccepted' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+          '502': { $ref: '#/components/responses/DeviceCommandPublishFailed' },
+        },
+      },
+    },
+    '/devices/{id}/power-off': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      post: {
+        operationId: 'powerOffDevice',
+        summary: 'Power off a device (owner/admin only)',
+        description:
+          'Publishes a one-shot power-off command to the device over MQTT. Same delivery semantics and guards as ' +
+          'the reboot command, but NOT remotely recoverable: the device stays off until someone physically powers ' +
+          'it back on. The device must be online (409 otherwise).',
+        tags: ['Devices'],
+        responses: {
+          '202': { $ref: '#/components/responses/DeviceCommandAccepted' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+          '502': { $ref: '#/components/responses/DeviceCommandPublishFailed' },
         },
       },
     },

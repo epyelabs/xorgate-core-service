@@ -47,6 +47,19 @@ export function created<T>(body: T): APIGatewayProxyResultV2 {
   };
 }
 
+/**
+ * 202: handed off, outcome not yet known. Used by device commands — the publish
+ * succeeded, but whether the device acts on it is observed separately (it goes
+ * offline, then comes back).
+ */
+export function accepted<T>(body: T): APIGatewayProxyResultV2 {
+  return {
+    statusCode: 202,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
 export function methodNotAllowed(method: string, allowed: string): APIGatewayProxyResultV2 {
   return {
     statusCode: 405,

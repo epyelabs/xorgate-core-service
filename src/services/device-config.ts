@@ -1,8 +1,5 @@
-import { IoTClient, DescribeEndpointCommand } from '@aws-sdk/client-iot';
-import {
-  IoTDataPlaneClient,
-  PublishCommand,
-} from '@aws-sdk/client-iot-data-plane';
+import { PublishCommand } from '@aws-sdk/client-iot-data-plane';
+import { iotDataClient } from './iot-data';
 
 /**
  * Cloud -> device config delivery. Publishes the device's full config object
@@ -23,31 +20,6 @@ export interface DeviceConfigMessage {
   ts: number;
 }
 
-// The default IoTDataPlaneClient endpoint is the legacy (non-ATS) data
-// endpoint, which devices' Amazon Root CA1 trust does not chain to. Resolve
-// the account's ATS endpoint once per container and reuse it.
-let dataClientPromise: Promise<IoTDataPlaneClient> | undefined;
-
-async function dataClient(): Promise<IoTDataPlaneClient> {
-  if (!dataClientPromise) {
-    dataClientPromise = (async () => {
-      const iot = new IoTClient({});
-      const res = await iot.send(
-        new DescribeEndpointCommand({ endpointType: 'iot:Data-ATS' }),
-      );
-      if (!res.endpointAddress) {
-        throw new Error('DescribeEndpoint returned no iot:Data-ATS address');
-      }
-      return new IoTDataPlaneClient({ endpoint: `https://${res.endpointAddress}` });
-    })();
-    // A failed resolution must not poison later invocations of a warm container.
-    dataClientPromise.catch(() => {
-      dataClientPromise = undefined;
-    });
-  }
-  return dataClientPromise;
-}
-
 /** Publish the retained per-device config message. Throws on failure. */
 export async function publishDeviceConfig(
   deviceId: string,
@@ -58,7 +30,7 @@ export async function publishDeviceConfig(
     gnssAntBias: config.gnssAntBias,
     ts: Date.now(),
   };
-  const client = await dataClient();
+  const client = await iotDataClient();
   await client.send(
     new PublishCommand({
       topic: `xorgate/devices/${deviceId}/config`,

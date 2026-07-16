@@ -237,6 +237,19 @@ export class XorgateCoreApiStack extends cdk.Stack {
         ],
       }),
     );
+    // One-shot device commands (reboot / power-off). Separate from the config
+    // grant above because commands are deliberately NOT retained — a retained
+    // reboot would replay on every reconnect and boot-loop the device — so this
+    // statement withholds iot:RetainPublish. Keep it that way.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "IotPublishDeviceCommand",
+        actions: ["iot:Publish"],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:topic/xorgate/devices/*/command`,
+        ],
+      }),
+    );
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "KvsChannels",
@@ -611,6 +624,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ...standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
       // Bundles @aws-sdk/client-iot-data-plane (retained device-config publish),
       // which isn't guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
+
+    const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-commands.ts"),
+        "POST /devices/{id}/reboot|power-off — one-shot device commands",
+      ),
+      // Bundles @aws-sdk/client-iot-data-plane (command publish), which isn't
+      // guaranteed in the Lambda runtime SDK.
       bundling: bundlingWithSdk,
     });
 
@@ -1299,6 +1322,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DevicesInt",
       devicesFn,
     );
+    const deviceCommandsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceCommandsInt",
+      deviceCommandsFn,
+    );
     const searchInt = new apigwv2int.HttpLambdaIntegration(
       "SearchInt",
       searchFn,
@@ -1478,6 +1505,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceProvisioningInt,
+    });
+    // One-shot commands. Separate routes rather than one /commands endpoint so
+    // each action is independently visible in the route table and in docs.
+    this.api.addRoutes({
+      path: "/devices/{id}/reboot",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/power-off",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
     });
 
     // Device registration (onboarding). The {code}/claim route is reached
