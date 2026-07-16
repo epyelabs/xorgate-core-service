@@ -3,6 +3,7 @@ import { IoTDataPlaneClient, PublishCommand } from '@aws-sdk/client-iot-data-pla
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import type { EngineArtifactSink, EngineSecretReader } from '../catalog/types';
+import { isSecretGoneError, orgSecretName, PROVIDER_BY_LOGICAL_SECRET } from '../org-credentials';
 import type { WorkflowDefinition } from '../../schemas/workflows';
 import type { EngineRunOutcome } from './index';
 import {
@@ -184,38 +185,102 @@ export function manifestProgress(manifest: RunManifest, log?: (m: string) => voi
 
 /**
  * Secrets seam implementation over Secrets Manager. Logical names map to
- * physical secret names via env (GOOGLE_ROADS_SECRET_NAME today); values are
- * cached for the process lifetime, so per-sample connector lookups never
- * re-hit the API.
+ * physical secret names via env (GOOGLE_ROADS_SECRET_NAME / HERE_SECRET_NAME /
+ * ANTHROPIC_SECRET_NAME); values are cached for the process lifetime, so
+ * per-sample connector lookups never re-hit the API.
+ *
+ * M7 resolution order: when the manifest carries an orgId and the logical name
+ * maps to an org-settable provider, the per-org secret
+ * (xorgate/orgs/<orgId>/<provider>) wins when it exists; otherwise the
+ * platform secret; otherwise the existing clear failure. Values are cached per
+ * physical name for the process/task lifetime (the M3/M5 rotation caveat);
+ * org-secret MISSES are deliberately not cached, so a newly set org key is
+ * picked up on the next run even on a warm target.
  */
 const SECRET_ENV_BY_LOGICAL_NAME: Record<string, string> = {
   'google-roads-api-key': 'GOOGLE_ROADS_SECRET_NAME',
+  'here-api-key': 'HERE_SECRET_NAME', // connector.third_party provider "here" (M7)
   'anthropic-api-key': 'ANTHROPIC_SECRET_NAME', // model.vlm (M5)
 };
-const secretCache = new Map<string, Promise<string>>();
-export function secretsManagerReader(): EngineSecretReader {
-  const client = new SecretsManagerClient({});
+
+export interface SecretReaderDeps {
+  orgId: string | null;
+  env: Record<string, string | undefined>;
+  /** Resolved SecretString, or null when the secret does not exist. */
+  fetchSecretValue: (secretName: string) => Promise<string | null>;
+  /** Process-lifetime value cache, keyed by physical secret name. */
+  cache?: Map<string, Promise<string | null>>;
+}
+
+/**
+ * The pure resolution half of the secrets seam (smoke-testable offline);
+ * secretsManagerReader() below wires it to Secrets Manager.
+ */
+export function createSecretReader(deps: SecretReaderDeps): EngineSecretReader {
+  const cache = deps.cache ?? new Map<string, Promise<string | null>>();
+  const cachedFetch = (secretName: string): Promise<string | null> => {
+    let entry = cache.get(secretName);
+    if (!entry) {
+      entry = deps.fetchSecretValue(secretName).then((value) => {
+        // Never cache a miss: a just-created org secret must be seen next run.
+        if (value === null || value === '') cache.delete(secretName);
+        return value;
+      });
+      entry.catch(() => cache.delete(secretName));
+      cache.set(secretName, entry);
+    }
+    return entry;
+  };
+
   return {
-    getSecret(logicalName: string): Promise<string> {
+    async getSecret(logicalName: string): Promise<string> {
       const envVar = SECRET_ENV_BY_LOGICAL_NAME[logicalName];
-      if (!envVar) return Promise.reject(new Error(`Unknown secret "${logicalName}"`));
-      const secretName = process.env[envVar];
+      if (!envVar) throw new Error(`Unknown secret "${logicalName}"`);
+
+      const provider = PROVIDER_BY_LOGICAL_SECRET[logicalName];
+      if (deps.orgId && provider) {
+        const orgValue = await cachedFetch(orgSecretName(deps.orgId, provider));
+        if (orgValue) return orgValue; // empty/missing org secret -> platform
+      }
+
+      const secretName = deps.env[envVar];
       if (!secretName) {
-        return Promise.reject(
-          new Error(`Secret "${logicalName}" is not configured on this engine target (${envVar} unset)`),
+        throw new Error(
+          `Secret "${logicalName}" is not configured: no organization credential` +
+            (provider ? ` for ${provider}` : '') +
+            ` and ${envVar} is unset on this engine target`,
         );
       }
-      let entry = secretCache.get(secretName);
-      if (!entry) {
-        entry = (async () => {
-          const res = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
-          if (!res.SecretString) throw new Error(`Secret "${secretName}" has no string value`);
-          return res.SecretString;
-        })();
-        entry.catch(() => secretCache.delete(secretName));
-        secretCache.set(secretName, entry);
+      const value = await cachedFetch(secretName);
+      if (value === null) {
+        throw new Error(
+          `Secret "${secretName}" does not exist` +
+            (provider ? `; set an organization ${provider} credential or create the platform secret` : ''),
+        );
       }
-      return entry;
+      if (!value) throw new Error(`Secret "${secretName}" has no string value`);
+      return value;
     },
   };
+}
+
+const secretCache = new Map<string, Promise<string | null>>();
+export function secretsManagerReader(orgId: string | null = null): EngineSecretReader {
+  const client = new SecretsManagerClient({});
+  return createSecretReader({
+    orgId,
+    env: process.env,
+    cache: secretCache,
+    fetchSecretValue: async (secretName) => {
+      try {
+        const res = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
+        return res.SecretString ?? '';
+      } catch (err) {
+        // Missing AND scheduled-for-deletion both mean "absent" (a just-
+        // cleared org key must fall back to the platform key, not fail).
+        if (isSecretGoneError(err)) return null;
+        throw err;
+      }
+    },
+  });
 }

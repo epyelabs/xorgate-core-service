@@ -160,65 +160,12 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     this.executionRoleArn = this.taskDefinition.obtainExecutionRole().roleArn;
     this.publicSubnetIds = vpc.publicSubnets.map((s) => s.subnetId);
 
-    // --- CV runner (RETIRED in M6, constructs kept ONE deploy) ---
-    // The Python cv-runner is unreachable: the dispatch path, the lambdaRole
-    // CvRunTask/CvPassRole grants, and the CV_* env are gone, and the v2 TS
-    // engine below replaced it. These constructs (repo, log group, role, task
-    // definition) survive one more deploy ONLY because their role ARNs were
-    // cross-stack tokens: deleting the producer while the not-yet-updated api
-    // stack still imports the auto-exports fails the recorder update with
-    // "export in use". The exportValue() pins below hold the exports through
-    // this transition deploy. NEXT deploy: delete this whole block (dev repo
-    // is DESTROY/emptyOnDelete; rollback = git revert + rebuild the image
-    // from the reverted cv-runner/ source).
-    const cvRepository = new ecr.Repository(this, 'CvRunnerRepo', {
-      repositoryName: isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev',
-      removalPolicy,
-      emptyOnDelete: !isProd,
-      imageScanOnPush: true,
-    });
-    const cvLogGroup = new logs.LogGroup(this, 'CvRunnerLogs', {
-      logGroupName: isProd ? '/xorgate/cv-runner' : '/xorgate/cv-runner-dev',
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy,
-    });
-    const cvTaskRole = new iam.Role(this, 'CvRunnerTaskRole', {
-      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'RETIRED (M6): Xorgate CV runner task role, removal queued',
-    });
-    cvTaskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'CvReadInputs',
-        actions: ['s3:GetObject'],
-        resources: [bucket.arnForObjects('media/v1/*'), bucket.arnForObjects('workflows/v1/*')],
-      }),
-    );
-    cvTaskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'CvWriteResults',
-        actions: ['s3:PutObject'],
-        resources: [bucket.arnForObjects('workflows/v1/*')],
-      }),
-    );
-    const cvTaskDefinition = new ecs.FargateTaskDefinition(this, 'CvRunnerTaskDef', {
-      family: isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev',
-      cpu: 2048,
-      memoryLimitMiB: 4096,
-      taskRole: cvTaskRole,
-      runtimePlatform: {
-        cpuArchitecture: ecs.CpuArchitecture.ARM64,
-        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-      },
-    });
-    cvTaskDefinition.addContainer('cv-runner', {
-      containerName: 'cv-runner',
-      image: ecs.ContainerImage.fromEcrRepository(cvRepository, 'latest'),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cv-runner', logGroup: cvLogGroup }),
-      stopTimeout: cdk.Duration.seconds(120),
-    });
-    // Pin the exports the OLD api stack still imports until its update lands.
-    this.exportValue(cvTaskRole.roleArn);
-    this.exportValue(cvTaskDefinition.obtainExecutionRole().roleArn);
+    // (CV runner constructs REMOVED in M7. They were kept exactly one deploy
+    // past the M6 cutover with exportValue pins because their role ARNs were
+    // cross-stack auto-exports the pre-M6 api stack imported; the M6 api-stack
+    // deploy landed, nothing imports them anymore. Dev repo/log group were
+    // DESTROY/emptyOnDelete; prod would orphan with RETAIN. Rollback = git
+    // revert + rebuild the image from the reverted cv-runner/ source.)
 
     // --- v2 engine runner (M2: TS streaming engine, Fargate target) ---
     // Node 20 + ffmpeg + onnxruntime-node on Fargate ARM64. Reads the v2 run
@@ -348,6 +295,30 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         ],
       }),
     );
+    // Optional platform-level HERE key (M7) — same out-of-band pattern; the
+    // env var is wired below whether or not the secret exists yet.
+    const hereSecretName = isProd ? 'xorgate-here-api-key' : 'xorgate-here-api-key-dev';
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineHereSecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${hereSecretName}*`,
+        ],
+      }),
+    );
+    // Per-org connector credentials (M7): the engine resolves
+    // xorgate/orgs/<orgId>/<provider> ahead of the platform secrets. Read-only
+    // name-pattern grant; the org-settings Lambda owns the writes (api-stack).
+    engineTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EngineOrgCredentialSecrets',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:xorgate/orgs/*`,
+        ],
+      }),
+    );
 
     this.engineTaskFamily = isProd ? 'xorgate-engine-runner' : 'xorgate-engine-runner-dev';
     this.engineTaskDefinition = new ecs.FargateTaskDefinition(this, 'EngineRunnerTaskDef', {
@@ -369,6 +340,7 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
       // the secrets seam maps logical secret names through it.
       environment: {
         GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName,
+        HERE_SECRET_NAME: hereSecretName,
         ANTHROPIC_SECRET_NAME: anthropicSecretName,
       },
       // The runner self-limits via manifest.limits.maxRuntimeSeconds and always

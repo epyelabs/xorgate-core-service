@@ -78,6 +78,21 @@
  *  28. capability re-verify (M6): upgraded v1 graphs emit metric:* tokens that
  *      real device-model caps satisfy; legacy gps/imu group tokens still
  *      satisfiable for stored attachments
+ *  29. connector providers (M7): HERE and OSM through the real executor with
+ *      mocked HTTP — request shapes (HERE route-match CSV trace, Overpass
+ *      form body + identifying User-Agent), no-answer samples emit no record,
+ *      the additive `source` field, OSM min-interval throttling (real clock),
+ *      back-off-once-then-fail on 429, maxLookupsPerRun cap + summary counts,
+ *      maxspeed tag parsing (kph/mph/knots/none). Adds ~6 s of real throttle/
+ *      back-off sleeps by design.
+ *  30. secrets resolution order (M7): createSecretReader — org key wins,
+ *      missing/empty org secret falls back to the platform secret, no orgId =
+ *      platform only, clear failures when nothing is configured, values
+ *      cached / misses not cached
+ *  31. org-credentials module (M7): secret naming, request schemas, validation
+ *      probes with mocked HTTP (Google speed-limits 403 surfaces, HERE
+ *      401-vs-400 semantics, minimal 1-token Claude Messages probe, OSM
+ *      reachability)
  *
  * Checks 20/21 need the M4 model exports on disk (model-export/out/...); run
  * model-export/export_depth.py and export_yolo.py --name yolov8n-seg first.
@@ -126,6 +141,16 @@ import {
   unknownNodeTypes,
 } from '../src/workflows/production';
 import { upgradeDefinition } from '../src/workflows/compat';
+import { parseMaxspeedTag } from '../src/workflows/catalog/nodes/connector-third-party';
+import { createSecretReader } from '../src/workflows/engine/target';
+import {
+  CREDENTIAL_PROVIDERS,
+  isSecretGoneError,
+  orgSecretName,
+  probeCredential,
+  PROVIDER_BY_LOGICAL_SECRET,
+  setCredentialSchema,
+} from '../src/workflows/org-credentials';
 import {
   computeRequiredCapabilities,
   missingCapabilities,
@@ -1162,6 +1187,7 @@ function testSimulationsModule(): void {
   });
   runManifestSchema.parse(manifest); // freeze check (buildSimulationManifest already parses)
   assert.strictEqual(manifest.mode, 'simulation');
+  assert.strictEqual(manifest.orgId, orgId); // M7: org-credential resolution field
   assert.strictEqual(manifest.progress?.topicPrefix, `wf/sim/${orgId}/run-sim-1`);
   assert.strictEqual(manifest.window?.from, '2026-01-01T12:00:00.000Z');
   assert.strictEqual(manifest.limits.maxRuntimeSeconds, 900);
@@ -2134,6 +2160,7 @@ function testProductionDispatchModule(): void {
     target: 'fargate',
   });
   assert.equal(manifest.mode, 'batch');
+  assert.equal(manifest.orgId, 'org-1'); // M7: org-credential resolution field
   assert.equal(manifest.progress?.topicPrefix, runTopicPrefix('org-1', 'run-1'));
   assert.equal(manifest.progress?.topicPrefix, 'wf/run/org-1/run-1');
   assert.equal(manifest.limits.maxRuntimeSeconds, PRODUCTION_MAX_RUNTIME_SECONDS.fargate);
@@ -2237,6 +2264,354 @@ function testUpgradedCapabilities(): void {
   console.log('check 28 ok: upgraded-graph capabilities (metric tokens satisfiable, legacy group tokens intact)');
 }
 
+// --- 29. Connector providers: HERE + OSM (M7) -----------------------------------------
+async function testConnectorProviders(): Promise<void> {
+  const connector = getExecutor('connector.third_party')!;
+  const t0 = Date.UTC(2026, 0, 1, 12, 0, 0);
+  const telemetryChannel = (
+    samples: Array<{ ts: number; signals: Record<string, number> }>,
+  ): { port: string; from: { nodeId: string; port: string }; messages: BoundedChannel<EngineMessage> } => {
+    const ch = new BoundedChannel<EngineMessage>(64);
+    for (let i = 0; i < samples.length; i++) {
+      void ch.push({ ch: 'telemetry', ts: samples[i].ts, seq: i, payload: { signals: samples[i].signals } });
+    }
+    ch.close();
+    return { port: 'positions', from: { nodeId: 'src', port: 'telemetry' }, messages: ch };
+  };
+  const pos = (i: number, lngOffset: number) => ({
+    ts: t0 + i * 1000,
+    signals: { 'gps.latitude': 45.5017, 'gps.longitude': -73.5673 + lngOffset },
+  });
+
+  // maxspeed tag parsing units.
+  assert.strictEqual(parseMaxspeedTag('50'), 50);
+  assert.strictEqual(parseMaxspeedTag('30 mph'), 48);
+  assert.strictEqual(parseMaxspeedTag('10 knots'), 19);
+  assert.strictEqual(parseMaxspeedTag('none'), null);
+  assert.strictEqual(parseMaxspeedTag('signals'), null);
+  assert.strictEqual(parseMaxspeedTag('DE:zone30'), null);
+  assert.strictEqual(parseMaxspeedTag(undefined), null);
+
+  // HERE: request shape, parse, per-position 400 = no answer, source field, secret name.
+  {
+    let hereCalls = 0;
+    const hereFetch = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      hereCalls += 1;
+      assert.ok(url.startsWith('https://routematching.hereapi.com/v8/match/routelinks?'), url);
+      assert.ok(url.includes('apikey=test-here-key'), 'HERE request must carry the key');
+      assert.ok(decodeURIComponent(url).includes('SPEED_LIMITS_FCn(*)'), 'must request the speed-limit layer');
+      assert.strictEqual(init?.method, 'POST');
+      assert.ok(String(init?.body).startsWith('LATITUDE,LONGITUDE\n'), 'one-point CSV trace body');
+      if (hereCalls === 2) return { ok: false, status: 400, text: async () => 'no match' } as unknown as Response;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          response: {
+            route: [
+              { leg: [{ link: [{ attributes: { SPEED_LIMITS_FCN: [{ FROM_REF_SPEED_LIMIT: '60', TO_REF_SPEED_LIMIT: '0' }] } }] }] },
+            ],
+          },
+        }),
+        text: async () => '',
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const secrets: EngineSecretReader = {
+      getSecret: async (name) => {
+        assert.strictEqual(name, 'here-api-key');
+        return 'test-here-key';
+      },
+    };
+    const ctx = stubCtx({ nodeId: 'roads', secrets, http: hereFetch });
+    const emitted: EngineMessage[] = [];
+    const gen = connector(
+      [telemetryChannel([pos(0, 0), pos(1, 0.001), pos(2, 0.001)])],
+      { provider: 'here' },
+      ctx,
+    );
+    let seq = 0;
+    for await (const m of gen) emitted.push({ seq: seq++, ...m } as EngineMessage);
+    assert.strictEqual(hereCalls, 2, 'two unique positions, one cache hit');
+    assert.strictEqual(emitted.length, 1, '400 position emits no record');
+    const payload = emitted[0].payload as { ts: number; speedLimitKph: number; source: string; placeId?: string };
+    assert.strictEqual(payload.speedLimitKph, 60);
+    assert.strictEqual(payload.source, 'here');
+    assert.strictEqual(payload.placeId, undefined, 'placeId stays Google-only');
+    assert.ok(ctx.summary!.includes('via here'), ctx.summary!);
+    // Samples 2 and 3 share the no-answer position: no-coverage counts per
+    // SAMPLE (cache-hit nulls included), the existing cache/skip semantics.
+    assert.ok(ctx.summary!.includes('2 without coverage'), ctx.summary!);
+  }
+
+  // OSM: no secret needed, form body + User-Agent, throttle interval, back-off
+  // retry on a single 429, source field.
+  {
+    const callTimes: number[] = [];
+    let osmCalls = 0;
+    const osmFetch = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      osmCalls += 1;
+      callTimes.push(Date.now());
+      assert.strictEqual(url, 'https://overpass-api.de/api/interpreter');
+      assert.strictEqual(init?.method, 'POST');
+      const headers = init?.headers as Record<string, string>;
+      assert.ok(headers['User-Agent']?.includes('xorgate'), 'identifying User-Agent required');
+      assert.ok(String(init?.body).startsWith('data='), 'form-encoded query');
+      assert.ok(decodeURIComponent(String(init?.body)).includes('["highway"]["maxspeed"]'), 'maxspeed way query');
+      if (osmCalls === 1) return { ok: false, status: 429, text: async () => 'rate limited' } as unknown as Response;
+      const maxspeed = osmCalls === 2 ? '40' : 'none';
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ elements: [{ tags: { highway: 'residential', maxspeed } }] }),
+        text: async () => '',
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    // secrets: null proves OSM resolves no secret at all.
+    const ctx = stubCtx({ nodeId: 'roads', secrets: null, http: osmFetch });
+    const emitted: EngineMessage[] = [];
+    const started = Date.now();
+    for await (const m of connector(
+      [telemetryChannel([pos(0, 0), pos(1, 0.001)])],
+      { provider: 'osm' },
+      ctx,
+    )) {
+      emitted.push(m as EngineMessage);
+    }
+    // Call 1: 429 -> back-off -> call 2 (position A, 40 kph); call 3: position B, untagged.
+    assert.strictEqual(osmCalls, 3);
+    assert.strictEqual(emitted.length, 1);
+    const payload = emitted[0].payload as { speedLimitKph: number; source: string };
+    assert.strictEqual(payload.speedLimitKph, 40);
+    assert.strictEqual(payload.source, 'osm');
+    assert.ok(Date.now() - started >= 3000, 'the 429 back-off must actually wait');
+    // Min-interval throttle between the two REAL lookups (calls 2 and 3).
+    assert.ok(callTimes[2] - callTimes[1] >= 900, `throttle gap was ${callTimes[2] - callTimes[1]} ms`);
+    assert.ok(ctx.summary!.includes('via osm'), ctx.summary!);
+    assert.ok(ctx.summary!.includes('1 without coverage'), ctx.summary!);
+  }
+
+  // OSM: persistent 429 fails the node with the clear self-host pointer.
+  {
+    const osmFetch = (async () =>
+      ({ ok: false, status: 429, text: async () => 'busy' }) as unknown as Response) as unknown as typeof fetch;
+    const ctx = stubCtx({ nodeId: 'roads', secrets: null, http: osmFetch });
+    await assert.rejects(
+      (async () => {
+        for await (const _m of connector([telemetryChannel([pos(0, 0)])], { provider: 'osm' }, ctx)) {
+          // no emits expected
+        }
+      })(),
+      /Overpass is overloaded.*back-off retry.*self-host/is,
+    );
+  }
+
+  // maxLookupsPerRun cap: third unique position is skipped, cache hits still emit.
+  {
+    let calls = 0;
+    const okFetch = (async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ elements: [{ tags: { maxspeed: '50' } }] }),
+        text: async () => '',
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const ctx = stubCtx({ nodeId: 'roads', secrets: null, http: okFetch });
+    const emitted: EngineMessage[] = [];
+    for await (const m of connector(
+      [telemetryChannel([pos(0, 0), pos(1, 0.001), pos(2, 0), pos(3, 0.002)])],
+      { provider: 'osm', maxLookupsPerRun: 2 },
+      ctx,
+    )) {
+      emitted.push(m as EngineMessage);
+    }
+    assert.strictEqual(calls, 2, 'lookup cap enforced');
+    assert.strictEqual(emitted.length, 3, 'cache-hit position still emits past the cap');
+    assert.ok(ctx.summary!.includes('1 skipped by lookup cap'), ctx.summary!);
+  }
+
+  console.log('check 29 ok: connector providers (HERE parse/400, OSM throttle/back-off/cap/UA, source field)');
+}
+
+// --- 30. Secrets resolution order (M7) --------------------------------------------------
+async function testSecretResolutionOrder(): Promise<void> {
+  const makeReader = (opts: {
+    orgId: string | null;
+    env: Record<string, string | undefined>;
+    values: Record<string, string | null>; // physical name -> value (null = not found)
+  }) => {
+    const fetched: string[] = [];
+    const reader = createSecretReader({
+      orgId: opts.orgId,
+      env: opts.env,
+      fetchSecretValue: async (name) => {
+        fetched.push(name);
+        return name in opts.values ? opts.values[name] : null;
+      },
+    });
+    return { reader, fetched };
+  };
+  const env = { GOOGLE_ROADS_SECRET_NAME: 'platform-roads', HERE_SECRET_NAME: 'platform-here' };
+
+  // Org key wins.
+  {
+    const { reader, fetched } = makeReader({
+      orgId: 'org-1',
+      env,
+      values: { 'xorgate/orgs/org-1/google_roads': 'org-key', 'platform-roads': 'platform-key' },
+    });
+    assert.strictEqual(await reader.getSecret('google-roads-api-key'), 'org-key');
+    assert.deepStrictEqual(fetched, ['xorgate/orgs/org-1/google_roads']);
+  }
+  // Missing org secret -> platform.
+  {
+    const { reader, fetched } = makeReader({
+      orgId: 'org-1',
+      env,
+      values: { 'platform-here': 'platform-here-key' },
+    });
+    assert.strictEqual(await reader.getSecret('here-api-key'), 'platform-here-key');
+    assert.deepStrictEqual(fetched, ['xorgate/orgs/org-1/here', 'platform-here']);
+  }
+  // EMPTY org secret behaves like unset -> platform.
+  {
+    const { reader } = makeReader({
+      orgId: 'org-1',
+      env,
+      values: { 'xorgate/orgs/org-1/google_roads': '', 'platform-roads': 'platform-key' },
+    });
+    assert.strictEqual(await reader.getSecret('google-roads-api-key'), 'platform-key');
+  }
+  // No orgId -> platform only (no org fetch at all).
+  {
+    const { reader, fetched } = makeReader({ orgId: null, env, values: { 'platform-roads': 'p' } });
+    assert.strictEqual(await reader.getSecret('google-roads-api-key'), 'p');
+    assert.deepStrictEqual(fetched, ['platform-roads']);
+  }
+  // Nothing configured: clear failures.
+  {
+    const { reader } = makeReader({ orgId: 'org-1', env: {}, values: {} });
+    await assert.rejects(reader.getSecret('here-api-key'), /no organization credential for here.*HERE_SECRET_NAME/s);
+  }
+  {
+    const { reader } = makeReader({ orgId: 'org-1', env, values: {} });
+    await assert.rejects(reader.getSecret('here-api-key'), /"platform-here" does not exist/);
+  }
+  {
+    const { reader } = makeReader({ orgId: null, env, values: {} });
+    await assert.rejects(reader.getSecret('unknown-name'), /Unknown secret/);
+  }
+  // Values are cached; org-secret misses are NOT (a newly set key is seen next run).
+  {
+    const { reader, fetched } = makeReader({
+      orgId: 'org-1',
+      env,
+      values: { 'platform-roads': 'p' },
+    });
+    await reader.getSecret('google-roads-api-key');
+    await reader.getSecret('google-roads-api-key');
+    const orgFetches = fetched.filter((n) => n === 'xorgate/orgs/org-1/google_roads').length;
+    const platformFetches = fetched.filter((n) => n === 'platform-roads').length;
+    assert.strictEqual(orgFetches, 2, 'org miss must be re-checked per resolution');
+    assert.strictEqual(platformFetches, 1, 'platform value must be cached');
+  }
+  console.log('check 30 ok: secrets resolution order (org -> platform -> clear failure; miss not cached)');
+}
+
+// --- 31. Org-credentials module (M7) -----------------------------------------------------
+async function testOrgCredentialsModule(): Promise<void> {
+  assert.strictEqual(orgSecretName('org-1', 'google_roads'), 'xorgate/orgs/org-1/google_roads');
+  assert.strictEqual(orgSecretName('org-1', 'anthropic'), 'xorgate/orgs/org-1/anthropic');
+  assert.deepStrictEqual(PROVIDER_BY_LOGICAL_SECRET['here-api-key'], 'here');
+  assert.deepStrictEqual([...CREDENTIAL_PROVIDERS], ['google_roads', 'here', 'anthropic']);
+
+  assert.ok(!setCredentialSchema.safeParse({ apiKey: 'short' }).success, 'too-short key rejected');
+  assert.strictEqual(setCredentialSchema.parse({ apiKey: '  padded-key-value  ' }).apiKey, 'padded-key-value');
+
+  // Absent-secret classification: missing AND scheduled-for-deletion both read
+  // as gone (the force-delete lingering window, found by the M7 E2E).
+  assert.ok(isSecretGoneError({ name: 'ResourceNotFoundException' }));
+  assert.ok(
+    isSecretGoneError({
+      name: 'InvalidRequestException',
+      message: "You can't perform this operation on the secret because it was marked for deletion.",
+    }),
+  );
+  assert.ok(!isSecretGoneError({ name: 'InvalidRequestException', message: 'other invalid request' }));
+  assert.ok(!isSecretGoneError({ name: 'AccessDeniedException', message: 'nope' }));
+
+  const jsonRes = (status: number, body: unknown) =>
+    ({
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }) as unknown as Response;
+
+  // Google: the entitlement 403 must surface with the provider's message.
+  {
+    const http = (async () =>
+      jsonRes(403, { error: { status: 'PERMISSION_DENIED', message: 'Speed limits are not available for this project.' } })) as unknown as typeof fetch;
+    const res = await probeCredential('google_roads', 'k', http);
+    assert.strictEqual(res.ok, false);
+    assert.ok(res.message.includes('Speed limits are not available'), res.message);
+  }
+  {
+    const http = (async (input: unknown) => {
+      assert.ok(String(input).includes('roads.googleapis.com/v1/speedLimits'), String(input));
+      return jsonRes(200, { speedLimits: [] });
+    }) as unknown as typeof fetch;
+    assert.strictEqual((await probeCredential('google_roads', 'k', http)).ok, true);
+  }
+  // HERE: 401 = bad key, 400 (no match) still proves the key.
+  {
+    const http = (async () => jsonRes(401, { error: 'Unauthorized' })) as unknown as typeof fetch;
+    assert.strictEqual((await probeCredential('here', 'k', http)).ok, false);
+  }
+  {
+    const http = (async () => jsonRes(400, { error: 'no match' })) as unknown as typeof fetch;
+    assert.strictEqual((await probeCredential('here', 'k', http)).ok, true);
+  }
+  // Anthropic: minimal 1-token Messages probe shape; 200 ok, 401 fails.
+  {
+    let seen: { url: string; init?: RequestInit } | null = null;
+    const http = (async (input: unknown, init?: RequestInit) => {
+      seen = { url: String(input), init };
+      return jsonRes(200, { id: 'msg_1' });
+    }) as unknown as typeof fetch;
+    assert.strictEqual((await probeCredential('anthropic', 'sk-ant-test', http)).ok, true);
+    assert.strictEqual(seen!.url, 'https://api.anthropic.com/v1/messages');
+    const headers = seen!.init?.headers as Record<string, string>;
+    assert.strictEqual(headers['x-api-key'], 'sk-ant-test');
+    assert.ok(headers['anthropic-version'], 'anthropic-version header required');
+    const body = JSON.parse(String(seen!.init?.body)) as { model: string; max_tokens: number };
+    assert.strictEqual(body.max_tokens, 1);
+    assert.strictEqual(body.model, 'claude-haiku-4-5');
+  }
+  {
+    const http = (async () =>
+      jsonRes(401, { error: { type: 'authentication_error', message: 'invalid x-api-key' } })) as unknown as typeof fetch;
+    const res = await probeCredential('anthropic', 'bad', http);
+    assert.strictEqual(res.ok, false);
+    assert.ok(res.message.includes('invalid x-api-key'), res.message);
+  }
+  // No key to validate.
+  assert.strictEqual((await probeCredential('anthropic', null, failingFetch)).ok, false);
+  // OSM: reachability only, no key involved.
+  {
+    const http = (async (input: unknown, init?: RequestInit) => {
+      assert.strictEqual(String(input), 'https://overpass-api.de/api/interpreter');
+      assert.ok((init?.headers as Record<string, string>)['User-Agent']);
+      return jsonRes(200, { elements: [] });
+    }) as unknown as typeof fetch;
+    assert.strictEqual((await probeCredential('osm', null, http)).ok, true);
+  }
+  console.log('check 31 ok: org-credentials module (naming, schemas, Google/HERE/Claude/OSM probes)');
+}
+
 async function main(): Promise<void> {
   await testBackpressure();
   await testDropOldest();
@@ -2266,6 +2641,9 @@ async function main(): Promise<void> {
   testProductionDispatchModule();
   testCutoverRouting();
   testUpgradedCapabilities();
+  await testConnectorProviders();
+  await testSecretResolutionOrder();
+  await testOrgCredentialsModule();
   console.log('\nengine smoke: all checks passed');
 }
 

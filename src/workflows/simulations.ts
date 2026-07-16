@@ -293,6 +293,7 @@ export function buildSimulationManifest(args: {
     manifestVersion: 2,
     runId: args.runId,
     mode: live ? 'live' : 'simulation',
+    orgId: args.orgId, // M7: per-org credential resolution in the secrets seam
     deviceId: args.deviceId,
     window: args.window,
     definition: args.definition,

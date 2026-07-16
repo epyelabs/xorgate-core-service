@@ -157,6 +157,7 @@ export function buildProductionManifest(args: {
     manifestVersion: 2,
     runId: args.runId,
     mode: 'batch',
+    orgId: args.orgId, // M7: per-org credential resolution in the secrets seam
     deviceId: args.deviceId,
     window: args.window,
     definition: args.definition,

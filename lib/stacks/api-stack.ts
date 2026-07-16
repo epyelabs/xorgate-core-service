@@ -348,6 +348,41 @@ export class XorgateCoreApiStack extends cdk.Stack {
         ],
       }),
     );
+    // Optional platform-level HERE key (M7): same out-of-band pattern. The env
+    // var is always wired; while the secret does not exist the engine surfaces
+    // its clear "does not exist" failure and org keys still work.
+    const hereSecretName = isProd
+      ? "xorgate-here-api-key"
+      : "xorgate-here-api-key-dev";
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "HereSecretRead",
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${hereSecretName}*`,
+        ],
+      }),
+    );
+    // Per-org connector credentials (M7): xorgate/orgs/<orgId>/<provider>.
+    // GetSecretValue serves the Lambda engine's org-first resolution; the
+    // Create/Put/Delete/Describe actions serve the org-settings handler. Name-
+    // pattern grant (no per-org literal ARNs exist at deploy time); the engine
+    // TASK role gets the read-only twin in recorder-stack.ts.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "OrgCredentialSecrets",
+        actions: [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:DeleteSecret",
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:xorgate/orgs/*`,
+        ],
+      }),
+    );
     // Warm simulator sessions (M5): the simulations handler creates/sends to
     // per-editing-session SQS queues and looks for a running session task
     // before launching one (ecs:ListTasks is cluster-conditioned; its resource
@@ -1106,6 +1141,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       environment: {
         ...commonEnv,
         GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName,
+        HERE_SECRET_NAME: hereSecretName,
         ANTHROPIC_SECRET_NAME: anthropicSecretName,
       },
     });
@@ -1148,6 +1184,32 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // Warm simulator sessions (M5): per-(org, template) SQS queues under this
     // prefix; unset would disable the warm path (cold RunTask per run).
     workflowSimulationsFn.addEnvironment("WF_SESSION_QUEUE_PREFIX", sessionQueuePrefix);
+
+    // Per-org connector credentials (M7): set/rotate/clear/validate BYO API
+    // keys (google_roads / here / anthropic) stored as
+    // xorgate/orgs/<orgId>/<provider> secrets. Bundles the SDK
+    // (client-secrets-manager); the validate probes call the providers
+    // outbound, so give it probe headroom over the 10 s default.
+    const organizationCredentialsFn = new nodejs.NodejsFunction(
+      this,
+      "OrganizationCredentialsFn",
+      {
+        ...standardFnProps(
+          path.join(entryBase, "organization-credentials.ts"),
+          "org connector credentials — set/rotate/clear/validate",
+        ),
+        timeout: cdk.Duration.seconds(20),
+        memorySize: 256,
+        bundling: bundlingWithSdk,
+        environment: {
+          ...commonEnv,
+          // Platform defaults the validate endpoint can probe.
+          GOOGLE_ROADS_SECRET_NAME: googleRoadsSecretName,
+          HERE_SECRET_NAME: hereSecretName,
+          ANTHROPIC_SECRET_NAME: anthropicSecretName,
+        },
+      },
+    );
 
     // Workflow scheduler (1-min tick): schedule triggers + the stuck-run watchdog.
     // Fires runs (SQS) and StopTask's stale Fargate tasks -> bundles the AWS SDK.
@@ -1296,6 +1358,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowSimulationsInt = new apigwv2int.HttpLambdaIntegration(
       "WorkflowSimulationsInt",
       workflowSimulationsFn,
+    );
+    const organizationCredentialsInt = new apigwv2int.HttpLambdaIntegration(
+      "OrganizationCredentialsInt",
+      organizationCredentialsFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
@@ -1535,6 +1601,23 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-templates/{id}/simulations/uploads",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
+    });
+
+    // Per-org connector credentials (M7).
+    this.api.addRoutes({
+      path: "/organization-credentials",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: organizationCredentialsInt,
+    });
+    this.api.addRoutes({
+      path: "/organization-credentials/{provider}",
+      methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
+      integration: organizationCredentialsInt,
+    });
+    this.api.addRoutes({
+      path: "/organization-credentials/{provider}/validate",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: organizationCredentialsInt,
     });
 
     // Served node catalog (static per deployment, ETag cached).

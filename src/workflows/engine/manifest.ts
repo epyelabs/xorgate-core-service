@@ -62,6 +62,13 @@ export const runManifestSchema = z.object({
     bucket: z.string().min(1),
     prefix: z.string().min(1), // runPrefix(runId)
   }),
+  // ADDITIVE (M7, optional; absent on every pre-M7 manifest): the org that
+  // owns the run, used by the secrets seam to resolve per-org credentials
+  // (xorgate/orgs/<orgId>/<provider>) ahead of the platform secrets. Absent =
+  // platform-only resolution, exactly the pre-M7 behavior. Deliberately an
+  // explicit field: production manifests already embed the org id in
+  // progress.topicPrefix, but the seam must not parse topics.
+  orgId: z.string().min(1).optional(),
   // ADDITIVE (M3, optional; absent on every pre-M3 manifest): when present the
   // target publishes live progress to IoT topics under topicPrefix
   // (wf/sim/<orgId>/<runId>). Absent = silent run, exactly the M2 behavior.

@@ -116,7 +116,9 @@ export const handler = async (
         },
         {
           sources: telemetrySources(bucket),
-          secrets: secretsManagerReader(),
+          // M7: org credentials win over platform secrets when the manifest
+          // names the owning org.
+          secrets: secretsManagerReader(manifest.orgId ?? null),
           ...(progress ? { progress } : {}),
           deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
         },
