@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import { ECSClient, ListTasksCommand, RunTaskCommand } from '@aws-sdk/client-ecs';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -7,32 +7,38 @@ import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { readTelemetryWindow } from './telemetry-window';
-import { getNodeType } from '../workflows/catalog/index';
-import { sessionQueueName } from '../workflows/simulations';
-import { inputRecordsKey, manifestKey, runPrefix, type RunManifest } from '../workflows/engine/manifest';
+import { upgradeDefinition } from '../workflows/compat';
+import { engineTargetForDefinition, sessionQueueName } from '../workflows/simulations';
+import {
+  buildProductionManifest,
+  buildTriggeredInputs,
+  resolveTriggeredWindow,
+  triggeredVideoSelection,
+  unknownNodeTypes,
+  type ResolvedVideoInput,
+} from '../workflows/production';
+import { inputRecordsKey, manifestKey, type RunManifest } from '../workflows/engine/manifest';
 
 /**
  * v2 engine dispatch: write the v2 manifest to S3, then either async-invoke
  * the Lambda engine (telemetry-only graphs) or RunTask the engine-runner
- * container (media graphs) with the same env contract as the cv-runner. Two
- * callers:
+ * container (media graphs). Two callers:
  *
- * - The M3 simulations handler (workflow-simulations.ts): a NEW dispatch path,
- *   direct (no SQS hop) because the caller is an interactive request that
- *   wants dispatch errors synchronously; the run row exists before dispatch
- *   and the watchdog covers lost tasks, so there is nothing for a retry queue
- *   to add.
- * - The M2 experimental production path (default OFF): when
- *   WORKFLOW_V2_EXPERIMENT=on, stored schemaVersion-2 TELEMETRY-ONLY
- *   definitions run on the v2 Lambda engine. Everything else keeps flowing to
- *   the PoC inline runner / cv-runner until M6.
+ * - The M3 simulations handler (workflow-simulations.ts): direct dispatch (no
+ *   SQS hop) because the caller is an interactive request that wants dispatch
+ *   errors synchronously; the run row exists before dispatch and the watchdog
+ *   covers lost tasks, so there is nothing for a retry queue to add.
+ * - The M6 production trigger path (workflow-dispatch.ts): every triggered
+ *   run (telemetry_condition / recording_saved / schedule / manual / rerun)
+ *   lands on dispatchV2TriggeredRun after the dispatcher's atomic
+ *   dispatched_at claim. The PoC inline runner and Python cv-runner are
+ *   retired; v1 definitions are upgraded at fire time (workflow-triggers.ts)
+ *   and here again defensively for rows enqueued before the cutover deploy.
  *
- * Idempotency notes: Fargate dispatch stamps the REAL taskArn (the watchdog
- * can StopTask it). Lambda dispatch stamps nothing (a fake ARN would be
- * StopTask'd), so an SQS redelivery mid-run could invoke the engine twice;
- * both invocations write the same artifact keys and finalize is
- * status-guarded, so the second result is a no-op. Accepted for the
- * experiment; M6 needs a real idempotency stamp.
+ * Idempotency: the SQS dispatcher claims runs via the dispatched_at column
+ * (migration 0016) BEFORE calling in here, so redelivery can never
+ * double-invoke either target. Fargate dispatch additionally stamps the real
+ * taskArn so the watchdog can StopTask a hung task.
  */
 
 const s3 = new S3Client({});
@@ -60,36 +66,14 @@ const SESSION_QUEUE_ATTRIBUTES = {
   ReceiveMessageWaitTimeSeconds: '20',
 };
 
-export function v2ExperimentEnabled(): boolean {
-  return process.env.WORKFLOW_V2_EXPERIMENT === 'on';
-}
-
-/** True iff the STORED definition is schemaVersion 2 with only known, non-media nodes. */
-export function isV2TelemetryOnly(definition: WorkflowDefinition): boolean {
-  if ((definition.schemaVersion ?? 1) < 2) return false;
-  for (const node of definition.nodes) {
-    const typeDef = getNodeType(node.type);
-    if (!typeDef || typeDef.runtime.target === 'media') return false;
-  }
-  return true;
-}
-
-// Same fallback the inline runner uses (workflow-runner.ts resolveWindow).
-function resolveWindow(run: WorkflowRun): { from: string; to: string } {
-  const ctx = run.triggerContext as { window?: { from?: string; to?: string } } | null;
-  if (ctx?.window?.from && ctx?.window?.to) {
-    return { from: ctx.window.from, to: ctx.window.to };
-  }
-  const to = run.startedAt ?? new Date();
-  const from = new Date(to.getTime() - 15 * 60_000);
-  return { from: from.toISOString(), to: to.toISOString() };
-}
-
+// Guarded running -> failed transition: a no-op when the run was already
+// finalized (finalize or the watchdog got there first), so a late dispatch
+// error can never clobber a real outcome.
 async function failRun(runId: string, error: string): Promise<void> {
   await db
     .update(schema.workflowRuns)
     .set({ status: 'failed', endedAt: new Date(), error })
-    .where(eq(schema.workflowRuns.id, runId));
+    .where(and(eq(schema.workflowRuns.id, runId), eq(schema.workflowRuns.status, 'running')));
 }
 
 /**
@@ -346,25 +330,113 @@ export async function dispatchV2Run(runId: string, opts: DispatchV2Options): Pro
   console.log('workflow-engine-v2: engine task launched', { runId, taskArn });
 }
 
-/** The M2 experimental production path (telemetry-only, Lambda target). */
-export async function dispatchV2LambdaRun(run: WorkflowRun): Promise<void> {
-  if (!BUCKET || !ENGINE_FN) {
-    return failRun(run.id, 'v2 engine is not configured');
-  }
-  const manifest: RunManifest = {
-    manifestVersion: 2,
-    runId: run.id,
-    mode: run.mode === 'simulation' ? 'simulation' : 'batch',
-    deviceId: run.deviceId,
-    window: resolveWindow(run),
-    definition: run.definition as WorkflowDefinition,
-    inputs: [], // telemetry sources default to a history read over the window
-    output: { bucket: BUCKET, prefix: runPrefix(run.id) },
-    limits: { maxRuntimeSeconds: 240 },
+// The organization owning the run's template: production progress topics are
+// org-prefixed (wf/run/<orgId>/<runId>), same scoping as the simulator plane.
+async function templateOrgId(templateId: string): Promise<string> {
+  const row = await db.query.workflowTemplates.findFirst({
+    where: eq(schema.workflowTemplates.id, templateId),
+    columns: { organizationId: true },
+  });
+  if (!row) throw new Error('Workflow template no longer exists');
+  return row.organizationId;
+}
+
+// Resolve the triggered run's video input from its trigger context: an s3Key
+// carried directly (recording_saved), or a schedule selection resolved against
+// the recordings table (hand-picked ids / most recent N). Multiple matches
+// reduce to the primary (newest) recording, the retired v1 dispatcher's rule.
+async function resolveTriggeredVideoInput(run: WorkflowRun): Promise<ResolvedVideoInput | null> {
+  const selection = triggeredVideoSelection(run.triggerContext);
+  if (!selection) return null;
+  if (selection.kind === 'context') return selection.input;
+  if (!run.deviceId) return null;
+
+  const rows =
+    selection.kind === 'recordings'
+      ? await db
+          .select()
+          .from(schema.recordings)
+          .where(
+            and(
+              eq(schema.recordings.deviceId, run.deviceId),
+              inArray(schema.recordings.id, selection.recordingIds),
+              isNotNull(schema.recordings.s3Key),
+            ),
+          )
+          .orderBy(desc(schema.recordings.createdAt))
+          .limit(1)
+      : await db
+          .select()
+          .from(schema.recordings)
+          .where(
+            and(
+              eq(schema.recordings.deviceId, run.deviceId),
+              eq(schema.recordings.status, 'completed'),
+              isNotNull(schema.recordings.s3Key),
+            ),
+          )
+          .orderBy(desc(schema.recordings.createdAt))
+          .limit(1);
+  const rec = rows[0];
+  if (!rec) return null;
+  return {
+    s3Key: rec.s3Key as string,
+    recordingId: rec.id,
+    recordingStartedAt: rec.startedAt ? rec.startedAt.toISOString() : null,
+    captureStartedAt: rec.captureStartedAt ? rec.captureStartedAt.toISOString() : null,
   };
+}
+
+/**
+ * The M6 production trigger path: builds the v2 manifest for a triggered
+ * (device-attachment) run and dispatches the engine target. Called by the SQS
+ * dispatcher AFTER its atomic dispatched_at claim. No retry semantics (same
+ * stance as the retired v1 dispatchers): any failure fails the run row with a
+ * clear error and returns, so the SQS message always acks.
+ */
+export async function dispatchV2TriggeredRun(run: WorkflowRun): Promise<void> {
   try {
-    await dispatchV2Run(run.id, { target: 'lambda', manifest });
-  } catch {
-    return; // the run row is already failed; the SQS dispatcher must not retry
+    if (!BUCKET) throw new Error('v2 engine is not configured (BUCKET_NAME unset)');
+    // fireWorkflowRun stamps upgraded definitions since M6; upgrading again is
+    // a pure no-op for v2 and covers rows enqueued before the cutover deploy
+    // (and historical-rerun snapshots).
+    const definition = upgradeDefinition(run.definition as WorkflowDefinition);
+    const unknown = unknownNodeTypes(definition);
+    if (unknown.length > 0) {
+      throw new Error(
+        `Definition uses node types not in the catalog (${unknown.join(', ')}); edit and re-publish the template`,
+      );
+    }
+    const target = engineTargetForDefinition(definition);
+    const window = resolveTriggeredWindow(run.triggerContext, run.startedAt);
+    const video = await resolveTriggeredVideoInput(run);
+    let inputs = buildTriggeredInputs(definition, video, target);
+    if (target === 'fargate') {
+      // The M4 telemetry seam, reused verbatim: history bindings become
+      // dispatcher-written records.jsonl objects (the task role is DB-free).
+      inputs = await materializeHistoryInputs({
+        runId: run.id,
+        definition,
+        inputs,
+        deviceId: run.deviceId,
+        window,
+      });
+    }
+    const orgId = await templateOrgId(run.templateId);
+    const manifest = buildProductionManifest({
+      runId: run.id,
+      orgId,
+      bucket: BUCKET,
+      definition,
+      deviceId: run.deviceId,
+      inputs,
+      window,
+      target,
+    });
+    await dispatchV2Run(run.id, { target, manifest });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('workflow-engine-v2: triggered dispatch failed', { runId: run.id, err });
+    await failRun(run.id, message); // no-op if dispatchV2Run already failed it
   }
 }

@@ -29,8 +29,9 @@ import { upgradeDefinition } from '../workflows/compat';
  * graphs (any node with runtime.target === "media") are refused here and
  * belong to the Fargate engine target (engine-runner/).
  *
- * Not routed to yet: workflow-dispatch.ts still drives the PoC inline runner
- * and cv-runner until the M6 cutover (or the experimental env-gated v2 path).
+ * Routed to by BOTH dispatch paths since M6: the simulations handler (direct
+ * invoke) and the SQS production dispatcher (every triggered telemetry-only
+ * run; media runs go to the Fargate engine-runner instead).
  */
 
 const BUCKET = process.env.BUCKET_NAME;

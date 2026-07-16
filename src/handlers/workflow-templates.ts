@@ -134,6 +134,12 @@ async function loadVersions(exec: Executor, templateId: string) {
     message: r.message ?? null,
     // Read-path v1 -> v2 upgrade (pure; the stored row is not rewritten).
     definition: upgradeDefinitionSafe(r.definition),
+    // ADDITIVE (M6): the schemaVersion of the STORED row, before the read-path
+    // upgrade. The batch-upgrade tooling keys off this to find templates whose
+    // published definition still needs a v2 re-publish (the served definition
+    // above is always upgraded, so it can't tell).
+    storedSchemaVersion:
+      ((r.definition as { schemaVersion?: number } | null)?.schemaVersion ?? 1),
     createdBy: authorFrom(
       r.authorId ? { id: r.authorId, name: r.authorName, email: r.authorEmail as string } : null,
     ),

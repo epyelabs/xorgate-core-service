@@ -10,6 +10,7 @@ import { tsParam } from '../utils/sql';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { runPrefix } from '../workflows/engine/manifest';
+import { runTopicPrefix, simTopicPrefix } from '../workflows/engine/progress';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -249,6 +250,21 @@ export const handler = async (
           // result and where its Data Capture / events artifacts live in S3.
           engineVersion: run.engineVersion ?? null,
           artifacts: run.artifacts ?? null,
+          // ADDITIVE (M6): live-progress subscription hint. v2 runs (their
+          // stored snapshot is schemaVersion 2) publish the M3 topic/payload
+          // contract under this prefix — wf/run/<org>/<id> for production
+          // runs, wf/sim/<org>/<id> for simulations. Null on PoC-era rows,
+          // which never published progress. engineVersion can't gate this
+          // (finalize stamps it only at run END), the snapshot version can.
+          progress:
+            ((run.definition as { schemaVersion?: number })?.schemaVersion ?? 1) >= 2
+              ? {
+                  topicPrefix:
+                    run.mode === 'simulation'
+                      ? simTopicPrefix(auth.organizationId, id)
+                      : runTopicPrefix(auth.organizationId, id),
+                }
+              : null,
           error: run.error ?? null,
           failedNodeId: run.failedNodeId ?? null,
         },

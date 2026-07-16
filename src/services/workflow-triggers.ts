@@ -4,7 +4,8 @@ import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import { flattenTelemetryToRows, type TelemetryPayload } from '../schemas/telemetry';
 import type { AttachmentTrigger, WorkflowDefinition } from '../schemas/workflows';
-import { executionModeForDefinition } from './workflow-runner';
+import { upgradeDefinition } from '../workflows/compat';
+import { engineTargetForDefinition } from '../workflows/simulations';
 
 /**
  * Shared trigger plumbing: fireWorkflowRun() pre-creates a workflow_runs row and
@@ -39,7 +40,14 @@ export interface FireArgs {
  * callers never leave a dangling "running" row.
  */
 export async function fireWorkflowRun(args: FireArgs): Promise<WorkflowRun> {
-  const executionMode = executionModeForDefinition(args.definition);
+  // M6 cutover: the run snapshots the definition that will actually RUN — the
+  // upgraded (schemaVersion 2) view. upgradeDefinition is pure and a no-op for
+  // v2 definitions; v1 sources (unupgraded pinned versions, reruns of
+  // historical snapshots) map through the same compat aliases the read path
+  // serves. executionMode is the v2 dispatch target (lambda | fargate),
+  // catalog-derived — VIDEO_NODE_TYPES is retired.
+  const definition = upgradeDefinition(args.definition);
+  const executionMode = engineTargetForDefinition(definition);
   const [run] = await db
     .insert(schema.workflowRuns)
     .values({
@@ -48,7 +56,7 @@ export async function fireWorkflowRun(args: FireArgs): Promise<WorkflowRun> {
       attachmentId: args.attachmentId,
       templateId: args.templateId,
       templateVersion: args.templateVersion,
-      definition: args.definition,
+      definition,
       trigger: args.trigger,
       triggerContext: args.triggerContext ?? null,
       status: 'running',
@@ -85,6 +93,27 @@ export async function fireWorkflowRun(args: FireArgs): Promise<WorkflowRun> {
     return failed ?? run;
   }
   return run;
+}
+
+/**
+ * Update the attachment's denormalized lastRunStatus only if this run is its
+ * most recent (guards against an older run clobbering a newer one's status).
+ * Shared by the v2 finalize Lambda and the scheduler watchdog. (Lived in the
+ * retired workflow-runner.ts until M6.)
+ */
+export async function updateAttachmentStatusIfLatest(run: WorkflowRun, status: string): Promise<void> {
+  if (!run.attachmentId) return;
+  const [latest] = await db
+    .select({ id: schema.workflowRuns.id })
+    .from(schema.workflowRuns)
+    .where(eq(schema.workflowRuns.attachmentId, run.attachmentId))
+    .orderBy(sql`${schema.workflowRuns.startedAt} desc`)
+    .limit(1);
+  if (latest?.id !== run.id) return;
+  await db
+    .update(schema.workflowAttachments)
+    .set({ lastRunStatus: status, updatedAt: new Date() })
+    .where(eq(schema.workflowAttachments.id, run.attachmentId));
 }
 
 // --- Recording-saved trigger (media-finalize hook) ---------------------------

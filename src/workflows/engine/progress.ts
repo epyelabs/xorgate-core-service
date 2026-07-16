@@ -37,6 +37,16 @@ export function simTopicPrefix(orgId: string, runId: string): string {
   return `wf/sim/${orgId}/${runId}`;
 }
 
+/**
+ * Production twin of simTopicPrefix (M6): triggered runs publish the SAME
+ * topic/payload contract under wf/run/<orgId>/<runId>, so the run-detail page
+ * subscribes with the same machinery the simulator panel uses. The prefixes
+ * stay distinct so IoT policy scoping can diverge later (per-org hardening).
+ */
+export function runTopicPrefix(orgId: string, runId: string): string {
+  return `wf/run/${orgId}/${runId}`;
+}
+
 const isoAt = z.object({ at: z.string().min(1) });
 
 export const simStatusPayloadSchema = isoAt.extend({

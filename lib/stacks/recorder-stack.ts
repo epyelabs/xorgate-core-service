@@ -36,13 +36,6 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
   public readonly taskRoleArn: string;
   public readonly executionRoleArn: string;
   public readonly publicSubnetIds: string[];
-  // CV runner (workflows video path) — reuses this stack's cluster/VPC/SG.
-  public readonly cvRepository: ecr.Repository;
-  public readonly cvTaskDefinition: ecs.FargateTaskDefinition;
-  public readonly cvContainerName = 'cv-runner';
-  public readonly cvTaskFamily: string;
-  public readonly cvTaskRoleArn: string;
-  public readonly cvExecutionRoleArn: string;
   // v2 TS engine runner (M2) — reuses this stack's cluster/VPC/SG.
   public readonly engineRepository: ecr.Repository;
   public readonly engineTaskDefinition: ecs.FargateTaskDefinition;
@@ -167,30 +160,31 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     this.executionRoleArn = this.taskDefinition.obtainExecutionRole().roleArn;
     this.publicSubnetIds = vpc.publicSubnets.map((s) => s.subnetId);
 
-    // --- CV runner (workflows video path) ---
-    // Python + ONNX Runtime (CPU) on Fargate ARM64. Reads the run manifest + input
-    // MP4 from S3, runs the graph (decode/detect/track), and writes result.json.
-    // Reuses this stack's cluster/VPC/SG; only the repo, roles, log group, and a
-    // beefier task definition are new. Image built + pushed out-of-band from
-    // xorgate/backend/xorgate-core-service/cv-runner (docker buildx linux/arm64).
-    this.cvRepository = new ecr.Repository(this, 'CvRunnerRepo', {
+    // --- CV runner (RETIRED in M6, constructs kept ONE deploy) ---
+    // The Python cv-runner is unreachable: the dispatch path, the lambdaRole
+    // CvRunTask/CvPassRole grants, and the CV_* env are gone, and the v2 TS
+    // engine below replaced it. These constructs (repo, log group, role, task
+    // definition) survive one more deploy ONLY because their role ARNs were
+    // cross-stack tokens: deleting the producer while the not-yet-updated api
+    // stack still imports the auto-exports fails the recorder update with
+    // "export in use". The exportValue() pins below hold the exports through
+    // this transition deploy. NEXT deploy: delete this whole block (dev repo
+    // is DESTROY/emptyOnDelete; rollback = git revert + rebuild the image
+    // from the reverted cv-runner/ source).
+    const cvRepository = new ecr.Repository(this, 'CvRunnerRepo', {
       repositoryName: isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev',
       removalPolicy,
       emptyOnDelete: !isProd,
       imageScanOnPush: true,
     });
-
     const cvLogGroup = new logs.LogGroup(this, 'CvRunnerLogs', {
       logGroupName: isProd ? '/xorgate/cv-runner' : '/xorgate/cv-runner-dev',
       retention: logs.RetentionDays.TWO_WEEKS,
       removalPolicy,
     });
-
-    // Task role: read the manifest + input recordings, write result.json + clips.
-    // The DB stays in TypeScript — the CV task holds no API/DB credentials.
     const cvTaskRole = new iam.Role(this, 'CvRunnerTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'Xorgate CV runner task: read media + workflow manifest, write results',
+      description: 'RETIRED (M6): Xorgate CV runner task role, removal queued',
     });
     cvTaskRole.addToPolicy(
       new iam.PolicyStatement({
@@ -206,11 +200,9 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         resources: [bucket.arnForObjects('workflows/v1/*')],
       }),
     );
-
-    this.cvTaskFamily = isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev';
-    this.cvTaskDefinition = new ecs.FargateTaskDefinition(this, 'CvRunnerTaskDef', {
-      family: this.cvTaskFamily,
-      cpu: 2048, // 2 vCPU — ffmpeg decode + ONNX CPU inference
+    const cvTaskDefinition = new ecs.FargateTaskDefinition(this, 'CvRunnerTaskDef', {
+      family: isProd ? 'xorgate-cv-runner' : 'xorgate-cv-runner-dev',
+      cpu: 2048,
       memoryLimitMiB: 4096,
       taskRole: cvTaskRole,
       runtimePlatform: {
@@ -218,16 +210,15 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
       },
     });
-    this.cvTaskDefinition.addContainer('cv-runner', {
-      containerName: this.cvContainerName,
-      image: ecs.ContainerImage.fromEcrRepository(this.cvRepository, 'latest'),
+    cvTaskDefinition.addContainer('cv-runner', {
+      containerName: 'cv-runner',
+      image: ecs.ContainerImage.fromEcrRepository(cvRepository, 'latest'),
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'cv-runner', logGroup: cvLogGroup }),
-      // The runner self-limits via manifest.limits.maxRuntimeSeconds and always
-      // writes result.json on the way out; this is the hard ECS backstop.
       stopTimeout: cdk.Duration.seconds(120),
     });
-    this.cvTaskRoleArn = cvTaskRole.roleArn;
-    this.cvExecutionRoleArn = this.cvTaskDefinition.obtainExecutionRole().roleArn;
+    // Pin the exports the OLD api stack still imports until its update lands.
+    this.exportValue(cvTaskRole.roleArn);
+    this.exportValue(cvTaskDefinition.obtainExecutionRole().roleArn);
 
     // --- v2 engine runner (M2: TS streaming engine, Fargate target) ---
     // Node 20 + ffmpeg + onnxruntime-node on Fargate ARM64. Reads the v2 run
@@ -283,13 +274,18 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         resources: [bucket.arnForObjects('workflows/v2/*')],
       }),
     );
-    // M3 simulator progress plane: publish to wf/sim/<orgId>/<runId>/* over the
-    // resolved ATS data endpoint (DescribeEndpoint has no resource scoping).
+    // Progress planes: simulator runs publish under wf/sim/<orgId>/<runId>/*
+    // (M3) and production triggered runs under wf/run/<orgId>/<runId>/* (M6),
+    // over the resolved ATS data endpoint (DescribeEndpoint has no resource
+    // scoping).
     engineTaskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'EngineSimProgressPublish',
         actions: ['iot:Publish'],
-        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`,
+          `arn:aws:iot:${this.region}:${this.account}:topic/wf/run/*`,
+        ],
       }),
     );
     // M5 live ingest plane: the engine subscribes (MQTT-over-WSS, SigV4) to
@@ -389,10 +385,6 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RecorderRepoUri', {
       value: this.repository.repositoryUri,
       exportName: `XorgateRecorderRepoUri${suffix}`,
-    });
-    new cdk.CfnOutput(this, 'CvRunnerRepoUri', {
-      value: this.cvRepository.repositoryUri,
-      exportName: `XorgateCvRunnerRepoUri${suffix}`,
     });
     new cdk.CfnOutput(this, 'EngineRunnerRepoUri', {
       value: this.engineRepository.repositoryUri,

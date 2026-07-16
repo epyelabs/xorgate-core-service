@@ -1,2 +1,0 @@
-# The real model file `yolov8n.onnx` (~12 MB) lives here at build time but is NOT
-# committed to git. See ../README.md for how to export/download it before building.

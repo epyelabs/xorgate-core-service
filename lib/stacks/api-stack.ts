@@ -55,15 +55,9 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   recorderSecurityGroupId: string;
   recorderSubnets: string; // comma-separated public subnet ids
   recorderContainerName: string;
-  // CV runner (workflows video path) launch config — shares the recorder
-  // cluster/VPC/SG (see recorder-stack.ts). RunTask'd by the dispatch Lambda.
-  cvTaskFamily: string;
-  cvTaskRoleArn: string;
-  cvExecutionRoleArn: string;
-  cvContainerName: string;
-  // v2 engine runner (M2) launch config — same wiring pattern as the CV runner.
-  // Pre-wired on the dispatch Lambda (ENGINE_*); nothing routes to it until the
-  // experimental flag / M6 cutover.
+  // v2 engine runner launch config — shares the recorder cluster/VPC/SG. Since
+  // the M6 cutover this is the ONLY workflow execution plane (the Python
+  // cv-runner and its CV_* wiring are retired).
   engineTaskFamily: string;
   engineTaskRoleArn: string;
   engineExecutionRoleArn: string;
@@ -103,10 +97,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       recorderSecurityGroupId,
       recorderSubnets,
       recorderContainerName,
-      cvTaskFamily,
-      cvTaskRoleArn,
-      cvExecutionRoleArn,
-      cvContainerName,
       engineTaskFamily,
       engineTaskRoleArn,
       engineExecutionRoleArn,
@@ -288,30 +278,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
-    // CV runner (workflows video path): launch the CV task + pass its roles. It
-    // shares the recorder cluster, so the RecorderStopTask/DescribeTasks statement
-    // above already covers StopTask on CV tasks (used by the M5 watchdog).
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: "CvRunTask",
-        actions: ["ecs:RunTask"],
-        resources: [
-          `arn:aws:ecs:${this.region}:${this.account}:task-definition/${cvTaskFamily}:*`,
-        ],
-      }),
-    );
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: "CvPassRole",
-        actions: ["iam:PassRole"],
-        resources: [cvTaskRoleArn, cvExecutionRoleArn],
-        conditions: {
-          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
-        },
-      }),
-    );
+    // (CvRunTask/CvPassRole retired in M6 with the Python cv-runner: the
+    // shared Lambda role can no longer launch the CV task definition at all.)
 
-    // v2 engine runner (M2): same launch pattern as the CV runner, same shared
+    // v2 engine runner (M2): launch + pass roles on the shared recorder
     // cluster (StopTask/DescribeTasks already covered by RecorderStopTask).
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
@@ -333,14 +303,19 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
-    // M3 simulator progress plane: the v2 Lambda engine publishes run progress
-    // to wf/sim/<orgId>/<runId>/* (the engine TASK role gets the same grant in
-    // recorder-stack.ts). Literal ARN, no construct references (shared-role rule).
+    // Progress planes: the v2 Lambda engine publishes simulator progress to
+    // wf/sim/<orgId>/<runId>/* (M3) and production run progress to
+    // wf/run/<orgId>/<runId>/* (M6). The engine TASK role gets the same grants
+    // in recorder-stack.ts. Literal ARNs, no construct references (shared-role
+    // rule).
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "IotPublishSimProgress",
         actions: ["iot:Publish"],
-        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`],
+        resources: [
+          `arn:aws:iot:${this.region}:${this.account}:topic/wf/sim/*`,
+          `arn:aws:iot:${this.region}:${this.account}:topic/wf/run/*`,
+        ],
       }),
     );
     // Google Roads connector API key (secret created OUT-OF-BAND; deploy
@@ -1028,13 +1003,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // The shared Lambda role can enqueue runs (telemetry/media/http firing paths).
     workflowRunQueue.grantSendMessages(lambdaRole);
 
-    // Run dispatcher: SQS-driven, runs telemetry graphs inline in-process and
-    // launches the Fargate CV runner for video graphs. Bundles the AWS SDK
-    // (client-sqs / client-ecs) and gets more time + memory than the default.
+    // Run dispatcher: SQS-driven; since the M6 cutover every triggered run is
+    // claimed (dispatched_at) and dispatched to the v2 engine (Lambda for
+    // telemetry-only graphs, engine-runner RunTask for media). Bundles the AWS
+    // SDK (client-sqs / client-ecs / client-lambda).
     const workflowDispatchFn = new nodejs.NodejsFunction(this, "WorkflowDispatchFn", {
       ...standardFnProps(
         path.join(entryBase, "workflow-dispatch.ts"),
-        "SQS -> dispatch workflow run (inline runner / Fargate)",
+        "SQS -> claim + dispatch workflow run (v2 engine: Lambda / Fargate)",
       ),
       timeout: cdk.Duration.seconds(120),
       memorySize: 512,
@@ -1054,29 +1030,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
     telemetryIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     mediaFinalizeFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
 
-    // The dispatcher launches the CV runner for video graphs (shares the recorder
-    // cluster/VPC/SG). The manifest is written to the core bucket (BUCKET_NAME).
-    workflowDispatchFn.addEnvironment("CV_CLUSTER_ARN", recorderClusterArn);
-    workflowDispatchFn.addEnvironment("CV_TASKDEF", cvTaskFamily);
-    workflowDispatchFn.addEnvironment("CV_SUBNETS", recorderSubnets);
-    workflowDispatchFn.addEnvironment("CV_SG", recorderSecurityGroupId);
-    workflowDispatchFn.addEnvironment("CV_CONTAINER_NAME", cvContainerName);
-
-    // v2 engine runner launch config (M2), pre-wired alongside CV_* so cutover
-    // (or the experimental flag) is dispatcher-code-only. Same cluster/VPC/SG.
+    // v2 engine runner launch config (media graphs; Lambda engine handles
+    // telemetry-only). Same cluster/VPC/SG as the recorder. The CV_* env and
+    // the WORKFLOW_V2_EXPERIMENT flag were retired with the M6 cutover.
     workflowDispatchFn.addEnvironment("ENGINE_CLUSTER_ARN", recorderClusterArn);
     workflowDispatchFn.addEnvironment("ENGINE_TASKDEF", engineTaskFamily);
     workflowDispatchFn.addEnvironment("ENGINE_SUBNETS", recorderSubnets);
     workflowDispatchFn.addEnvironment("ENGINE_SG", recorderSecurityGroupId);
     workflowDispatchFn.addEnvironment("ENGINE_CONTAINER_NAME", engineContainerName);
-    // Experimental v2 dispatch (default OFF): stored schemaVersion-2
-    // telemetry-only definitions run on the Lambda engine when set to "on".
-    // Production routing stays PoC until M6 either way. Flip at deploy with
-    // --context workflowV2Experiment=on.
-    workflowDispatchFn.addEnvironment(
-      "WORKFLOW_V2_EXPERIMENT",
-      recCtx("workflowV2Experiment", "off"),
-    );
 
     // Fargate CV-run finalizer: result.json (S3 Object Created under workflows/v1/)
     // -> persist steps/events + run status. Same EventBridge->finalize pattern as

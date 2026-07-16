@@ -1,27 +1,22 @@
 import type { SQSEvent, SQSBatchResponse } from 'aws-lambda';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index';
-import type { WorkflowDefinition } from '../schemas/workflows';
-import { runWorkflowInline } from '../services/workflow-runner';
-import { dispatchFargateRun } from '../services/workflow-fargate';
-import {
-  dispatchV2LambdaRun,
-  isV2TelemetryOnly,
-  v2ExperimentEnabled,
-} from '../services/workflow-engine-v2';
+import { dispatchV2TriggeredRun } from '../services/workflow-engine-v2';
 
 /**
  * Run dispatcher. SQS event source (batchSize 1, reportBatchItemFailures). The
- * message body is just {runId}; this re-reads authoritative run state, so it is
- * idempotent under SQS redelivery:
- *   - run missing / not 'running'  -> ack (already finalized or gone)
- *   - run already has a taskArn / steps -> ack (already dispatched/processed)
- *   - inline graph  -> runWorkflowInline() in this invocation
- *   - video graph   -> launch the Fargate CV runner (result.json -> finalize Lambda)
+ * message body is just {runId}; this re-reads authoritative run state. Since
+ * the M6 cutover every triggered run executes on the v2 engine
+ * (dispatchV2TriggeredRun routes lambda vs fargate off the catalog); the PoC
+ * inline runner and Python cv-runner are retired.
  *
- * EXPERIMENTAL (WORKFLOW_V2_EXPERIMENT=on, default off): schemaVersion-2
- * telemetry-only definitions route to the v2 Lambda engine instead. Production
- * routing is otherwise unchanged until M6.
+ * Idempotency under SQS redelivery:
+ *   - run missing / not 'running'      -> ack (already finalized or gone)
+ *   - dispatched_at claim lost         -> ack (another delivery dispatched it)
+ * The claim is an atomic conditional UPDATE (migration 0016) stamped BEFORE
+ * any engine launch, so a redelivery mid-run can never double-invoke. The one
+ * residual window: a crash AFTER the claim but BEFORE the launch strands the
+ * run for the 45-minute watchdog — accepted, same backstop as a lost task.
  */
 export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
   const batchItemFailures: { itemIdentifier: string }[] = [];
@@ -52,24 +47,25 @@ async function dispatchRun(runId: string): Promise<void> {
     console.warn('workflow-dispatch: run not found, acking', { runId });
     return;
   }
-  // Idempotency guards: only a fresh 'running' run with no task/steps proceeds.
-  if (run.status !== 'running') return;
-  if (run.taskArn) return; // a Fargate task was already launched
-  const [existingStep] = await db
-    .select({ id: schema.workflowRunSteps.id })
-    .from(schema.workflowRunSteps)
-    .where(eq(schema.workflowRunSteps.runId, runId))
-    .limit(1);
-  if (existingStep) return; // inline run already persisted steps
+  if (run.status !== 'running') return; // already finalized (or failed at fire time)
 
-  if (v2ExperimentEnabled() && isV2TelemetryOnly(run.definition as WorkflowDefinition)) {
-    await dispatchV2LambdaRun(run);
+  // Atomic idempotency claim: exactly one delivery proceeds per run.
+  const claimed = await db
+    .update(schema.workflowRuns)
+    .set({ dispatchedAt: new Date() })
+    .where(
+      and(
+        eq(schema.workflowRuns.id, runId),
+        eq(schema.workflowRuns.status, 'running'),
+        isNull(schema.workflowRuns.dispatchedAt),
+      ),
+    )
+    .returning({ id: schema.workflowRuns.id });
+  if (claimed.length === 0) {
+    console.log('workflow-dispatch: run already claimed, acking', { runId });
     return;
   }
 
-  if (run.executionMode === 'inline') {
-    await runWorkflowInline(run);
-  } else {
-    await dispatchFargateRun(run);
-  }
+  // Fails the run row itself on any error (no retry semantics on this path).
+  await dispatchV2TriggeredRun(run);
 }

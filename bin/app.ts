@@ -19,12 +19,8 @@ function recorderProps(rec: XorgateCoreRecorderStack) {
     recorderSecurityGroupId: rec.securityGroup.securityGroupId,
     recorderSubnets: rec.publicSubnetIds.join(','),
     recorderContainerName: rec.containerName,
-    // CV runner (workflows video path) shares the recorder cluster/VPC/SG.
-    cvTaskFamily: rec.cvTaskFamily,
-    cvTaskRoleArn: rec.cvTaskRoleArn,
-    cvExecutionRoleArn: rec.cvExecutionRoleArn,
-    cvContainerName: rec.cvContainerName,
-    // v2 engine runner (M2) shares the same cluster/VPC/SG.
+    // v2 engine runner (the only workflow execution plane since M6; the CV
+    // runner props were retired with the Python cv-runner).
     engineTaskFamily: rec.engineTaskFamily,
     engineTaskRoleArn: rec.engineTaskRoleArn,
     engineExecutionRoleArn: rec.engineExecutionRoleArn,

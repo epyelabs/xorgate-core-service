@@ -2,8 +2,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { CronExpressionParser } from 'cron-parser';
 import { ECSClient, StopTaskCommand } from '@aws-sdk/client-ecs';
 import { db, schema } from '../db/index';
-import { fireWorkflowRun } from '../services/workflow-triggers';
-import { updateAttachmentStatusIfLatest } from '../services/workflow-runner';
+import { fireWorkflowRun, updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
 import type { AttachmentTrigger, ContextWindow, WorkflowDefinition } from '../schemas/workflows';
 
 /**

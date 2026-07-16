@@ -21,8 +21,9 @@
  *      -> ffmpeg decode -> onnxruntime detection -> data_capture +
  *      visualization JPEGs + the M3 events leg (detection_gate -> emit event;
  *      testsrc contains no people, so the leg runs ok with zero events here),
- *      using the ffmpeg-static devDependency and the cv-runner's baked
- *      yolov8n.onnx as a local registry
+ *      using the ffmpeg-static devDependency and the baked yolov8n.onnx
+ *      (scripts/models/, relocated from the retired cv-runner) as a local
+ *      registry
  *  10. video.scale unit (persistent ffmpeg rawvideo pipe)
  *  11. scenario 1 events leg, deterministic: real detection_gate + output.event
  *      executors chained over synthetic detections -> exactly one rising-edge
@@ -67,6 +68,16 @@
  *      the session, idle timeout ends it
  *  25. simulations module M5 additions: webcam API binding validation +
  *      manifest mapping, live manifest mode, session key/queue naming
+ *  26. production dispatch module (M6): trigger-context video selection,
+ *      triggered manifest inputs (recording bindings + fargate-only
+ *      telemetry_history), window resolution, production manifest (mode
+ *      batch, wf/run progress prefix, per-target runtime limits)
+ *  27. cutover routing (M6): v1 definitions upgraded at fire time route to the
+ *      catalog-derived target (video graph -> fargate, telemetry -> lambda);
+ *      unknown types are detected before dispatch
+ *  28. capability re-verify (M6): upgraded v1 graphs emit metric:* tokens that
+ *      real device-model caps satisfy; legacy gps/imu group tokens still
+ *      satisfiable for stored attachments
  *
  * Checks 20/21 need the M4 model exports on disk (model-export/out/...); run
  * model-export/export_depth.py and export_yolo.py --name yolov8n-seg first.
@@ -103,8 +114,22 @@ import {
   simRecordPayloadSchema,
   simStatusPayloadSchema,
   simStepPayloadSchema,
+  runTopicPrefix,
   simTopicPrefix,
 } from '../src/workflows/engine/progress';
+import {
+  buildProductionManifest,
+  buildTriggeredInputs,
+  PRODUCTION_MAX_RUNTIME_SECONDS,
+  resolveTriggeredWindow,
+  triggeredVideoSelection,
+  unknownNodeTypes,
+} from '../src/workflows/production';
+import { upgradeDefinition } from '../src/workflows/compat';
+import {
+  computeRequiredCapabilities,
+  missingCapabilities,
+} from '../src/services/workflow-capabilities';
 import {
   buildSimulationManifest,
   createSimulationSchema,
@@ -562,7 +587,8 @@ const COCO_CLASSES = [
   'toothbrush',
 ];
 
-const YOLO_MODEL_PATH = path.resolve(__dirname, '../cv-runner/models/yolov8n.onnx');
+// The baked ultralytics 640 export, relocated from the retired cv-runner (M6).
+const YOLO_MODEL_PATH = path.resolve(__dirname, 'models/yolov8n.onnx');
 
 function localDetectionManifest(): ModelManifest {
   return modelManifestSchema.parse({
@@ -601,7 +627,7 @@ function synthesizeMp4(outPath: string): Promise<void> {
 async function testScenario1(): Promise<void> {
   if (!existsSync(YOLO_MODEL_PATH)) {
     throw new Error(
-      `scenario 1 needs ${YOLO_MODEL_PATH} (the cv-runner's baked model); export/download it per cv-runner/README.md`,
+      `scenario 1 needs ${YOLO_MODEL_PATH} (the baked yolov8n export, committed at scripts/models/); restore it from git or run model-export/export_yolo.py`,
     );
   }
   const workDir = await mkdtemp(path.join(tmpdir(), 'engine-smoke-'));
@@ -2031,6 +2057,186 @@ function testSimulationsM5(): void {
   console.log('ok: simulations module M5 additions (webcam binding, live mode, session naming)');
 }
 
+// --- Check 26: production dispatch module (M6) -------------------------------
+
+function testProductionDispatchModule(): void {
+  const mkNode = (id: string, type: string, config: Record<string, unknown> = {}) => ({
+    id,
+    type,
+    position: { x: 0, y: 0 },
+    data: { label: id, config },
+  });
+
+  // Trigger-context video selection classification.
+  const recCtx = {
+    type: 'recording_saved',
+    s3Key: 'media/v1/dev/cam0/rec.mp4',
+    recordingId: 'rec-1',
+    recordingStartedAt: '2026-07-15T00:00:00.000Z',
+    captureStartedAt: '2026-07-15T00:00:01.000Z',
+  };
+  const fromCtx = triggeredVideoSelection(recCtx);
+  assert.ok(fromCtx && fromCtx.kind === 'context');
+  assert.equal(fromCtx.input.s3Key, recCtx.s3Key);
+  assert.equal(fromCtx.input.captureStartedAt, recCtx.captureStartedAt);
+  const picked = triggeredVideoSelection({ selection: { mode: 'recordings', recordingIds: ['a', 'b'] } });
+  assert.ok(picked && picked.kind === 'recordings' && picked.recordingIds.length === 2);
+  const lastN = triggeredVideoSelection({ selection: { mode: 'lastN', n: 3 } });
+  assert.ok(lastN && lastN.kind === 'lastN' && lastN.n === 3);
+  assert.equal(triggeredVideoSelection({ window: { from: 'x', to: 'y' } }), null);
+
+  // Window resolution: context window wins; else 15 minutes ending at start.
+  const win = resolveTriggeredWindow({ window: { from: 'A', to: 'B' } }, new Date());
+  assert.deepEqual(win, { from: 'A', to: 'B' });
+  const started = new Date('2026-07-15T12:00:00.000Z');
+  const fallback = resolveTriggeredWindow({}, started);
+  assert.equal(fallback.to, started.toISOString());
+  assert.equal(Date.parse(fallback.to) - Date.parse(fallback.from), 15 * 60_000);
+
+  // Triggered inputs: recording bindings per video node; telemetry_history
+  // only on the fargate target; no-recording video graph throws.
+  const mediaDef = {
+    schemaVersion: 2,
+    nodes: [
+      mkNode('cam', 'source.video'),
+      mkNode('gps', 'source.telemetry', { metrics: ['gps.speed'] }),
+      mkNode('dec', 'video.decode_sample', { fps: 2 }),
+    ],
+    edges: [{ id: 'e1', source: 'cam', target: 'dec' }],
+  } as never;
+  const video = { s3Key: 'media/v1/x.mp4', recordingId: 'r1', recordingStartedAt: null, captureStartedAt: null };
+  const fargateInputs = buildTriggeredInputs(mediaDef, video, 'fargate');
+  assert.deepEqual(
+    fargateInputs.map((i) => `${i.nodeId}:${i.binding.kind}`).sort(),
+    ['cam:recording', 'gps:telemetry_history'],
+  );
+  const camBinding = fargateInputs.find((i) => i.nodeId === 'cam')!.binding as Record<string, unknown>;
+  assert.equal(camBinding.s3Key, 'media/v1/x.mp4');
+  assert.equal('recordingStartedAt' in camBinding, false); // null fields omitted
+  const telDef = {
+    schemaVersion: 2,
+    nodes: [mkNode('gps', 'source.telemetry', { metrics: ['gps.speed'] })],
+    edges: [],
+  } as never;
+  assert.deepEqual(buildTriggeredInputs(telDef, null, 'lambda'), []);
+  assert.throws(() => buildTriggeredInputs(mediaDef, null, 'fargate'), /No video input/);
+
+  // Production manifest: schema-valid, mode batch, wf/run progress prefix,
+  // per-target runtime limits.
+  const manifest = buildProductionManifest({
+    runId: 'run-1',
+    orgId: 'org-1',
+    bucket: 'bkt',
+    definition: mediaDef,
+    deviceId: 'dev-1',
+    inputs: fargateInputs,
+    window: { from: fallback.from, to: fallback.to },
+    target: 'fargate',
+  });
+  assert.equal(manifest.mode, 'batch');
+  assert.equal(manifest.progress?.topicPrefix, runTopicPrefix('org-1', 'run-1'));
+  assert.equal(manifest.progress?.topicPrefix, 'wf/run/org-1/run-1');
+  assert.equal(manifest.limits.maxRuntimeSeconds, PRODUCTION_MAX_RUNTIME_SECONDS.fargate);
+  assert.equal(manifest.limits.maxRuntimeSeconds, 1800);
+  assert.equal(PRODUCTION_MAX_RUNTIME_SECONDS.lambda, 240);
+  runManifestSchema.parse(JSON.parse(JSON.stringify(manifest)));
+  console.log('check 26 ok: production dispatch module (selection, inputs, window, manifest)');
+}
+
+// --- Check 27: cutover routing (M6) -------------------------------------------
+
+function testCutoverRouting(): void {
+  const mkV1Node = (id: string, type: string, config: Record<string, unknown> = {}) => ({
+    id,
+    type,
+    position: { x: 0, y: 0 },
+    data: { label: id, config },
+  });
+
+  // v1 video graph -> upgraded types -> fargate.
+  const v1Video = {
+    nodes: [
+      mkV1Node('v', 'source.video'),
+      mkV1Node('d', 'processor.decode_sample', { fps: 2 }),
+      mkV1Node('o', 'processor.object_detection', { model: 'yolo-n' }),
+    ],
+    edges: [
+      { id: 'e1', source: 'v', target: 'd' },
+      { id: 'e2', source: 'd', target: 'o' },
+    ],
+  } as never;
+  const upVideo = upgradeDefinition(v1Video);
+  assert.equal(upVideo.schemaVersion, 2);
+  assert.deepEqual(unknownNodeTypes(upVideo), []);
+  assert.equal(engineTargetForDefinition(upVideo), 'fargate');
+  assert.ok(upVideo.nodes.some((n) => n.type === 'model.object_detection'));
+
+  // v1 telemetry graph (the PoC overspeed shape) -> lambda.
+  const v1Tel = {
+    nodes: [
+      mkV1Node('g', 'source.gps'),
+      mkV1Node('s', 'processor.speed_from_gps'),
+      mkV1Node('c', 'processor.speed_limit_check', { limitKph: 80 }),
+      mkV1Node('e', 'output.event', { kind: 'overspeed' }),
+    ],
+    edges: [
+      { id: 'e1', source: 'g', target: 's' },
+      { id: 'e2', source: 's', target: 'c' },
+      { id: 'e3', source: 'c', target: 'e' },
+    ],
+  } as never;
+  const upTel = upgradeDefinition(v1Tel);
+  assert.deepEqual(unknownNodeTypes(upTel), []);
+  assert.equal(engineTargetForDefinition(upTel), 'lambda');
+
+  // Upgrading a v2 definition is a pure no-op (idempotent at dispatch time).
+  assert.deepEqual(upgradeDefinition(upTel), upTel);
+
+  // Unknown types surface BEFORE dispatch (the dispatcher fails the run).
+  const bogus = {
+    nodes: [mkV1Node('x', 'custom.mystery')],
+    edges: [],
+  } as never;
+  assert.deepEqual(unknownNodeTypes(upgradeDefinition(bogus)), ['custom.mystery']);
+  console.log('check 27 ok: cutover routing (v1 upgrade -> catalog-derived target, unknown-type detection)');
+}
+
+// --- Check 28: capability re-verify for upgraded graphs (M6) ------------------
+
+function testUpgradedCapabilities(): void {
+  const v1Gps = {
+    nodes: [
+      {
+        id: 'g',
+        type: 'source.gps',
+        position: { x: 0, y: 0 },
+        data: { label: 'GPS', config: {} },
+      },
+    ],
+    edges: [],
+  } as never;
+  // computeRequiredCapabilities upgrades internally: the v1 gps source becomes
+  // source.telemetry with explicit metric tokens.
+  const required = computeRequiredCapabilities(v1Gps);
+  assert.deepEqual(
+    required,
+    ['metric:gps.latitude', 'metric:gps.longitude', 'metric:gps.speed'],
+  );
+
+  const gpsImuVideoCaps = {
+    media: { video: [{ key: 'cam0' }] },
+    comm: { gps: { fields: ['latitude', 'longitude', 'speed'] } },
+    sensors: { imu: { accel: ['x', 'y', 'z'] } },
+  };
+  assert.deepEqual(missingCapabilities(required, gpsImuVideoCaps), []);
+  assert.deepEqual(missingCapabilities(required, {}), required);
+
+  // Legacy group tokens (stored pre-M1 attachments) must STAY satisfiable.
+  assert.deepEqual(missingCapabilities(['gps', 'imu', 'video'], gpsImuVideoCaps), []);
+  assert.deepEqual(missingCapabilities(['gps', 'imu', 'video'], {}), ['gps', 'imu', 'video']);
+  console.log('check 28 ok: upgraded-graph capabilities (metric tokens satisfiable, legacy group tokens intact)');
+}
+
 async function main(): Promise<void> {
   await testBackpressure();
   await testDropOldest();
@@ -2057,6 +2263,9 @@ async function main(): Promise<void> {
   await testLiveWebcamVlmGraph();
   await testSessionLoop();
   testSimulationsM5();
+  testProductionDispatchModule();
+  testCutoverRouting();
+  testUpgradedCapabilities();
   console.log('\nengine smoke: all checks passed');
 }
 

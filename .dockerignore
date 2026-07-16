@@ -1,10 +1,8 @@
 # Keep the engine-runner build context small: only package manifests, src/, and
-# engine-runner/ are COPY'd (see engine-runner/Dockerfile). The cv-runner has its
-# own context (cv-runner/) and is unaffected.
+# engine-runner/ are COPY'd (see engine-runner/Dockerfile).
 node_modules
 cdk.out
 dist
-cv-runner
 model-export
 drizzle
 scripts

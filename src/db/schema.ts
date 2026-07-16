@@ -489,6 +489,11 @@ export const workflowRuns = pgTable(
     // 2 = the v2 TS engine (stamped by the v2 finalize path, session 2).
     engineVersion: integer('engine_version'),
     taskArn: text('task_arn'),
+    // M6 idempotency stamp: the SQS dispatcher claims a run atomically
+    // (conditional UPDATE ... WHERE dispatched_at IS NULL) before launching an
+    // engine target, so an SQS redelivery mid-run can never double-invoke.
+    // Null on simulation runs (their dispatch is direct, no retry queue).
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
     startedAt: timestamp('started_at', { withTimezone: true }).defaultNow().notNull(),
     endedAt: timestamp('ended_at', { withTimezone: true }),
     durationMs: integer('duration_ms'),

@@ -141,10 +141,12 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Action: 'iot:Subscribe',
             Resource: [
               `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
-              // Workflow simulator progress plane (M3): wf/sim/<orgId>/<runId>/...
+              // Workflow progress planes: simulator wf/sim/<orgId>/<runId>/...
+              // (M3) and production runs wf/run/<orgId>/<runId>/... (M6).
               // Same v1 broad-but-authenticated stance as telemetry; per-org
               // scoping via policy variables is the P7 hardening hook.
               `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
+              `arn:aws:iot:${region}:${account}:topicfilter/wf/run/*`,
             ],
           },
           {
@@ -154,6 +156,7 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Resource: [
               `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
               `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
+              `arn:aws:iot:${region}:${account}:topic/wf/run/*`,
             ],
           },
           {
@@ -221,6 +224,8 @@ export class XorgateCoreIotStack extends cdk.Stack {
           `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
           `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
+          `arn:aws:iot:${region}:${account}:topicfilter/wf/run/*`,
+          `arn:aws:iot:${region}:${account}:topic/wf/run/*`,
         ],
       }),
     );

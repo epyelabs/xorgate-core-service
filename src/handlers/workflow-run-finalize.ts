@@ -3,7 +3,7 @@ import { eq } from 'drizzle-orm';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
-import { updateAttachmentStatusIfLatest } from '../services/workflow-runner';
+import { updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
 import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/engine/finalize';
 import { engineResultSchema } from '../workflows/engine/manifest';
 
