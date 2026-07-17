@@ -14,20 +14,30 @@ import { iotDataClient } from './iot-data';
  * topic (granted in api-stack.ts).
  */
 
+export interface ImuMountConfig {
+  enabled: boolean;
+  rollDeg: number;
+  pitchDeg: number;
+  yawDeg: number;
+}
+
 export interface DeviceConfigMessage {
   v: 1;
   gnssAntBias: boolean;
+  /** Omitted (not null) when the device has never had a mount configured. */
+  imuMount?: ImuMountConfig;
   ts: number;
 }
 
 /** Publish the retained per-device config message. Throws on failure. */
 export async function publishDeviceConfig(
   deviceId: string,
-  config: { gnssAntBias: boolean },
+  config: { gnssAntBias: boolean; imuMount?: ImuMountConfig | null },
 ): Promise<void> {
   const message: DeviceConfigMessage = {
     v: 1,
     gnssAntBias: config.gnssAntBias,
+    ...(config.imuMount ? { imuMount: config.imuMount } : {}),
     ts: Date.now(),
   };
   const client = await iotDataClient();

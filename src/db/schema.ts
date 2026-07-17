@@ -133,6 +133,22 @@ export const devices = pgTable(
     // to the stack default (MAX_RECORDING_MS). The watchdog stops any recording that
     // runs longer than this. See kvs-webrtc-lts plan Phase 2 / §6.
     maxRecordingMs: integer('max_recording_ms'),
+    // IMU mounting correction: how the BNO085 is physically rotated relative to
+    // the vehicle (ZYX euler, degrees). Delivered to the device as retained MQTT
+    // config; the agent then publishes vehicle-frame euler angles (the raw
+    // quaternion stays sensor-frame). NULL = never configured (no correction).
+    imuMount: jsonb('imu_mount').$type<{
+      enabled: boolean;
+      rollDeg: number;
+      pitchDeg: number;
+      yawDeg: number;
+    }>(),
+    // Camera direction for the web 3D orientation view. Cloud-only (never
+    // delivered to the device). NULL = the view's built-in default 3/4 angle.
+    imuView: jsonb('imu_view').$type<{
+      azimuthDeg: number;
+      elevationDeg: number;
+    }>(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),

@@ -20,6 +20,42 @@ import { publishDeviceConfig } from '../services/device-config';
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 const VALID_VIEW_TYPES = ['card', 'map'] as const;
 
+interface ImuMountBody {
+  enabled: boolean;
+  rollDeg: number;
+  pitchDeg: number;
+  yawDeg: number;
+}
+
+interface ImuViewBody {
+  azimuthDeg: number;
+  elevationDeg: number;
+}
+
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+// null clears the setting; 'invalid' rejects the request. Mirrors the device
+// agent's parseImuMount so both ends accept exactly the same shape.
+function parseImuMountBody(v: unknown): ImuMountBody | null | 'invalid' {
+  if (v === null) return null;
+  if (!v || typeof v !== 'object') return 'invalid';
+  const o = v as Record<string, unknown>;
+  if (typeof o.enabled !== 'boolean') return 'invalid';
+  if (!finite(o.rollDeg) || !finite(o.pitchDeg) || !finite(o.yawDeg)) return 'invalid';
+  return { enabled: o.enabled, rollDeg: o.rollDeg, pitchDeg: o.pitchDeg, yawDeg: o.yawDeg };
+}
+
+function parseImuViewBody(v: unknown): ImuViewBody | null | 'invalid' {
+  if (v === null) return null;
+  if (!v || typeof v !== 'object') return 'invalid';
+  const o = v as Record<string, unknown>;
+  if (!finite(o.azimuthDeg) || !finite(o.elevationDeg)) return 'invalid';
+  // Clamp elevation shy of the poles: at ±90° the view's look-at up-vector
+  // degenerates and the camera flips.
+  const elevationDeg = Math.max(-85, Math.min(85, o.elevationDeg));
+  return { azimuthDeg: o.azimuthDeg, elevationDeg };
+}
+
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
     where: eq(schema.workspaces.organizationId, organizationId),
@@ -165,6 +201,8 @@ export const handler = async (
         autoRecord?: boolean;
         gnssAntBias?: boolean;
         activeStreamsViewType?: string;
+        imuMount?: unknown;
+        imuView?: unknown;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -195,6 +233,28 @@ export const handler = async (
         return badRequest(`activeStreamsViewType must be one of: ${VALID_VIEW_TYPES.join(', ')}`);
       }
 
+      let imuMount: ImuMountBody | null | undefined;
+      if (body.imuMount !== undefined) {
+        const parsed = parseImuMountBody(body.imuMount);
+        if (parsed === 'invalid') {
+          return badRequest(
+            'imuMount must be null or { enabled: boolean, rollDeg, pitchDeg, yawDeg: finite numbers }',
+          );
+        }
+        imuMount = parsed;
+      }
+
+      let imuView: ImuViewBody | null | undefined;
+      if (body.imuView !== undefined) {
+        const parsed = parseImuViewBody(body.imuView);
+        if (parsed === 'invalid') {
+          return badRequest(
+            'imuView must be null or { azimuthDeg, elevationDeg: finite numbers }',
+          );
+        }
+        imuView = parsed;
+      }
+
       const updates: Record<string, unknown> = {};
       if (body.name !== undefined) updates.name = body.name;
       if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
@@ -204,6 +264,8 @@ export const handler = async (
       if (body.autoRecord !== undefined) updates.autoRecord = body.autoRecord;
       if (body.gnssAntBias !== undefined) updates.gnssAntBias = body.gnssAntBias;
       if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
+      if (imuMount !== undefined) updates.imuMount = imuMount;
+      if (imuView !== undefined) updates.imuView = imuView;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
@@ -220,14 +282,19 @@ export const handler = async (
         .returning();
       if (updated.length === 0) return notFound(`Device "${id}" not found`);
 
-      // Deliver the new GNSS antenna setting to the device as a retained MQTT
-      // config message (thing name = device id). Retained means an offline
-      // device picks it up on next connect. Publish failure is surfaced as a
-      // 502 so the operator knows the device was NOT told — the DB row is
-      // already updated; re-saving the toggle retries the publish.
-      if (body.gnssAntBias !== undefined) {
+      // Deliver device-facing settings (GNSS antenna power, IMU mount) as a
+      // retained MQTT config message (thing name = device id). Retained means
+      // an offline device picks it up on next connect. The message always
+      // carries the FULL device config from the updated row, so publishing on
+      // either field's change keeps the retained copy complete. Publish
+      // failure is surfaced as a 502 so the operator knows the device was NOT
+      // told — the DB row is already updated; re-saving retries the publish.
+      if (body.gnssAntBias !== undefined || imuMount !== undefined) {
         try {
-          await publishDeviceConfig(id, { gnssAntBias: updated[0].gnssAntBias });
+          await publishDeviceConfig(id, {
+            gnssAntBias: updated[0].gnssAntBias,
+            imuMount: updated[0].imuMount,
+          });
         } catch (err) {
           console.error('device config publish failed', { deviceId: id, err });
           return errorResponse(

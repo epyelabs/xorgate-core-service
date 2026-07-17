@@ -200,6 +200,32 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             enum: ['card', 'map'],
             description: 'Layout for the Active Streams tab: card grid (default) or location-first map view.',
           },
+          imuMount: {
+            type: 'object',
+            nullable: true,
+            description:
+              'IMU mounting correction: how the sensor is physically rotated relative to the vehicle ' +
+              '(ZYX euler, degrees). Delivered to the device via a retained MQTT config message; when ' +
+              'enabled, the agent publishes vehicle-frame euler angles (the raw quaternion stays sensor-frame). ' +
+              'null = never configured.',
+            properties: {
+              enabled: { type: 'boolean' },
+              rollDeg: { type: 'number' },
+              pitchDeg: { type: 'number' },
+              yawDeg: { type: 'number' },
+            },
+          },
+          imuView: {
+            type: 'object',
+            nullable: true,
+            description:
+              'Camera direction for the web 3D orientation view (azimuth/elevation, degrees). ' +
+              'Cloud-only; null = the built-in default 3/4 angle.',
+            properties: {
+              azimuthDeg: { type: 'number' },
+              elevationDeg: { type: 'number' },
+            },
+          },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
@@ -1147,6 +1173,29 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   activeStreamsViewType: {
                     type: 'string',
                     enum: ['card', 'map'],
+                  },
+                  imuMount: {
+                    type: 'object',
+                    nullable: true,
+                    description:
+                      'IMU mounting correction (ZYX euler, degrees); null clears it. ' +
+                      'Delivered to the device as a retained MQTT config message.',
+                    properties: {
+                      enabled: { type: 'boolean' },
+                      rollDeg: { type: 'number' },
+                      pitchDeg: { type: 'number' },
+                      yawDeg: { type: 'number' },
+                    },
+                  },
+                  imuView: {
+                    type: 'object',
+                    nullable: true,
+                    description:
+                      '3D orientation view camera (degrees); elevation is clamped to ±85. null resets to default.',
+                    properties: {
+                      azimuthDeg: { type: 'number' },
+                      elevationDeg: { type: 'number' },
+                    },
                   },
                 },
               },
