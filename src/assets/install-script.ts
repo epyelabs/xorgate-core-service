@@ -283,6 +283,15 @@ if [ -f "$INSTALL_PREFIX/modem/sim7600-lte.sh" ]; then
   install -m 0644 "$INSTALL_PREFIX/modem/sim7600-lte.service" /etc/systemd/system/sim7600-lte.service
   install -m 0644 "$INSTALL_PREFIX/modem/99-sim7600-lte.rules" /etc/udev/rules.d/99-sim7600-lte.rules
   udevadm control --reload-rules 2>/dev/null || true
+  # usb0 is owned exclusively by the sim7600-lte daemon (its own dhclient +
+  # end-to-end health checks). NetworkManager must not manage it, or it races
+  # the daemon for the modem's internal DHCP lease and leaves stale duplicate
+  # addresses that wedge reconnection after an LTE outage.
+  if [ -f "$INSTALL_PREFIX/modem/99-sim7600-unmanaged.conf" ]; then
+    install -d -m 0755 /etc/NetworkManager/conf.d
+    install -m 0644 "$INSTALL_PREFIX/modem/99-sim7600-unmanaged.conf" /etc/NetworkManager/conf.d/99-sim7600-unmanaged.conf
+    systemctl reload NetworkManager 2>/dev/null || true
+  fi
   systemctl daemon-reload
   # Enable so it persists + starts now if the modem is already enumerated; the
   # udev rule also starts it on hotplug. Failure here only disables LTE/GPS.
@@ -294,14 +303,14 @@ else
 fi
 
 # 7b. Uplink priority: prefer WiFi over the LTE modem for the IPv4 default route.
-#     The modem (usb0) is an ethernet-class device, so NetworkManager gives it the
-#     default route metric 100, beating WiFi's 600. That means a dead-but-up LTE
-#     link (antenna out / no signal, but the USB net iface still up) keeps winning
-#     the route and black-holes IPv4 — including KVS WebRTC video, whose endpoints
-#     are IPv4-only. Dropping WiFi's metric below the modem's makes WiFi win
-#     whenever it is associated, with LTE as the fallback (used only when WiFi is
-#     down/absent). Best-effort and self-gating: only applied when NetworkManager
-#     is the active stack. The SIM7600 manager is unaffected — its health checks
+#     usb0 is unmanaged by NM (see 7); the sim7600-lte daemon installs the LTE
+#     default route itself at metric 100. Dropping WiFi's metric to 50 makes WiFi
+#     win whenever it is associated, with LTE as the fallback (used only when
+#     WiFi is down/absent). Without this, a dead-but-up LTE link (antenna out /
+#     no signal, USB net iface still up) could win the route and black-hole
+#     IPv4 — including KVS WebRTC video, whose endpoints are IPv4-only.
+#     Best-effort and self-gating: only applied when NetworkManager is the
+#     active stack. The SIM7600 manager is unaffected — its health checks
 #     bind to usb0 directly (ping -I usb0), independent of the default route.
 #     NOTE: this is link-based, not connectivity-based; it assumes the device only
 #     joins trusted WiFi that has real internet (a captive/dead AP would black-hole).
@@ -310,10 +319,11 @@ if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManage
   install -d -m 0755 /etc/NetworkManager/conf.d
   cat > /etc/NetworkManager/conf.d/10-uplink-priority.conf <<'NMEOF'
 # Prefer WiFi over the LTE modem (usb0) for the IPv4 default route.
-# WiFi connections get route-metric 50; the modem's ethernet-class usb0 keeps its
-# default ~100, so WiFi wins whenever it is associated. LTE stays the fallback,
-# used only when WiFi is down or absent. Interface-bound health checks in the
-# SIM7600 manager (ping -I usb0) are unaffected by this.
+# WiFi connections get route-metric 50; usb0 is unmanaged by NM and the
+# sim7600-lte daemon installs its default route at metric 100, so WiFi wins
+# whenever it is associated. LTE stays the fallback, used only when WiFi is
+# down or absent. Interface-bound health checks in the SIM7600 manager
+# (ping -I usb0) are unaffected by this.
 [connection-wifi-priority]
 match-device=type:wifi
 ipv4.route-metric=50
