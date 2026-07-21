@@ -3,7 +3,7 @@ import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
-import { badRequest, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
@@ -210,6 +210,7 @@ async function loadTemplate(orgId: string, id: string): Promise<TemplateRow | un
  *   POST   /workflow-templates
  *   GET    /workflow-templates/{id}
  *   PUT    /workflow-templates/{id}
+ *   DELETE /workflow-templates/{id}
  *   PUT    /workflow-templates/{id}/draft
  *   POST   /workflow-templates/{id}/versions/{versionId}/publish
  *   POST   /workflow-templates/{id}/versions/{versionId}/restore
@@ -228,7 +229,7 @@ export const handler = async (
 
   let auth;
   try {
-    const writeMethod = method === 'POST' || method === 'PUT';
+    const writeMethod = method === 'POST' || method === 'PUT' || method === 'DELETE';
     auth = await requireOrgContext(event, writeMethod ? ['owner', 'admin', 'member'] : undefined);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
@@ -561,6 +562,31 @@ export const handler = async (
       return ok({ template: result.detail, version: result.version });
     }
 
+    case 'DELETE /workflow-templates/{id}': {
+      if (!id) return badRequest('template id required');
+      const template = await loadTemplate(orgId, id);
+      if (!template) return notFound(`Workflow template "${id}" not found`);
+
+      // Deleting a template a device still runs would silently kill its
+      // workflows (and cascade-drop the attachments + run history), so refuse
+      // while attachments exist: the caller detaches on each device first. The
+      // FE mirrors this by disabling delete while `usage` is non-empty.
+      const [attached] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(schema.workflowAttachments)
+        .where(eq(schema.workflowAttachments.templateId, id));
+      const usedBy = Number(attached?.count ?? 0);
+      if (usedBy > 0) {
+        return conflict(
+          `Template is attached to ${usedBy} device${usedBy === 1 ? '' : 's'}; detach it from every device before deleting.`,
+        );
+      }
+
+      // Versions and (historical) runs go with the template via ON DELETE CASCADE.
+      await db.delete(schema.workflowTemplates).where(eq(schema.workflowTemplates.id, id));
+      return { statusCode: 204, body: '' };
+    }
+
     case 'GET /workflow-templates/{id}/usage': {
       if (!id) return badRequest('template id required');
       const template = await loadTemplate(orgId, id);
@@ -569,7 +595,7 @@ export const handler = async (
     }
 
     default:
-      return methodNotAllowed(method, 'GET, POST, PUT');
+      return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
   }
 };
 

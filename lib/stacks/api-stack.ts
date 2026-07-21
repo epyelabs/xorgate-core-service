@@ -1606,7 +1606,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     this.api.addRoutes({
       path: "/workflow-templates/{id}",
-      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
+      methods: [
+        apigwv2.HttpMethod.GET,
+        apigwv2.HttpMethod.PUT,
+        apigwv2.HttpMethod.DELETE,
+      ],
       integration: workflowTemplatesInt,
     });
     this.api.addRoutes({
