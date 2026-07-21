@@ -363,7 +363,7 @@ esac
 # endpoint, role alias, and per-channel names, all straight from the claim
 # response. Mode 0600, owned by the service user (matches the cert files).
 echo "$CLAIM_RESPONSE" \\
-  | jq '{deviceId, region, credentialEndpoint, roleAlias, channels: (.channels // [])}' \\
+  | jq '{deviceId, region, credentialEndpoint, roleAlias, channels: (.channels // []), uploadBucket}' \\
   | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/kvs.json"
 
 # Per-stream pipeline dir (operator drops <streamKey>.gst files here for cameras).

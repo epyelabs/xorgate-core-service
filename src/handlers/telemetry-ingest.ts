@@ -160,9 +160,22 @@ export const handler = async (event: unknown): Promise<void> => {
   // UPDATE throwing (which drives the async-retry / DLQ path).
   if (rows.length > 0 && (await deviceFlags(payload.deviceId)).persistTelemetry) {
     try {
-      // Batched insert. Typed columns give `ts` (a Date) the correct typeHint, and
-      // Postgres routes the row to the right monthly partition automatically.
-      await db.insert(schema.telemetryReadings).values(rows);
+      // Authority split (offline recording plan D4): while the device reports
+      // on-device telemetry recording active, the batch path (S3 segment →
+      // telemetry-batch-ingest) is the sole writer of `telemetry_readings`;
+      // persisting the live 1 Hz samples too would duplicate history (the table
+      // has no unique key). The signal is the payload's own `recording.enabled`
+      // — the device asserting "I am the authoritative recorder" — rather than
+      // a config column, so the split stays correct even if cloud config and
+      // device reality diverge (Phase 5 adds the config column for the UI).
+      // `device_latest`, the heartbeat, auto-record and workflow triggers below
+      // are untouched: live remains the realtime plane either way.
+      const recordingActive = payload.recording?.enabled === true;
+      if (!recordingActive) {
+        // Batched insert. Typed columns give `ts` (a Date) the correct typeHint,
+        // and Postgres routes the row to the right monthly partition automatically.
+        await db.insert(schema.telemetryReadings).values(rows);
+      }
 
       // Last-writer-wins per (device_id, metric).
       const tsIso = new Date(payload.ts).toISOString();

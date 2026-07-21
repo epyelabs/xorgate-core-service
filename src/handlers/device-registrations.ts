@@ -284,6 +284,11 @@ async function claimRegistration(
       streamKey: c.streamKey,
       channelName: c.channelName,
     })),
+    // Recording-segment upload target (offline recording plan, Phase 2): the
+    // install script writes this into kvs.json as `uploadBucket`; the agent's
+    // uploader PUTs telemetry/v1/* + media-sessions/v1/* here with the same
+    // IoT role-alias creds the KVS runtime uses.
+    uploadBucket: process.env.BUCKET_NAME ?? null,
   });
 }
 

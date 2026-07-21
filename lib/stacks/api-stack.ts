@@ -903,6 +903,66 @@ export class XorgateCoreApiStack extends cdk.Stack {
       action: "lambda:InvokeFunction",
     });
 
+    // --- Batch telemetry ingest (offline recording plan, Phase 2) ---
+    // Device uploads a closed recording segment to telemetry/v1/... (direct S3
+    // PUT with IoT role-alias creds) -> S3 Object Created -> EventBridge ->
+    // this Lambda -> telemetry_readings (history only; never device_latest, D4).
+    // Function-level DLQ catches a Lambda that ran and threw past its retries
+    // (DB down / partition miss); the rule target DLQ catches invocation
+    // failures — same two-layer posture as the live telemetry path above.
+    const telemetryBatchFnDlq = new sqs.Queue(this, "TelemetryBatchIngestFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const telemetryBatchIngestFn = new nodejs.NodejsFunction(this, "TelemetryBatchIngestFn", {
+      ...standardFnProps(
+        path.join(entryBase, "telemetry-batch-ingest.ts"),
+        "S3 Object Created(telemetry/v1/*.jsonl.gz) -> batch insert telemetry_readings",
+      ),
+      // A 60 s segment at 10 Hz is ~600 samples (~12k rows) -> dozens of
+      // sequential Data API batches inside one transaction; give it headroom.
+      memorySize: 512,
+      timeout: cdk.Duration.minutes(2),
+      environment: {
+        ...commonEnv,
+        // Partition-age acceptance window (services/telemetry-batch.ts).
+        TELEMETRY_BATCH_MAX_AGE_DAYS: recCtx("telemetryBatchMaxAgeDays", "90"),
+      },
+      onFailure: new lambdaDestinations.SqsDestination(telemetryBatchFnDlq),
+    });
+    const telemetryBatchRuleDlq = new sqs.Queue(this, "TelemetryBatchIngestRuleDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    new events.Rule(this, "TelemetryBatchIngestRule", {
+      description: "Device telemetry segment uploaded -> batch ingest into telemetry_readings",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ prefix: "telemetry/v1/" }] },
+        },
+      },
+      targets: [
+        new targets.LambdaFunction(telemetryBatchIngestFn, {
+          deadLetterQueue: telemetryBatchRuleDlq,
+          retryAttempts: 2,
+        }),
+      ],
+    });
+    const telemetryBatchDlqAlarm = new cloudwatch.Alarm(this, "TelemetryBatchDlqDepthAlarm", {
+      metric: telemetryBatchFnDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "TelemetryBatchIngestFn async invoke failed past retries (segment not ingested)",
+    });
+    telemetryBatchDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+
     // --- Recording capture signal (Method #3): IoT Topic Rule -> Lambda -> Postgres ---
     // The cloud recorder publishes a one-shot "capturing" event on its first received
     // frame; this stamps recordings.capture_started_at so the UI can flip the badge

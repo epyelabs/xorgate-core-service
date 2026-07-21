@@ -71,7 +71,15 @@ export class XorgateCoreIotStack extends cdk.Stack {
       new iam.PolicyStatement({
         sid: 'S3SegmentUpload', // used in P5; granted now
         actions: ['s3:PutObject'],
-        resources: [bucket.arnForObjects('media/v1/*')],
+        resources: [
+          bucket.arnForObjects('media/v1/*'),
+          // Offline-recording segment uploads (offline_telemetry_video_recording
+          // plan, D3): telemetry JSONL.gz now, video MP4 segments + sidecars in
+          // Phase 4. Deliberately NOT under media/v1/ so the media-finalize rule
+          // never sees segment objects.
+          bucket.arnForObjects('telemetry/v1/*'),
+          bucket.arnForObjects('media-sessions/v1/*'),
+        ],
       }),
     );
 

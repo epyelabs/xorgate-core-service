@@ -272,6 +272,20 @@ export const deviceLatest = pgTable(
   (t) => [uniqueIndex('device_latest_device_metric_idx').on(t.deviceId, t.metric)],
 );
 
+// Batch-ingest audit/idempotency log (offline recording plan, Phase 2): one row
+// per S3 telemetry segment object ever ingested. The PK on s3_key is the
+// redelivery guard — an S3 event delivered twice inserts once — and the counts
+// give a backlog-debugging audit trail. Low volume (one row per ~60 s segment
+// per recording device), so no partitioning.
+export const telemetryIngestLog = pgTable('telemetry_ingest_log', {
+  s3Key: text('s3_key').primaryKey(),
+  deviceId: uuid('device_id').notNull(),
+  sessionId: uuid('session_id'),
+  rowsInserted: integer('rows_inserted').notNull(),
+  linesSkipped: integer('lines_skipped').default(0).notNull(),
+  ingestedAt: timestamp('ingested_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 // A continuous recording run for one stream. Groups segments and holds the CMAF init key.
 export const mediaSessions = pgTable(
   'media_sessions',

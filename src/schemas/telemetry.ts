@@ -25,6 +25,24 @@ const mediaStreamLeaf = z.union([
   }),
 ]);
 
+/**
+ * On-device recording status (offline recording plan, Phase 2). Mirrors the
+ * agent's `RecordingStatus` (device src/agent/telemetry.ts) and the frontend
+ * copy in xorgate-web src/lib/schemas.ts — change all three together.
+ * Optional: pre-Phase-2 agents don't send it. Also the D4 authority-split
+ * signal: `enabled: true` means the device itself is the authoritative writer
+ * of telemetry history (batch path), so live ingest skips `telemetry_readings`.
+ */
+export const recordingStatusSchema = z.object({
+  enabled: z.boolean(),
+  sessionId: z.string().nullable(),
+  backlogBytes: z.number().nonnegative(),
+  backlogSegments: z.number().int().nonnegative(),
+  droppedSegments: z.number().int().nonnegative(),
+  uploading: z.boolean(),
+  lastUploadAt: z.number().nullable(),
+});
+
 export const telemetryPayloadSchema = z.object({
   v: z.literal(1),
   deviceId: z.string().uuid(),
@@ -38,6 +56,7 @@ export const telemetryPayloadSchema = z.object({
       streams: z.array(mediaStreamLeaf).optional(),
     })
     .optional(),
+  recording: recordingStatusSchema.optional(),
 });
 
 export type TelemetryPayload = z.infer<typeof telemetryPayloadSchema>;
@@ -105,6 +124,24 @@ export function flattenTelemetryToRows(payload: TelemetryPayload): NewTelemetryR
       value: payload.media.recording.value ? 1 : 0,
       unit: 'bool',
     });
+  }
+
+  // On-device recording gauges (Phase 2): numeric projections of the recording
+  // block, so `device_latest` carries live backlog/eviction state for the
+  // Phase 5 UI without a new table. sessionId/lastUploadAt are skipped (not
+  // meaningfully numeric).
+  if (payload.recording) {
+    const r = payload.recording;
+    const gauges: Array<[string, number, string | undefined]> = [
+      ['recording.enabled', r.enabled ? 1 : 0, 'bool'],
+      ['recording.uploading', r.uploading ? 1 : 0, 'bool'],
+      ['recording.backlog_bytes', r.backlogBytes, 'B'],
+      ['recording.backlog_segments', r.backlogSegments, undefined],
+      ['recording.dropped_segments', r.droppedSegments, undefined],
+    ];
+    for (const [metric, value, unit] of gauges) {
+      rows.push({ deviceId: payload.deviceId, ts, metric, value, unit: unit ?? null });
+    }
   }
 
   return rows;
