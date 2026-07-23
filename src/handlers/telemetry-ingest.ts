@@ -158,7 +158,9 @@ export const handler = async (event: unknown): Promise<void> => {
   // principle as §4.5. Log + continue; the heartbeat, auto-record and workflow
   // triggers still run. A persistent DB outage still surfaces via the heartbeat
   // UPDATE throwing (which drives the async-retry / DLQ path).
-  if (rows.length > 0 && (await deviceFlags(payload.deviceId)).persistTelemetry) {
+  const persistTelemetry =
+    rows.length > 0 && (await deviceFlags(payload.deviceId)).persistTelemetry;
+  if (persistTelemetry) {
     try {
       // Authority split (offline recording plan D4): while the device reports
       // on-device telemetry recording active, the batch path (S3 segment →
@@ -186,6 +188,29 @@ export const handler = async (event: unknown): Promise<void> => {
         deviceId: payload.deviceId,
         err,
       });
+    }
+  } else if (rows.length > 0) {
+    // Phase 6.7(a): even with persist_telemetry off, keep the recording/backlog
+    // gauges in `device_latest` live — Phase 2 advertised them as "free UI
+    // data", but skipping the upsert entirely froze them at their last
+    // persisted value for non-persisting devices (observed 2 days stale during
+    // Phase 5 E2E). Only the recording.* + media.recording rows are upserted
+    // (~7 rows/device at 1 Hz — cheap); history stays untouched. Best-effort,
+    // same isolation stance as the persist path above.
+    const gaugeRows = rows.filter(
+      (r) => r.metric.startsWith('recording.') || r.metric === 'media.recording',
+    );
+    if (gaugeRows.length > 0) {
+      try {
+        const tsIso = new Date(payload.ts).toISOString();
+        const upsert = buildDeviceLatestUpsert(payload.deviceId, tsIso, gaugeRows);
+        if (upsert) await db.execute(upsert);
+      } catch (err) {
+        console.error('telemetry-ingest: gauge upsert failed (continuing to heartbeat)', {
+          deviceId: payload.deviceId,
+          err,
+        });
+      }
     }
   }
 

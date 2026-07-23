@@ -4,7 +4,10 @@ import {
   runRecordingWatchdog,
   stopRecordingsForOfflineDevice,
 } from '../services/recordings';
-import { closeStaleMediaSessions } from '../services/media-sessions';
+import {
+  closeStaleMediaSessions,
+  expireSegmentIndexRows,
+} from '../services/media-sessions';
 import { recordingConfig } from '../config/recording';
 
 /**
@@ -26,6 +29,11 @@ import { recordingConfig } from '../config/recording';
  *     so no recording runs forever and no row sticks in recording/stopping.
  *  4. Media-session close (offline recording plan, Phase 4): advisorily flip
  *     device-recorded media_sessions to 'closed' once segments stop arriving.
+ *     Each open→closed transition also fires `session_completed` workflow
+ *     triggers (Phase 6.4, at-least-once — see closeStaleMediaSessions).
+ *  5. Segment index-row expiry (Phase 6.3): delete media_segments /
+ *     empty media_sessions / telemetry_ingest_log rows one day after the S3
+ *     lifecycle expired their objects.
  *
  * Each job is isolated in its own try/catch so one failing job never starves the
  * others. Pure server-side time; idempotent.
@@ -76,5 +84,15 @@ export const handler = async (): Promise<void> => {
     if (closed > 0) console.log('offline-sweeper: closed stale media sessions', { closed });
   } catch (err) {
     console.error('offline-sweeper: media-session close failed', err);
+  }
+
+  // 5: expire segment index rows behind the S3 lifecycle (Phase 6.3).
+  try {
+    const expired = await expireSegmentIndexRows();
+    if (expired.segments > 0 || expired.sessions > 0 || expired.ingestLog > 0) {
+      console.log('offline-sweeper: expired segment index rows', expired);
+    }
+  } catch (err) {
+    console.error('offline-sweeper: segment index expiry failed', err);
   }
 };

@@ -1729,6 +1729,29 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
     },
+    '/devices/{id}/sessions/{sessionId}': {
+      parameters: [
+        { $ref: '#/components/parameters/IdPath' },
+        { $ref: '#/components/parameters/SessionIdPath' },
+        { $ref: '#/components/parameters/OrganizationIdHeader' },
+      ],
+      delete: {
+        operationId: 'deleteMediaSession',
+        summary: 'Delete a device-recorded media session',
+        description:
+          'Deletes every segment object (video + sidecar) from storage and removes the session and its ' +
+          'segment index rows. Owner/admin only — device-recorded sessions are not re-creatable. A segment ' +
+          'still uploading from the device after the delete recreates the session index (at-least-once ' +
+          'ingest); delete again once the device has drained.',
+        tags: ['Media Sessions'],
+        responses: {
+          '204': { description: 'Session deleted.' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
     '/devices/{id}/sessions/{sessionId}/segments': {
       parameters: [
         { $ref: '#/components/parameters/IdPath' },

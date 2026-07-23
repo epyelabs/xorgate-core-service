@@ -252,6 +252,24 @@ else
 fi
 rm -f "\$SUDOERS_TMP"
 
+# 6b. Keep POSIX shared memory alive across ssh logouts. logind's default
+#     RemoveIPC=yes deletes a user's shm segments when their last login session
+#     ends — that destroys the shmsink bridge areas of bridged camera pipelines
+#     mid-flight, and any later-connecting KVS master then shm_open-fails
+#     forever (black streams; hardware-verified, offline-recording plan spike
+#     notes gotcha #5). A drop-in keeps the distro's logind.conf pristine;
+#     restarting logind applies it and does not disturb existing sessions.
+install -d -m 0755 /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/10-xorgate-removeipc.conf <<'EOF'
+# Installed by xorgate. Bridged camera pipelines publish frames through POSIX
+# shared memory owned by the agent user; logind must not remove it when the
+# last ssh session closes.
+[Login]
+RemoveIPC=no
+EOF
+systemctl try-restart systemd-logind 2>/dev/null \\
+  || log "WARN: could not restart systemd-logind; RemoveIPC=no applies on next boot"
+
 systemctl daemon-reload
 systemctl enable --now xorgate-agent
 

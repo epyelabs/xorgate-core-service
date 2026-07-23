@@ -54,6 +54,15 @@ export const recordingConfig = {
    * gaps of a few minutes are normal while a device rides through dead zones.
    */
   mediaSessionCloseAfterMs: numEnv('MEDIA_SESSION_CLOSE_AFTER_MS', 10 * 60 * 1000),
+  /**
+   * Device-recorded segment retention (offline recording plan, Phase 6.3).
+   * S3 lifecycle rules expire `telemetry/v1/*` + `media-sessions/v1/*` objects
+   * at this age (storage-stack, same context key); the sweeper expires the
+   * matching DB index rows one day LATER, so S3 always deletes first and a
+   * row is never removed while its object still needs indexing (see
+   * expireSegmentIndexRows).
+   */
+  segmentRetentionDays: numEnv('SEGMENT_RETENTION_DAYS', 90),
   recorder: {
     /** Capture-heartbeat cadence the recorder publishes at (media-plane liveness). */
     heartbeatMs: numEnv('RECORDER_HEARTBEAT_MS', 12_000),

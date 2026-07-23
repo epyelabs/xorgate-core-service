@@ -75,6 +75,15 @@ export const attachmentTriggerSchema = z.discriminatedUnion('type', [
     type: z.literal('recording_saved'),
     streamKeys: z.array(z.string()).min(1),
   }),
+  // Device-recorded media session closed by the sweeper (offline recording
+  // plan, Phase 6.4). AT-LEAST-ONCE: close is advisory and reversible — a
+  // straggler segment reopens the session and the next sweep re-closes it,
+  // firing this trigger AGAIN with updated rollups. Workflows that care must
+  // dedupe on sessionId (the trigger-state/run-history pattern).
+  z.object({
+    type: z.literal('session_completed'),
+    streamKeys: z.array(z.string()).min(1),
+  }),
   z.object({
     type: z.literal('schedule'),
     cron: z.string().min(1),

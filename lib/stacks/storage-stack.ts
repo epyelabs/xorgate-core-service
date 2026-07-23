@@ -22,6 +22,14 @@ export class XorgateCoreStorageStack extends cdk.Stack {
     const isProd = stage === 'prod';
     const suffix = isProd ? '' : 'Dev';
 
+    // Retention for device-recorded segment objects (offline recording plan,
+    // Phase 6.3). One knob for both prefixes; keep in sync with the DB row
+    // expiry the sweeper runs (api-stack SEGMENT_RETENTION_DAYS reads the same
+    // context key). 90 d default for both stages until a prod policy is set.
+    const retentionCtx = this.node.tryGetContext('segmentRetentionDays');
+    const segmentRetentionDays =
+      retentionCtx === undefined || retentionCtx === null ? 90 : Number(retentionCtx);
+
     if (isProd) {
       this.vpc = new ec2.Vpc(this, 'XorgateVpc', {
         maxAzs: 2,
@@ -67,6 +75,24 @@ export class XorgateCoreStorageStack extends cdk.Stack {
           prefix: 'workflows/v2/uploads/',
           expiration: cdk.Duration.days(7),
           abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
+        },
+        // Device-recorded segment prefixes (offline recording plan, Phase 6.3):
+        // without expiry these grow without bound (~1.7 GB/h per recording
+        // device). Age is a context value shared with the sweeper's DB row
+        // expiry (SEGMENT_RETENTION_DAYS in api-stack) — override at deploy
+        // with `--context segmentRetentionDays=<n>`. telemetry_readings rows
+        // (the authoritative telemetry record) deliberately do NOT follow this
+        // clock — only the raw .jsonl.gz upload artifacts and the video
+        // segment objects expire.
+        {
+          id: 'ExpireTelemetrySegmentUploads',
+          prefix: 'telemetry/v1/',
+          expiration: cdk.Duration.days(segmentRetentionDays),
+        },
+        {
+          id: 'ExpireMediaSessionSegments',
+          prefix: 'media-sessions/v1/',
+          expiration: cdk.Duration.days(segmentRetentionDays),
         },
       ],
       removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,

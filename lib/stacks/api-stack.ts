@@ -502,6 +502,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // R6 gate: keep off until the recorder heartbeat (Phase 4) is deployed. Then
       // enable with `--context offlineStopEnabled=true` (rollout §9 step 4).
       OFFLINE_STOP_ENABLED: recCtx("offlineStopEnabled", "false"),
+      // Device-recorded segment retention (offline recording plan, Phase 6.3).
+      // Drives the sweeper's DB row expiry; MUST match the S3 lifecycle age in
+      // storage-stack — both read the `segmentRetentionDays` context key.
+      SEGMENT_RETENTION_DAYS: recCtx("segmentRetentionDays", "90"),
       // Device-recorded media sessions (offline recording plan, Phase 4):
       // sweeper close window — no new segment ARRIVAL for this long -> closed.
       MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
@@ -719,13 +723,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       bundling: bundlingWithSdk,
     });
 
-    // /devices/{id}/sessions (+ segment sub-routes) — read-only index over
-    // device-recorded media sessions/segments (offline recording plan, Phase 4).
-    // Presigns S3 GETs for per-segment playback (same posture as recordings).
+    // /devices/{id}/sessions (+ segment sub-routes) — index over
+    // device-recorded media sessions/segments (offline recording plan, Phase 4;
+    // session DELETE added Phase 6.3 — S3 object deletion is covered by the
+    // shared lambdaRole's bucket.grantReadWrite above, which includes
+    // s3:DeleteObject*). Presigns S3 GETs for per-segment playback (same
+    // posture as recordings).
     const deviceSessionsFn = new nodejs.NodejsFunction(this, "DeviceSessionsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-sessions.ts"),
-        "GET /devices/{id}/sessions(+/segments,/playback) — device-recorded media index",
+        "GET/DELETE /devices/{id}/sessions(+/segments,/playback) — device-recorded media index",
       ),
       timeout: cdk.Duration.seconds(15),
       bundling: bundlingWithSdk,
@@ -1216,6 +1223,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
     workflowRunsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     telemetryIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     mediaFinalizeFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    // Phase 6.4: session_completed fires from the sweeper's close pass AND the
+    // sessions list's close-on-read — both evaluate triggers via
+    // fireWorkflowRun, which enqueues here. (Caught live: without these the
+    // run row is created and then flipped to failed with "enqueue failed".)
+    offlineSweeperFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    deviceSessionsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
 
     // v2 engine runner launch config (media graphs; Lambda engine handles
     // telemetry-only). Same cluster/VPC/SG as the recorder. The CV_* env and
@@ -1704,10 +1717,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceRecordingsInt,
     });
-    // Device-recorded media sessions (offline recording plan, Phase 4).
+    // Device-recorded media sessions (offline recording plan, Phase 4;
+    // DELETE added in Phase 6.3).
     this.api.addRoutes({
       path: "/devices/{id}/sessions",
       methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSessionsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/sessions/{sessionId}",
+      methods: [apigwv2.HttpMethod.DELETE],
       integration: deviceSessionsInt,
     });
     this.api.addRoutes({

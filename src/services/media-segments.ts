@@ -58,7 +58,11 @@ export const videoSidecarSchema = z.object({
   height: z.number().int().optional(),
   fps: z.number().int().optional(),
   bitrateKbps: z.number().int().optional(),
-  anchor: z.enum(['fstat', 'computed']).optional(),
+  // 'boundary' added in Phase 6.6 (fragment-0 startTs walked back from the
+  // 0→1 rotation point). Deploy this widening BEFORE any device build that
+  // emits it — an unknown value here fails the sidecar parse and DLQs the
+  // segment event.
+  anchor: z.enum(['fstat', 'computed', 'boundary']).optional(),
   finalized: z.boolean().optional(),
 });
 export type VideoSidecar = z.infer<typeof videoSidecarSchema>;

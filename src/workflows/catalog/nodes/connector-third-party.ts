@@ -373,8 +373,11 @@ export const executor = async function* connectorThirdParty(
   };
 
   for await (const sample of telemetrySamples(requireInput(inputs, 'positions'))) {
-    const lat = sample.signals['gps.latitude'];
-    const lng = sample.signals['gps.longitude'];
+    // Accept both position namings: devices emit gps.lat/gps.lon, older demo
+    // templates/CSVs use the long forms (Phase 6.10 — same fix as
+    // telemetry-derivative.ts).
+    const lat = sample.signals['gps.latitude'] ?? sample.signals['gps.lat'];
+    const lng = sample.signals['gps.longitude'] ?? sample.signals['gps.lon'];
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       skippedNoPosition += 1;
       continue;

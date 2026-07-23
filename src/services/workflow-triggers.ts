@@ -200,6 +200,109 @@ export async function evaluateRecordingSavedTriggers(rec: {
   }
 }
 
+// --- Session-completed trigger (sweeper close hook, Phase 6.4) ---------------
+
+type SessionCompletedTrigger = Extract<AttachmentTrigger, { type: 'session_completed' }>;
+
+/**
+ * Fire workflow runs when a device-recorded media session flips open→closed
+ * (offline recording plan, Phase 6.4). Called (best-effort) from the sweeper's
+ * close pass AND the close-on-read path in device-sessions.ts — mirror of
+ * evaluateRecordingSavedTriggers.
+ *
+ * AT-LEAST-ONCE by design: close is advisory and reversible. A straggler
+ * segment reopens the session (media-segment-ingest sets status='open' on
+ * every insert) and the next sweep re-closes it, firing this again with
+ * updated rollups. Consumers that must run once per session dedupe on
+ * triggerContext.sessionId.
+ */
+export async function evaluateSessionCompletedTriggers(session: {
+  id: string;
+  deviceId: string;
+  streamKey: string;
+  startedAt: Date;
+  endedAt: Date | null;
+}): Promise<void> {
+  const device = await db.query.devices.findFirst({
+    where: eq(schema.devices.id, session.deviceId),
+    columns: { workspaceId: true },
+  });
+  if (!device) return;
+
+  const rows = await db
+    .select({
+      id: schema.workflowAttachments.id,
+      templateId: schema.workflowAttachments.templateId,
+      pinnedVersion: schema.workflowAttachments.pinnedVersion,
+      triggers: schema.workflowAttachments.triggers,
+      publishedVersion: schema.workflowTemplates.publishedVersion,
+    })
+    .from(schema.workflowAttachments)
+    .innerJoin(
+      schema.workflowTemplates,
+      eq(schema.workflowTemplates.id, schema.workflowAttachments.templateId),
+    )
+    .where(
+      and(
+        eq(schema.workflowAttachments.deviceId, session.deviceId),
+        eq(schema.workflowAttachments.enabled, true),
+      ),
+    );
+
+  const subscribed = rows.filter((a) =>
+    ((a.triggers as AttachmentTrigger[]) ?? []).some(
+      (t): t is SessionCompletedTrigger =>
+        t.type === 'session_completed' && t.streamKeys.includes(session.streamKey),
+    ),
+  );
+  if (subscribed.length === 0) return;
+
+  // Rollups computed once per fire (not stored — same stance as the list API).
+  const [agg] = await db
+    .select({
+      segmentCount: sql<number>`count(*)::int`,
+      totalBytes: sql<number>`coalesce(sum(${schema.mediaSegments.sizeBytes}), 0)::bigint`,
+      totalDurationMs: sql<number>`coalesce(sum(${schema.mediaSegments.durationMs}), 0)::bigint`,
+    })
+    .from(schema.mediaSegments)
+    .where(eq(schema.mediaSegments.sessionId, session.id));
+
+  for (const a of subscribed) {
+    const resolvedVersion = a.pinnedVersion ?? a.publishedVersion;
+    if (resolvedVersion == null) continue;
+    const [ver] = await db
+      .select({ definition: schema.workflowTemplateVersions.definition })
+      .from(schema.workflowTemplateVersions)
+      .where(
+        and(
+          eq(schema.workflowTemplateVersions.templateId, a.templateId),
+          eq(schema.workflowTemplateVersions.version, resolvedVersion),
+        ),
+      );
+    if (!ver) continue;
+
+    await fireWorkflowRun({
+      workspaceId: device.workspaceId,
+      deviceId: session.deviceId,
+      attachmentId: a.id,
+      templateId: a.templateId,
+      templateVersion: resolvedVersion,
+      definition: ver.definition as WorkflowDefinition,
+      trigger: 'event',
+      triggerContext: {
+        type: 'session_completed',
+        sessionId: session.id,
+        streamKey: session.streamKey,
+        startedAt: session.startedAt.toISOString(),
+        endedAt: session.endedAt ? session.endedAt.toISOString() : null,
+        segmentCount: Number(agg?.segmentCount ?? 0),
+        totalBytes: Number(agg?.totalBytes ?? 0),
+        totalDurationMs: Number(agg?.totalDurationMs ?? 0),
+      },
+    });
+  }
+}
+
 // --- Telemetry condition trigger (1 Hz hot path) -----------------------------
 
 type ConditionTrigger = Extract<AttachmentTrigger, { type: 'telemetry_condition' }>;

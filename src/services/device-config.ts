@@ -41,6 +41,14 @@ export interface DeviceConfigMessage {
    * `recording` namespace with this value (cloud is authoritative once set).
    */
   recording?: RecordingConfigMessage;
+  /**
+   * Segment-upload S3 bucket (offline recording plan, Phase 6.2). The install
+   * script writes this into kvs.json for NEW devices; carrying it on the
+   * retained config message backfills devices fielded before Phase 2 (the
+   * agent persists it into kvs.json and arms its uploader live). Sourced from
+   * the Lambda's BUCKET_NAME env; omitted if that is unset.
+   */
+  uploadBucket?: string;
   ts: number;
 }
 
@@ -53,11 +61,13 @@ export async function publishDeviceConfig(
     recording?: RecordingConfigMessage | null;
   },
 ): Promise<void> {
+  const uploadBucket = process.env.BUCKET_NAME;
   const message: DeviceConfigMessage = {
     v: 1,
     gnssAntBias: config.gnssAntBias,
     ...(config.imuMount ? { imuMount: config.imuMount } : {}),
     ...(config.recording ? { recording: config.recording } : {}),
+    ...(uploadBucket ? { uploadBucket } : {}),
     ts: Date.now(),
   };
   const client = await iotDataClient();

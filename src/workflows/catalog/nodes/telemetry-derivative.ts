@@ -83,8 +83,12 @@ export const executor = async function* telemetryDerivative(
         prevValue = value;
       }
     } else {
-      const lat = signals['gps.latitude'];
-      const lon = signals['gps.longitude'];
+      // Devices emit `gps.lat`/`gps.lon` (see device collectors/gps.ts); the
+      // long names predate that and survive in older demo templates/CSV
+      // uploads — accept both (Phase 6.10; the mismatch made this node derive
+      // all-zeros against real device history).
+      const lat = signals['gps.latitude'] ?? signals['gps.lat'];
+      const lon = signals['gps.longitude'] ?? signals['gps.lon'];
       if (typeof lat === 'number' && typeof lon === 'number') {
         if (prevTs !== null && prevLat !== null && prevLon !== null && sample.ts > prevTs) {
           const meters = haversineMeters(prevLat, prevLon, lat, lon);
