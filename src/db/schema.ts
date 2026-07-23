@@ -287,6 +287,10 @@ export const telemetryIngestLog = pgTable('telemetry_ingest_log', {
 });
 
 // A continuous recording run for one stream. Groups segments and holds the CMAF init key.
+// Populated (offline recording plan, Phase 4) by media-segment-ingest from device-uploaded
+// segments: `id` IS the device-minted session UUID (uuidv7 — sorts by start time), not a
+// defaultRandom value; started_at/ended_at/last_segment_at are rolled forward as segments
+// arrive. init_key stays NULL until CMAF/stitching lands (deferred).
 export const mediaSessions = pgTable(
   'media_sessions',
   {
@@ -302,6 +306,21 @@ export const mediaSessions = pgTable(
     width: integer('width'),
     height: integer('height'),
     fps: integer('fps'),
+    // Where the session came from: 'device-offline' (Phase 4 device recorder).
+    // Text, not pgEnum (aws-data-api enum-cast issue — same as devices.status).
+    source: text('source'),
+    // Advisory lifecycle: 'open' while segments may still arrive, 'closed' once
+    // the sweeper sees no new segment for the close window (there is no explicit
+    // end signal — the device may die mid-session). Segments stay queryable
+    // regardless of status.
+    status: text('status').default('open').notNull(),
+    // Device clock quality when the session started: ntp | rtc | unsynced (D6).
+    timeSource: text('time_source'),
+    bitrateKbps: integer('bitrate_kbps'),
+    // Server-side arrival time of the most recent segment — the sweeper's
+    // close-detection clock (upload can lag recording by hours; never use
+    // device timestamps to decide "no longer arriving").
+    lastSegmentAt: timestamp('last_segment_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [index('media_sessions_device_stream_started_idx').on(t.deviceId, t.streamKey, t.startedAt)],
@@ -323,6 +342,13 @@ export const mediaSegments = pgTable(
     durationMs: integer('duration_ms').notNull(),
     keyframe: boolean('keyframe').default(true).notNull(),
     sizeBytes: integer('size_bytes'),
+    // False = the device cut this fragment mid-write (crash/power loss). Still
+    // playable up to the cut (fragmented MP4), but stitching should prefer the
+    // next segment's start_ts over this row's duration_ms.
+    finalized: boolean('finalized').default(true).notNull(),
+    // Sidecar provenance passthrough (anchor: fstat|computed, timeSource,
+    // startMono) — kept for cloud-side re-anchoring (D6) without more columns.
+    meta: jsonb('meta'),
     uploadedAt: timestamp('uploaded_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [

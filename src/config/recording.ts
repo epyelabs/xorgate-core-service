@@ -47,6 +47,13 @@ export const recordingConfig = {
    * `services/recordings.ts`. Baked defaults live in the recorder C; these let the
    * backend override them per launch without a recorder-image rebuild.
    */
+  /**
+   * Device-recorded media sessions (offline recording plan, Phase 4): a session
+   * with no new segment ARRIVAL for this long is advisorily closed by the
+   * sweeper. Generous by design — segments upload on backlog drain, so arrival
+   * gaps of a few minutes are normal while a device rides through dead zones.
+   */
+  mediaSessionCloseAfterMs: numEnv('MEDIA_SESSION_CLOSE_AFTER_MS', 10 * 60 * 1000),
   recorder: {
     /** Capture-heartbeat cadence the recorder publishes at (media-plane liveness). */
     heartbeatMs: numEnv('RECORDER_HEARTBEAT_MS', 12_000),

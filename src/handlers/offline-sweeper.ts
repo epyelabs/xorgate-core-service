@@ -4,12 +4,13 @@ import {
   runRecordingWatchdog,
   stopRecordingsForOfflineDevice,
 } from '../services/recordings';
+import { closeStaleMediaSessions } from '../services/media-sessions';
 import { recordingConfig } from '../config/recording';
 
 /**
  * Housekeeping tick (kvs-webrtc-lts Phase 2). Invoked by the existing EventBridge
  * schedule (~1 min, gated by disableScheduledJobs so it stays OFF in the shared
- * sandbox). Folds three jobs onto the ONE tick — deliberately no new schedule, so
+ * sandbox). Folds four jobs onto the ONE tick — deliberately no new schedule, so
  * no new Aurora wake source (§7.3):
  *
  *  1. Offline sweep: flip devices that stopped reporting `online` -> `offline`
@@ -23,6 +24,8 @@ import { recordingConfig } from '../config/recording';
  *     behave identically.
  *  3. Recording watchdog: max-duration cap (runaway guard) + orphan/stuck reconcile
  *     so no recording runs forever and no row sticks in recording/stopping.
+ *  4. Media-session close (offline recording plan, Phase 4): advisorily flip
+ *     device-recorded media_sessions to 'closed' once segments stop arriving.
  *
  * Each job is isolated in its own try/catch so one failing job never starves the
  * others. Pure server-side time; idempotent.
@@ -64,5 +67,14 @@ export const handler = async (): Promise<void> => {
     await runRecordingWatchdog();
   } catch (err) {
     console.error('offline-sweeper: recording watchdog failed', err);
+  }
+
+  // 4: advisory close of device-recorded media sessions that stopped receiving
+  // segments (offline recording plan, Phase 4 — same "no new schedule" stance).
+  try {
+    const closed = await closeStaleMediaSessions();
+    if (closed > 0) console.log('offline-sweeper: closed stale media sessions', { closed });
+  } catch (err) {
+    console.error('offline-sweeper: media-session close failed', err);
   }
 };

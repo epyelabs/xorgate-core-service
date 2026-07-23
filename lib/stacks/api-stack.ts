@@ -502,6 +502,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // R6 gate: keep off until the recorder heartbeat (Phase 4) is deployed. Then
       // enable with `--context offlineStopEnabled=true` (rollout §9 step 4).
       OFFLINE_STOP_ENABLED: recCtx("offlineStopEnabled", "false"),
+      // Device-recorded media sessions (offline recording plan, Phase 4):
+      // sweeper close window — no new segment ARRIVAL for this long -> closed.
+      MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
       // Passed through to the recorder container via RunTask overrides.
       RECORDER_HEARTBEAT_MS: recCtx("recorderHeartbeatMs", "12000"),
       RECORDER_RECONNECT_WINDOW_MS: recCtx("recorderReconnectWindowMs", "90000"),
@@ -713,6 +716,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "CRUD + control /devices/{id}/recordings (cloud recorder)",
       ),
       timeout: cdk.Duration.seconds(20),
+      bundling: bundlingWithSdk,
+    });
+
+    // /devices/{id}/sessions (+ segment sub-routes) — read-only index over
+    // device-recorded media sessions/segments (offline recording plan, Phase 4).
+    // Presigns S3 GETs for per-segment playback (same posture as recordings).
+    const deviceSessionsFn = new nodejs.NodejsFunction(this, "DeviceSessionsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-sessions.ts"),
+        "GET /devices/{id}/sessions(+/segments,/playback) — device-recorded media index",
+      ),
+      timeout: cdk.Duration.seconds(15),
       bundling: bundlingWithSdk,
     });
 
@@ -962,6 +977,60 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "TelemetryBatchIngestFn async invoke failed past retries (segment not ingested)",
     });
     telemetryBatchDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+
+    // --- Device video-segment ingest (offline recording plan, Phase 4) ---
+    // Device uploads a video fragment pair (sidecar-first, then mp4) to
+    // media-sessions/v1/... -> S3 Object Created -> EventBridge -> this Lambda
+    // -> media_sessions/media_segments. The prefix is deliberately NOT
+    // media/v1/, so MediaFinalizeRule never sees segment objects. Same
+    // two-layer DLQ posture as the telemetry batch path above.
+    const mediaSegmentFnDlq = new sqs.Queue(this, "MediaSegmentIngestFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const mediaSegmentIngestFn = new nodejs.NodejsFunction(this, "MediaSegmentIngestFn", {
+      ...standardFnProps(
+        path.join(entryBase, "media-segment-ingest.ts"),
+        "S3 Object Created(media-sessions/v1/*.mp4) -> media_sessions + media_segments",
+      ),
+      // Sidecar GET + a 3-statement transaction; the default 10 s is tight
+      // against a cold Aurora resume.
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(30),
+      onFailure: new lambdaDestinations.SqsDestination(mediaSegmentFnDlq),
+    });
+    const mediaSegmentRuleDlq = new sqs.Queue(this, "MediaSegmentIngestRuleDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    new events.Rule(this, "MediaSegmentIngestRule", {
+      description: "Device video segment uploaded -> index into media_sessions/media_segments",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ prefix: "media-sessions/v1/" }] },
+        },
+      },
+      targets: [
+        new targets.LambdaFunction(mediaSegmentIngestFn, {
+          deadLetterQueue: mediaSegmentRuleDlq,
+          retryAttempts: 2,
+        }),
+      ],
+    });
+    const mediaSegmentDlqAlarm = new cloudwatch.Alarm(this, "MediaSegmentDlqDepthAlarm", {
+      metric: mediaSegmentFnDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "MediaSegmentIngestFn async invoke failed past retries (video segment not indexed)",
+    });
+    mediaSegmentDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
 
     // --- Recording capture signal (Method #3): IoT Topic Rule -> Lambda -> Postgres ---
     // The cloud recorder publishes a one-shot "capturing" event on its first received
@@ -1418,6 +1487,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DeviceRecordingsInt",
       deviceRecordingsFn,
     );
+    const deviceSessionsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceSessionsInt",
+      deviceSessionsFn,
+    );
     const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
@@ -1630,6 +1703,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/recordings/{recordingId}/playback",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceRecordingsInt,
+    });
+    // Device-recorded media sessions (offline recording plan, Phase 4).
+    this.api.addRoutes({
+      path: "/devices/{id}/sessions",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSessionsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/sessions/{sessionId}/segments",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSessionsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/sessions/{sessionId}/segments/{seq}/playback",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSessionsInt,
     });
     this.api.addRoutes({
       path: "/devices/{id}/telemetry",
