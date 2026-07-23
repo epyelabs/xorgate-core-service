@@ -141,6 +141,13 @@
       "when": 1784816211410,
       "tag": "0019_great_iron_patriot",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1784821498286,
+      "tag": "0020_smart_wendigo",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "recording_config" jsonb;

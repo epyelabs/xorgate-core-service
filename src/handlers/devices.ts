@@ -16,6 +16,10 @@ import {
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { publishDeviceConfig } from '../services/device-config';
+import {
+  parseRecordingConfigBody,
+  type RecordingConfig,
+} from '../schemas/recording-config';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 const VALID_VIEW_TYPES = ['card', 'map'] as const;
@@ -203,6 +207,7 @@ export const handler = async (
         activeStreamsViewType?: string;
         imuMount?: unknown;
         imuView?: unknown;
+        recordingConfig?: unknown;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -244,6 +249,13 @@ export const handler = async (
         imuMount = parsed;
       }
 
+      let recordingConfig: RecordingConfig | null | undefined;
+      if (body.recordingConfig !== undefined) {
+        const parsed = parseRecordingConfigBody(body.recordingConfig);
+        if ('error' in parsed) return badRequest(parsed.error);
+        recordingConfig = parsed.value;
+      }
+
       let imuView: ImuViewBody | null | undefined;
       if (body.imuView !== undefined) {
         const parsed = parseImuViewBody(body.imuView);
@@ -266,6 +278,7 @@ export const handler = async (
       if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
       if (imuMount !== undefined) updates.imuMount = imuMount;
       if (imuView !== undefined) updates.imuView = imuView;
+      if (recordingConfig !== undefined) updates.recordingConfig = recordingConfig;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
@@ -289,11 +302,16 @@ export const handler = async (
       // either field's change keeps the retained copy complete. Publish
       // failure is surfaced as a 502 so the operator knows the device was NOT
       // told — the DB row is already updated; re-saving retries the publish.
-      if (body.gnssAntBias !== undefined || imuMount !== undefined) {
+      if (
+        body.gnssAntBias !== undefined ||
+        imuMount !== undefined ||
+        recordingConfig !== undefined
+      ) {
         try {
           await publishDeviceConfig(id, {
             gnssAntBias: updated[0].gnssAntBias,
             imuMount: updated[0].imuMount,
+            recording: updated[0].recordingConfig,
           });
         } catch (err) {
           console.error('device config publish failed', { deviceId: id, err });

@@ -21,23 +21,43 @@ export interface ImuMountConfig {
   yawDeg: number;
 }
 
+/** The README `recording` settings shape (offline recording plan, D7). */
+export interface RecordingConfigMessage {
+  telemetry?: { enabled?: boolean; rateHz?: number };
+  video?: { enabled?: boolean; preset?: string; segmentSeconds?: number };
+  upload?: { mode?: 'auto' | 'off' };
+  retention?: { maxBytes?: number; minFreeBytes?: number };
+}
+
 export interface DeviceConfigMessage {
   v: 1;
   gnssAntBias: boolean;
   /** Omitted (not null) when the device has never had a mount configured. */
   imuMount?: ImuMountConfig;
+  /**
+   * On-device recording config (offline recording plan, Phase 5). Omitted when
+   * `devices.recording_config` is NULL — the device then keeps its local
+   * settings untouched; when present the agent REPLACES its settings.json
+   * `recording` namespace with this value (cloud is authoritative once set).
+   */
+  recording?: RecordingConfigMessage;
   ts: number;
 }
 
 /** Publish the retained per-device config message. Throws on failure. */
 export async function publishDeviceConfig(
   deviceId: string,
-  config: { gnssAntBias: boolean; imuMount?: ImuMountConfig | null },
+  config: {
+    gnssAntBias: boolean;
+    imuMount?: ImuMountConfig | null;
+    recording?: RecordingConfigMessage | null;
+  },
 ): Promise<void> {
   const message: DeviceConfigMessage = {
     v: 1,
     gnssAntBias: config.gnssAntBias,
     ...(config.imuMount ? { imuMount: config.imuMount } : {}),
+    ...(config.recording ? { recording: config.recording } : {}),
     ts: Date.now(),
   };
   const client = await iotDataClient();

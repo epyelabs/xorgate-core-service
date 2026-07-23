@@ -143,6 +143,18 @@ export const devices = pgTable(
       pitchDeg: number;
       yawDeg: number;
     }>(),
+    // On-device recording config (offline recording plan, Phase 5 / D7). The
+    // README `recording` settings shape, validated against a closed preset
+    // table on PUT and delivered to the device as retained MQTT config; the
+    // agent merges it into settings.json and applies live. NULL = never
+    // configured from the cloud (device keeps its local settings; feature off
+    // by default).
+    recordingConfig: jsonb('recording_config').$type<{
+      telemetry?: { enabled?: boolean; rateHz?: number };
+      video?: { enabled?: boolean; preset?: string; segmentSeconds?: number };
+      upload?: { mode?: 'auto' | 'off' };
+      retention?: { maxBytes?: number; minFreeBytes?: number };
+    }>(),
     // Camera direction for the web 3D orientation view. Cloud-only (never
     // delivered to the device). NULL = the view's built-in default 3/4 angle.
     imuView: jsonb('imu_view').$type<{

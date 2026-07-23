@@ -45,6 +45,19 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         required: true,
         schema: { type: 'string', format: 'uuid' },
       },
+      SessionIdPath: {
+        name: 'sessionId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string', format: 'uuid' },
+      },
+      SegmentSeqPath: {
+        name: 'seq',
+        in: 'path',
+        required: true,
+        schema: { type: 'integer', minimum: 0 },
+        description: 'Segment sequence number within the session (0-based).',
+      },
     },
     schemas: {
       ApiError: {
@@ -226,8 +239,157 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               elevationDeg: { type: 'number' },
             },
           },
+          recordingConfig: {
+            allOf: [{ $ref: '#/components/schemas/RecordingConfig' }],
+            nullable: true,
+            description:
+              'On-device recording config. Delivered to the device via a retained MQTT config ' +
+              'message and applied live by the agent. null = never configured from the cloud ' +
+              '(recording off by default; any device-local settings are left untouched).',
+          },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      RecordingConfig: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'On-device recording settings (`recording` namespace). All fields optional — omitted ' +
+          'fields fall back to device defaults. Unknown keys and out-of-range values are rejected.',
+        properties: {
+          telemetry: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              enabled: { type: 'boolean', description: 'Record telemetry locally (default false).' },
+              rateHz: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 20,
+                description:
+                  'Target sample rate. Each sensor group is additionally capped by its native cadence ' +
+                  '(IMU 20 Hz, GPS 1 Hz, system 1 Hz). Default 10.',
+              },
+            },
+          },
+          video: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              enabled: { type: 'boolean', description: 'Record camera video locally (default false).' },
+              preset: {
+                type: 'string',
+                enum: ['1080p30-4mbps', '1080p15-2mbps', '720p30-2mbps'],
+                description: 'Closed quality preset table (bounded CPU cost). Default 1080p15-2mbps.',
+              },
+              segmentSeconds: {
+                type: 'integer',
+                minimum: 10,
+                maximum: 300,
+                description: 'Segment length — the unit of upload, retry and eviction. Default 60.',
+              },
+            },
+          },
+          upload: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              mode: {
+                type: 'string',
+                enum: ['auto', 'off'],
+                description: 'auto (default): drain segments to S3 whenever connected; off: keep local only.',
+              },
+            },
+          },
+          retention: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              maxBytes: {
+                type: 'integer',
+                minimum: 536870912,
+                maximum: 1099511627776,
+                description: 'Local recordings quota in bytes (oldest segments evicted first). Default 10 GiB.',
+              },
+              minFreeBytes: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 68719476736,
+                description: 'Free-disk floor in bytes; recording evicts/stops before crossing it. Default 2 GiB.',
+              },
+            },
+          },
+        },
+      },
+      MediaSession: {
+        type: 'object',
+        required: ['id', 'deviceId', 'streamKey', 'startedAt', 'status'],
+        description:
+          'A continuous on-device recording run for one camera (offline recording plan). Sessions are ' +
+          'per-camera: a dual-camera drive is two sessions with near-identical startedAt. `status` is ' +
+          'advisory — a session closes ~10 min after segments stop arriving and reopens if a straggler ' +
+          'segment lands later.',
+        properties: {
+          id: { type: 'string', format: 'uuid', description: 'Device-minted UUIDv7 (sorts by start time).' },
+          deviceId: { type: 'string', format: 'uuid' },
+          streamKey: { type: 'string', example: 'cam0' },
+          startedAt: { type: 'string', format: 'date-time' },
+          endedAt: { type: 'string', format: 'date-time', nullable: true },
+          codec: { type: 'string', nullable: true, example: 'h264' },
+          width: { type: 'integer', nullable: true },
+          height: { type: 'integer', nullable: true },
+          fps: { type: 'integer', nullable: true },
+          bitrateKbps: { type: 'integer', nullable: true },
+          source: { type: 'string', nullable: true, example: 'device-offline' },
+          status: { type: 'string', enum: ['open', 'closed'] },
+          timeSource: {
+            type: 'string',
+            nullable: true,
+            enum: ['ntp', 'rtc', 'unsynced'],
+            description: 'Device clock quality at session start; "unsynced" timestamps may be wrong wall-clock.',
+          },
+          lastSegmentAt: {
+            type: 'string',
+            format: 'date-time',
+            nullable: true,
+            description: 'Server-side arrival time of the most recent segment (upload can lag recording).',
+          },
+          createdAt: { type: 'string', format: 'date-time' },
+          segmentCount: { type: 'integer', description: 'Rollup (list endpoint only).' },
+          totalBytes: { type: 'integer', description: 'Rollup (list endpoint only).' },
+          totalDurationMs: { type: 'integer', description: 'Rollup (list endpoint only).' },
+        },
+      },
+      MediaSegment: {
+        type: 'object',
+        required: ['id', 'deviceId', 'sessionId', 'streamKey', 's3Key', 'seq', 'startTs', 'durationMs'],
+        description:
+          'One ~60 s MP4 segment of a media session. `finalized: false` = crash-cut partial ' +
+          '(fragmented MP4, playable up to the cut). When stitching, prefer the next segment\'s ' +
+          'startTs delta over durationMs (segment 0 includes ~2 s pipeline startup).',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          deviceId: { type: 'string', format: 'uuid' },
+          sessionId: { type: 'string', format: 'uuid' },
+          streamKey: { type: 'string', example: 'cam0' },
+          s3Key: {
+            type: 'string',
+            description: 'media-sessions/v1/<deviceId>/<streamKey>/<sessionId>/<seq>.mp4',
+          },
+          seq: { type: 'integer' },
+          startTs: { type: 'string', format: 'date-time' },
+          durationMs: { type: 'integer' },
+          keyframe: { type: 'boolean' },
+          sizeBytes: { type: 'integer', nullable: true },
+          finalized: { type: 'boolean' },
+          meta: {
+            type: 'object',
+            additionalProperties: true,
+            nullable: true,
+            description: 'Sidecar provenance passthrough (anchor, timeSource, startMono).',
+          },
+          uploadedAt: { type: 'string', format: 'date-time' },
         },
       },
       DeviceProvisioning: {
@@ -1197,6 +1359,16 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                       elevationDeg: { type: 'number' },
                     },
                   },
+                  recordingConfig: {
+                    allOf: [{ $ref: '#/components/schemas/RecordingConfig' }],
+                    nullable: true,
+                    description:
+                      'On-device recording settings. Validated strictly (closed preset table, bounded ' +
+                      'numbers, unknown keys rejected 400) and delivered to the device as a retained MQTT ' +
+                      'config message; the agent applies it live within a few seconds. null clears the ' +
+                      'cloud-managed config (the device keeps its current local settings). Note: toggling ' +
+                      'video recording or changing its preset briefly restarts the live stream.',
+                  },
                 },
               },
             },
@@ -1482,6 +1654,145 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               },
             },
           },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+        },
+      },
+    },
+    '/devices/{id}/sessions': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'listMediaSessions',
+        summary: 'List device-recorded media sessions',
+        description:
+          'Sessions recorded on the device itself (offline recording plan) and uploaded segment-by-segment ' +
+          'to S3 — distinct from cloud /recordings. Filterable by streamKey, status (open|closed) and ' +
+          'from/to; the time filter matches sessions OVERLAPPING [from, to), not just those started inside ' +
+          'it. Each row carries computed rollups (segmentCount, totalBytes, totalDurationMs).',
+        tags: ['Media Sessions'],
+        parameters: [
+          {
+            name: 'streamKey',
+            in: 'query',
+            required: false,
+            schema: { type: 'string' },
+            description: 'Filter to one camera, e.g. cam0.',
+          },
+          {
+            name: 'status',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['open', 'closed'] },
+          },
+          { name: 'from', in: 'query', required: false, schema: { type: 'string', format: 'date-time' } },
+          { name: 'to', in: 'query', required: false, schema: { type: 'string', format: 'date-time' } },
+          { name: 'limit', in: 'query', required: false, schema: { type: 'integer' } },
+          { name: 'offset', in: 'query', required: false, schema: { type: 'integer' } },
+          { name: 'order', in: 'query', required: false, schema: { type: 'string', enum: ['asc', 'desc'] } },
+          {
+            name: 'sort',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['startedAt', 'createdAt'] },
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'Sessions with per-session rollups, newest first by default.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['sessions'],
+                  properties: {
+                    sessions: { type: 'array', items: { $ref: '#/components/schemas/MediaSession' } },
+                    page: {
+                      type: 'object',
+                      properties: {
+                        limit: { type: 'integer' },
+                        offset: { type: 'integer' },
+                        order: { type: 'string', enum: ['asc', 'desc'] },
+                        total: { type: 'integer' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/sessions/{sessionId}/segments': {
+      parameters: [
+        { $ref: '#/components/parameters/IdPath' },
+        { $ref: '#/components/parameters/SessionIdPath' },
+        { $ref: '#/components/parameters/OrganizationIdHeader' },
+      ],
+      get: {
+        operationId: 'listMediaSessionSegments',
+        summary: 'List a session\'s full segment index',
+        description:
+          'The whole ordered index in one response (seq asc = chronological) — this is the replay/' +
+          'stitching input, so it is deliberately unpaginated.',
+        tags: ['Media Sessions'],
+        responses: {
+          '200': {
+            description: 'Session + ordered segments.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['session', 'segments'],
+                  properties: {
+                    session: { $ref: '#/components/schemas/MediaSession' },
+                    segments: { type: 'array', items: { $ref: '#/components/schemas/MediaSegment' } },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/sessions/{sessionId}/segments/{seq}/playback': {
+      parameters: [
+        { $ref: '#/components/parameters/IdPath' },
+        { $ref: '#/components/parameters/SessionIdPath' },
+        { $ref: '#/components/parameters/SegmentSeqPath' },
+        { $ref: '#/components/parameters/OrganizationIdHeader' },
+      ],
+      get: {
+        operationId: 'getMediaSegmentPlayback',
+        summary: 'Get a presigned playback URL for one segment',
+        tags: ['Media Sessions'],
+        responses: {
+          '200': {
+            description: 'Presigned S3 GET URL for the segment MP4 (1 h TTL).',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['url', 'expiresIn', 'segment'],
+                  properties: {
+                    url: { type: 'string', format: 'uri' },
+                    expiresIn: { type: 'integer', description: 'URL TTL in seconds.' },
+                    segment: { $ref: '#/components/schemas/MediaSegment' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
