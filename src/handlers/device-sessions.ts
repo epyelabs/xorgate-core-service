@@ -8,10 +8,23 @@ import { badRequest, conflict, methodNotAllowed, notFound, ok } from '../utils/r
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { closeStaleMediaSessions } from '../services/media-sessions';
+import { buildSessionTimeline } from '../services/replay-manifest';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
 const PLAYBACK_TTL_SECONDS = 3600;
+
+// Replay manifest (Composite Replays plan, Phase 2 — decision R3): one
+// response carries every presigned URL the player needs, so cap what one
+// request may expand into. 600 segments ≈ 10 h of 60 s video; the session and
+// range caps only bind in ?from&to (composite) mode.
+const REPLAY_MAX_SEGMENTS = 600;
+const REPLAY_MAX_SESSIONS = 10;
+const REPLAY_MAX_RANGE_MS = 24 * 60 * 60 * 1000;
+// Clients refetch the manifest when urlExpiresAt nears; report expiry with a
+// safety margin so they refresh BEFORE URLs actually die mid-scrub.
+const REPLAY_URL_REFRESH_MARGIN_MS = 5 * 60 * 1000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({
@@ -28,6 +41,8 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
  *   GET    /devices/{id}/sessions                                  list + per-session rollups
  *   GET    /devices/{id}/sessions/{sessionId}/segments             ordered segment index
  *   GET    /devices/{id}/sessions/{sessionId}/segments/{seq}/playback  presigned GET
+ *   GET    /devices/{id}/replay-manifest?sessionId=… | ?from&to[&streamKey]
+ *            gap-aware replay timeline + batch-presigned segment URLs (R3)
  *   DELETE /devices/{id}/sessions/{sessionId}                      segments (S3+rows) + session
  * Ownership: the device must belong to a workspace in the caller's org (same
  * check as device-recordings.ts). Response casing: drizzle camelCase rows,
@@ -193,6 +208,9 @@ export const handler = async (
       return ok({ url, expiresIn: PLAYBACK_TTL_SECONDS, segment });
     }
 
+    case 'GET /devices/{id}/replay-manifest':
+      return replayManifest(event, deviceId);
+
     case 'DELETE /devices/{id}/sessions/{sessionId}': {
       const session = await loadSession();
       if (!session) return notFound(`Session "${sessionId}" not found`);
@@ -240,3 +258,193 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, DELETE');
   }
 };
+
+/**
+ * GET /devices/{id}/replay-manifest — everything the replay page needs to
+ * render and play, in one response (Composite Replays R3): session metadata +
+ * gap-aware timeline (services/replay-manifest.ts owns the R2 math) + every
+ * segment with a presigned URL. Two addressing modes, one response shape:
+ *   ?sessionId=…            single session (MVP; Phase 3 consumes this)
+ *   ?from&to[&streamKey]    every session overlapping the range (composite,
+ *                           Phase 5) — segments clipped to the window
+ * Timestamps in the response are epoch ms (the R2 replay-clock unit), not
+ * ISO — the exception to the sessions-API dialect, per the plan contract.
+ * Honest-degradation rules (R6): a sessionId whose segments all expired
+ * returns the session with empty segments/gaps (telemetry-only replay);
+ * range mode omits sessions with no in-range media.
+ */
+async function replayManifest(
+  event: APIGatewayProxyEventV2,
+  deviceId: string,
+): Promise<APIGatewayProxyResultV2> {
+  const qs = event.queryStringParameters ?? {};
+  const sessionIdParam = qs.sessionId;
+  const hasRangeParams = qs.from !== undefined || qs.to !== undefined;
+  if (sessionIdParam && hasRangeParams) {
+    return badRequest('Provide either "sessionId" or "from"/"to", not both');
+  }
+  if (!sessionIdParam && !hasRangeParams) {
+    return badRequest('Provide "sessionId", or "from" and "to"');
+  }
+  if (!BUCKET) return conflict('Storage bucket is not configured');
+
+  // Same advisory close-on-read as the sessions list (best-effort): the
+  // manifest's session.status feeds the replay page's open/closed badge.
+  try {
+    await closeStaleMediaSessions(deviceId);
+  } catch (err) {
+    console.warn('replay-manifest: close-on-read failed', { deviceId, err });
+  }
+
+  let sessionRows;
+  let rangeFromMs: number | null = null;
+  let rangeToMs: number | null = null;
+
+  if (sessionIdParam) {
+    if (!UUID_RE.test(sessionIdParam)) return badRequest('"sessionId" must be a UUID');
+    const session = await db.query.mediaSessions.findFirst({
+      where: and(
+        eq(schema.mediaSessions.id, sessionIdParam),
+        eq(schema.mediaSessions.deviceId, deviceId),
+      ),
+    });
+    if (!session) return notFound(`Session "${sessionIdParam}" not found`);
+    sessionRows = [session];
+  } else {
+    const fromMs = Date.parse(qs.from ?? '');
+    const toMs = Date.parse(qs.to ?? '');
+    if (Number.isNaN(fromMs)) return badRequest('"from" must be a valid ISO-8601 timestamp');
+    if (Number.isNaN(toMs)) return badRequest('"to" must be a valid ISO-8601 timestamp');
+    if (fromMs >= toMs) return badRequest('"from" must be earlier than "to"');
+    if (toMs - fromMs > REPLAY_MAX_RANGE_MS) {
+      return badRequest('Replay range must not exceed 24 hours');
+    }
+    rangeFromMs = fromMs;
+    rangeToMs = toMs;
+    const streamKey = qs.streamKey;
+    // Overlap semantics match the sessions list: a session spans a window, so
+    // filter on [coalesce(endedAt, startedAt), startedAt) crossing the range.
+    sessionRows = await db.query.mediaSessions.findMany({
+      where: and(
+        eq(schema.mediaSessions.deviceId, deviceId),
+        streamKey ? eq(schema.mediaSessions.streamKey, streamKey) : undefined,
+        sql`coalesce(${schema.mediaSessions.endedAt}, ${schema.mediaSessions.startedAt}) >= ${tsParam(new Date(fromMs).toISOString())}`,
+        sql`${schema.mediaSessions.startedAt} < ${tsParam(new Date(toMs).toISOString())}`,
+      ),
+      orderBy: [asc(schema.mediaSessions.startedAt)],
+    });
+    if (sessionRows.length > REPLAY_MAX_SESSIONS) {
+      return badRequest(
+        `Range overlaps ${sessionRows.length} sessions (max ${REPLAY_MAX_SESSIONS}); narrow the range or filter by streamKey`,
+      );
+    }
+  }
+
+  const sessionIds = sessionRows.map((s) => s.id);
+  const segmentRows = sessionIds.length
+    ? await db.query.mediaSegments.findMany({
+        where: and(
+          inArray(schema.mediaSegments.sessionId, sessionIds),
+          // Range mode: clip to segments whose media overlaps [from, to).
+          rangeToMs !== null
+            ? sql`${schema.mediaSegments.startTs} < ${tsParam(new Date(rangeToMs).toISOString())}`
+            : undefined,
+          rangeFromMs !== null
+            ? sql`${schema.mediaSegments.startTs} + ${schema.mediaSegments.durationMs} * interval '1 millisecond' > ${tsParam(new Date(rangeFromMs).toISOString())}`
+            : undefined,
+        ),
+        orderBy: [asc(schema.mediaSegments.startTs)],
+      })
+    : [];
+  if (segmentRows.length > REPLAY_MAX_SEGMENTS) {
+    return badRequest(
+      `Replay would span ${segmentRows.length} segments (max ${REPLAY_MAX_SEGMENTS}); use "from"/"to" to replay part of it`,
+    );
+  }
+
+  const bySession = new Map<string, typeof segmentRows>();
+  for (const row of segmentRows) {
+    if (!row.sessionId) continue;
+    const list = bySession.get(row.sessionId);
+    if (list) list.push(row);
+    else bySession.set(row.sessionId, [row]);
+  }
+
+  // Batch presign: local SigV4 crypto, no S3 round trips — cheap even at the
+  // 600-segment cap. NOT inside a DB transaction, so Promise.all is fine.
+  const urlExpiresAt = Date.now() + PLAYBACK_TTL_SECONDS * 1000 - REPLAY_URL_REFRESH_MARGIN_MS;
+  const urlByKey = new Map(
+    await Promise.all(
+      segmentRows.map(async (row): Promise<[string, string]> => [
+        row.s3Key,
+        await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: row.s3Key }), {
+          expiresIn: PLAYBACK_TTL_SECONDS,
+        }),
+      ]),
+    ),
+  );
+
+  let fromMs = rangeFromMs ?? Number.POSITIVE_INFINITY;
+  let toMs = rangeToMs ?? Number.NEGATIVE_INFINITY;
+  const sessions = [];
+  for (const s of sessionRows) {
+    const timeline = buildSessionTimeline(bySession.get(s.id) ?? [], {
+      // Evicted-head detection only makes sense against the session's own
+      // start; in range mode the window boundary clips segments arbitrarily.
+      sessionStartedAt: rangeToMs === null ? s.startedAt : undefined,
+    });
+    if (!timeline) {
+      // No (in-range) media. Range mode: omit the session entirely. Session
+      // mode: return it with an empty timeline so the client can offer a
+      // telemetry-only replay over the session's recorded span (R6).
+      if (rangeToMs !== null) continue;
+      fromMs = s.startedAt.getTime();
+      toMs = (s.endedAt ?? s.startedAt).getTime();
+      sessions.push(sessionManifestShape(s, [], []));
+      continue;
+    }
+    if (timeline.outOfOrder) {
+      console.warn('replay-manifest: out-of-order segment startTs (sorted)', {
+        deviceId,
+        sessionId: s.id,
+      });
+    }
+    if (rangeToMs === null) {
+      fromMs = Math.min(fromMs, timeline.fromTs);
+      toMs = Math.max(toMs, timeline.toTs);
+    }
+    sessions.push(
+      sessionManifestShape(
+        s,
+        timeline.segments.map(({ s3Key, ...seg }) => ({
+          ...seg,
+          url: urlByKey.get(s3Key) as string,
+        })),
+        timeline.gaps,
+      ),
+    );
+  }
+
+  return ok({
+    replay: { deviceId, from: fromMs, to: toMs, sessions, urlExpiresAt },
+  });
+}
+
+function sessionManifestShape(
+  s: typeof schema.mediaSessions.$inferSelect,
+  segments: unknown[],
+  gaps: unknown[],
+) {
+  return {
+    id: s.id,
+    streamKey: s.streamKey,
+    status: s.status,
+    timeSource: s.timeSource,
+    codec: s.codec,
+    width: s.width,
+    height: s.height,
+    fps: s.fps,
+    segments,
+    gaps,
+  };
+}

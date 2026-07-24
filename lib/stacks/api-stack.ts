@@ -728,11 +728,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // session DELETE added Phase 6.3 — S3 object deletion is covered by the
     // shared lambdaRole's bucket.grantReadWrite above, which includes
     // s3:DeleteObject*). Presigns S3 GETs for per-segment playback (same
-    // posture as recordings).
+    // posture as recordings). Also serves /devices/{id}/replay-manifest
+    // (Composite Replays plan, Phase 2) — batch-presigns up to 600 segment
+    // URLs per request, still local crypto (no S3 calls, no new IAM).
     const deviceSessionsFn = new nodejs.NodejsFunction(this, "DeviceSessionsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-sessions.ts"),
-        "GET/DELETE /devices/{id}/sessions(+/segments,/playback) — device-recorded media index",
+        "GET/DELETE /devices/{id}/sessions(+/segments,/playback,/replay-manifest) — device-recorded media index",
       ),
       timeout: cdk.Duration.seconds(15),
       bundling: bundlingWithSdk,
@@ -1736,6 +1738,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     this.api.addRoutes({
       path: "/devices/{id}/sessions/{sessionId}/segments/{seq}/playback",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSessionsInt,
+    });
+    // Replay manifest (Composite Replays plan, Phase 2): gap-aware timeline +
+    // batch-presigned segment URLs, one response per replay (R3).
+    this.api.addRoutes({
+      path: "/devices/{id}/replay-manifest",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceSessionsInt,
     });

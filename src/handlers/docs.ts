@@ -392,6 +392,104 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           uploadedAt: { type: 'string', format: 'date-time' },
         },
       },
+      ReplayManifest: {
+        type: 'object',
+        required: ['deviceId', 'from', 'to', 'sessions', 'urlExpiresAt'],
+        description:
+          'Everything a replay player needs in one response: per-session gap-aware timelines plus a ' +
+          'presigned GET URL per segment. All timestamps are epoch milliseconds (the replay-clock unit), ' +
+          'unlike the ISO strings elsewhere in this API. Format-neutral by design: no codec strings or ' +
+          'playlist syntax — clients parse media details from the segment bytes.',
+        properties: {
+          deviceId: { type: 'string', format: 'uuid' },
+          from: {
+            type: 'integer',
+            description:
+              'Epoch ms start of the whole replay: the requested range (range mode) or the earliest ' +
+              'covered instant incl. any evicted-head gap (session mode).',
+          },
+          to: { type: 'integer', description: 'Epoch ms end of the whole replay.' },
+          urlExpiresAt: {
+            type: 'integer',
+            description:
+              'Epoch ms after which segment URLs may stop working (real TTL minus a safety margin) — ' +
+              'refetch the manifest before this.',
+          },
+          sessions: {
+            type: 'array',
+            description:
+              'One entry per session with media in the replay (a dual-camera range yields two). A ' +
+              'sessionId request whose segments have all expired returns the session with empty ' +
+              'segments/gaps, for telemetry-only replay.',
+            items: {
+              type: 'object',
+              required: ['id', 'streamKey', 'status', 'segments', 'gaps'],
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                streamKey: { type: 'string', example: 'cam0' },
+                status: { type: 'string', enum: ['open', 'closed'] },
+                timeSource: {
+                  type: 'string',
+                  nullable: true,
+                  enum: ['ntp', 'rtc', 'unsynced'],
+                  description: '"unsynced" = wall-clock correlation with telemetry is untrustworthy.',
+                },
+                codec: { type: 'string', nullable: true, example: 'h264' },
+                width: { type: 'integer', nullable: true },
+                height: { type: 'integer', nullable: true },
+                fps: { type: 'integer', nullable: true },
+                segments: {
+                  type: 'array',
+                  description: 'Ordered by startTs. Segment i covers [startTs, startTs + effectiveDurationMs).',
+                  items: {
+                    type: 'object',
+                    required: ['seq', 'startTs', 'effectiveDurationMs', 'finalized', 'url'],
+                    properties: {
+                      seq: { type: 'integer' },
+                      startTs: { type: 'integer', description: 'Epoch ms.' },
+                      effectiveDurationMs: {
+                        type: 'integer',
+                        description:
+                          'Next-segment startTs delta when contiguous, else the recorded durationMs — ' +
+                          'deltas beat durations (rotation timestamps are accurate; durations drift).',
+                      },
+                      finalized: {
+                        type: 'boolean',
+                        description: 'False = crash-cut partial; playable up to the cut.',
+                      },
+                      anchor: {
+                        type: 'string',
+                        nullable: true,
+                        enum: ['fstat', 'computed', 'boundary'],
+                        description:
+                          'startTs provenance. "fstat" seq-0 rows include ~2 s of pipeline startup, so ' +
+                          'the first seam may hold a ~2 s buffered hole.',
+                      },
+                      sizeBytes: { type: 'integer', nullable: true, description: 'For prefetch budgeting.' },
+                      url: { type: 'string', format: 'uri', description: 'Presigned S3 GET for the MP4.' },
+                    },
+                  },
+                },
+                gaps: {
+                  type: 'array',
+                  description:
+                    'Holes > 2 s with no media, computed server-side so every client renders the same ' +
+                    'timeline; the replay clock free-runs (or skips) across them.',
+                  items: {
+                    type: 'object',
+                    required: ['fromTs', 'toTs', 'reason'],
+                    properties: {
+                      fromTs: { type: 'integer', description: 'Epoch ms.' },
+                      toTs: { type: 'integer', description: 'Epoch ms.' },
+                      reason: { type: 'string', enum: ['missing-segments', 'evicted-head'] },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
       DeviceProvisioning: {
         type: 'object',
         required: ['device', 'iot', 'mqtt', 'kvs'],
@@ -1811,6 +1909,63 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                     expiresIn: { type: 'integer', description: 'URL TTL in seconds.' },
                     segment: { $ref: '#/components/schemas/MediaSegment' },
                   },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+        },
+      },
+    },
+    '/devices/{id}/replay-manifest': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getReplayManifest',
+        summary: 'Get a gap-aware replay manifest with presigned segment URLs',
+        description:
+          'One response feeds a whole replay: per-session timelines (effective durations + gaps, computed ' +
+          'server-side) and a presigned GET URL per segment. Address it by sessionId (single session) OR by ' +
+          'from/to (every session overlapping the range, segments clipped to it; optional streamKey filter) ' +
+          '— never both. Caps: 600 segments total, and in range mode 10 sessions / 24 h. Refetch before ' +
+          '`urlExpiresAt` (epoch ms) — URLs die after ~1 h.',
+        tags: ['Media Sessions'],
+        parameters: [
+          {
+            name: 'sessionId',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', format: 'uuid' },
+            description: 'Single-session mode. Mutually exclusive with from/to.',
+          },
+          {
+            name: 'from',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', format: 'date-time' },
+            description: 'Range mode start (with `to`). ISO-8601, like the telemetry endpoints.',
+          },
+          { name: 'to', in: 'query', required: false, schema: { type: 'string', format: 'date-time' } },
+          {
+            name: 'streamKey',
+            in: 'query',
+            required: false,
+            schema: { type: 'string' },
+            description: 'Range mode only: limit to one camera, e.g. cam0.',
+          },
+        ],
+        responses: {
+          '200': {
+            description: 'The replay manifest. Timestamps are epoch ms.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['replay'],
+                  properties: { replay: { $ref: '#/components/schemas/ReplayManifest' } },
                 },
               },
             },
