@@ -280,7 +280,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               enabled: { type: 'boolean', description: 'Record camera video locally (default false).' },
               preset: {
                 type: 'string',
-                enum: ['1080p30-4mbps', '1080p15-2mbps', '720p30-2mbps'],
+                enum: [
+                  '1080p30-4mbps',
+                  '1080p15-2mbps',
+                  '720p30-2mbps',
+                  '720p15-2mbps',
+                  '720p15-1mbps',
+                ],
                 description: 'Closed quality preset table (bounded CPU cost). Default 1080p15-2mbps.',
               },
               segmentSeconds: {

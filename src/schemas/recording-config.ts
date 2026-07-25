@@ -23,6 +23,8 @@ export const VIDEO_PRESET_NAMES = [
   '1080p30-4mbps',
   '1080p15-2mbps',
   '720p30-2mbps',
+  '720p15-2mbps',
+  '720p15-1mbps',
 ] as const;
 
 export const RECORDING_RATE_HZ_MIN = 1;
