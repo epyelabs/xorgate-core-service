@@ -1,7 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/index';
-import { stopRecordingsForOfflineDevice } from '../services/recordings';
 import { recordingConfig } from '../config/recording';
 
 // The IoT topic rule injects `topicDeviceId` via `topic(3)` and forwards the
@@ -30,10 +29,9 @@ const lastOnlineAt = new Map<string, number>();
  * the LWT after the keepalive lapses (~1.5x), which is what distinguishes a true
  * power-off from a brief tunnel (§4.2).
  *
- * On offline we flip the device badge immediately (safe: self-corrects on
- * reconnect) and then do the §4.5 corroborated stop of active recordings — but only
- * once `offlineStopEnabled` (R6) is on and the media plane confirms the recording is
- * actually dead (stale capture heartbeat). Until then we only flip the badge.
+ * On offline we flip the device badge (safe: self-corrects on reconnect). That is
+ * the handler's only job — the cloud recorder's corroborated stop was removed with
+ * the recorder itself (destroy-kvs-recorder Phase 3).
  *
  * Error semantics mirror telemetry-ingest (IoT rule lambda actions are async
  * invokes): unrecoverable/bad payloads log and drop; a transient DB error throws so
@@ -67,9 +65,7 @@ export const handler = async (event: unknown): Promise<void> => {
   if (online) {
     lastOnlineAt.set(deviceId, now);
     // Re-assert online + bump last_seen so the sweeper doesn't immediately re-flip
-    // it. Never resurrect a decommissioned device. (Do NOT auto-start recordings
-    // here; auto-record start stays in reconcileAutoRecord, which picks the stream
-    // up once telemetry resumes.)
+    // it. Never resurrect a decommissioned device.
     await db.execute(sql`
       UPDATE devices
       SET status = CASE WHEN status = 'decommissioned' THEN status ELSE 'online' END,
@@ -94,15 +90,4 @@ export const handler = async (event: unknown): Promise<void> => {
     SET status = 'offline', updated_at = now()
     WHERE id = ${deviceId}::uuid AND status = 'online'
   `);
-
-  // Corroborated stop (§4.5). No-op until offlineStopEnabled (R6) + the media plane
-  // (capture heartbeat) confirms the recording is really dead.
-  try {
-    const stopped = await stopRecordingsForOfflineDevice(deviceId);
-    if (stopped > 0) {
-      console.log('device-status: stopped recordings on offline', { deviceId, stopped });
-    }
-  } catch (err) {
-    console.error('device-status: offline-stop failed', { deviceId, err });
-  }
 };

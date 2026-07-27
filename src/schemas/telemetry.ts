@@ -62,27 +62,6 @@ export const telemetryPayloadSchema = z.object({
 export type TelemetryPayload = z.infer<typeof telemetryPayloadSchema>;
 
 /**
- * Stream keys that are currently live in a telemetry payload, used by the
- * auto-record path. Object streams count as active when running/starting (or when
- * no state is reported); bare-string streams are assumed active (best effort).
- * Returns null when the payload carries no media block at all, so the caller can
- * distinguish "no streams active" from "media state unknown this tick".
- */
-export function activeStreamKeys(payload: TelemetryPayload): string[] | null {
-  const streams = payload.media?.streams;
-  if (!payload.media || streams === undefined) return null;
-  const keys: string[] = [];
-  for (const s of streams) {
-    if (typeof s === 'string') {
-      keys.push(s);
-    } else if (!s.state || s.state === 'running' || s.state === 'starting') {
-      keys.push(s.streamKey);
-    }
-  }
-  return keys;
-}
-
-/**
  * Encode the metric-naming contract: flatten a payload into rows ready for
  * `db.insert(telemetryReadings)`. `ts` is returned as a `Date` so the Data API
  * driver inserts it with the correct typeHint (the cast caveat is filter-only).

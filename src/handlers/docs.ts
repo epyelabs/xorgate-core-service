@@ -39,12 +39,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         required: true,
         schema: { type: 'string', format: 'uuid' },
       },
-      RecordingIdPath: {
-        name: 'recordingId',
-        in: 'path',
-        required: true,
-        schema: { type: 'string', format: 'uuid' },
-      },
       SessionIdPath: {
         name: 'sessionId',
         in: 'path',
@@ -194,14 +188,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             enum: ['provisioned', 'online', 'offline', 'decommissioned'],
           },
           lastSeenAt: { type: 'string', format: 'date-time', nullable: true },
-          persistTelemetry: {
-            type: 'boolean',
-            description: 'Opt-in: when true, telemetry is written to the DB (default false).',
-          },
-          autoRecord: {
-            type: 'boolean',
-            description: 'Opt-in: when true, streams are auto-recorded while live (default false).',
-          },
           gnssAntBias: {
             type: 'boolean',
             description:
@@ -629,31 +615,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           value: { type: 'number', nullable: true },
           unit: { type: 'string', nullable: true, example: '°C' },
           ts: { type: 'string', format: 'date-time' },
-        },
-      },
-      Recording: {
-        type: 'object',
-        required: ['id', 'deviceId', 'streamKey', 'status', 'trigger', 'startedAt'],
-        description:
-          'A cloud-side recording of one stream, captured by a headless KVS viewer (Fargate) ' +
-          'and stored as a single MP4 in S3. The row flips to `completed` once the upload lands.',
-        properties: {
-          id: { type: 'string', format: 'uuid' },
-          deviceId: { type: 'string', format: 'uuid' },
-          streamKey: { type: 'string', example: 'cam0' },
-          status: { type: 'string', enum: ['recording', 'completed', 'failed'] },
-          trigger: { type: 'string', enum: ['manual', 'auto'] },
-          startedAt: { type: 'string', format: 'date-time' },
-          endedAt: { type: 'string', format: 'date-time', nullable: true },
-          s3Key: {
-            type: 'string',
-            nullable: true,
-            description: 'media/v1/<deviceId>/<streamKey>/<id>.mp4',
-          },
-          sizeBytes: { type: 'integer', nullable: true },
-          durationMs: { type: 'integer', nullable: true },
-          taskArn: { type: 'string', nullable: true, description: 'Fargate task ARN (while recording).' },
-          createdAt: { type: 'string', format: 'date-time' },
         },
       },
     },
@@ -1466,8 +1427,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                     enum: ['provisioned', 'online', 'offline', 'decommissioned'],
                   },
                   lastSeenAt: { type: 'string', format: 'date-time' },
-                  persistTelemetry: { type: 'boolean' },
-                  autoRecord: { type: 'boolean' },
                   gnssAntBias: { type: 'boolean' },
                   activeStreamsViewType: {
                     type: 'string',
@@ -1653,160 +1612,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         },
       },
     },
-    '/devices/{id}/recordings': {
-      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
-      get: {
-        operationId: 'listRecordings',
-        summary: 'List recordings for a device',
-        tags: ['Recordings'],
-        responses: {
-          '200': {
-            description: 'Recordings, newest first.',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['recordings'],
-                  properties: {
-                    recordings: { type: 'array', items: { $ref: '#/components/schemas/Recording' } },
-                  },
-                },
-              },
-            },
-          },
-          '401': { $ref: '#/components/responses/Unauthorized' },
-          '403': { $ref: '#/components/responses/Forbidden' },
-          '404': { $ref: '#/components/responses/NotFound' },
-        },
-      },
-      post: {
-        operationId: 'startRecording',
-        summary: 'Start recording one stream (or all)',
-        description:
-          'Launches a cloud viewer-recorder (Fargate) for the given stream. Pass `{"all": true}` to start ' +
-          'one recorder per media channel. Trigger is "manual".',
-        tags: ['Recordings'],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: {
-                type: 'object',
-                description: 'Provide `streamKey`, or `all: true` to record every channel.',
-                properties: {
-                  streamKey: { type: 'string', example: 'cam0' },
-                  all: { type: 'boolean' },
-                },
-              },
-            },
-          },
-        },
-        responses: {
-          '201': {
-            description: 'Started. `recording` for a single stream; `recordings` for `{all:true}`.',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    recording: { $ref: '#/components/schemas/Recording' },
-                    recordings: { type: 'array', items: { $ref: '#/components/schemas/Recording' } },
-                  },
-                },
-              },
-            },
-          },
-          '400': { $ref: '#/components/responses/BadRequest' },
-          '401': { $ref: '#/components/responses/Unauthorized' },
-          '403': { $ref: '#/components/responses/Forbidden' },
-          '404': { $ref: '#/components/responses/NotFound' },
-          '409': { $ref: '#/components/responses/Conflict' },
-        },
-      },
-    },
-    '/devices/{id}/recordings/{recordingId}': {
-      parameters: [
-        { $ref: '#/components/parameters/IdPath' },
-        { $ref: '#/components/parameters/RecordingIdPath' },
-        { $ref: '#/components/parameters/OrganizationIdHeader' },
-      ],
-      delete: {
-        operationId: 'deleteRecording',
-        summary: 'Delete a recording (stops it if active; removes the S3 object)',
-        tags: ['Recordings'],
-        responses: {
-          '204': { $ref: '#/components/responses/NoContent' },
-          '401': { $ref: '#/components/responses/Unauthorized' },
-          '403': { $ref: '#/components/responses/Forbidden' },
-          '404': { $ref: '#/components/responses/NotFound' },
-        },
-      },
-    },
-    '/devices/{id}/recordings/{recordingId}/stop': {
-      parameters: [
-        { $ref: '#/components/parameters/IdPath' },
-        { $ref: '#/components/parameters/RecordingIdPath' },
-        { $ref: '#/components/parameters/OrganizationIdHeader' },
-      ],
-      post: {
-        operationId: 'stopRecording',
-        summary: 'Stop an active recording',
-        description:
-          'Stops the recorder task. The MP4 is finalized and uploaded asynchronously; the row flips to ' +
-          '`completed` shortly after via the S3 finalize event.',
-        tags: ['Recordings'],
-        responses: {
-          '200': {
-            description: 'Stop requested.',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['recording'],
-                  properties: { recording: { $ref: '#/components/schemas/Recording' } },
-                },
-              },
-            },
-          },
-          '401': { $ref: '#/components/responses/Unauthorized' },
-          '403': { $ref: '#/components/responses/Forbidden' },
-          '404': { $ref: '#/components/responses/NotFound' },
-        },
-      },
-    },
-    '/devices/{id}/recordings/{recordingId}/playback': {
-      parameters: [
-        { $ref: '#/components/parameters/IdPath' },
-        { $ref: '#/components/parameters/RecordingIdPath' },
-        { $ref: '#/components/parameters/OrganizationIdHeader' },
-      ],
-      get: {
-        operationId: 'getRecordingPlayback',
-        summary: 'Get a presigned playback URL for a recording',
-        tags: ['Recordings'],
-        responses: {
-          '200': {
-            description: 'Presigned S3 GET URL for the MP4.',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['url', 'expiresIn'],
-                  properties: {
-                    url: { type: 'string', format: 'uri' },
-                    expiresIn: { type: 'integer', description: 'URL TTL in seconds.' },
-                  },
-                },
-              },
-            },
-          },
-          '401': { $ref: '#/components/responses/Unauthorized' },
-          '403': { $ref: '#/components/responses/Forbidden' },
-          '404': { $ref: '#/components/responses/NotFound' },
-          '409': { $ref: '#/components/responses/Conflict' },
-        },
-      },
-    },
     '/devices/{id}/sessions': {
       parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
       get: {
@@ -1814,7 +1619,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         summary: 'List device-recorded media sessions',
         description:
           'Sessions recorded on the device itself (offline recording plan) and uploaded segment-by-segment ' +
-          'to S3 — distinct from cloud /recordings. Filterable by streamKey, status (open|closed) and ' +
+          'to S3. Filterable by streamKey, status (open|closed) and ' +
           'from/to; the time filter matches sessions OVERLAPPING [from, to), not just those started inside ' +
           'it. Each row carries computed rollups (segmentCount, totalBytes, totalDurationMs).',
         tags: ['Media Sessions'],
