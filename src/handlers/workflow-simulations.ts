@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, eq, inArray, isNotNull } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { S3Client } from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
@@ -21,10 +21,11 @@ import {
   toManifestInputs,
   uploadPrefixForOrg,
   validateSimulationBindings,
-  type ResolvedRecording,
   type SimulationBinding,
   type SimulationBindingIssue,
 } from '../workflows/simulations';
+import type { ResolvedVideoSession } from '../workflows/production';
+import { findOrgSessions, resolveVideoSessions } from '../services/media-session-input';
 
 /**
  * Simulator API (M3, architecture §5): a simulation is a REAL run of the real
@@ -132,52 +133,41 @@ export const handler = async (
       const bindingIssues = validateSimulationBindings(definition, bindings, orgId);
       if (bindingIssues.length > 0) return bindingIssuesResponse(bindingIssues);
 
-      // Resolve recording bindings to completed, org-owned recordings.
-      const recordingIds = Object.values(bindings)
-        .filter((b): b is Extract<SimulationBinding, { kind: 'recording' }> => b.kind === 'recording')
-        .map((b) => b.recordingId);
-      const recordings = new Map<string, ResolvedRecording & { deviceId: string; workspaceId: string }>();
-      if (recordingIds.length > 0) {
-        const rows = await db
-          .select({
-            id: schema.recordings.id,
-            s3Key: schema.recordings.s3Key,
-            startedAt: schema.recordings.startedAt,
-            captureStartedAt: schema.recordings.captureStartedAt,
-            deviceId: schema.recordings.deviceId,
-            workspaceId: schema.devices.workspaceId,
-          })
-          .from(schema.recordings)
-          .innerJoin(schema.devices, eq(schema.devices.id, schema.recordings.deviceId))
-          .innerJoin(schema.workspaces, eq(schema.workspaces.id, schema.devices.workspaceId))
-          .where(
-            and(
-              inArray(schema.recordings.id, recordingIds),
-              eq(schema.workspaces.organizationId, orgId),
-              isNotNull(schema.recordings.s3Key),
-            ),
-          );
+      // Resolve session bindings to org-owned on-device sessions, through the
+      // SAME reader the production trigger path uses (buildSessionTimeline via
+      // services/media-session-input.ts) — a simulation must see exactly the
+      // segment list and wall clock a real run would.
+      const sessionIds = Object.values(bindings)
+        .filter((b): b is Extract<SimulationBinding, { kind: 'session' }> => b.kind === 'session')
+        .map((b) => b.sessionId);
+      const sessions = new Map<string, ResolvedVideoSession>();
+      const sessionDevices = new Map<string, { deviceId: string; workspaceId: string }>();
+      if (sessionIds.length > 0) {
+        const rows = await findOrgSessions(sessionIds, orgId);
         for (const r of rows) {
-          recordings.set(r.id, {
-            s3Key: r.s3Key as string,
-            recordingId: r.id,
-            recordingStartedAt: r.startedAt ? r.startedAt.toISOString() : null,
-            captureStartedAt: r.captureStartedAt ? r.captureStartedAt.toISOString() : null,
-            deviceId: r.deviceId,
-            workspaceId: r.workspaceId,
-          });
+          sessionDevices.set(r.id, { deviceId: r.deviceId, workspaceId: r.workspaceId });
         }
-        const missing = recordingIds.filter((id) => !recordings.has(id));
+        for (const resolved of await resolveVideoSessions(rows)) {
+          sessions.set(resolved.sessionId, resolved);
+        }
+        // A session the org doesn't own, or one whose segments have all been
+        // expired by the retention sweep, is a binding issue — not a run that
+        // fails later with "No video input".
+        const missing = sessionIds.filter((id) => !sessions.has(id));
         if (missing.length > 0) {
           return bindingIssuesResponse(
-            missing.map((id) => ({ message: `Recording "${id}" not found (or has no stored media)` })),
+            missing.map((id) => ({
+              message: sessionDevices.has(id)
+                ? `Session "${id}" has no stored segments`
+                : `Session "${id}" not found`,
+            })),
           );
         }
       }
 
       // Resolve the run-level device: the telemetry device when bound (the
       // telemetry_history executor reads ctx.deviceId), else the single
-      // recording device, else none (upload-only simulation).
+      // session's device, else none (upload-only simulation).
       const telemetryDeviceIds = [
         ...new Set(
           Object.values(bindings)
@@ -199,11 +189,11 @@ export const handler = async (
         deviceId = device[0].id;
         workspaceId = device[0].workspaceId;
       } else {
-        const recordingDevices = [...new Set([...recordings.values()].map((r) => r.deviceId))];
-        if (recordingDevices.length === 1) {
-          const rec = [...recordings.values()][0];
-          deviceId = rec.deviceId;
-          workspaceId = rec.workspaceId;
+        const bound = [...sessionDevices.values()];
+        const uniqueDevices = [...new Set(bound.map((d) => d.deviceId))];
+        if (uniqueDevices.length === 1) {
+          deviceId = bound[0].deviceId;
+          workspaceId = bound[0].workspaceId;
         }
       }
 
@@ -226,8 +216,8 @@ export const handler = async (
         })
         .returning();
 
-      const window = simulationWindow(bindings);
-      let inputs = toManifestInputs(bindings, recordings);
+      const window = simulationWindow(bindings, sessions);
+      let inputs = toManifestInputs(bindings, sessions);
       if (target === 'fargate') {
         // M4 container telemetry seam: the engine task role is DB-free, so
         // history bindings are pre-read here and swapped for materialized

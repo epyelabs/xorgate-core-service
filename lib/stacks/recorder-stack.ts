@@ -200,6 +200,11 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         sid: 'EngineReadInputs',
         actions: ['s3:GetObject'],
         resources: [
+          // On-device recording segments — Workflows' video input since
+          // destroy-kvs-recorder Phase W. Without this every segment fetch
+          // 403s mid-run.
+          bucket.arnForObjects('media-sessions/v1/*'),
+          // Cloud recorder MP4s: dead, dropped with the objects in Phase 6.
           bucket.arnForObjects('media/v1/*'),
           bucket.arnForObjects('workflows/v2/*'),
           bucket.arnForObjects('models/*'),

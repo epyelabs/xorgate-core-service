@@ -98,10 +98,23 @@ export const executor = async function* videoDecodeSample(
       '-q:v', '3',
       'pipe:1',
     ];
+    // Session segments carry an EFFECTIVE duration (the next segment's startTs
+    // delta). Frames past it belong to the next segment, so they are dropped
+    // rather than emitted at a timestamp that overlaps the next anchor — a
+    // seq-0 `fstat` segment can over-report its length by ~2 s of pipeline
+    // startup (destroy-kvs-recorder README §9 risk 8).
+    const limitMs = video.durationMs;
     let localIndex = 0;
+    let clipped = 0;
     for await (const jpegBuf of mjpegFrames(args)) {
+      const offsetMs = Math.round((localIndex * 1000) / cfg.fps);
+      localIndex += 1;
+      if (limitMs !== undefined && offsetMs >= limitMs) {
+        clipped += 1;
+        continue;
+      }
       const { width, height, data } = decodeJpegToRgba(jpegBuf);
-      const ts = video.startedAtMs + Math.round((localIndex * 1000) / cfg.fps);
+      const ts = video.startedAtMs + offsetMs;
       const payload: FramePayload = {
         seq: frameSeq,
         ts,
@@ -110,11 +123,22 @@ export const executor = async function* videoDecodeSample(
         height,
         format: 'rgba',
       };
-      localIndex += 1;
       frameSeq += 1;
       yield { ch: 'frames' as const, ts, payload };
     }
-    ctx.log(`decoded ${localIndex} frame(s) from ${video.path}`);
+    ctx.log(
+      `decoded ${localIndex - clipped} frame(s) from ${video.path}` +
+        (clipped > 0 ? ` (${clipped} past its ${limitMs}ms window dropped)` : ''),
+    );
+    // Free the fetched segment now that it is fully decoded; a long session
+    // would otherwise leave every segment on the task disk until it exits.
+    if (video.releasable && ctx.sources.releaseVideo) {
+      try {
+        await ctx.sources.releaseVideo(video.path);
+      } catch (err) {
+        ctx.log(`could not release ${video.path}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
   ctx.setSummary(`${frameSeq} frame(s) sampled at ${cfg.fps} fps from ${videos} video(s)`);
 };

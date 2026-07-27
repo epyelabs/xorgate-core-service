@@ -10,6 +10,7 @@ import {
   sidecarMatchesKey,
   videoSidecarSchema,
 } from '../services/media-segments';
+import { evaluateSegmentUploadedTriggers } from '../services/workflow-triggers';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge (same as media-finalize).
 interface S3ObjectCreatedDetail {
@@ -46,9 +47,10 @@ class AlreadyIngested extends Error {}
  * ON CONFLICT DO NOTHING inside the same tx as the session upsert/rollup; a
  * duplicate delivery inserts nothing and rolls the session update back.
  *
- * Deferred hook (do not build yet): a `session_completed` workflow trigger
- * would fire from the sweeper's close transition, mirroring `recording_saved`
- * in media-finalize.ts → workflow-triggers.ts.
+ * Workflow hook (destroy-kvs-recorder Phase W): each successfully ingested
+ * segment fires `segment_uploaded` triggers — the near-realtime half of the
+ * media trigger pair. Its batch twin, `session_completed`, fires from the
+ * advisory close in services/media-sessions.ts.
  */
 export const handler = async (
   event: EventBridgeEvent<'Object Created', S3ObjectCreatedDetail>,
@@ -163,4 +165,23 @@ export const handler = async (
     sizeBytes: segment.sizeBytes,
     finalized: segment.finalized,
   });
+
+  // Near-realtime media trigger (destroy-kvs-recorder Phase W, decision L):
+  // fires only for attachments subscribed to `segment_uploaded` on this stream,
+  // so the steady-state cost here is one indexed attachment read. Deliberately
+  // AFTER the commit + log, and best-effort: a workflow problem must never fail
+  // the ingest (which would retry and re-deliver an already-stored segment).
+  try {
+    await evaluateSegmentUploadedTriggers({
+      sessionId,
+      deviceId,
+      streamKey,
+      s3Key: key,
+      seq,
+      startTs: segment.startTs,
+      durationMs: segment.durationMs,
+    });
+  } catch (err) {
+    console.error('media-segment-ingest: segment_uploaded trigger eval failed', { key, err });
+  }
 };

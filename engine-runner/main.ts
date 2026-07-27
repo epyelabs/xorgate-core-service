@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -91,6 +91,14 @@ function buildSources(bucket: string, workDir: string): EngineSourceReader {
       await pipeline(res.Body as Readable, createWriteStream(localPath));
       log(`fetched video s3://${refBucket ?? bucket}/${key} -> ${localPath}`);
       return { path: localPath };
+    },
+    // Called by video.decode_sample once a `releasable` segment is decoded. A
+    // long on-device session is ~60 segments (~1.5 GB+); without this they all
+    // sit on the task disk until it exits. Best-effort by design — a failed
+    // unlink must never fail the run.
+    async releaseVideo(localPath: string) {
+      if (path.dirname(localPath) !== workDir) return; // never touch caller-owned files
+      await unlink(localPath).catch(() => {});
     },
     fetchModel({ family, name }) {
       const cacheKey = `${family}/${name}`;

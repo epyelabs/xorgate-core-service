@@ -60,7 +60,7 @@ function mapAttachment(
  *   DELETE /devices/{id}/workflows/{attachmentId}
  * ("Run now" is POST /devices/{id}/workflows/{attachmentId}/run — added with the
  * run-execution path in M3.) Ownership: the device must belong to a workspace in
- * the caller's org (same check as device-recordings.ts).
+ * the caller's org (same check as device-sessions.ts).
  */
 export const handler = async (
   event: APIGatewayProxyEventV2,
@@ -322,24 +322,28 @@ async function buildManualContext(
     return { type: 'manual', window: recentWindow() };
   }
 
-  if (context.triggerType === 'recording_saved') {
-    const rec = await db.query.recordings.findFirst({
+  // Both media trigger types resolve the same way downstream (the run's
+  // `sessionId` becomes a device_session binding); `segment_uploaded` just
+  // narrows it to one chunk via `seq`. Deliberately NO explicit `window` here:
+  // the dispatcher then derives the telemetry window from the resolved segment
+  // timeline (production.ts resolveTriggeredWindow), which is exact — the
+  // session row's own started/ended can lag the segments that actually landed.
+  if (context.triggerType === 'session_completed' || context.triggerType === 'segment_uploaded') {
+    const session = await db.query.mediaSessions.findFirst({
       where: and(
-        eq(schema.recordings.id, context.recordingId),
-        eq(schema.recordings.deviceId, deviceId),
+        eq(schema.mediaSessions.id, context.sessionId),
+        eq(schema.mediaSessions.deviceId, deviceId),
       ),
+      columns: { id: true, streamKey: true, startedAt: true, endedAt: true },
     });
     return {
-      type: 'recording_saved',
-      recordingId: context.recordingId,
-      s3Key: rec?.s3Key ?? null,
-      streamKey: rec?.streamKey ?? null,
-      recordingStartedAt: rec?.startedAt?.toISOString() ?? null,
-      captureStartedAt: rec?.captureStartedAt?.toISOString() ?? null,
-      window:
-        rec?.startedAt && rec?.endedAt
-          ? { from: rec.startedAt.toISOString(), to: rec.endedAt.toISOString() }
-          : recentWindow(),
+      type: context.triggerType,
+      sessionId: context.sessionId,
+      streamKey: session?.streamKey ?? null,
+      startedAt: session?.startedAt?.toISOString() ?? null,
+      endedAt: session?.endedAt?.toISOString() ?? null,
+      // undefined = the session's newest segment (see media-session-input.ts).
+      ...(context.triggerType === 'segment_uploaded' ? { seq: context.seq ?? null } : {}),
     };
   }
 
@@ -354,16 +358,12 @@ async function buildManualContext(
     return { type: 'telemetry_condition', window };
   }
 
-  // schedule selection: pass through, plus a telemetry window for inline runs.
-  const window =
-    context.selection.mode === 'lastN'
-      ? await lastNWindow(deviceId, context.selection.n)
-      : recentWindow();
-  return {
-    type: 'schedule',
-    selection: context.selection,
-    window,
-  };
+  // Schedule selection: pass the media selection through with NO explicit
+  // window, so the dispatcher derives the telemetry window from the sessions it
+  // actually resolves (production.ts resolveTriggeredWindow). A telemetry-only
+  // graph then falls back to the standard 15-minute window — the media
+  // selection has nothing to say about telemetry.
+  return { type: 'schedule', selection: context.selection };
 }
 
 // Concrete window spanning the device's most recent N telemetry readings.

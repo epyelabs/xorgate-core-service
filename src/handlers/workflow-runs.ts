@@ -98,8 +98,13 @@ async function countRuns(where: SQL | undefined): Promise<number> {
 function deriveTriggeredBy(trigger: string, ctx: unknown): string {
   const c = (ctx ?? {}) as Record<string, unknown>;
   const type = typeof c.type === 'string' ? c.type : trigger;
-  if (type === 'recording_saved' && typeof c.streamKey === 'string') {
-    return `recording_saved · ${c.streamKey}`;
+  if (type === 'session_completed' && typeof c.streamKey === 'string') {
+    return `session_completed · ${c.streamKey}`;
+  }
+  if (type === 'segment_uploaded' && typeof c.streamKey === 'string') {
+    return typeof c.seq === 'number'
+      ? `segment_uploaded · ${c.streamKey} #${c.seq}`
+      : `segment_uploaded · ${c.streamKey}`;
   }
   if (type === 'telemetry_condition' && Array.isArray(c.matched) && c.matched.length > 0) {
     const first = c.matched[0] as Record<string, unknown>;
