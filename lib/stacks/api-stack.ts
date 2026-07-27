@@ -1231,6 +1231,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // run row is created and then flipped to failed with "enqueue failed".)
     offlineSweeperFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     deviceSessionsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    // destroy-kvs-recorder Phase W: segment_uploaded fires from the segment
+    // ingest path, so it enqueues here too. (Caught live the same way as the
+    // Phase 6.4 pair above — the run row is created and immediately flipped to
+    // failed with "enqueue failed: WORKFLOW_QUEUE_URL is not configured".)
+    mediaSegmentIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
 
     // v2 engine runner launch config (media graphs; Lambda engine handles
     // telemetry-only). Same cluster/VPC/SG as the recorder. The CV_* env and
