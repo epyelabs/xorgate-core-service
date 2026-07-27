@@ -10,8 +10,13 @@ import { engineTargetForDefinition } from '../workflows/simulations';
 /**
  * Shared trigger plumbing: fireWorkflowRun() pre-creates a workflow_runs row and
  * enqueues {runId}, and evaluateTelemetryTriggers() is the (near-zero-cost) hook
- * called on the 1 Hz telemetry hot path. All firing paths (recording_saved,
+ * called on the 1 Hz telemetry hot path. All firing paths (session_completed,
  * telemetry_condition, schedule, manual, rerun) go through fireWorkflowRun.
+ *
+ * The cloud recorder's `recording_saved` path was removed with the recorder
+ * (destroy-kvs-recorder Phase 3). The trigger type still exists in
+ * `schemas/workflows.ts` but has no producer — Phase W replaces it with
+ * `session_completed` / `segment_uploaded`.
  */
 
 const sqs = new SQSClient({});
@@ -116,90 +121,6 @@ export async function updateAttachmentStatusIfLatest(run: WorkflowRun, status: s
     .where(eq(schema.workflowAttachments.id, run.attachmentId));
 }
 
-// --- Recording-saved trigger (media-finalize hook) ---------------------------
-
-type RecordingSavedTrigger = Extract<AttachmentTrigger, { type: 'recording_saved' }>;
-
-/**
- * Fire workflow runs for a freshly-completed recording. Called (best-effort) from
- * media-finalize.ts after the recording row flips to `completed`. Low frequency,
- * so no cache: query enabled attachments for the device, keep those whose
- * recording_saved trigger includes this stream, and fire one run per attachment.
- */
-export async function evaluateRecordingSavedTriggers(rec: {
-  id: string;
-  deviceId: string;
-  streamKey: string;
-  s3Key: string | null;
-  startedAt: Date;
-  captureStartedAt: Date | null;
-}): Promise<void> {
-  const device = await db.query.devices.findFirst({
-    where: eq(schema.devices.id, rec.deviceId),
-    columns: { workspaceId: true },
-  });
-  if (!device) return;
-
-  const rows = await db
-    .select({
-      id: schema.workflowAttachments.id,
-      templateId: schema.workflowAttachments.templateId,
-      pinnedVersion: schema.workflowAttachments.pinnedVersion,
-      triggers: schema.workflowAttachments.triggers,
-      publishedVersion: schema.workflowTemplates.publishedVersion,
-    })
-    .from(schema.workflowAttachments)
-    .innerJoin(
-      schema.workflowTemplates,
-      eq(schema.workflowTemplates.id, schema.workflowAttachments.templateId),
-    )
-    .where(
-      and(
-        eq(schema.workflowAttachments.deviceId, rec.deviceId),
-        eq(schema.workflowAttachments.enabled, true),
-      ),
-    );
-
-  for (const a of rows) {
-    const triggers = (a.triggers as AttachmentTrigger[]) ?? [];
-    const matches = triggers.some(
-      (t): t is RecordingSavedTrigger =>
-        t.type === 'recording_saved' && t.streamKeys.includes(rec.streamKey),
-    );
-    if (!matches) continue;
-    const resolvedVersion = a.pinnedVersion ?? a.publishedVersion;
-    if (resolvedVersion == null) continue;
-    const [ver] = await db
-      .select({ definition: schema.workflowTemplateVersions.definition })
-      .from(schema.workflowTemplateVersions)
-      .where(
-        and(
-          eq(schema.workflowTemplateVersions.templateId, a.templateId),
-          eq(schema.workflowTemplateVersions.version, resolvedVersion),
-        ),
-      );
-    if (!ver) continue;
-
-    await fireWorkflowRun({
-      workspaceId: device.workspaceId,
-      deviceId: rec.deviceId,
-      attachmentId: a.id,
-      templateId: a.templateId,
-      templateVersion: resolvedVersion,
-      definition: ver.definition as WorkflowDefinition,
-      trigger: 'event',
-      triggerContext: {
-        type: 'recording_saved',
-        recordingId: rec.id,
-        streamKey: rec.streamKey,
-        s3Key: rec.s3Key,
-        recordingStartedAt: rec.startedAt.toISOString(),
-        captureStartedAt: rec.captureStartedAt ? rec.captureStartedAt.toISOString() : null,
-      },
-    });
-  }
-}
-
 // --- Session-completed trigger (sweeper close hook, Phase 6.4) ---------------
 
 type SessionCompletedTrigger = Extract<AttachmentTrigger, { type: 'session_completed' }>;
@@ -207,8 +128,7 @@ type SessionCompletedTrigger = Extract<AttachmentTrigger, { type: 'session_compl
 /**
  * Fire workflow runs when a device-recorded media session flips open→closed
  * (offline recording plan, Phase 6.4). Called (best-effort) from the sweeper's
- * close pass AND the close-on-read path in device-sessions.ts — mirror of
- * evaluateRecordingSavedTriggers.
+ * close pass AND the close-on-read path in device-sessions.ts.
  *
  * AT-LEAST-ONCE by design: close is advisory and reversible. A straggler
  * segment reopens the session (media-segment-ingest sets status='open' on

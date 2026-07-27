@@ -205,8 +205,6 @@ export const handler = async (
         firmwareVersion?: string;
         status?: string;
         lastSeenAt?: string;
-        persistTelemetry?: boolean;
-        autoRecord?: boolean;
         gnssAntBias?: boolean;
         activeStreamsViewType?: string;
         imuMount?: unknown;
@@ -223,15 +221,6 @@ export const handler = async (
       if (body.status !== undefined &&
           !VALID_STATUSES.includes(body.status as (typeof VALID_STATUSES)[number])) {
         return badRequest(`status must be one of: ${VALID_STATUSES.join(', ')}`);
-      }
-
-      if (body.persistTelemetry !== undefined &&
-          typeof body.persistTelemetry !== 'boolean') {
-        return badRequest('persistTelemetry must be a boolean');
-      }
-
-      if (body.autoRecord !== undefined && typeof body.autoRecord !== 'boolean') {
-        return badRequest('autoRecord must be a boolean');
       }
 
       if (body.gnssAntBias !== undefined && typeof body.gnssAntBias !== 'boolean') {
@@ -284,8 +273,6 @@ export const handler = async (
       if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
       if (body.status !== undefined) updates.status = body.status;
       if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
-      if (body.persistTelemetry !== undefined) updates.persistTelemetry = body.persistTelemetry;
-      if (body.autoRecord !== undefined) updates.autoRecord = body.autoRecord;
       if (body.gnssAntBias !== undefined) updates.gnssAntBias = body.gnssAntBias;
       if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
       if (imuMount !== undefined) updates.imuMount = imuMount;
