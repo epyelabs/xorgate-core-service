@@ -155,6 +155,16 @@ export const devices = pgTable(
       upload?: { mode?: 'auto' | 'off' };
       retention?: { maxBytes?: number; minFreeBytes?: number };
     }>(),
+    // LTE recovery policy (lte_gnss_recovery plan, R8): how aggressively the
+    // device's connection-manager may use the GNSS-destructive modem reset.
+    // Validated on PUT (schemas/lte-recovery-config.ts) and delivered as the
+    // `lteRecovery` key of the retained MQTT config; the sim7600-lte daemon
+    // reads it live at each recovery decision. NULL = never configured from
+    // the cloud (device uses its safe defaults: defer / balanced).
+    lteRecoveryConfig: jsonb('lte_recovery_config').$type<{
+      gpsFixResetPolicy?: 'defer' | 'veto-deadzone';
+      deadZoneProfile?: 'conservative' | 'balanced' | 'aggressive';
+    }>(),
     // Camera direction for the web 3D orientation view. Cloud-only (never
     // delivered to the device). NULL = the view's built-in default 3/4 angle.
     imuView: jsonb('imu_view').$type<{

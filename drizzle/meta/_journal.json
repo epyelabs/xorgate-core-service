@@ -148,6 +148,13 @@
       "when": 1784821498286,
       "tag": "0020_smart_wendigo",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785117034824,
+      "tag": "0021_low_talisman",
+      "breakpoints": true
     }
   ]
 }

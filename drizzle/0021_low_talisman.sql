@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "lte_recovery_config" jsonb;

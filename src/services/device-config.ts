@@ -29,6 +29,12 @@ export interface RecordingConfigMessage {
   retention?: { maxBytes?: number; minFreeBytes?: number };
 }
 
+/** LTE recovery policy shape (lte_gnss_recovery plan, R8). */
+export interface LteRecoveryConfigMessage {
+  gpsFixResetPolicy?: 'defer' | 'veto-deadzone';
+  deadZoneProfile?: 'conservative' | 'balanced' | 'aggressive';
+}
+
 export interface DeviceConfigMessage {
   v: 1;
   gnssAntBias: boolean;
@@ -41,6 +47,15 @@ export interface DeviceConfigMessage {
    * `recording` namespace with this value (cloud is authoritative once set).
    */
   recording?: RecordingConfigMessage;
+  /**
+   * LTE recovery policy (lte_gnss_recovery plan, R8). Omitted when
+   * `devices.lte_recovery_config` is NULL — the device then keeps its local
+   * settings; when present the agent REPLACES its settings.json `lteRecovery`
+   * namespace with this value (cloud is authoritative once set). The
+   * sim7600-lte daemon re-reads the file at each recovery decision, so a
+   * change applies without any device restart.
+   */
+  lteRecovery?: LteRecoveryConfigMessage;
   /**
    * Segment-upload S3 bucket (offline recording plan, Phase 6.2). The install
    * script writes this into kvs.json for NEW devices; carrying it on the
@@ -59,6 +74,7 @@ export async function publishDeviceConfig(
     gnssAntBias: boolean;
     imuMount?: ImuMountConfig | null;
     recording?: RecordingConfigMessage | null;
+    lteRecovery?: LteRecoveryConfigMessage | null;
   },
 ): Promise<void> {
   const uploadBucket = process.env.BUCKET_NAME;
@@ -67,6 +83,7 @@ export async function publishDeviceConfig(
     gnssAntBias: config.gnssAntBias,
     ...(config.imuMount ? { imuMount: config.imuMount } : {}),
     ...(config.recording ? { recording: config.recording } : {}),
+    ...(config.lteRecovery ? { lteRecovery: config.lteRecovery } : {}),
     ...(uploadBucket ? { uploadBucket } : {}),
     ts: Date.now(),
   };

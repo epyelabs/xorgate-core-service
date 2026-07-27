@@ -20,6 +20,10 @@ import {
   parseRecordingConfigBody,
   type RecordingConfig,
 } from '../schemas/recording-config';
+import {
+  parseLteRecoveryConfigBody,
+  type LteRecoveryConfig,
+} from '../schemas/lte-recovery-config';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 const VALID_VIEW_TYPES = ['card', 'map'] as const;
@@ -208,6 +212,7 @@ export const handler = async (
         imuMount?: unknown;
         imuView?: unknown;
         recordingConfig?: unknown;
+        lteRecoveryConfig?: unknown;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -256,6 +261,13 @@ export const handler = async (
         recordingConfig = parsed.value;
       }
 
+      let lteRecoveryConfig: LteRecoveryConfig | null | undefined;
+      if (body.lteRecoveryConfig !== undefined) {
+        const parsed = parseLteRecoveryConfigBody(body.lteRecoveryConfig);
+        if ('error' in parsed) return badRequest(parsed.error);
+        lteRecoveryConfig = parsed.value;
+      }
+
       let imuView: ImuViewBody | null | undefined;
       if (body.imuView !== undefined) {
         const parsed = parseImuViewBody(body.imuView);
@@ -279,6 +291,7 @@ export const handler = async (
       if (imuMount !== undefined) updates.imuMount = imuMount;
       if (imuView !== undefined) updates.imuView = imuView;
       if (recordingConfig !== undefined) updates.recordingConfig = recordingConfig;
+      if (lteRecoveryConfig !== undefined) updates.lteRecoveryConfig = lteRecoveryConfig;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
@@ -305,13 +318,15 @@ export const handler = async (
       if (
         body.gnssAntBias !== undefined ||
         imuMount !== undefined ||
-        recordingConfig !== undefined
+        recordingConfig !== undefined ||
+        lteRecoveryConfig !== undefined
       ) {
         try {
           await publishDeviceConfig(id, {
             gnssAntBias: updated[0].gnssAntBias,
             imuMount: updated[0].imuMount,
             recording: updated[0].recordingConfig,
+            lteRecovery: updated[0].lteRecoveryConfig,
           });
         } catch (err) {
           console.error('device config publish failed', { deviceId: id, err });

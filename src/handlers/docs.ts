@@ -247,8 +247,41 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               'message and applied live by the agent. null = never configured from the cloud ' +
               '(recording off by default; any device-local settings are left untouched).',
           },
+          lteRecoveryConfig: {
+            allOf: [{ $ref: '#/components/schemas/LteRecoveryConfig' }],
+            nullable: true,
+            description:
+              'LTE recovery policy. Delivered to the device via a retained MQTT config message ' +
+              'and read live by the modem daemon at each recovery decision. null = never ' +
+              'configured from the cloud (device defaults: defer / balanced).',
+          },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      LteRecoveryConfig: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'LTE recovery policy (`lteRecovery` namespace): how aggressively the device connection ' +
+          'manager may use the GNSS-destructive full modem reset. Both fields optional; omitted ' +
+          'fields fall back to the device defaults.',
+        properties: {
+          gpsFixResetPolicy: {
+            type: 'string',
+            enum: ['defer', 'veto-deadzone'],
+            description:
+              'With a live GPS fix: "defer" (default) allows a modem reset only after 30+ min of ' +
+              'unusable LTE; "veto-deadzone" additionally never resets while parked in a dead zone.',
+          },
+          deadZoneProfile: {
+            type: 'string',
+            enum: ['conservative', 'balanced', 'aggressive'],
+            description:
+              'Dead-zone recovery pacing: conservative (nudge every 15-120 min, never resets), ' +
+              'balanced (default; 10-60 min, reset only after 3 failed radio cycles), aggressive ' +
+              '(10-20 min, reset after 1 failed cycle).',
+          },
         },
       },
       RecordingConfig: {
@@ -1472,6 +1505,15 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                       'config message; the agent applies it live within a few seconds. null clears the ' +
                       'cloud-managed config (the device keeps its current local settings). Note: toggling ' +
                       'video recording or changing its preset briefly restarts the live stream.',
+                  },
+                  lteRecoveryConfig: {
+                    allOf: [{ $ref: '#/components/schemas/LteRecoveryConfig' }],
+                    nullable: true,
+                    description:
+                      'LTE recovery policy. Validated strictly (unknown keys/values rejected 400) and ' +
+                      'delivered to the device as a retained MQTT config message; the modem daemon reads ' +
+                      'it live at its next recovery decision — no device restart. null clears the ' +
+                      'cloud-managed policy (the device falls back to its safe defaults).',
                   },
                 },
               },
