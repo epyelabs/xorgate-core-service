@@ -11,12 +11,14 @@ import { engineTargetForDefinition } from '../workflows/simulations';
  * Shared trigger plumbing: fireWorkflowRun() pre-creates a workflow_runs row and
  * enqueues {runId}, and evaluateTelemetryTriggers() is the (near-zero-cost) hook
  * called on the 1 Hz telemetry hot path. All firing paths (session_completed,
- * telemetry_condition, schedule, manual, rerun) go through fireWorkflowRun.
+ * segment_uploaded, telemetry_condition, schedule, manual, rerun) go through
+ * fireWorkflowRun.
  *
  * The cloud recorder's `recording_saved` path was removed with the recorder
- * (destroy-kvs-recorder Phase 3). The trigger type still exists in
- * `schemas/workflows.ts` but has no producer — Phase W replaces it with
- * `session_completed` / `segment_uploaded`.
+ * (destroy-kvs-recorder Phase 3) and its trigger TYPE with Phase W. Recorded
+ * video now comes from on-device sessions: `session_completed` (batch, fired
+ * on advisory close) and `segment_uploaded` (near-realtime, fired per chunk
+ * from media-segment-ingest).
  */
 
 const sqs = new SQSClient({});
@@ -121,33 +123,37 @@ export async function updateAttachmentStatusIfLatest(run: WorkflowRun, status: s
     .where(eq(schema.workflowAttachments.id, run.attachmentId));
 }
 
-// --- Session-completed trigger (sweeper close hook, Phase 6.4) ---------------
+// --- Media triggers: session_completed + segment_uploaded --------------------
+//
+// The two media triggers (destroy-kvs-recorder decision L) differ only in WHEN
+// they fire and what their context names; both resolve to the same
+// `device_session` executor binding downstream (a chunk is the N=1 case), so
+// they share the attachment fan-out below.
 
-type SessionCompletedTrigger = Extract<AttachmentTrigger, { type: 'session_completed' }>;
+/** Any attachment trigger keyed by stream (both media triggers today). */
+type StreamKeyedTrigger = Extract<
+  AttachmentTrigger,
+  { type: 'session_completed' | 'segment_uploaded' }
+>;
 
 /**
- * Fire workflow runs when a device-recorded media session flips open→closed
- * (offline recording plan, Phase 6.4). Called (best-effort) from the sweeper's
- * close pass AND the close-on-read path in device-sessions.ts.
- *
- * AT-LEAST-ONCE by design: close is advisory and reversible. A straggler
- * segment reopens the session (media-segment-ingest sets status='open' on
- * every insert) and the next sweep re-closes it, firing this again with
- * updated rollups. Consumers that must run once per session dedupe on
- * triggerContext.sessionId.
+ * Enabled attachments on `deviceId` subscribed to `type` for `streamKey`,
+ * each resolved to the template version that would actually run.
  */
-export async function evaluateSessionCompletedTriggers(session: {
-  id: string;
-  deviceId: string;
-  streamKey: string;
-  startedAt: Date;
-  endedAt: Date | null;
-}): Promise<void> {
+async function subscribedAttachments(
+  deviceId: string,
+  type: StreamKeyedTrigger['type'],
+  streamKey: string,
+): Promise<{
+  workspaceId: string;
+  matches: Array<{ id: string; templateId: string; version: number; definition: WorkflowDefinition }>;
+}> {
+  const empty = { workspaceId: '', matches: [] };
   const device = await db.query.devices.findFirst({
-    where: eq(schema.devices.id, session.deviceId),
+    where: eq(schema.devices.id, deviceId),
     columns: { workspaceId: true },
   });
-  if (!device) return;
+  if (!device) return empty;
 
   const rows = await db
     .select({
@@ -164,29 +170,19 @@ export async function evaluateSessionCompletedTriggers(session: {
     )
     .where(
       and(
-        eq(schema.workflowAttachments.deviceId, session.deviceId),
+        eq(schema.workflowAttachments.deviceId, deviceId),
         eq(schema.workflowAttachments.enabled, true),
       ),
     );
 
   const subscribed = rows.filter((a) =>
     ((a.triggers as AttachmentTrigger[]) ?? []).some(
-      (t): t is SessionCompletedTrigger =>
-        t.type === 'session_completed' && t.streamKeys.includes(session.streamKey),
+      (t): t is StreamKeyedTrigger => t.type === type && t.streamKeys.includes(streamKey),
     ),
   );
-  if (subscribed.length === 0) return;
+  if (subscribed.length === 0) return empty;
 
-  // Rollups computed once per fire (not stored — same stance as the list API).
-  const [agg] = await db
-    .select({
-      segmentCount: sql<number>`count(*)::int`,
-      totalBytes: sql<number>`coalesce(sum(${schema.mediaSegments.sizeBytes}), 0)::bigint`,
-      totalDurationMs: sql<number>`coalesce(sum(${schema.mediaSegments.durationMs}), 0)::bigint`,
-    })
-    .from(schema.mediaSegments)
-    .where(eq(schema.mediaSegments.sessionId, session.id));
-
+  const matches: Array<{ id: string; templateId: string; version: number; definition: WorkflowDefinition }> = [];
   for (const a of subscribed) {
     const resolvedVersion = a.pinnedVersion ?? a.publishedVersion;
     if (resolvedVersion == null) continue;
@@ -200,14 +196,62 @@ export async function evaluateSessionCompletedTriggers(session: {
         ),
       );
     if (!ver) continue;
+    matches.push({
+      id: a.id,
+      templateId: a.templateId,
+      version: resolvedVersion,
+      definition: ver.definition as WorkflowDefinition,
+    });
+  }
+  return { workspaceId: device.workspaceId, matches };
+}
 
+/**
+ * Fire workflow runs when a device-recorded media session flips open→closed
+ * (offline recording plan, Phase 6.4). Called (best-effort) from the sweeper's
+ * close pass AND the close-on-read path in device-sessions.ts.
+ *
+ * AT-LEAST-ONCE by design: close is advisory and reversible. A straggler
+ * segment reopens the session (media-segment-ingest sets status='open' on
+ * every insert) and the next sweep re-closes it, firing this again with
+ * updated rollups. Consumers that must run once per session dedupe on
+ * triggerContext.sessionId.
+ *
+ * The run then resolves `sessionId` to the whole ordered segment list
+ * (services/media-session-input.ts) — this is the BATCH media path.
+ */
+export async function evaluateSessionCompletedTriggers(session: {
+  id: string;
+  deviceId: string;
+  streamKey: string;
+  startedAt: Date;
+  endedAt: Date | null;
+}): Promise<void> {
+  const { workspaceId, matches } = await subscribedAttachments(
+    session.deviceId,
+    'session_completed',
+    session.streamKey,
+  );
+  if (matches.length === 0) return;
+
+  // Rollups computed once per fire (not stored — same stance as the list API).
+  const [agg] = await db
+    .select({
+      segmentCount: sql<number>`count(*)::int`,
+      totalBytes: sql<number>`coalesce(sum(${schema.mediaSegments.sizeBytes}), 0)::bigint`,
+      totalDurationMs: sql<number>`coalesce(sum(${schema.mediaSegments.durationMs}), 0)::bigint`,
+    })
+    .from(schema.mediaSegments)
+    .where(eq(schema.mediaSegments.sessionId, session.id));
+
+  for (const a of matches) {
     await fireWorkflowRun({
-      workspaceId: device.workspaceId,
+      workspaceId,
       deviceId: session.deviceId,
       attachmentId: a.id,
       templateId: a.templateId,
-      templateVersion: resolvedVersion,
-      definition: ver.definition as WorkflowDefinition,
+      templateVersion: a.version,
+      definition: a.definition,
       trigger: 'event',
       triggerContext: {
         type: 'session_completed',
@@ -218,6 +262,60 @@ export async function evaluateSessionCompletedTriggers(session: {
         segmentCount: Number(agg?.segmentCount ?? 0),
         totalBytes: Number(agg?.totalBytes ?? 0),
         totalDurationMs: Number(agg?.totalDurationMs ?? 0),
+      },
+    });
+  }
+}
+
+/**
+ * The NEAR-REALTIME media trigger (decision L): fires once per ~60 s chunk, from
+ * media-segment-ingest, as soon as the `media_segments` row is written. The run
+ * resolves to the SAME `device_session` binding with a one-element `segments`
+ * array, so incident detection and alerting get ~one-chunk latency without a
+ * second media path.
+ *
+ * Firing is per (segment, subscribed attachment) — it does NOT also fire
+ * `session_completed`; those are independent subscriptions on the attachment.
+ *
+ * ⚠️ NO freshness gate and NO burst throttling (decision K — prototyping, no
+ * fleet). A device back from hours offline uploads a flood of chunks and this
+ * fires a run for every one of them, over stale video. That is inherent to
+ * edge IoT and WILL matter with a real fleet; carried as known debt in
+ * destroy-kvs-recorder README §10, deliberately not built here.
+ */
+export async function evaluateSegmentUploadedTriggers(segment: {
+  sessionId: string;
+  deviceId: string;
+  streamKey: string;
+  s3Key: string;
+  seq: number;
+  startTs: Date;
+  durationMs: number;
+}): Promise<void> {
+  const { workspaceId, matches } = await subscribedAttachments(
+    segment.deviceId,
+    'segment_uploaded',
+    segment.streamKey,
+  );
+  if (matches.length === 0) return; // zero steady-state cost on the ingest path
+
+  for (const a of matches) {
+    await fireWorkflowRun({
+      workspaceId,
+      deviceId: segment.deviceId,
+      attachmentId: a.id,
+      templateId: a.templateId,
+      templateVersion: a.version,
+      definition: a.definition,
+      trigger: 'event',
+      triggerContext: {
+        type: 'segment_uploaded',
+        sessionId: segment.sessionId,
+        streamKey: segment.streamKey,
+        s3Key: segment.s3Key,
+        seq: segment.seq,
+        startTs: segment.startTs.toISOString(),
+        durationMs: segment.durationMs,
       },
     });
   }

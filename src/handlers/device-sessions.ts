@@ -60,9 +60,9 @@ export const handler = async (
 
   let auth;
   try {
-    // DELETE destroys recorded data — restrict to owner/admin (tighter than
-    // the recordings delete, which members may also call: a cloud recording is
-    // re-creatable from a live stream, a device-recorded session is not).
+    // DELETE destroys recorded data — restrict to owner/admin. A
+    // device-recorded session is not re-creatable, and since Phase W it is
+    // also a workflow video input, so a delete can invalidate future runs.
     auth = await requireOrgContext(
       event,
       method === 'DELETE' ? ['owner', 'admin'] : undefined,

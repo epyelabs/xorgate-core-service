@@ -6,8 +6,9 @@
  * removed in Phase 3. This stub exists only so `cdk synth` can still resolve the
  * `MediaFinalizeFn` entry path (see device-recordings.ts for the full note).
  *
- * Nothing writes `media/v1/*` any more. `recording_saved` has no producer until
- * Phase W replaces it with `session_completed` / `segment_uploaded`. Phase 5
+ * Nothing writes `media/v1/*` any more, and Phase W removed the
+ * `recording_saved` trigger type outright — recorded video now comes from
+ * `session_completed` / `segment_uploaded` over on-device sessions. Phase 5
  * deletes the Lambda and its EventBridge rule — delete this file in the same change.
  */
 export const handler = async (_event: unknown): Promise<void> => {

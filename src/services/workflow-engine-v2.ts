@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { ECSClient, ListTasksCommand, RunTaskCommand } from '@aws-sdk/client-ecs';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -13,10 +13,16 @@ import {
   buildProductionManifest,
   buildTriggeredInputs,
   resolveTriggeredWindow,
+  sessionsWindow,
   triggeredVideoSelection,
   unknownNodeTypes,
-  type ResolvedVideoInput,
+  type ResolvedVideoSession,
 } from '../workflows/production';
+import {
+  findDeviceSessions,
+  findRecentDeviceSessions,
+  resolveVideoSessions,
+} from './media-session-input';
 import { inputRecordsKey, manifestKey, type RunManifest } from '../workflows/engine/manifest';
 
 /**
@@ -29,7 +35,8 @@ import { inputRecordsKey, manifestKey, type RunManifest } from '../workflows/eng
  *   errors synchronously; the run row exists before dispatch and the watchdog
  *   covers lost tasks, so there is nothing for a retry queue to add.
  * - The M6 production trigger path (workflow-dispatch.ts): every triggered
- *   run (telemetry_condition / recording_saved / schedule / manual / rerun)
+ *   run (telemetry_condition / session_completed / segment_uploaded /
+ *   schedule / manual / rerun)
  *   lands on dispatchV2TriggeredRun after the dispatcher's atomic
  *   dispatched_at claim. The PoC inline runner and Python cv-runner are
  *   retired; v1 definitions are upgraded at fire time (workflow-triggers.ts)
@@ -341,50 +348,41 @@ async function templateOrgId(templateId: string): Promise<string> {
   return row.organizationId;
 }
 
-// Resolve the triggered run's video input from its trigger context: an s3Key
-// carried directly (recording_saved), or a schedule selection resolved against
-// the recordings table (hand-picked ids / most recent N). Multiple matches
-// reduce to the primary (newest) recording, the retired v1 dispatcher's rule.
-async function resolveTriggeredVideoInput(run: WorkflowRun): Promise<ResolvedVideoInput | null> {
+/**
+ * Resolve the triggered run's video input from its trigger context, against
+ * on-device `media_sessions`/`media_segments` (Phase W — the cloud
+ * `recordings` table is gone):
+ *  - `session_completed` / manual session run -> that one session
+ *  - `segment_uploaded` -> that ONE chunk of the session (the N=1 case)
+ *  - schedule selection -> hand-picked session ids, or the most recent N
+ *
+ * Returns a LIST, newest first: a multi-camera drive is N per-camera sessions,
+ * and buildTriggeredInputs picks per `source.video` node by `config.streamKey`
+ * (see sessionForVideoNode). Segment ordering and wall-clock anchoring come
+ * from buildSessionTimeline via services/media-session-input.ts.
+ */
+async function resolveTriggeredVideoSessions(run: WorkflowRun): Promise<ResolvedVideoSession[]> {
   const selection = triggeredVideoSelection(run.triggerContext);
-  if (!selection) return null;
-  if (selection.kind === 'context') return selection.input;
-  if (!run.deviceId) return null;
+  if (!selection || !run.deviceId) return [];
 
-  const rows =
-    selection.kind === 'recordings'
-      ? await db
-          .select()
-          .from(schema.recordings)
-          .where(
-            and(
-              eq(schema.recordings.deviceId, run.deviceId),
-              inArray(schema.recordings.id, selection.recordingIds),
-              isNotNull(schema.recordings.s3Key),
-            ),
-          )
-          .orderBy(desc(schema.recordings.createdAt))
-          .limit(1)
-      : await db
-          .select()
-          .from(schema.recordings)
-          .where(
-            and(
-              eq(schema.recordings.deviceId, run.deviceId),
-              eq(schema.recordings.status, 'completed'),
-              isNotNull(schema.recordings.s3Key),
-            ),
-          )
-          .orderBy(desc(schema.recordings.createdAt))
-          .limit(1);
-  const rec = rows[0];
-  if (!rec) return null;
-  return {
-    s3Key: rec.s3Key as string,
-    recordingId: rec.id,
-    recordingStartedAt: rec.startedAt ? rec.startedAt.toISOString() : null,
-    captureStartedAt: rec.captureStartedAt ? rec.captureStartedAt.toISOString() : null,
-  };
+  switch (selection.kind) {
+    case 'session': {
+      const rows = await findDeviceSessions(run.deviceId, [selection.sessionId]);
+      return resolveVideoSessions(rows);
+    }
+    case 'segment': {
+      const rows = await findDeviceSessions(run.deviceId, [selection.sessionId]);
+      return resolveVideoSessions(rows, { onlySeq: selection.seq });
+    }
+    case 'sessions': {
+      const rows = await findDeviceSessions(run.deviceId, selection.sessionIds);
+      return resolveVideoSessions(rows);
+    }
+    case 'lastNSessions': {
+      const rows = await findRecentDeviceSessions(run.deviceId, selection.n);
+      return resolveVideoSessions(rows);
+    }
+  }
 }
 
 /**
@@ -408,9 +406,12 @@ export async function dispatchV2TriggeredRun(run: WorkflowRun): Promise<void> {
       );
     }
     const target = engineTargetForDefinition(definition);
-    const window = resolveTriggeredWindow(run.triggerContext, run.startedAt);
-    const video = await resolveTriggeredVideoInput(run);
-    let inputs = buildTriggeredInputs(definition, video, target);
+    // Media first: the resolved session timeline is the telemetry window when
+    // the trigger context carries no explicit one, so correlation covers the
+    // REAL session instead of the 15-minute default.
+    const sessions = await resolveTriggeredVideoSessions(run);
+    const window = resolveTriggeredWindow(run.triggerContext, run.startedAt, sessionsWindow(sessions));
+    let inputs = buildTriggeredInputs(definition, sessions, target);
     if (target === 'fargate') {
       // The M4 telemetry seam, reused verbatim: history bindings become
       // dispatcher-written records.jsonl objects (the task role is DB-free).

@@ -153,6 +153,25 @@ export interface VideoPayload {
   path: string;
   startedAtMs: number;
   recordingId?: string | null;
+  /** On-device session this segment belongs to (`device_session` bindings). */
+  sessionId?: string | null;
+  /** Segment index within that session; null when the source isn't segmented. */
+  segmentSeq?: number | null;
+  /**
+   * How much wall-clock time this media is allowed to cover. For a session
+   * segment it is the EFFECTIVE duration (the next segment's startTs delta),
+   * so a decoder must not emit frames past `startedAtMs + durationMs` — an
+   * fstat-inflated duration would otherwise overlap the next segment's anchor.
+   * Absent = decode everything the file contains.
+   */
+  durationMs?: number;
+  /**
+   * True when the target may delete `path` once this media has been fully
+   * decoded (via ctx.sources.releaseVideo). Set for session segments, where a
+   * long run would otherwise accumulate GBs of fetched .mp4s on the task disk;
+   * never set for caller-owned files (uploads, local test fixtures).
+   */
+  releasable?: boolean;
   /**
    * M5 live plane: when set, `path` is a placeholder and the video is a live
    * frame stream the target exposes through ctx.sources.openLiveFrames
@@ -316,6 +335,13 @@ export interface EngineSourceReader {
   }): Promise<TelemetrySample[]>;
   /** Fetches a video object to local disk (Fargate target: S3 download). */
   fetchVideo?(ref: { bucket: string | null; key: string }): Promise<{ path: string }>;
+  /**
+   * Frees a file `fetchVideo` wrote, once its consumer is done with it. Only
+   * called for payloads flagged `releasable` (session segments). Optional: a
+   * target without it simply keeps every fetched file until the task exits,
+   * which is the pre-Phase-W behavior.
+   */
+  releaseVideo?(path: string): Promise<void>;
   /**
    * Fetches a small text object (telemetry CSV uploads, M3). Both deployed
    * targets implement it with S3 GetObject; tests read from memory.
