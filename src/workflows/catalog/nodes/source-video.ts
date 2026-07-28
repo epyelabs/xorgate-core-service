@@ -123,7 +123,6 @@ export const executor = async function* sourceVideo(
     const payload: VideoPayload = {
       path: `live:${ctx.nodeId}`,
       startedAtMs: anchor,
-      recordingId: null,
       live: {
         nodeId: ctx.nodeId,
         maxDurationMs,
@@ -163,7 +162,6 @@ export const executor = async function* sourceVideo(
       const payload: VideoPayload = {
         path,
         startedAtMs: seg.startTs, // per-segment anchor: drift never accumulates
-        recordingId: null,
         sessionId: binding.sessionId,
         segmentSeq: seg.seq ?? null,
         // Frames past this are the NEXT segment's territory.
@@ -207,7 +205,6 @@ export const executor = async function* sourceVideo(
   const payload: VideoPayload = {
     path,
     startedAtMs: anchor,
-    recordingId: null,
   };
   yield { ch: 'video' as const, ts: anchor, payload };
 };

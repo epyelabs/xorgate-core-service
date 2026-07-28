@@ -45,8 +45,8 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
  *            gap-aware replay timeline + batch-presigned segment URLs (R3)
  *   DELETE /devices/{id}/sessions/{sessionId}                      segments (S3+rows) + session
  * Ownership: the device must belong to a workspace in the caller's org (same
- * check as device-recordings.ts). Response casing: drizzle camelCase rows,
- * same dialect as /recordings.
+ * check as devices.ts). Response casing: drizzle camelCase rows, matching the
+ * dialect every other device sub-resource uses.
  */
 export const handler = async (
   event: APIGatewayProxyEventV2,

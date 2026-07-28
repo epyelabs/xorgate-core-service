@@ -32,7 +32,7 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  * the same gate as provisioning rather than the ordinary write gate.
  *
  * Ownership: the device must belong to a workspace in the caller's org (same
- * check as devices.ts / device-recordings.ts); cross-org reads surface as 404.
+ * check as devices.ts / device-sessions.ts); cross-org reads surface as 404.
  */
 export const handler = async (
   event: APIGatewayProxyEventV2,

@@ -152,7 +152,6 @@ export interface ConditionPayload {
 export interface VideoPayload {
   path: string;
   startedAtMs: number;
-  recordingId?: string | null;
   /** On-device session this segment belongs to (`device_session` bindings). */
   sessionId?: string | null;
   /** Segment index within that session; null when the source isn't segmented. */

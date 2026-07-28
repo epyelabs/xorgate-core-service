@@ -5,7 +5,6 @@ import {
   jsonb,
   timestamp,
   integer,
-  bigint,
   boolean,
   doublePrecision,
   index,
@@ -113,13 +112,6 @@ export const devices = pgTable(
     name: text('name'),
     firmwareVersion: text('firmware_version'),
     status: text('status').default('provisioned').notNull(),
-    // Opt-in telemetry persistence. When false (default) the ingest Lambda streams
-    // to IoT Core but writes nothing to telemetry_readings / device_latest.
-    persistTelemetry: boolean('persist_telemetry').default(false).notNull(),
-    // Opt-in automatic recording. When true the telemetry-ingest Lambda spawns a
-    // cloud viewer-recorder (Fargate) whenever a media stream becomes active, and
-    // stops it when the stream drops. Off by default.
-    autoRecord: boolean('auto_record').default(false).notNull(),
     // GNSS antenna bias: true powers an active GPS antenna's LNA via the modem's
     // VDD_AUX LDO (AT+CVAUXV/AT+CVAUXS). False (default) = passive antenna, bias
     // off — the hardware-safe state. Delivered to the device as a retained MQTT
@@ -129,10 +121,6 @@ export const devices = pgTable(
     // 'card' (default) is the media-over-telemetry grid; 'map' is the location-first
     // map view. text (not pgEnum) + app-side allowlist, per the enum-cast convention.
     activeStreamsViewType: text('active_streams_view_type').default('card').notNull(),
-    // Per-device override for the recording max-duration cap (ms). NULL falls back
-    // to the stack default (MAX_RECORDING_MS). The watchdog stops any recording that
-    // runs longer than this. See kvs-webrtc-lts plan Phase 2 / §6.
-    maxRecordingMs: integer('max_recording_ms'),
     // IMU mounting correction: how the BNO085 is physically rotated relative to
     // the vehicle (ZYX euler, degrees). Delivered to the device as retained MQTT
     // config; the agent then publishes vehicle-frame euler angles (the raw
@@ -379,62 +367,11 @@ export const mediaSegments = pgTable(
   ],
 );
 
-// A cloud-side recording of one stream. A headless KVS viewer-recorder (Fargate)
-// joins the device's existing signaling channel as an extra VIEWER, remuxes the
-// incoming H.264 to a single MP4, and uploads it to S3 on stop. One row per run.
-// `status` / `trigger` are text (not pgEnum) to dodge the aws-data-api enum-cast
-// issue — same reasoning as devices.status.
-export const recordings = pgTable(
-  'recordings',
-  {
-    id: uuid('id').primaryKey().defaultRandom(),
-    deviceId: uuid('device_id')
-      .references(() => devices.id, { onDelete: 'cascade' })
-      .notNull(),
-    streamKey: text('stream_key').notNull(), // cam0 | cam1 | ...
-    status: text('status').default('recording').notNull(), // recording | stopping | completed | failed
-    trigger: text('trigger').default('manual').notNull(), // manual | auto
-    // Why the recording ended, stamped by whichever path terminated it. NULL while
-    // still recording or for a natural EOS with no explicit reason. Values:
-    // user_stop | device_offline | stream_ended | max_duration | task_lost | error.
-    // See kvs-webrtc-lts plan §4.1 / Phase 3.
-    endReason: text('end_reason'),
-    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
-    endedAt: timestamp('ended_at', { withTimezone: true }),
-    // Set by the recorder (via an IoT "capturing" signal) on its first received video
-    // frame. NULL while the row is 'recording' but the recorder hasn't captured yet
-    // (cold start) -> the UI shows "Starting…"; non-NULL -> "REC".
-    captureStartedAt: timestamp('capture_started_at', { withTimezone: true }),
-    // Media-plane liveness: bumped by the recorder's periodic capture heartbeat
-    // (every RECORDER_HEARTBEAT_MS while frames actually arrive). The offline-stop
-    // corroboration (§4.5) and the orphan reconciler check this against
-    // CAPTURE_STALE_MS: a recording is only stopped on device-offline if this is
-    // stale, so a control-plane false positive never truncates a healthy recording.
-    captureHeartbeatAt: timestamp('capture_heartbeat_at', { withTimezone: true }),
-    s3Key: text('s3_key'), // media/v1/<deviceId>/<streamKey>/<recordingId>.mp4
-    // bigint (not int4): a 4h recording at the new MAX_RECORDING_MS default is many
-    // GB, which overflows int4 (~2.1 GB) and would throw on the finalize write. mode
-    // 'number' keeps the JS/API type a plain number (values stay well under 2^53).
-    sizeBytes: bigint('size_bytes', { mode: 'number' }),
-    durationMs: bigint('duration_ms', { mode: 'number' }),
-    // How many times the recorder rode through a recoverable outage (re-offer loop)
-    // during this recording. Observability for tuning the ride-through window. See
-    // Phase 4.
-    reconnectCount: integer('reconnect_count').default(0).notNull(),
-    taskArn: text('task_arn'), // Fargate task ARN, for StopTask
-    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-  },
-  (t) => [
-    index('recordings_device_stream_status_idx').on(t.deviceId, t.streamKey, t.status),
-    index('recordings_device_created_idx').on(t.deviceId, t.createdAt),
-  ],
-);
-
 // --- Workflows (user-defined processing pipelines) ---
 // A workflow: a graph of nodes (CV / telemetry processors) that attaches to a
 // device, fires on a trigger, and produces reviewable runs + events. `status`
 // columns are text (not pgEnum) to dodge the aws-data-api enum-cast issue — same
-// reasoning as devices.status / recordings.status. All graph/trigger/payload
+// reasoning as devices.status. All graph/trigger/payload
 // shapes are jsonb, validated app-side against the schemas in src/schemas/workflows.ts.
 
 // Org-scoped template (the reusable definition). `publishedVersion`/`currentVersion`
@@ -664,8 +601,6 @@ export type MediaSession = InferSelectModel<typeof mediaSessions>;
 export type NewMediaSession = InferInsertModel<typeof mediaSessions>;
 export type MediaSegment = InferSelectModel<typeof mediaSegments>;
 export type NewMediaSegment = InferInsertModel<typeof mediaSegments>;
-export type Recording = InferSelectModel<typeof recordings>;
-export type NewRecording = InferInsertModel<typeof recordings>;
 export type WorkflowTemplate = InferSelectModel<typeof workflowTemplates>;
 export type NewWorkflowTemplate = InferInsertModel<typeof workflowTemplates>;
 export type WorkflowTemplateVersion = InferSelectModel<typeof workflowTemplateVersions>;
