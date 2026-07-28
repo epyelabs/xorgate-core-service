@@ -16,10 +16,10 @@ channels.
 
 ```
 bin/app.ts              # CDK app: wires the stacks (dev imports shared sandbox Aurora; prod builds its own)
-lib/stacks/             # storage, database, auth (Cognito), iot, recorder (ECS/ECR), api
+lib/stacks/             # storage, database, auth (Cognito), iot, recorder (shared Fargate plane — historic name), api
 src/
-  handlers/             # one Lambda per file (devices, device-provisioning, device-registrations, install-script, telemetry-*, device-recordings, media-finalize, …)
-  services/             # shared logic (iot-provisioning: thing + cert + KVS; recordings: ECS RunTask/StopTask + DB)
+  handlers/             # one Lambda per file (devices, device-provisioning, device-registrations, install-script, telemetry-*, media-segment-ingest, device-sessions, …)
+  services/             # shared logic (iot-provisioning: thing + cert + KVS; media-sessions/media-segments: on-device recording index)
   middleware/auth.ts    # requireAuth / requireOrgContext (Cognito + org/project scoping)
   db/                   # Drizzle schema + RDS Data API client
   assets/install-script.ts  # the install.sh template served per-request
@@ -72,56 +72,37 @@ gates access). Published by the device repo's
 `.github/workflows/device-deploy-{dev,prod}.yml`. The install Lambda bakes the
 bucket URL into the script via `DEVICE_DIST_BUCKET_URL` / `DEVICE_DIST_VERSION`.
 
-## Stream recording (cloud viewer-recorder)
+## Stream recording (on-device)
 
 KVS WebRTC here is **signaling only**: live media flows peer-to-peer between the
-device (master) and the browser, and KVS does not store it. Enabling KVS's native
-ingestion would replace that P2P path, so recording instead uses a **cloud
-viewer-recorder**: a headless KVS viewer (a Fargate task, built from
-[`device/xorgate-kvs-webrtc`](../../device/xorgate-kvs-webrtc)) joins the device's
-existing signaling channel as *one more viewer*, remuxes the incoming H.264 to a
-single MP4, and uploads it to S3 on stop. The device and the browser's live view
-are untouched.
+device (master) and the browser, and KVS does not store it. **Recording happens on
+the device**, not in the cloud: the agent writes ~60 s MP4 segments locally and
+uploads them to `s3://…/media-sessions/v1/…` when it has connectivity, so a drive
+through a dead zone still records. The backend only **ingests and indexes** what
+the device uploads.
 
-**Lifecycle** (one row per run in the `recordings` table):
+1. **Ingest**: the upload fires an S3 *Object Created* event → **EventBridge** rule
+   → `media-segment-ingest` inserts the `media_segments` row (idempotent under
+   redelivery) and opens/extends the owning `media_sessions` row.
+2. **Close**: a session with no new segments for `MEDIA_SESSION_CLOSE_AFTER_MS` is
+   closed — by the `offline-sweeper` schedule, or lazily on read in
+   `device-sessions.ts`.
+3. **Read**: `GET /devices/{id}/sessions[…]` lists sessions/segments and mints
+   presigned playback URLs; `GET /devices/{id}/replay-manifest`
+   (`services/replay-manifest.ts`) builds the ordered, gap-aware timeline the
+   replay player and the workflow engine both consume.
+4. **Trigger**: `segment_uploaded` fires per chunk from `media-segment-ingest`;
+   `session_completed` fires once per session on close.
 
-1. **Start**: `POST /devices/{id}/recordings` (or auto-record, below) →
-   `services/recordings.ts` inserts the row (`status='recording'`), resolves the
-   device's KVS channel from `kvs_channels`, and **ECS `RunTask`** launches the
-   recorder with the channel + S3 key passed as container env. The task ARN is
-   saved for stop.
-2. **Stop**: `POST /devices/{id}/recordings/{rid}/stop` → **ECS `StopTask`**. ECS
-   sends SIGTERM; the recorder sends EOS so the MP4's `moov` atom is written
-   (seekable/playable), then uploads to
-   `media/v1/<deviceId>/<streamKey>/<recordingId>.mp4`.
-3. **Finalize**: the upload fires an S3 *Object Created* event → **EventBridge**
-   rule → `media-finalize` Lambda flips the row to `completed` with the final size.
-   The API never marks `completed` itself (avoids racing the upload).
-4. **Playback / delete**: `GET …/{rid}/playback` returns a presigned S3 GET URL;
-   `DELETE …/{rid}` stops an active task, deletes the S3 object, and removes the row.
-
-**Manual vs auto.** Manual recording is per-stream (or `{"all": true}` to record
-every channel). Auto-record is the opt-in `devices.auto_record` flag (default
-off), reconciled inside `telemetry-ingest`: while on, it keeps a recorder running
-for each live stream and stops it once the stream has been gone past a grace
-window (so a brief stream restart does not fragment the recording). Both paths
-share `services/recordings.ts`.
-
-**Infra** (`lib/stacks/recorder-stack.ts`): an ECR repo (`xorgate-recorder[-dev]`),
-an ECS cluster, an **ARM64** Fargate task def (120s stop timeout so the MP4 can
-finalize + upload before SIGKILL), and a dedicated **public-subnet VPC with no NAT**
-(tasks get a public IP to reach KVS/S3/TURN). The task role grants the KVS viewer
-actions + `s3:PutObject` on `media/v1/*` (mirroring the device credential role in
-`iot-stack.ts`). The API-stack Lambdas get `ecs:RunTask`/`StopTask` + `iam:PassRole`
-on the recorder roles and the `RECORDER_*` env.
-
-Two non-obvious choices: the API stack is passed the task **family** name (not a
-revision ARN) so task-def changes never hit CloudFormation's "cannot update an
-export in use" deadlock; and the recorder uses the SDK's bundled `cert.pem` for KVS
-TLS (the system CA bundle fails verification in the slim image).
-
-The recorder **image is built and pushed out-of-band** (not by `cdk deploy`); see
-the deploy steps below and `device/xorgate-kvs-webrtc`.
+> **Removed 2026-07-28:** a **cloud viewer-recorder** used to exist alongside this —
+> a headless KVS viewer on Fargate that joined a device channel as one more viewer,
+> remuxed to a single MP4 in `media/v1/*`, and was driven by `POST
+> /devices/{id}/recordings` + an auto-record flag. It is gone: handlers, the
+> `recordings` table, the `media/v1/*` objects, the ECR repo, and the ECS task
+> definition. ⚠️ `lib/stacks/recorder-stack.ts` and the `RECORDER_*` env vars keep
+> their historic names but are now the **shared Fargate plane** (VPC, SG, cluster)
+> that the workflow engine-runner uses — do not "clean up" those names; renaming the
+> cluster would replace it.
 
 ## Workflows
 
@@ -135,7 +116,7 @@ Lambda; **video** graphs run on a **Fargate CV task** (Python + ONNX Runtime).
 
 ```mermaid
 flowchart TD
-  A[recording_saved<br/>media-finalize.ts] --> F
+  A[session_completed / segment_uploaded<br/>media-segment-ingest.ts] --> F
   B[telemetry_condition<br/>telemetry-ingest.ts<br/>cached + debounced] --> F
   C[schedule + watchdog<br/>workflow-scheduler.ts<br/>1-min rule, prod-only] --> F
   D[manual run-now / rerun<br/>HTTP handlers] --> F
@@ -166,16 +147,17 @@ cursor), `workflow_runs` (snapshot of the definition that ran),
 | `handlers/workflow-dispatch.ts` | SQS consumer → inline runner or Fargate launch (idempotent under redelivery) |
 | `handlers/workflow-run-finalize.ts` | S3 `result.json` → persist steps/events + run status |
 | `handlers/workflow-scheduler.ts` | schedule triggers + stuck-run watchdog (1-min rule, `!disableScheduledJobs`) |
-| `services/workflow-triggers.ts` | `fireWorkflowRun` + telemetry / recording trigger evaluation |
+| `services/workflow-triggers.ts` | `fireWorkflowRun` + telemetry / session / segment trigger evaluation |
 | `services/workflow-runner.ts` | inline executor registry (telemetry graphs) |
 | `services/workflow-fargate.ts` | manifest writer + ECS RunTask (video graphs) |
 | `services/workflow-capabilities.ts` | required-capabilities vs `device_models.ioCapabilities` |
 
 **CV runner image** — `cv-runner/` is a Python container (Fargate ARM64), built +
-pushed out-of-band like the recorder (the recorder stack holds the ECR repo
-`xorgate-cv-runner[-dev]` + task def). It needs `yolov8n.onnx` baked in; full
-build/push steps are in [`cv-runner/README.md`](cv-runner/README.md). Same
-ECR/ECS/`iam:PassRole` grants as the recorder image (plus `ecr:BatchGetImage`).
+pushed out-of-band (`recorder-stack.ts` — historic name, it is now the shared
+Fargate plane — holds the ECR repo `xorgate-cv-runner[-dev]` + task def). It needs
+`yolov8n.onnx` baked in; full build/push steps are in
+[`cv-runner/README.md`](cv-runner/README.md). Needs ECR/ECS/`iam:PassRole` grants
+beyond the base deploy user's (plus `ecr:BatchGetImage`).
 
 **Notes:** new deps `@aws-sdk/client-sqs` + `cron-parser`; the run-firing Lambdas
 bundle the AWS SDK (`bundling: bundlingWithSdk`) since client-sqs isn't guaranteed
@@ -192,12 +174,10 @@ before deploying the new Lambdas.
 | `POST /device-registrations/{code}/claim` | **no** | called by install.sh — creates + provisions the device |
 | `GET /get/{code}` | **no** | renders install.sh (text/x-shellscript) |
 | `POST /devices/{id}/provision` | yes | provision an existing device (same IoT service) |
-| `GET/POST/PUT/DELETE /devices[/{id}]` | yes | device CRUD (`PUT` also sets `persistTelemetry` / `autoRecord`) |
+| `GET/POST/PUT/DELETE /devices[/{id}]` | yes | device CRUD (`PUT` also sets `recordingConfig` / `lteRecoveryConfig`) |
 | `GET /devices/{id}/{identity,kvs-channels,telemetry,telemetry/latest}` | yes | device detail reads |
-| `GET/POST /devices/{id}/recordings` | yes | list / start (one stream or `{"all": true}`) |
-| `POST /devices/{id}/recordings/{rid}/stop` | yes | stop the recording's Fargate task |
-| `GET /devices/{id}/recordings/{rid}/playback` | yes | presigned S3 GET URL |
-| `DELETE /devices/{id}/recordings/{rid}` | yes | stop if active, delete S3 object + row |
+| `GET /devices/{id}/sessions[/{sessionId}[/segments…]]` | yes | on-device recordings: list / detail / segments / segment playback URL |
+| `GET /devices/{id}/replay-manifest` | yes | ordered segment timeline for the replay player |
 | `…/me, /organizations, /projects, /device-models, /api-keys, /iot/attach-policy, /docs` | mixed | platform + tenancy |
 
 `API_BASE_URL` (used to build `installUrl` and the claim URL inside the script) is
@@ -215,20 +195,8 @@ npm run deploy:prod          # cdk deploy --context stage=prod --all
 npm run db:generate          # generate a Drizzle migration after editing src/db/schema.ts
 ```
 
-**Recorder image** (separate from `cdk deploy`, which only references the ECR
-repo). After the recorder stack exists, build + push the viewer-recorder once (and
-on any change under `device/xorgate-kvs-webrtc`). The Fargate task runs **arm64**:
-
-```sh
-aws ecr get-login-password --region us-east-1 \
-  | docker login --username AWS --password-stdin <acct>.dkr.ecr.us-east-1.amazonaws.com
-cd ../../device/xorgate-kvs-webrtc
-docker build --platform linux/arm64 -t <acct>.dkr.ecr.us-east-1.amazonaws.com/xorgate-recorder-dev:latest .
-docker push <acct>.dkr.ecr.us-east-1.amazonaws.com/xorgate-recorder-dev:latest
-```
-
-The recorder paths (push the image, run/stop tasks) need ECR + ECS + `iam:PassRole`
-permissions the base deploy user does not have; grant them separately.
+The Fargate paths (push a runner image, run/stop tasks) need ECR + ECS +
+`iam:PassRole` permissions the base deploy user does not have; grant them separately.
 
 **Migrations** are generated here but **applied out-of-band via the RDS Data
 API** — the local deploy credentials lack migration permissions. Status columns
