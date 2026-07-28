@@ -131,8 +131,6 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
           // destroy-kvs-recorder Phase W. Without this every segment fetch
           // 403s mid-run.
           bucket.arnForObjects('media-sessions/v1/*'),
-          // Cloud recorder MP4s: dead, dropped with the objects in Phase 6.
-          bucket.arnForObjects('media/v1/*'),
           bucket.arnForObjects('workflows/v2/*'),
           bucket.arnForObjects('models/*'),
         ],
