@@ -9,32 +9,33 @@ import { Construct } from 'constructs';
 
 export interface XorgateCoreRecorderStackProps extends cdk.StackProps {
   stage: 'dev' | 'prod';
-  // Core bucket; recordings are written under media/v1/<deviceId>/<streamKey>/.
+  // Core bucket; the engine runner reads device-recorded media segments from
+  // media-sessions/v1/ and writes v2 run artifacts under workflows/v2/.
   bucket: s3.Bucket;
 }
 
 /**
- * Cloud-side video recorder infra. A headless KVS WebRTC viewer-recorder runs as a
- * Fargate task: it joins a device's existing signaling channel as one more VIEWER,
- * remuxes the incoming H.264 to MP4, and uploads it to the core bucket on stop. The
- * device and the browser's live P2P viewing are untouched.
+ * Shared Fargate infra: a dedicated public-subnet VPC, security group and ECS
+ * cluster, plus the v2 TS engine runner that workflows dispatch onto.
  *
- * The recorder image lives in this stack's ECR repo (built + pushed out-of-band
- * from xorgate/device/xorgate-kvs-webrtc). The api-stack's Lambdas launch/stop
+ * ⚠️ The stack (and the `Recorder*` construct ids inside it) are named after the
+ * cloud KVS viewer-recorder that once lived here. That recorder was removed in
+ * destroy-kvs-recorder Phase 5 — its ECR repo, log group, task role and task
+ * definition are gone — but the VPC/SG/cluster it introduced are SHARED with the
+ * engine runner, so they stay under their original ids (renaming them would
+ * replace live infrastructure). Nothing named `Recorder*` here is recorder-owned
+ * any more; treat them as the shared Fargate plane.
+ *
+ * The engine-runner image lives in this stack's `EngineRunnerRepo` (built +
+ * pushed out-of-band from the service root). The api-stack's Lambdas launch/stop
  * tasks here (RunTask/StopTask) using the exported ARNs.
  *
- * Networking: a dedicated public-subnet VPC with NO NAT gateway (tasks get a public
- * IP and reach KVS/S3/TURN directly) keeps cost down for the PoC.
+ * Networking: no NAT gateway (tasks get a public IP and reach S3/KVS/TURN
+ * directly) keeps cost down for the PoC.
  */
 export class XorgateCoreRecorderStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
-  public readonly taskDefinition: ecs.FargateTaskDefinition;
   public readonly securityGroup: ec2.SecurityGroup;
-  public readonly repository: ecr.Repository;
-  public readonly containerName = 'recorder';
-  public readonly taskFamily: string;
-  public readonly taskRoleArn: string;
-  public readonly executionRoleArn: string;
   public readonly publicSubnetIds: string[];
   // v2 TS engine runner (M2) — reuses this stack's cluster/VPC/SG.
   public readonly engineRepository: ecr.Repository;
@@ -67,98 +68,24 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    this.repository = new ecr.Repository(this, 'RecorderRepo', {
-      repositoryName: isProd ? 'xorgate-recorder' : 'xorgate-recorder-dev',
-      removalPolicy,
-      emptyOnDelete: !isProd,
-      imageScanOnPush: true,
-    });
-
     this.cluster = new ecs.Cluster(this, 'RecorderCluster', {
       clusterName: isProd ? 'xorgate-recorder' : 'xorgate-recorder-dev',
       vpc,
     });
 
-    const logGroup = new logs.LogGroup(this, 'RecorderLogs', {
-      logGroupName: isProd ? '/xorgate/recorder' : '/xorgate/recorder-dev',
-      retention: logs.RetentionDays.TWO_WEEKS,
-      removalPolicy,
-    });
-
-    // Task role: KVS viewer + S3 upload (scoped to the media prefix, mirroring the
-    // device credential role's media/v1/* grant in iot-stack.ts).
-    const taskRole = new iam.Role(this, 'RecorderTaskRole', {
-      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'Xorgate recorder task: KVS viewer + media S3 upload',
-    });
-    taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'KvsViewer',
-        actions: [
-          'kinesisvideo:DescribeSignalingChannel',
-          'kinesisvideo:GetSignalingChannelEndpoint',
-          'kinesisvideo:GetIceServerConfig',
-          'kinesisvideo:ConnectAsViewer',
-        ],
-        resources: [`arn:aws:kinesisvideo:${this.region}:${this.account}:channel/*`],
-      }),
-    );
-    taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'MediaS3Upload',
-        actions: ['s3:PutObject'],
-        resources: [bucket.arnForObjects('media/v1/*')],
-      }),
-    );
-    // On its first received frame the recorder publishes a "capturing" event to
-    // IoT Core (xorgate/recordings/<recordingId>/status), which a topic rule turns
-    // into recordings.capture_started_at. Scoped to the recordings topic space.
-    taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'IotPublishStatus',
-        actions: ['iot:Publish'],
-        resources: [`arn:aws:iot:${this.region}:${this.account}:topic/xorgate/recordings/*`],
-      }),
-    );
-    // The bundled aws-cli v1 defaults iot-data to the deprecated non-ATS endpoint
-    // (data.iot.<region>), whose cert is no longer trusted. entrypoint.sh resolves the
-    // account's ATS data endpoint at startup so the publish can target it explicitly.
-    // DescribeEndpoint does not support resource-level permissions.
-    taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'IotDescribeEndpoint',
-        actions: ['iot:DescribeEndpoint'],
-        resources: ['*'],
-      }),
-    );
-
-    this.taskFamily = isProd ? 'xorgate-recorder' : 'xorgate-recorder-dev';
-    this.taskDefinition = new ecs.FargateTaskDefinition(this, 'RecorderTaskDef', {
-      family: this.taskFamily,
-      cpu: 512, // 0.5 vCPU — video-only remux, no re-encode
-      memoryLimitMiB: 1024,
-      taskRole,
-      runtimePlatform: {
-        // ARM64 (Graviton): cheaper, and builds natively/fast on the arm64 dev
-        // machine. The recorder image must be built for linux/arm64 to match.
-        cpuArchitecture: ecs.CpuArchitecture.ARM64,
-        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
-      },
-    });
-
-    this.taskDefinition.addContainer('recorder', {
-      containerName: this.containerName,
-      image: ecs.ContainerImage.fromEcrRepository(this.repository, 'latest'),
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'recorder', logGroup }),
-      // ECS sends SIGTERM then SIGKILL after this window; the recorder needs time
-      // to flush a clean MP4 (EOS -> moov atom) and upload before being killed.
-      stopTimeout: cdk.Duration.seconds(120),
-    });
-
-    // Exposed for the api-stack's Lambdas (RunTask env + iam:PassRole grant).
-    this.taskRoleArn = taskRole.roleArn;
-    this.executionRoleArn = this.taskDefinition.obtainExecutionRole().roleArn;
     this.publicSubnetIds = vpc.publicSubnets.map((s) => s.subnetId);
+
+    // (Cloud KVS viewer-recorder constructs REMOVED in destroy-kvs-recorder
+    // Phase 5: RecorderRepo (ECR), RecorderLogs, RecorderTaskRole + its
+    // KvsViewer/MediaS3Upload/IotPublishStatus/IotDescribeEndpoint policies,
+    // RecorderTaskDef + its 'recorder' container, the taskRoleArn/
+    // executionRoleArn exports and the RecorderRepoUri output. The VPC, SG,
+    // cluster and publicSubnetIds above stayed — they are shared with the
+    // engine runner below. ⚠️ The two deleted role ARNs were cross-stack
+    // auto-exports the api stack imported for RecorderPassRole, so the api
+    // stack must be deployed BEFORE this one (see PROGRESS Phase 5). In prod
+    // the ECR repo and log group are RETAIN, so they orphan rather than delete
+    // — Phase 7 retires the image.)
 
     // (CV runner constructs REMOVED in M7. They were kept exactly one deploy
     // past the M6 cutover with exportValue pins because their role ARNs were
@@ -187,7 +114,7 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
       removalPolicy,
     });
 
-    // Task role: read inputs (recordings, v2 manifests, the model registry),
+    // Task role: read inputs (media segments, v2 manifests, the model registry),
     // write v2 run artifacts. ListBucket is needed to resolve the latest model
     // version, scoped to the registry prefix. NO DB credentials by design: a
     // media graph that needs device telemetry history fails that source.
@@ -355,13 +282,11 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     this.engineTaskRoleArn = engineTaskRole.roleArn;
     this.engineExecutionRoleArn = this.engineTaskDefinition.obtainExecutionRole().roleArn;
 
+    // The SHARED Fargate cluster (engine-runner dispatch + the scheduler's
+    // stale-task stop). Historic name; see the class doc.
     new cdk.CfnOutput(this, 'RecorderClusterArn', {
       value: this.cluster.clusterArn,
       exportName: `XorgateRecorderClusterArn${suffix}`,
-    });
-    new cdk.CfnOutput(this, 'RecorderRepoUri', {
-      value: this.repository.repositoryUri,
-      exportName: `XorgateRecorderRepoUri${suffix}`,
     });
     new cdk.CfnOutput(this, 'EngineRunnerRepoUri', {
       value: this.engineRepository.repositoryUri,

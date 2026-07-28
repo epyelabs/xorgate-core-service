@@ -46,15 +46,13 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   iotRoleAlias: string;
   cognitoIdentityPoolId: string;
   cognitoUserPoolProvider: string;
-  // Cloud viewer-recorder (Fargate) launch config — see recorder-stack.ts.
+  // Shared Fargate cluster/network — see recorder-stack.ts. Historic `recorder`
+  // naming; the engine runner is the only thing that launches here now (the
+  // cloud viewer-recorder's four task-only props went in Phase 5).
   recorderClusterArn: string;
   recorderClusterName: string;
-  recorderTaskFamily: string;
-  recorderTaskRoleArn: string;
-  recorderExecutionRoleArn: string;
   recorderSecurityGroupId: string;
   recorderSubnets: string; // comma-separated public subnet ids
-  recorderContainerName: string;
   // v2 engine runner launch config — shares the recorder cluster/VPC/SG. Since
   // the M6 cutover this is the ONLY workflow execution plane (the Python
   // cv-runner and its CV_* wiring are retired).
@@ -91,12 +89,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       cognitoUserPoolProvider,
       recorderClusterArn,
       recorderClusterName,
-      recorderTaskFamily,
-      recorderTaskRoleArn,
-      recorderExecutionRoleArn,
       recorderSecurityGroupId,
       recorderSubnets,
-      recorderContainerName,
       engineTaskFamily,
       engineTaskRoleArn,
       engineExecutionRoleArn,
@@ -261,41 +255,26 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
-    // Recordings: launch/stop the Fargate viewer-recorder and pass its roles.
+    // Stop/inspect tasks in the SHARED Fargate cluster. Kept — rescoped from
+    // the cloud recorder to the engine — when destroy-kvs-recorder Phase 5
+    // deleted RecorderRunTask/RecorderPassRole: workflow-scheduler.ts stops
+    // stale engine-runner tasks and workflow-engine-v2.ts lists/describes them.
+    // The resource is the shared cluster's task space, so the ARN is unchanged.
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
-        sid: "RecorderRunTask",
-        actions: ["ecs:RunTask"],
-        resources: [
-          `arn:aws:ecs:${this.region}:${this.account}:task-definition/${recorderTaskFamily}:*`,
-        ],
-      }),
-    );
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: "RecorderStopTask",
+        sid: "EngineStopTask",
         actions: ["ecs:StopTask", "ecs:DescribeTasks"],
         resources: [
           `arn:aws:ecs:${this.region}:${this.account}:task/${recorderClusterName}/*`,
         ],
       }),
     );
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: "RecorderPassRole",
-        actions: ["iam:PassRole"],
-        resources: [recorderTaskRoleArn, recorderExecutionRoleArn],
-        conditions: {
-          StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
-        },
-      }),
-    );
 
     // (CvRunTask/CvPassRole retired in M6 with the Python cv-runner: the
     // shared Lambda role can no longer launch the CV task definition at all.)
 
-    // v2 engine runner (M2): launch + pass roles on the shared recorder
-    // cluster (StopTask/DescribeTasks already covered by RecorderStopTask).
+    // v2 engine runner (M2): launch + pass roles on the shared Fargate
+    // cluster (StopTask/DescribeTasks already covered by EngineStopTask).
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "EngineRunTask",
@@ -484,24 +463,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       COGNITO_IDENTITY_POOL_ID: cognitoIdentityPoolId,
       COGNITO_USER_POOL_PROVIDER: cognitoUserPoolProvider,
       AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1",
-      // Cloud viewer-recorder (Fargate) launch config — read by services/recordings.ts.
+      // Shared Fargate cluster/network. Historic RECORDER_* names (the cloud
+      // recorder that owned them is gone): RECORDER_CLUSTER_ARN is read
+      // directly by src/handlers/workflow-scheduler.ts, and all three are
+      // re-exported below as the engine's ENGINE_* wiring. Renaming them is
+      // out of scope (README §10).
       RECORDER_CLUSTER_ARN: recorderClusterArn,
-      RECORDER_TASKDEF: recorderTaskFamily,
       RECORDER_SUBNETS: recorderSubnets,
       RECORDER_SG: recorderSecurityGroupId,
-      RECORDER_CONTAINER_NAME: recorderContainerName,
-      // Recording-lifecycle thresholds (kvs-webrtc-lts §6), read by src/config/recording.ts.
+      // Device-status / sweeper thresholds, read by src/config/recording.ts.
       // Defaults preserve today's behavior; override any at deploy via `--context <key>=<val>`.
-      MAX_RECORDING_MS: recCtx("maxRecordingMs", String(4 * 60 * 60 * 1000)),
-      RECONCILE_STUCK_MS: recCtx("reconcileStuckMs", String(5 * 60 * 1000)),
       STATUS_FLAP_GUARD_MS: recCtx("statusFlapGuardMs", "10000"),
-      CAPTURE_STALE_MS: recCtx("captureStaleMs", "36000"),
       DEVICE_OFFLINE_STALE_MS: recCtx("deviceOfflineStaleMs", "60000"),
-      AUTORECORD_STOP_GRACE_MS: recCtx("autorecordStopGraceMs", "30000"),
-      AUTORECORD_RECONCILE_MS: recCtx("autorecordReconcileMs", "8000"),
-      // R6 gate: keep off until the recorder heartbeat (Phase 4) is deployed. Then
-      // enable with `--context offlineStopEnabled=true` (rollout §9 step 4).
-      OFFLINE_STOP_ENABLED: recCtx("offlineStopEnabled", "false"),
       // Device-recorded segment retention (offline recording plan, Phase 6.3).
       // Drives the sweeper's DB row expiry; MUST match the S3 lifecycle age in
       // storage-stack — both read the `segmentRetentionDays` context key.
@@ -509,10 +482,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // Device-recorded media sessions (offline recording plan, Phase 4):
       // sweeper close window — no new segment ARRIVAL for this long -> closed.
       MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
-      // Passed through to the recorder container via RunTask overrides.
-      RECORDER_HEARTBEAT_MS: recCtx("recorderHeartbeatMs", "12000"),
-      RECORDER_RECONNECT_WINDOW_MS: recCtx("recorderReconnectWindowMs", "90000"),
-      RECORDER_REOFFER_INTERVAL_MS: recCtx("recorderReofferIntervalMs", "2000"),
     };
 
     // onnxruntime-node (native, media targets only) is required lazily inside
@@ -531,9 +500,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       forceDockerBundling: false,
     };
 
-    // @aws-sdk/client-ecs is not guaranteed to be in the Lambda runtime's bundled
-    // SDK (unlike client-s3 / client-rds-data), so the recorder-launching Lambdas
-    // bundle the SDK rather than externalize it.
+    // @aws-sdk/client-ecs and client-sqs are not guaranteed to be in the Lambda
+    // runtime's bundled SDK (unlike client-s3 / client-rds-data), so any Lambda
+    // that launches/stops Fargate tasks or enqueues workflow runs bundles the
+    // SDK rather than externalize it.
     const bundlingWithSdk: nodejs.BundlingOptions = {
       ...commonBundling,
       externalModules: ["onnxruntime-node", "@anthropic-ai/sdk", "mqtt"],
@@ -711,17 +681,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
-    // /devices/{id}/recordings (+ control sub-routes) — cloud viewer-recorder
-    // start/stop/list/playback/delete. Launches/stops Fargate tasks (RunTask/
-    // StopTask) and presigns S3 GETs, so give it more than the 10s default.
-    const deviceRecordingsFn = new nodejs.NodejsFunction(this, "DeviceRecordingsFn", {
-      ...standardFnProps(
-        path.join(entryBase, "device-recordings.ts"),
-        "CRUD + control /devices/{id}/recordings (cloud recorder)",
-      ),
-      timeout: cdk.Duration.seconds(20),
-      bundling: bundlingWithSdk,
-    });
+    // (DeviceRecordingsFn + the /devices/{id}/recordings* routes REMOVED in
+    // destroy-kvs-recorder Phase 5, together with src/handlers/device-recordings.ts.)
 
     // /devices/{id}/sessions (+ segment sub-routes) — index over
     // device-recorded media sessions/segments (offline recording plan, Phase 4;
@@ -740,30 +701,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       bundling: bundlingWithSdk,
     });
 
-    // S3 ObjectCreated(media/v1/*) -> flip the matching recording to completed.
-    // Routed via EventBridge (the bucket has EventBridge notifications enabled in
-    // storage-stack) so there's no cross-stack notification cycle. The rule matches
-    // the bucket by NAME, so this stack -> storage-stack stays one-directional.
-    const mediaFinalizeFn = new nodejs.NodejsFunction(this, "MediaFinalizeFn", {
-      ...standardFnProps(
-        path.join(entryBase, "media-finalize.ts"),
-        "S3 Object Created(media/v1/*.mp4) -> mark recording completed + fire workflows",
-      ),
-      // Fires recording_saved workflow triggers via SQS -> bundles client-sqs.
-      bundling: bundlingWithSdk,
-    });
-    new events.Rule(this, "MediaFinalizeRule", {
-      description: "Recorder MP4 uploaded -> finalize recording row",
-      eventPattern: {
-        source: ["aws.s3"],
-        detailType: ["Object Created"],
-        detail: {
-          bucket: { name: [bucket.bucketName] },
-          object: { key: [{ prefix: "media/v1/" }] },
-        },
-      },
-      targets: [new targets.LambdaFunction(mediaFinalizeFn)],
-    });
+    // (MediaFinalizeFn + MediaFinalizeRule on media/v1/* REMOVED in
+    // destroy-kvs-recorder Phase 5, together with src/handlers/media-finalize.ts.
+    // The bucket keeps EventBridge notifications enabled — MediaSegmentIngestRule
+    // and the telemetry batch rule below depend on them.)
 
     // GET /devices/{id}/telemetry + /telemetry/latest + /telemetry/recent +
     // /telemetry/readings (P4) — historical telemetry reads over the partitioned
@@ -811,27 +752,27 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // One message = up to 3 Data API round-trips (insert + upsert + heartbeat).
       memorySize: 256,
       timeout: cdk.Duration.seconds(15),
-      // Bundles client-ecs for the auto-record path (RunTask/StopTask).
+      // Bundles client-sqs: telemetry triggers enqueue workflow runs.
       bundling: bundlingWithSdk,
       // Capture async-invoke failures that survive Lambda's own retries (T3).
       onFailure: new lambdaDestinations.SqsDestination(telemetryFnDlq),
     });
 
     // EventBridge ~1 min -> housekeeping tick: flip stale `online` devices to
-    // `offline`, corroborated offline-stop of their recordings, and the recording
-    // watchdog (max-duration cap + orphan/stuck reconcile). Bundles client-ecs
-    // (StopTask/DescribeTasks via services/recordings). Reuses THIS existing tick —
-    // no new schedule -> no new Aurora wake source (kvs-webrtc-lts §7.3).
+    // `offline`, close stale device-recorded media sessions, and expire segment
+    // index rows. Bundles client-sqs (session_completed triggers enqueue runs).
+    // Reuses THIS existing tick — no new schedule -> no new Aurora wake source
+    // (kvs-webrtc-lts §7.3).
     const offlineSweeperFn = new nodejs.NodejsFunction(this, "OfflineSweeperFn", {
       ...standardFnProps(
         path.join(entryBase, "offline-sweeper.ts"),
-        "Schedule (1m) -> offline sweep + corroborated offline-stop + recording watchdog",
+        "Schedule (1m) -> offline sweep + media-session close + segment expiry",
       ),
       timeout: cdk.Duration.seconds(30),
       bundling: bundlingWithSdk,
     });
     new events.Rule(this, "OfflineSweeperSchedule", {
-      description: "Housekeeping: offline sweep + recording watchdog (P2 telemetry / kvs-webrtc-lts)",
+      description: "Housekeeping: offline sweep + media-session close (P2 telemetry / offline recording)",
       enabled: !props.disableScheduledJobs,
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
       targets: [new targets.LambdaFunction(offlineSweeperFn)],
@@ -1041,59 +982,23 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     mediaSegmentDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
 
-    // --- Recording capture signal (Method #3): IoT Topic Rule -> Lambda -> Postgres ---
-    // The cloud recorder publishes a one-shot "capturing" event on its first received
-    // frame; this stamps recordings.capture_started_at so the UI can flip the badge
-    // from "Starting…" to "REC". DB-only (no new IAM); like telemetry ingest it has no
-    // HTTP route and the rule lives in this stack (it must reference this Lambda).
-    const recordingCaptureFn = new nodejs.NodejsFunction(this, "RecordingCaptureFn", {
-      ...standardFnProps(
-        path.join(entryBase, "recording-capture.ts"),
-        "IoT rule -> recordings.capture_started_at (first-frame signal)",
-      ),
-    });
-
-    const recordingCaptureRule = new iot.CfnTopicRule(this, "RecordingCaptureRule", {
-      ruleName: isProd ? "xorgate_recording_capture" : "xorgate_recording_capture_dev",
-      topicRulePayload: {
-        // topic(3) is the recordingId wildcard in xorgate/recordings/<id>/status.
-        sql: "SELECT *, topic(3) AS recordingId FROM 'xorgate/recordings/+/status'",
-        awsIotSqlVersion: "2016-03-23",
-        ruleDisabled: false,
-        actions: [{ lambda: { functionArn: recordingCaptureFn.functionArn } }],
-        // Reuse the telemetry DLQ + role: one low-volume error sink already covered by
-        // the TelemetryDlqDepthAlarm above.
-        errorAction: {
-          sqs: {
-            queueUrl: telemetryDlq.queueUrl,
-            roleArn: telemetryRuleRole.roleArn,
-            useBase64: false,
-          },
-        },
-      },
-    });
-
-    recordingCaptureFn.addPermission("AllowIotRuleInvoke", {
-      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
-      sourceArn: recordingCaptureRule.attrArn,
-      sourceAccount: this.account,
-      action: "lambda:InvokeFunction",
-    });
+    // (RecordingCaptureFn + RecordingCaptureRule on xorgate/recordings/+/status
+    // and its IoT invoke permission REMOVED in destroy-kvs-recorder Phase 5,
+    // together with src/handlers/recording-capture.ts.)
 
     // --- Device status / Last-Will (kvs-webrtc-lts Phase 1): IoT Topic Rule -> Lambda ---
     // The device agent publishes {online} to xorgate/devices/<id>/status on connect,
     // on graceful shutdown, and via MQTT Last-Will on ungraceful disconnect (power-
-    // off). This flips the device badge immediately and — once OFFLINE_STOP_ENABLED —
-    // does the §4.5 corroborated stop of active recordings. Bundles client-ecs
-    // (StopTask via services/recordings). DB-only IAM otherwise; the shared
-    // lambdaRole already grants ecs:StopTask on the recorder cluster.
+    // off). This flips the device badge immediately. DB-only: it needs no AWS SDK
+    // client beyond client-rds-data, so it uses the default bundling (the
+    // corroborated recorder offline-stop that once required client-ecs went in
+    // destroy-kvs-recorder Phase 3).
     const deviceStatusFn = new nodejs.NodejsFunction(this, "DeviceStatusFn", {
       ...standardFnProps(
         path.join(entryBase, "device-status.ts"),
-        "IoT rule -> device status (LWT) + corroborated recording offline-stop",
+        "IoT rule -> device status (LWT)",
       ),
       timeout: cdk.Duration.seconds(20),
-      bundling: bundlingWithSdk,
     });
 
     const deviceStatusRule = new iot.CfnTopicRule(this, "DeviceStatusRule", {
@@ -1224,7 +1129,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
     deviceWorkflowsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     workflowRunsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     telemetryIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
-    mediaFinalizeFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     // Phase 6.4: session_completed fires from the sweeper's close pass AND the
     // sessions list's close-on-read — both evaluate triggers via
     // fireWorkflowRun, which enqueues here. (Caught live: without these the
@@ -1503,10 +1407,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "TelemetryHistoryInt",
       telemetryHistoryFn,
     );
-    const deviceRecordingsInt = new apigwv2int.HttpLambdaIntegration(
-      "DeviceRecordingsInt",
-      deviceRecordingsFn,
-    );
     const deviceSessionsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceSessionsInt",
       deviceSessionsFn,
@@ -1703,26 +1603,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/identity",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceIdentityInt,
-    });
-    this.api.addRoutes({
-      path: "/devices/{id}/recordings",
-      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
-      integration: deviceRecordingsInt,
-    });
-    this.api.addRoutes({
-      path: "/devices/{id}/recordings/{recordingId}",
-      methods: [apigwv2.HttpMethod.DELETE],
-      integration: deviceRecordingsInt,
-    });
-    this.api.addRoutes({
-      path: "/devices/{id}/recordings/{recordingId}/stop",
-      methods: [apigwv2.HttpMethod.POST],
-      integration: deviceRecordingsInt,
-    });
-    this.api.addRoutes({
-      path: "/devices/{id}/recordings/{recordingId}/playback",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: deviceRecordingsInt,
     });
     // Device-recorded media sessions (offline recording plan, Phase 4;
     // DELETE added in Phase 6.3).
