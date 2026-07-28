@@ -47,8 +47,8 @@ const resultSchema = z.object({
  * under workflows/v1/ (Python cv-runner results) and workflows/v2/ (TS engine
  * results); acts only on `.../result.json`. Both engines ALWAYS write a
  * result.json (even on failure/timeout), so this is the single place run
- * status is resolved for S3-results runs — the same proven pattern as
- * media-finalize.
+ * status is resolved for S3-results runs — the same S3-event-driven finalize
+ * pattern media-segment-ingest uses for uploaded segments.
  *
  * The two result shapes are versioned: `resultVersion: 2` routes to the v2
  * branch (engineResultSchema from workflows/engine/manifest.ts, stamps

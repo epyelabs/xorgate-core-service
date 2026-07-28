@@ -12,7 +12,7 @@ import {
 } from '../services/media-segments';
 import { evaluateSegmentUploadedTriggers } from '../services/workflow-triggers';
 
-// Shape of the S3 "Object Created" event delivered via EventBridge (same as media-finalize).
+// Shape of the S3 "Object Created" event delivered via EventBridge.
 interface S3ObjectCreatedDetail {
   bucket: { name: string };
   object: { key: string; size?: number };
@@ -68,7 +68,7 @@ export const handler = async (
     return;
   }
   // Sidecars are fetched alongside their mp4; their own Object Created events
-  // carry no extra work (the rule filters on prefix only, like media-finalize).
+  // carry no extra work (the rule filters on prefix only, not on suffix).
   if (parsedKey.ext === 'json') return;
   const { deviceId, sessionId, streamKey, seq } = parsedKey;
 
