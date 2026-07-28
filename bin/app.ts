@@ -7,18 +7,16 @@ import { XorgateCoreIotStack } from '../lib/stacks/iot-stack';
 import { XorgateCoreApiStack } from '../lib/stacks/api-stack';
 import { XorgateCoreRecorderStack } from '../lib/stacks/recorder-stack';
 
-// Recorder props shared by both stages: launch/stop config the api-stack Lambdas
-// need to run the Fargate viewer-recorder and pass its roles.
+// Shared Fargate props for both stages: the cluster/network the api-stack
+// Lambdas launch engine-runner tasks into. The `recorder*` names are historic
+// (destroy-kvs-recorder Phase 5 removed the cloud recorder; its four task-only
+// props went with it) — renaming them is deliberately out of scope.
 function recorderProps(rec: XorgateCoreRecorderStack) {
   return {
     recorderClusterArn: rec.cluster.clusterArn,
     recorderClusterName: rec.cluster.clusterName,
-    recorderTaskFamily: rec.taskFamily,
-    recorderTaskRoleArn: rec.taskRoleArn,
-    recorderExecutionRoleArn: rec.executionRoleArn,
     recorderSecurityGroupId: rec.securityGroup.securityGroupId,
     recorderSubnets: rec.publicSubnetIds.join(','),
-    recorderContainerName: rec.containerName,
     // v2 engine runner (the only workflow execution plane since M6; the CV
     // runner props were retired with the Python cv-runner).
     engineTaskFamily: rec.engineTaskFamily,

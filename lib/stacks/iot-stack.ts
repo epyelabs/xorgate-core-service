@@ -72,11 +72,10 @@ export class XorgateCoreIotStack extends cdk.Stack {
         sid: 'S3SegmentUpload', // used in P5; granted now
         actions: ['s3:PutObject'],
         resources: [
-          bucket.arnForObjects('media/v1/*'),
           // Offline-recording segment uploads (offline_telemetry_video_recording
-          // plan, D3): telemetry JSONL.gz now, video MP4 segments + sidecars in
-          // Phase 4. Deliberately NOT under media/v1/ so the media-finalize rule
-          // never sees segment objects.
+          // plan, D3): telemetry JSONL.gz and video MP4 segments + sidecars.
+          // (The recorder-era media/v1/* prefix was dropped in
+          // destroy-kvs-recorder Phase 5 — nothing writes there any more.)
           bucket.arnForObjects('telemetry/v1/*'),
           bucket.arnForObjects('media-sessions/v1/*'),
         ],
