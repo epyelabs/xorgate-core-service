@@ -375,6 +375,74 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               },
             },
           },
+          powerShedding: {
+            type: 'object',
+            additionalProperties: false,
+            description:
+              'Runtime undervoltage load shedding: when the 5 V rail measurably fails, the device sheds ' +
+              'live streaming first, then video recording (bridge-only), and restores in reverse with ' +
+              'hysteresis. Telemetry recording is never shed. All thresholds are starting values for the ' +
+              'field-tuning loop.',
+            properties: {
+              enabled: { type: 'boolean', description: 'Master switch. Default true.' },
+              uvSamples: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 60,
+                description:
+                  'Shed when this many ~1 Hz samples with the CURRENT undervoltage bit land within ' +
+                  'uvWindowSecs. Default 3.',
+              },
+              uvWindowSecs: {
+                type: 'integer',
+                minimum: 5,
+                maximum: 300,
+                description: 'Undervoltage counting window in seconds. Default 30.',
+              },
+              railLowVolts: {
+                type: 'number',
+                minimum: 4,
+                maximum: 5.2,
+                description: 'Alternative trigger: 5 V rail below this, sustained railLowSecs. Default 4.85.',
+              },
+              railLowSecs: {
+                type: 'integer',
+                minimum: 3,
+                maximum: 120,
+                description: 'How long the rail must stay below railLowVolts to trigger. Default 15.',
+              },
+              escalateDwellSecs: {
+                type: 'integer',
+                minimum: 5,
+                maximum: 600,
+                description:
+                  'Continued trigger this long at a shed rung escalates to the next rung ' +
+                  '(no-live → bridge-only). Default 60.',
+              },
+              restoreSecs: {
+                type: 'integer',
+                minimum: 10,
+                maximum: 3600,
+                description:
+                  'Clean interval (zero undervoltage samples, rail at/above railRestoreVolts) required ' +
+                  'to restore one rung. Default 120.',
+              },
+              railRestoreVolts: {
+                type: 'number',
+                minimum: 4,
+                maximum: 5.4,
+                description: 'Rail must be at/above this for a sample to count as clean. Default 4.95.',
+              },
+              maxShedsPerHour: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 60,
+                description:
+                  'Shed cycles per rolling hour before the device parks at its shed level (no ' +
+                  'auto-restore until reboot or a settings change). Default 4.',
+              },
+            },
+          },
         },
       },
       MediaSession: {

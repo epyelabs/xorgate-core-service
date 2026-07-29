@@ -44,6 +44,9 @@ export const recordingStatusSchema = z.object({
   // Boot power staging verdict (Phase 2): "off" | "skipped" | "deferring" |
   // "released:<why>". Absent on pre-Phase-2 agents and telemetry-only devices.
   bootDefer: z.string().optional(),
+  // Load-shedding rung (Phase 3): "no-live" | "bridge-only", "parked:" prefix
+  // when the cycle cap is exhausted. Absent at full operation.
+  powerShed: z.string().optional(),
 });
 
 export const telemetryPayloadSchema = z.object({
