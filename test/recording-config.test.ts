@@ -64,6 +64,31 @@ describe('parseRecordingConfigBody', () => {
     expect(parseRecordingConfigBody({ video: { segmentSeconds } })).toHaveProperty('error');
   });
 
+  it('accepts the Phase 2 boot staging knobs (bounds included)', () => {
+    const video = {
+      bootDefer: 'always',
+      bootDeferMaxSecs: 90,
+      bootDeferMinBudgetMa: 5000,
+      spawnStaggerSecs: 4,
+    };
+    expect(parseRecordingConfigBody({ video })).toEqual({ value: { video } });
+    // 0 is meaningful: feature off / no stagger.
+    expect(
+      parseRecordingConfigBody({ video: { bootDeferMaxSecs: 0, spawnStaggerSecs: 0 } }),
+    ).toEqual({ value: { video: { bootDeferMaxSecs: 0, spawnStaggerSecs: 0 } } });
+  });
+
+  it.each([
+    { video: { bootDefer: 'sometimes' } },
+    { video: { bootDeferMaxSecs: 601 } },
+    { video: { bootDeferMaxSecs: -1 } },
+    { video: { bootDeferMinBudgetMa: 10001 } },
+    { video: { spawnStaggerSecs: 31 } },
+    { video: { spawnStaggerSecs: 2.5 } },
+  ])('rejects out-of-bounds boot staging value %j', (body) => {
+    expect(parseRecordingConfigBody(body)).toHaveProperty('error');
+  });
+
   it('rejects out-of-bounds retention', () => {
     expect(
       parseRecordingConfigBody({ retention: { maxBytes: 1024 } }), // < 512 MiB

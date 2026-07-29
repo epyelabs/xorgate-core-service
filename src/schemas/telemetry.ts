@@ -41,6 +41,9 @@ export const recordingStatusSchema = z.object({
   droppedSegments: z.number().int().nonnegative(),
   uploading: z.boolean(),
   lastUploadAt: z.number().nullable(),
+  // Boot power staging verdict (Phase 2): "off" | "skipped" | "deferring" |
+  // "released:<why>". Absent on pre-Phase-2 agents and telemetry-only devices.
+  bootDefer: z.string().optional(),
 });
 
 export const telemetryPayloadSchema = z.object({
