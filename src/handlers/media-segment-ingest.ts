@@ -124,9 +124,10 @@ export const handler = async (
 
   // Monotonic time-source upgrade (optimize-system-process-cycle Phase 1, Q6):
   // a later segment whose sidecar reports a strictly better clock (unsynced <
-  // rtc < ntp) upgrades the session row — never downgrades — so a session that
-  // gained NTP mid-drive sheds the "clock unsynced" badge. Behind the
-  // MEDIA_TIME_SOURCE_UPGRADE flag (default off) while it's an experiment.
+  // rtc < nitz < gps < ntp) upgrades the session row — never downgrades — so a
+  // session that gained NTP (or a Phase 4 GPS/NITZ clock step) mid-drive sheds
+  // the "clock unsynced" badge. Behind the MEDIA_TIME_SOURCE_UPGRADE flag
+  // (default off) while it's an experiment.
   const sidecarRank = timeSourceRank(sidecar.data.timeSource);
   const upgradeTimeSource = recordingConfig.mediaTimeSourceUpgrade && sidecarRank >= 0;
 
@@ -155,7 +156,8 @@ export const handler = async (
           status: 'open',
           ...(upgradeTimeSource
             ? {
-                timeSource: sql`case when ${sidecarRank} > (case ${schema.mediaSessions.timeSource} when 'ntp' then 2 when 'rtc' then 1 when 'unsynced' then 0 else -1 end) then ${sidecar.data.timeSource!} else ${schema.mediaSessions.timeSource} end`,
+                // Rank mapping mirrors timeSourceRank() — keep in sync.
+                timeSource: sql`case when ${sidecarRank} > (case ${schema.mediaSessions.timeSource} when 'ntp' then 4 when 'gps' then 3 when 'nitz' then 2 when 'rtc' then 1 when 'unsynced' then 0 else -1 end) then ${sidecar.data.timeSource!} else ${schema.mediaSessions.timeSource} end`,
               }
             : {}),
         })

@@ -1,0 +1,1 @@
+ALTER TABLE "devices" ADD COLUMN "time_sync_config" jsonb;

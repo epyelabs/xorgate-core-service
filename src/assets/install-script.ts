@@ -252,6 +252,30 @@ else
 fi
 rm -f "\$SUDOERS_TMP"
 
+# 6a. Offline time sources (optimize-system-process-cycle plan, Phase 4): the
+#     root clock-step helper (agent invokes it via sudo to correct a wrong
+#     boot clock from GPS/NITZ while NTP is unsynced), its sudoers grant, and
+#     a cron drop-in that tightens fake-hwclock's save cadence to 5 min so a
+#     hard crash restores a clock at most 5 min stale.
+if [ -f "$INSTALL_PREFIX/system/xorgate-setclock" ]; then
+  install -m 0755 -o root -g root "$INSTALL_PREFIX/system/xorgate-setclock" /usr/local/bin/xorgate-setclock
+  SUDOERS_TMP="\$(mktemp)"
+  cat > "\$SUDOERS_TMP" <<EOF
+# Installed by xorgate. Allows the agent (running as $SVC_USER) to apply an
+# offline GPS/NITZ clock step. See device-agent src/agent/clock-step.ts.
+$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/xorgate-setclock
+EOF
+  if visudo -cf "\$SUDOERS_TMP" >/dev/null 2>&1; then
+    install -m 0440 -o root -g root "\$SUDOERS_TMP" /etc/sudoers.d/021_xorgate-clock
+  else
+    log "WARN: clock sudoers drop-in failed validation; offline clock steps will not work"
+  fi
+  rm -f "\$SUDOERS_TMP"
+fi
+if [ -f "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" ]; then
+  install -m 0644 -o root -g root "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" /etc/cron.d/xorgate-fake-hwclock
+fi
+
 # 6b. Keep POSIX shared memory alive across ssh logouts. logind's default
 #     RemoveIPC=yes deletes a user's shm segments when their last login session
 #     ends — that destroys the shmsink bridge areas of bridged camera pipelines

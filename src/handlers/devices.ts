@@ -24,6 +24,10 @@ import {
   parseLteRecoveryConfigBody,
   type LteRecoveryConfig,
 } from '../schemas/lte-recovery-config';
+import {
+  parseTimeSyncConfigBody,
+  type TimeSyncConfig,
+} from '../schemas/time-sync-config';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 const VALID_VIEW_TYPES = ['card', 'map'] as const;
@@ -211,6 +215,7 @@ export const handler = async (
         imuView?: unknown;
         recordingConfig?: unknown;
         lteRecoveryConfig?: unknown;
+        timeSyncConfig?: unknown;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
@@ -257,6 +262,13 @@ export const handler = async (
         lteRecoveryConfig = parsed.value;
       }
 
+      let timeSyncConfig: TimeSyncConfig | null | undefined;
+      if (body.timeSyncConfig !== undefined) {
+        const parsed = parseTimeSyncConfigBody(body.timeSyncConfig);
+        if ('error' in parsed) return badRequest(parsed.error);
+        timeSyncConfig = parsed.value;
+      }
+
       let imuView: ImuViewBody | null | undefined;
       if (body.imuView !== undefined) {
         const parsed = parseImuViewBody(body.imuView);
@@ -279,6 +291,7 @@ export const handler = async (
       if (imuView !== undefined) updates.imuView = imuView;
       if (recordingConfig !== undefined) updates.recordingConfig = recordingConfig;
       if (lteRecoveryConfig !== undefined) updates.lteRecoveryConfig = lteRecoveryConfig;
+      if (timeSyncConfig !== undefined) updates.timeSyncConfig = timeSyncConfig;
       if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
       updates.updatedAt = new Date();
 
@@ -306,7 +319,8 @@ export const handler = async (
         body.gnssAntBias !== undefined ||
         imuMount !== undefined ||
         recordingConfig !== undefined ||
-        lteRecoveryConfig !== undefined
+        lteRecoveryConfig !== undefined ||
+        timeSyncConfig !== undefined
       ) {
         try {
           await publishDeviceConfig(id, {
@@ -314,6 +328,7 @@ export const handler = async (
             imuMount: updated[0].imuMount,
             recording: updated[0].recordingConfig,
             lteRecovery: updated[0].lteRecoveryConfig,
+            timeSync: updated[0].timeSyncConfig,
           });
         } catch (err) {
           console.error('device config publish failed', { deviceId: id, err });

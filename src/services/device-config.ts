@@ -56,6 +56,13 @@ export interface LteRecoveryConfigMessage {
   deadZoneProfile?: 'conservative' | 'balanced' | 'aggressive';
 }
 
+/** Offline time sources shape (optimize-system-process-cycle plan, Phase 4). */
+export interface TimeSyncConfigMessage {
+  offlineSources?: boolean;
+  stepThresholdSecs?: number;
+  maxStepsPerBoot?: number;
+}
+
 export interface DeviceConfigMessage {
   v: 1;
   gnssAntBias: boolean;
@@ -78,6 +85,15 @@ export interface DeviceConfigMessage {
    */
   lteRecovery?: LteRecoveryConfigMessage;
   /**
+   * Offline time sources (optimize-system-process-cycle plan, Phase 4).
+   * Omitted when `devices.time_sync_config` is NULL — the device then keeps
+   * its local settings; when present the agent REPLACES its settings.json
+   * `timeSync` namespace with this value (cloud is authoritative once set).
+   * The agent's clock stepper re-reads the file each tick, so a change —
+   * including the kill switch — applies without any device restart.
+   */
+  timeSync?: TimeSyncConfigMessage;
+  /**
    * Segment-upload S3 bucket (offline recording plan, Phase 6.2). The install
    * script writes this into kvs.json for NEW devices; carrying it on the
    * retained config message backfills devices fielded before Phase 2 (the
@@ -96,6 +112,7 @@ export async function publishDeviceConfig(
     imuMount?: ImuMountConfig | null;
     recording?: RecordingConfigMessage | null;
     lteRecovery?: LteRecoveryConfigMessage | null;
+    timeSync?: TimeSyncConfigMessage | null;
   },
 ): Promise<void> {
   const uploadBucket = process.env.BUCKET_NAME;
@@ -105,6 +122,7 @@ export async function publishDeviceConfig(
     ...(config.imuMount ? { imuMount: config.imuMount } : {}),
     ...(config.recording ? { recording: config.recording } : {}),
     ...(config.lteRecovery ? { lteRecovery: config.lteRecovery } : {}),
+    ...(config.timeSync ? { timeSync: config.timeSync } : {}),
     ...(uploadBucket ? { uploadBucket } : {}),
     ts: Date.now(),
   };
