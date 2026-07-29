@@ -123,6 +123,24 @@ export function buildSegmentRows(key: MediaSegmentObjectKey, s3Key: string, sc: 
   };
 }
 
+/**
+ * Time-provenance ordering for the monotonic session upgrade (Phase 1, Q6):
+ * higher rank = better clock. Unknown/absent values rank below "unsynced" so
+ * they can never displace a known value (but any known value fills them in).
+ */
+export function timeSourceRank(value: string | null | undefined): number {
+  switch (value) {
+    case 'ntp':
+      return 2;
+    case 'rtc':
+      return 1;
+    case 'unsynced':
+      return 0;
+    default:
+      return -1;
+  }
+}
+
 /** The key prefix is IAM-scoped ground truth; a contradicting sidecar means a
  *  mis-built file — refuse rather than attribute media to the wrong place. */
 export function sidecarMatchesKey(key: MediaSegmentObjectKey, sc: VideoSidecar): boolean {

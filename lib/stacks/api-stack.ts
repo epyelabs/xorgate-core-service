@@ -482,6 +482,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // Device-recorded media sessions (offline recording plan, Phase 4):
       // sweeper close window — no new segment ARRIVAL for this long -> closed.
       MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
+      // Monotonic media_sessions.time_source upgrade on segment ingest
+      // (optimize-system-process-cycle Phase 1, Q6). Experiment flag, default
+      // off; flip with `--context mediaTimeSourceUpgrade=1`.
+      MEDIA_TIME_SOURCE_UPGRADE: recCtx("mediaTimeSourceUpgrade", "0"),
     };
 
     // onnxruntime-node (native, media targets only) is required lazily inside

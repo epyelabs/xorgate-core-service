@@ -8,8 +8,10 @@ import {
   parseMediaSegmentObjectKey,
   sidecarKeyFor,
   sidecarMatchesKey,
+  timeSourceRank,
   videoSidecarSchema,
 } from '../services/media-segments';
+import { recordingConfig } from '../config/recording';
 import { evaluateSegmentUploadedTriggers } from '../services/workflow-triggers';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge.
@@ -120,6 +122,14 @@ export const handler = async (
 
   const { session, segment, segmentEnd } = buildSegmentRows(parsedKey, key, sidecar.data);
 
+  // Monotonic time-source upgrade (optimize-system-process-cycle Phase 1, Q6):
+  // a later segment whose sidecar reports a strictly better clock (unsynced <
+  // rtc < ntp) upgrades the session row — never downgrades — so a session that
+  // gained NTP mid-drive sheds the "clock unsynced" badge. Behind the
+  // MEDIA_TIME_SOURCE_UPGRADE flag (default off) while it's an experiment.
+  const sidecarRank = timeSourceRank(sidecar.data.timeSource);
+  const upgradeTimeSource = recordingConfig.mediaTimeSourceUpgrade && sidecarRank >= 0;
+
   try {
     await db.transaction(async (tx) => {
       // Session row first (media_segments.session_id FK). Sequential statements
@@ -143,6 +153,11 @@ export const handler = async (
           endedAt: sql`greatest(coalesce(${schema.mediaSessions.endedAt}, 'epoch'::timestamptz), ${tsParam(segmentEnd.toISOString())})`,
           lastSegmentAt: sql`now()`,
           status: 'open',
+          ...(upgradeTimeSource
+            ? {
+                timeSource: sql`case when ${sidecarRank} > (case ${schema.mediaSessions.timeSource} when 'ntp' then 2 when 'rtc' then 1 when 'unsynced' then 0 else -1 end) then ${sidecar.data.timeSource!} else ${schema.mediaSessions.timeSource} end`,
+              }
+            : {}),
         })
         .where(eq(schema.mediaSessions.id, sessionId));
     });

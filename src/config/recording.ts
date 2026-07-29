@@ -39,4 +39,12 @@ export const recordingConfig = {
    * expireSegmentIndexRows).
    */
   segmentRetentionDays: numEnv('SEGMENT_RETENTION_DAYS', 90),
+  /**
+   * Media time-source upgrade experiment (optimize-system-process-cycle
+   * Phase 1, Q6): when on, segment ingest monotonically upgrades
+   * media_sessions.time_source (unsynced < rtc < ntp, never downgrades) as
+   * better-stamped sidecars arrive — so a session whose clock synced
+   * mid-session sheds the "clock unsynced" badge. Default off.
+   */
+  mediaTimeSourceUpgrade: numEnv('MEDIA_TIME_SOURCE_UPGRADE', 0) !== 0,
 } as const;
