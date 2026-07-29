@@ -314,6 +314,36 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 maximum: 300,
                 description: 'Segment length — the unit of upload, retry and eviction. Default 60.',
               },
+              bootDefer: {
+                type: 'string',
+                enum: ['auto', 'always', 'off'],
+                description:
+                  'Boot power staging: auto (default) defers heavy encoders at boot only when the ' +
+                  'negotiated PSU budget is below bootDeferMinBudgetMa; always defers every boot; ' +
+                  'off starts everything immediately.',
+              },
+              bootDeferMaxSecs: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 600,
+                description: 'Hard cap on the boot defer in seconds. Default 90; 0 = feature off.',
+              },
+              bootDeferMinBudgetMa: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 10000,
+                description:
+                  'auto mode skips the defer when the negotiated supply budget (mA) is at or above ' +
+                  'this. Default 5000 (a true 5 V/5 A PD supply).',
+              },
+              spawnStaggerSecs: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 30,
+                description:
+                  'Delay between camera encoder spawns in seconds (flattens the start-up power ' +
+                  'transient). Default 4; 0 = simultaneous.',
+              },
             },
           },
           upload: {

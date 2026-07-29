@@ -24,7 +24,16 @@ export interface ImuMountConfig {
 /** The README `recording` settings shape (offline recording plan, D7). */
 export interface RecordingConfigMessage {
   telemetry?: { enabled?: boolean; rateHz?: number };
-  video?: { enabled?: boolean; preset?: string; segmentSeconds?: number };
+  video?: {
+    enabled?: boolean;
+    preset?: string;
+    segmentSeconds?: number;
+    // Boot power staging (optimize-system-process-cycle plan, Phase 2).
+    bootDefer?: 'auto' | 'always' | 'off';
+    bootDeferMaxSecs?: number;
+    bootDeferMinBudgetMa?: number;
+    spawnStaggerSecs?: number;
+  };
   upload?: { mode?: 'auto' | 'off' };
   retention?: { maxBytes?: number; minFreeBytes?: number };
 }

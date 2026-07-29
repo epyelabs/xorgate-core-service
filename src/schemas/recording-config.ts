@@ -31,6 +31,12 @@ export const RECORDING_RATE_HZ_MIN = 1;
 export const RECORDING_RATE_HZ_MAX = 20; // IMU native cadence cap
 export const RECORDING_SEGMENT_SECONDS_MIN = 10;
 export const RECORDING_SEGMENT_SECONDS_MAX = 300;
+// Boot power staging (optimize-system-process-cycle plan, Phase 2). The device
+// clamps to the same bounds (device src/daemon/settings.ts).
+export const BOOT_DEFER_MODES = ['auto', 'always', 'off'] as const;
+export const BOOT_DEFER_MAX_SECS_MAX = 600; // recording is the product — never defer past 10 min
+export const BOOT_DEFER_MIN_BUDGET_MA_MAX = 10_000;
+export const SPAWN_STAGGER_SECS_MAX = 30;
 // Retention sanity bounds: at least one video segment's worth of quota, at
 // most far beyond any current device disk (the device additionally enforces
 // its own free-space floor).
@@ -62,6 +68,17 @@ export const recordingConfigSchema = z
           .min(RECORDING_SEGMENT_SECONDS_MIN)
           .max(RECORDING_SEGMENT_SECONDS_MAX)
           .optional(),
+        // Boot power staging knobs (Phase 2): defer heavy encoders at boot
+        // until the modem settles. bootDeferMaxSecs 0 = feature off.
+        bootDefer: z.enum(BOOT_DEFER_MODES).optional(),
+        bootDeferMaxSecs: z.number().int().min(0).max(BOOT_DEFER_MAX_SECS_MAX).optional(),
+        bootDeferMinBudgetMa: z
+          .number()
+          .int()
+          .min(0)
+          .max(BOOT_DEFER_MIN_BUDGET_MA_MAX)
+          .optional(),
+        spawnStaggerSecs: z.number().int().min(0).max(SPAWN_STAGGER_SECS_MAX).optional(),
       })
       .strict()
       .optional(),

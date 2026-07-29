@@ -139,7 +139,15 @@ export const devices = pgTable(
     // by default).
     recordingConfig: jsonb('recording_config').$type<{
       telemetry?: { enabled?: boolean; rateHz?: number };
-      video?: { enabled?: boolean; preset?: string; segmentSeconds?: number };
+      video?: {
+        enabled?: boolean;
+        preset?: string;
+        segmentSeconds?: number;
+        bootDefer?: 'auto' | 'always' | 'off';
+        bootDeferMaxSecs?: number;
+        bootDeferMinBudgetMa?: number;
+        spawnStaggerSecs?: number;
+      };
       upload?: { mode?: 'auto' | 'off' };
       retention?: { maxBytes?: number; minFreeBytes?: number };
     }>(),
