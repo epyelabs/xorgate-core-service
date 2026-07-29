@@ -89,6 +89,42 @@ describe('parseRecordingConfigBody', () => {
     expect(parseRecordingConfigBody(body)).toHaveProperty('error');
   });
 
+  it('accepts the Phase 3 powerShedding knobs (bounds included)', () => {
+    const powerShedding = {
+      enabled: true,
+      uvSamples: 3,
+      uvWindowSecs: 30,
+      railLowVolts: 4.85,
+      railLowSecs: 15,
+      escalateDwellSecs: 60,
+      restoreSecs: 120,
+      railRestoreVolts: 4.95,
+      maxShedsPerHour: 4,
+    };
+    expect(parseRecordingConfigBody({ powerShedding })).toEqual({ value: { powerShedding } });
+    // Voltages are non-integers by nature; 0 sheds-per-hour = park on first shed.
+    expect(
+      parseRecordingConfigBody({ powerShedding: { railLowVolts: 4.5, maxShedsPerHour: 0 } }),
+    ).toEqual({ value: { powerShedding: { railLowVolts: 4.5, maxShedsPerHour: 0 } } });
+  });
+
+  it.each([
+    { powerShedding: { uvSamples: 0 } },
+    { powerShedding: { uvSamples: 61 } },
+    { powerShedding: { uvWindowSecs: 4 } },
+    { powerShedding: { railLowVolts: 3.9 } },
+    { powerShedding: { railLowVolts: 5.3 } },
+    { powerShedding: { railLowSecs: 121 } },
+    { powerShedding: { escalateDwellSecs: 601 } },
+    { powerShedding: { restoreSecs: 9 } },
+    { powerShedding: { railRestoreVolts: 5.5 } },
+    { powerShedding: { maxShedsPerHour: 61 } },
+    { powerShedding: { uvSamples: 2.5 } },
+    { powerShedding: { flapGuard: true } },
+  ])('rejects out-of-bounds/unknown powerShedding value %j', (body) => {
+    expect(parseRecordingConfigBody(body)).toHaveProperty('error');
+  });
+
   it('rejects out-of-bounds retention', () => {
     expect(
       parseRecordingConfigBody({ retention: { maxBytes: 1024 } }), // < 512 MiB

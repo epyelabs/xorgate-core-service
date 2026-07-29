@@ -150,6 +150,17 @@ export const devices = pgTable(
       };
       upload?: { mode?: 'auto' | 'off' };
       retention?: { maxBytes?: number; minFreeBytes?: number };
+      powerShedding?: {
+        enabled?: boolean;
+        uvSamples?: number;
+        uvWindowSecs?: number;
+        railLowVolts?: number;
+        railLowSecs?: number;
+        escalateDwellSecs?: number;
+        restoreSecs?: number;
+        railRestoreVolts?: number;
+        maxShedsPerHour?: number;
+      };
     }>(),
     // LTE recovery policy (lte_gnss_recovery plan, R8): how aggressively the
     // device's connection-manager may use the GNSS-destructive modem reset.

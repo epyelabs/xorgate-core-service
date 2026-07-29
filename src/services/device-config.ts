@@ -36,6 +36,18 @@ export interface RecordingConfigMessage {
   };
   upload?: { mode?: 'auto' | 'off' };
   retention?: { maxBytes?: number; minFreeBytes?: number };
+  // Runtime undervoltage load shedding (optimize-system-process-cycle plan, Phase 3).
+  powerShedding?: {
+    enabled?: boolean;
+    uvSamples?: number;
+    uvWindowSecs?: number;
+    railLowVolts?: number;
+    railLowSecs?: number;
+    escalateDwellSecs?: number;
+    restoreSecs?: number;
+    railRestoreVolts?: number;
+    maxShedsPerHour?: number;
+  };
 }
 
 /** LTE recovery policy shape (lte_gnss_recovery plan, R8). */
