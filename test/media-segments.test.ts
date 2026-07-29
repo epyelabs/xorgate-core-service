@@ -134,15 +134,17 @@ describe('buildSegmentRows', () => {
 });
 
 describe('timeSourceRank', () => {
-  it('orders unsynced < rtc < ntp', async () => {
+  it('orders unsynced < rtc < nitz < gps < ntp', async () => {
     const { timeSourceRank } = await import('../src/services/media-segments');
-    expect(timeSourceRank('ntp')).toBeGreaterThan(timeSourceRank('rtc'));
+    expect(timeSourceRank('ntp')).toBeGreaterThan(timeSourceRank('gps'));
+    expect(timeSourceRank('gps')).toBeGreaterThan(timeSourceRank('nitz'));
+    expect(timeSourceRank('nitz')).toBeGreaterThan(timeSourceRank('rtc'));
     expect(timeSourceRank('rtc')).toBeGreaterThan(timeSourceRank('unsynced'));
   });
 
   it('unknown/absent values rank below every known value (never displace one)', async () => {
     const { timeSourceRank } = await import('../src/services/media-segments');
-    for (const bad of [null, undefined, 'gps', '']) {
+    for (const bad of [null, undefined, 'atomic', '']) {
       expect(timeSourceRank(bad as never)).toBeLessThan(timeSourceRank('unsynced'));
     }
   });

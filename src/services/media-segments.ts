@@ -127,10 +127,19 @@ export function buildSegmentRows(key: MediaSegmentObjectKey, s3Key: string, sc: 
  * Time-provenance ordering for the monotonic session upgrade (Phase 1, Q6):
  * higher rank = better clock. Unknown/absent values rank below "unsynced" so
  * they can never displace a known value (but any known value fills them in).
+ * "gps"/"nitz" (optimize-system-process-cycle Phase 4) are offline clock
+ * steps taken while NTP was still unsynced: a valid GNSS fix is effectively
+ * stratum-0 (but applied at ~second granularity, so ntp stays on top); NITZ
+ * is carrier-reported and coarser, so it sits between rtc and gps.
+ * KEEP IN SYNC with the SQL CASE in handlers/media-segment-ingest.ts.
  */
 export function timeSourceRank(value: string | null | undefined): number {
   switch (value) {
     case 'ntp':
+      return 4;
+    case 'gps':
+      return 3;
+    case 'nitz':
       return 2;
     case 'rtc':
       return 1;

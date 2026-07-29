@@ -241,8 +241,46 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               'and read live by the modem daemon at each recovery decision. null = never ' +
               'configured from the cloud (device defaults: defer / balanced).',
           },
+          timeSyncConfig: {
+            allOf: [{ $ref: '#/components/schemas/TimeSyncConfig' }],
+            nullable: true,
+            description:
+              'Offline time sources policy. Delivered to the device via a retained MQTT config ' +
+              'message and read live by the agent clock stepper. null = never configured from ' +
+              'the cloud (device defaults: stepping on, 10 s threshold, 4 steps/boot).',
+          },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      TimeSyncConfig: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'Offline time sources (`timeSync` namespace): while NTP is unsynced this boot, the agent ' +
+          'may step the system clock from GPS (valid GNSS fix) or the modem NITZ clock, then stand ' +
+          'down for the boot once NTP synchronizes. All fields optional; omitted fields fall back ' +
+          'to the device defaults.',
+        properties: {
+          offlineSources: {
+            type: 'boolean',
+            description:
+              'Kill switch: false disables GPS/NITZ clock stepping entirely (device default: true).',
+          },
+          stepThresholdSecs: {
+            type: 'integer',
+            minimum: 2,
+            maximum: 600,
+            description:
+              'Step only when the measured clock offset exceeds this many seconds (device default 10). ' +
+              'A battery-backed RTC boots inside the threshold, making the feature a natural no-op.',
+          },
+          maxStepsPerBoot: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 20,
+            description: 'Hard cap on clock steps per boot (device default 4; bounds a flapping source).',
+          },
         },
       },
       LteRecoveryConfig: {
@@ -469,8 +507,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           timeSource: {
             type: 'string',
             nullable: true,
-            enum: ['ntp', 'rtc', 'unsynced'],
-            description: 'Device clock quality at session start; "unsynced" timestamps may be wrong wall-clock.',
+            enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'],
+            description:
+              'Device clock quality at session start; "unsynced" timestamps may be wrong wall-clock. "gps"/"nitz" = offline clock step from GNSS / modem NITZ time while NTP was pending.',
           },
           lastSegmentAt: {
             type: 'string',
@@ -554,8 +593,9 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 timeSource: {
                   type: 'string',
                   nullable: true,
-                  enum: ['ntp', 'rtc', 'unsynced'],
-                  description: '"unsynced" = wall-clock correlation with telemetry is untrustworthy.',
+                  enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'],
+                  description:
+                    '"unsynced" = wall-clock correlation with telemetry is untrustworthy; "gps"/"nitz" = offline clock step while NTP was pending.',
                 },
                 codec: { type: 'string', nullable: true, example: 'h264' },
                 width: { type: 'integer', nullable: true },
@@ -1571,6 +1611,15 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                       'delivered to the device as a retained MQTT config message; the modem daemon reads ' +
                       'it live at its next recovery decision — no device restart. null clears the ' +
                       'cloud-managed policy (the device falls back to its safe defaults).',
+                  },
+                  timeSyncConfig: {
+                    allOf: [{ $ref: '#/components/schemas/TimeSyncConfig' }],
+                    nullable: true,
+                    description:
+                      'Offline time sources policy. Validated strictly (unknown keys/out-of-range values ' +
+                      'rejected 400) and delivered to the device as a retained MQTT config message; the ' +
+                      'agent clock stepper reads it live within ~30 s — no device restart. null clears ' +
+                      'the cloud-managed policy (the device falls back to its defaults).',
                   },
                 },
               },

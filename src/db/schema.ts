@@ -172,6 +172,17 @@ export const devices = pgTable(
       gpsFixResetPolicy?: 'defer' | 'veto-deadzone';
       deadZoneProfile?: 'conservative' | 'balanced' | 'aggressive';
     }>(),
+    // Offline time sources (optimize-system-process-cycle plan, Phase 4):
+    // GPS/NITZ clock stepping while NTP is unsynced. Validated on PUT
+    // (schemas/time-sync-config.ts) and delivered as the `timeSync` key of
+    // the retained MQTT config; the agent's clock stepper reads it live.
+    // NULL = never configured from the cloud (device defaults: stepping on,
+    // 10 s threshold, 4 steps/boot).
+    timeSyncConfig: jsonb('time_sync_config').$type<{
+      offlineSources?: boolean;
+      stepThresholdSecs?: number;
+      maxStepsPerBoot?: number;
+    }>(),
     // Camera direction for the web 3D orientation view. Cloud-only (never
     // delivered to the device). NULL = the view's built-in default 3/4 angle.
     imuView: jsonb('imu_view').$type<{
