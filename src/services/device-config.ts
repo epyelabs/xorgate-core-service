@@ -32,6 +32,10 @@ export interface RecordingConfigMessage {
     bootDefer?: 'auto' | 'always' | 'off';
     bootDeferMaxSecs?: number;
     bootDeferMinBudgetMa?: number;
+    // GPS/LTE video gate (optimize-system-process-cycle plan, Phase 7):
+    // stage 2 of the boot policy. gpsGateMaxSecs 0 = no time cap.
+    gpsGate?: 'auto' | 'always' | 'off';
+    gpsGateMaxSecs?: number;
     spawnStaggerSecs?: number;
     // Per-camera capacity (optimize-system-process-cycle plan, Phase 6);
     // an absent key means enabled.

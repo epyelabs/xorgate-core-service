@@ -89,6 +89,26 @@ describe('parseRecordingConfigBody', () => {
     expect(parseRecordingConfigBody(body)).toHaveProperty('error');
   });
 
+  it('accepts the Phase 7 GPS/LTE gate knobs', () => {
+    const video = { gpsGate: 'always' as const, gpsGateMaxSecs: 900 };
+    expect(parseRecordingConfigBody({ video })).toEqual({ value: { video } });
+    // 0 is meaningful: no time cap at all (Q8) — the other release conditions
+    // still bound the gate.
+    expect(parseRecordingConfigBody({ video: { gpsGateMaxSecs: 0 } })).toEqual({
+      value: { video: { gpsGateMaxSecs: 0 } },
+    });
+  });
+
+  it.each([
+    { video: { gpsGate: 'sometimes' } },
+    { video: { gpsGateMaxSecs: 3601 } },
+    { video: { gpsGateMaxSecs: -1 } },
+    { video: { gpsGateMaxSecs: 60.5 } },
+    { video: { gpsGateMinBudgetMa: 5000 } },
+  ])('rejects out-of-bounds / unknown gate value %j', (body) => {
+    expect(parseRecordingConfigBody(body)).toHaveProperty('error');
+  });
+
   it('accepts the Phase 3 powerShedding knobs (bounds included)', () => {
     const powerShedding = {
       enabled: true,
