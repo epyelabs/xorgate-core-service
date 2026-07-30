@@ -97,6 +97,7 @@ describe('parseRecordingConfigBody', () => {
       railLowVolts: 4.85,
       railLowSecs: 15,
       escalateDwellSecs: 60,
+      escalateDutyPct: 70,
       restoreSecs: 120,
       railRestoreVolts: 4.95,
       maxShedsPerHour: 4,
@@ -116,12 +117,34 @@ describe('parseRecordingConfigBody', () => {
     { powerShedding: { railLowVolts: 5.3 } },
     { powerShedding: { railLowSecs: 121 } },
     { powerShedding: { escalateDwellSecs: 601 } },
+    { powerShedding: { escalateDutyPct: 49 } },
+    { powerShedding: { escalateDutyPct: 101 } },
     { powerShedding: { restoreSecs: 9 } },
     { powerShedding: { railRestoreVolts: 5.5 } },
     { powerShedding: { maxShedsPerHour: 61 } },
     { powerShedding: { uvSamples: 2.5 } },
     { powerShedding: { flapGuard: true } },
   ])('rejects out-of-bounds/unknown powerShedding value %j', (body) => {
+    expect(parseRecordingConfigBody(body)).toHaveProperty('error');
+  });
+
+  it('accepts per-camera enables keyed by stream key (Phase 6)', () => {
+    const cameras = { cam0: true, cam1: false };
+    expect(parseRecordingConfigBody({ video: { cameras } })).toEqual({
+      value: { video: { cameras } },
+    });
+    // An empty map is valid: it means "every detected camera" (the default).
+    expect(parseRecordingConfigBody({ video: { cameras: {} } })).toEqual({
+      value: { video: { cameras: {} } },
+    });
+  });
+
+  it.each([
+    { video: { cameras: { 'cam 0': true } } },
+    { video: { cameras: { cam0: 'off' } } },
+    { video: { cameras: [true] } },
+    { video: { cameras: { cam0: true, cam1: true, cam2: true, cam3: true, cam4: true, cam5: true, cam6: true, cam7: true, cam8: true, cam9: true, cam10: true, cam11: true, cam12: true, cam13: true, cam14: true, cam15: true, cam16: true } } },
+  ])('rejects malformed video.cameras %j', (body) => {
     expect(parseRecordingConfigBody(body)).toHaveProperty('error');
   });
 

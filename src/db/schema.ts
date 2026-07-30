@@ -147,6 +147,8 @@ export const devices = pgTable(
         bootDeferMaxSecs?: number;
         bootDeferMinBudgetMa?: number;
         spawnStaggerSecs?: number;
+        /** Per-camera enables keyed by streamKey (Phase 6); an absent key = enabled. */
+        cameras?: Record<string, boolean>;
       };
       upload?: { mode?: 'auto' | 'off' };
       retention?: { maxBytes?: number; minFreeBytes?: number };
@@ -157,6 +159,7 @@ export const devices = pgTable(
         railLowVolts?: number;
         railLowSecs?: number;
         escalateDwellSecs?: number;
+        escalateDutyPct?: number;
         restoreSecs?: number;
         railRestoreVolts?: number;
         maxShedsPerHour?: number;
