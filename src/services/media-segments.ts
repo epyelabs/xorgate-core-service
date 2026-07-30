@@ -124,6 +124,24 @@ export function buildSegmentRows(key: MediaSegmentObjectKey, s3Key: string, sc: 
 }
 
 /**
+ * Far-future guardrail (optimize-system-process-cycle Phase 8). True when a
+ * segment claims to start further than `maxFutureMs` ahead of now — i.e. the
+ * uploading device's clock is broken, not merely skewed. `maxFutureMs <= 0`
+ * disables the check.
+ *
+ * Deliberately one-sided: far-PAST segments are legitimate (a device drains a
+ * backlog after days offline, and `segmentRetentionDays` already bounds how
+ * far back anything is kept), while a far-future stamp has no benign reading.
+ */
+export function segmentTooFarInFuture(
+  startTsMs: number,
+  nowMs: number,
+  maxFutureMs: number,
+): boolean {
+  return maxFutureMs > 0 && startTsMs > nowMs + maxFutureMs;
+}
+
+/**
  * Time-provenance ordering for the monotonic session upgrade (Phase 1, Q6):
  * higher rank = better clock. Unknown/absent values rank below "unsynced" so
  * they can never displace a known value (but any known value fills them in).

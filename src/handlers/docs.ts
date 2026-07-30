@@ -566,7 +566,10 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         description:
           'One ~60 s MP4 segment of a media session. `finalized: false` = crash-cut partial ' +
           '(fragmented MP4, playable up to the cut). When stitching, prefer the next segment\'s ' +
-          'startTs delta over durationMs (segment 0 includes ~2 s pipeline startup).',
+          'startTs delta over durationMs (segment 0 includes ~2 s pipeline startup). ' +
+          'Ingest drops segments whose startTs is more than MEDIA_SEGMENT_MAX_FUTURE_MS ' +
+          '(default 24 h) ahead of server time — a device with a catastrophically wrong ' +
+          'clock is rejected loudly rather than indexed where no query will find it.',
         properties: {
           id: { type: 'string', format: 'uuid' },
           deviceId: { type: 'string', format: 'uuid' },

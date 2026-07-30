@@ -6,6 +6,7 @@ import { tsParam } from '../utils/sql';
 import {
   buildSegmentRows,
   parseMediaSegmentObjectKey,
+  segmentTooFarInFuture,
   sidecarKeyFor,
   sidecarMatchesKey,
   timeSourceRank,
@@ -40,8 +41,9 @@ class AlreadyIngested extends Error {}
  *
  * Error semantics (async EventBridge invoke, retries + on-failure DLQ), same
  * split as telemetry-batch-ingest:
- *  - Permanent (bad key, unknown device, invalid sidecar, identity mismatch)
- *    → log + return (drop; a retry can never succeed).
+ *  - Permanent (bad key, unknown device, invalid sidecar, identity mismatch,
+ *    implausibly far-future start timestamp — Phase 8) → log + return (drop; a
+ *    retry can never succeed).
  *  - Transient (S3/DB failure, sidecar object missing — should not happen
  *    given sidecar-first ordering) → throw, so Lambda retry / DLQ recover it.
  *
@@ -121,6 +123,27 @@ export const handler = async (
   }
 
   const { session, segment, segmentEnd } = buildSegmentRows(parsedKey, key, sidecar.data);
+
+  // Far-future guardrail (optimize-system-process-cycle Phase 8): a broken
+  // device clock must be loud, not silently absorbed. Permanent — the sidecar
+  // will say the same thing on every retry — so log and drop.
+  if (
+    segmentTooFarInFuture(
+      segment.startTs.getTime(),
+      Date.now(),
+      recordingConfig.mediaSegmentMaxFutureMs,
+    )
+  ) {
+    console.error('media-segment-ingest: segment start is implausibly far in the future, dropping', {
+      key,
+      deviceId,
+      sessionId,
+      startTs: segment.startTs.toISOString(),
+      maxFutureMs: recordingConfig.mediaSegmentMaxFutureMs,
+      timeSource: sidecar.data.timeSource ?? null,
+    });
+    return;
+  }
 
   // Monotonic time-source upgrade (optimize-system-process-cycle Phase 1, Q6):
   // a later segment whose sidecar reports a strictly better clock (unsynced <
