@@ -149,3 +149,28 @@ describe('timeSourceRank', () => {
     }
   });
 });
+
+describe('segmentTooFarInFuture (Phase 8 guardrail)', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = Date.UTC(2026, 6, 30, 12, 0, 0);
+
+  it('accepts sane, backlogged and mildly skewed segments', async () => {
+    const { segmentTooFarInFuture } = await import('../src/services/media-segments');
+    expect(segmentTooFarInFuture(NOW, NOW, DAY)).toBe(false);
+    expect(segmentTooFarInFuture(NOW - 30 * DAY, NOW, DAY)).toBe(false); // long backlog drain
+    expect(segmentTooFarInFuture(NOW + 5 * 60_000, NOW, DAY)).toBe(false); // ordinary skew
+    expect(segmentTooFarInFuture(NOW + DAY, NOW, DAY)).toBe(false); // boundary is inclusive
+  });
+
+  it('rejects a device whose clock is broken, not merely skewed', async () => {
+    const { segmentTooFarInFuture } = await import('../src/services/media-segments');
+    // The 2026-07-29 field case: an un-NITZ'd modem clock parsed as 2080.
+    expect(segmentTooFarInFuture(Date.UTC(2080, 0, 6), NOW, DAY)).toBe(true);
+    expect(segmentTooFarInFuture(NOW + DAY + 1, NOW, DAY)).toBe(true);
+  });
+
+  it('is disabled by a zero/negative window', async () => {
+    const { segmentTooFarInFuture } = await import('../src/services/media-segments');
+    expect(segmentTooFarInFuture(Date.UTC(2080, 0, 6), NOW, 0)).toBe(false);
+  });
+});

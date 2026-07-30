@@ -47,4 +47,20 @@ export const recordingConfig = {
    * mid-session sheds the "clock unsynced" badge. Default off.
    */
   mediaTimeSourceUpgrade: numEnv('MEDIA_TIME_SOURCE_UPGRADE', 0) !== 0,
+  /**
+   * Far-future guardrail for device media segments (optimize-system-process-
+   * cycle Phase 8). A device whose clock is catastrophically wrong — the
+   * 2026-07-29 field case stamped segments in the year 2080 after trusting an
+   * un-NITZ'd modem clock — used to have those segments absorbed silently:
+   * the rows exist, no query with a sane time window ever returns them, and
+   * nothing anywhere says so. Segments starting further than this into the
+   * future are DROPPED with an error log instead (permanent failure, no
+   * retry: the object's own timestamp can't improve). The telemetry batch
+   * path has had the equivalent window since its Phase 2 build
+   * (DEFAULT_MAX_FUTURE_MS); this closes the media half.
+   *
+   * Generous on purpose — legitimate skew is seconds, and the point is to
+   * catch garbage, not to police clocks. 0 disables the check.
+   */
+  mediaSegmentMaxFutureMs: numEnv('MEDIA_SEGMENT_MAX_FUTURE_MS', 24 * 60 * 60 * 1000),
 } as const;

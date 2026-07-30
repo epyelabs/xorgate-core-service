@@ -486,6 +486,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // (optimize-system-process-cycle Phase 1, Q6). Experiment flag, default
       // off; flip with `--context mediaTimeSourceUpgrade=1`.
       MEDIA_TIME_SOURCE_UPGRADE: recCtx("mediaTimeSourceUpgrade", "0"),
+      // Far-future media-segment guardrail (optimize-system-process-cycle
+      // Phase 8): drop segments stamped more than this far ahead of now
+      // instead of silently absorbing a device's broken clock. 0 = off.
+      MEDIA_SEGMENT_MAX_FUTURE_MS: recCtx(
+        "mediaSegmentMaxFutureMs",
+        String(24 * 60 * 60 * 1000),
+      ),
     };
 
     // onnxruntime-node (native, media targets only) is required lazily inside
