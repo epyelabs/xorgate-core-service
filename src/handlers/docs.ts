@@ -374,6 +374,24 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   'auto mode skips the defer when the negotiated supply budget (mA) is at or above ' +
                   'this. Default 5000 (a true 5 V/5 A PD supply).',
               },
+              gpsGate: {
+                type: 'string',
+                enum: ['auto', 'always', 'off'],
+                description:
+                  'GPS/LTE video gate: hold video (recording AND live) until the modem stops ' +
+                  'converting power into value — LTE connected with a GPS fix, a declared dead ' +
+                  'zone, a sustained no-signal sky, or gpsGateMaxSecs. auto (default) applies it ' +
+                  'only below bootDeferMinBudgetMa; always gates every boot; off disables it. ' +
+                  'Telemetry recording is never gated.',
+              },
+              gpsGateMaxSecs: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 3600,
+                description:
+                  'Give-up cap on the GPS/LTE gate in seconds. Default 600; 0 = no time cap ' +
+                  '(the other release conditions still apply).',
+              },
               spawnStaggerSecs: {
                 type: 'integer',
                 minimum: 0,

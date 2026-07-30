@@ -37,6 +37,10 @@ export const BOOT_DEFER_MODES = ['auto', 'always', 'off'] as const;
 export const BOOT_DEFER_MAX_SECS_MAX = 600; // recording is the product — never defer past 10 min
 export const BOOT_DEFER_MIN_BUDGET_MA_MAX = 10_000;
 export const SPAWN_STAGGER_SECS_MAX = 30;
+// GPS/LTE video gate (Phase 7 / Q8). Same arming enum as bootDefer; the cap is
+// tunable AND fully disableable (0 = no time cap), clamped to an hour so a typo
+// cannot park video for a whole drive.
+export const GPS_GATE_MAX_SECS_MAX = 3600;
 // Per-camera enables (Phase 6). Keys are KVS stream keys (kvs.json
 // `streamKey`, e.g. `cam0`) — device-specific, so the shape is validated
 // rather than a closed enum. The device applies the same key rule.
@@ -101,6 +105,12 @@ export const recordingConfigSchema = z
           .min(0)
           .max(BOOT_DEFER_MIN_BUDGET_MA_MAX)
           .optional(),
+        // GPS/LTE video gate (Phase 7): on a constrained budget, video —
+        // recording AND live — waits until the modem stops converting power
+        // into value (LTE up + GPS fix / dead zone / no-RF sky / the cap).
+        // `gpsGate` arms like bootDefer; `gpsGateMaxSecs` 0 = no time cap.
+        gpsGate: z.enum(BOOT_DEFER_MODES).optional(),
+        gpsGateMaxSecs: z.number().int().min(0).max(GPS_GATE_MAX_SECS_MAX).optional(),
         spawnStaggerSecs: z.number().int().min(0).max(SPAWN_STAGGER_SECS_MAX).optional(),
         // Per-camera capacity (Phase 6): `{"cam1": false}` turns that camera
         // off entirely (no capture, no bridge, no live master). An ABSENT key

@@ -146,6 +146,9 @@ export const devices = pgTable(
         bootDefer?: 'auto' | 'always' | 'off';
         bootDeferMaxSecs?: number;
         bootDeferMinBudgetMa?: number;
+        /** GPS/LTE video gate (Phase 7); `gpsGateMaxSecs` 0 = no time cap. */
+        gpsGate?: 'auto' | 'always' | 'off';
+        gpsGateMaxSecs?: number;
         spawnStaggerSecs?: number;
         /** Per-camera enables keyed by streamKey (Phase 6); an absent key = enabled. */
         cameras?: Record<string, boolean>;
