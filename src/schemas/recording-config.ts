@@ -37,6 +37,11 @@ export const BOOT_DEFER_MODES = ['auto', 'always', 'off'] as const;
 export const BOOT_DEFER_MAX_SECS_MAX = 600; // recording is the product — never defer past 10 min
 export const BOOT_DEFER_MIN_BUDGET_MA_MAX = 10_000;
 export const SPAWN_STAGGER_SECS_MAX = 30;
+// Per-camera enables (Phase 6). Keys are KVS stream keys (kvs.json
+// `streamKey`, e.g. `cam0`) — device-specific, so the shape is validated
+// rather than a closed enum. The device applies the same key rule.
+export const STREAM_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/;
+export const CAMERAS_MAX_KEYS = 16;
 // Runtime undervoltage load shedding (optimize-system-process-cycle plan,
 // Phase 3). Bounds match the device's clamps (device src/daemon/settings.ts).
 export const SHED_UV_SAMPLES_MIN = 1;
@@ -50,6 +55,8 @@ export const SHED_RAIL_LOW_SECS_MIN = 3;
 export const SHED_RAIL_LOW_SECS_MAX = 120;
 export const SHED_ESCALATE_DWELL_SECS_MIN = 5;
 export const SHED_ESCALATE_DWELL_SECS_MAX = 600;
+export const SHED_ESCALATE_DUTY_PCT_MIN = 50;
+export const SHED_ESCALATE_DUTY_PCT_MAX = 100;
 export const SHED_RESTORE_SECS_MIN = 10;
 export const SHED_RESTORE_SECS_MAX = 3600;
 export const SHED_MAX_SHEDS_PER_HOUR_MAX = 60;
@@ -95,6 +102,17 @@ export const recordingConfigSchema = z
           .max(BOOT_DEFER_MIN_BUDGET_MA_MAX)
           .optional(),
         spawnStaggerSecs: z.number().int().min(0).max(SPAWN_STAGGER_SECS_MAX).optional(),
+        // Per-camera capacity (Phase 6): `{"cam1": false}` turns that camera
+        // off entirely (no capture, no bridge, no live master). An ABSENT key
+        // means enabled, so `{}` is "every detected camera" — today's
+        // behavior. Camera count is an install-time choice (1 camera on a 3 A
+        // supply, 2 on 5 A), never something the shed ladder toggles.
+        cameras: z
+          .record(z.string().regex(STREAM_KEY_RE, 'must be a stream key'), z.boolean())
+          .refine((m) => Object.keys(m).length <= CAMERAS_MAX_KEYS, {
+            message: `at most ${CAMERAS_MAX_KEYS} cameras`,
+          })
+          .optional(),
       })
       .strict()
       .optional(),
@@ -127,6 +145,14 @@ export const recordingConfigSchema = z
           .int()
           .min(SHED_ESCALATE_DWELL_SECS_MIN)
           .max(SHED_ESCALATE_DWELL_SECS_MAX)
+          .optional(),
+        // Phase 6: escalate when the supply was bad for this % of the trailing
+        // dwell window. 100 = the old continuous-trigger rule.
+        escalateDutyPct: z
+          .number()
+          .int()
+          .min(SHED_ESCALATE_DUTY_PCT_MIN)
+          .max(SHED_ESCALATE_DUTY_PCT_MAX)
           .optional(),
         restoreSecs: z
           .number()

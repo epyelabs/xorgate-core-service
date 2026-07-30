@@ -382,6 +382,15 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   'Delay between camera encoder spawns in seconds (flattens the start-up power ' +
                   'transient). Default 4; 0 = simultaneous.',
               },
+              cameras: {
+                type: 'object',
+                additionalProperties: { type: 'boolean' },
+                description:
+                  'Per-camera enable keyed by stream key (e.g. {"cam1": false}). A disabled camera ' +
+                  'gets no pipeline at all — no recording, no shm bridge, no live stream. An absent ' +
+                  'key means enabled, so {} is every detected camera (the default). Use it to match ' +
+                  'camera count to the supply (one camera on a 3 A install, two on 5 A).',
+              },
             },
           },
           upload: {
@@ -454,8 +463,18 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 minimum: 5,
                 maximum: 600,
                 description:
-                  'Continued trigger this long at a shed rung escalates to the next rung ' +
+                  'Trailing window (seconds) evaluated for escalation to the next rung ' +
                   '(no-live → bridge-only). Default 60.',
+              },
+              escalateDutyPct: {
+                type: 'integer',
+                minimum: 50,
+                maximum: 100,
+                description:
+                  'Escalate when the supply was bad (shed trigger, or an individual undervoltage/' +
+                  'low-rail sample) for at least this percentage of the trailing escalateDwellSecs ' +
+                  'window. Default 70; 100 requires a continuously bad supply, which a noisy rail ' +
+                  'never provides.',
               },
               restoreSecs: {
                 type: 'integer',

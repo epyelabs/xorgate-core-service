@@ -33,6 +33,9 @@ export interface RecordingConfigMessage {
     bootDeferMaxSecs?: number;
     bootDeferMinBudgetMa?: number;
     spawnStaggerSecs?: number;
+    // Per-camera capacity (optimize-system-process-cycle plan, Phase 6);
+    // an absent key means enabled.
+    cameras?: Record<string, boolean>;
   };
   upload?: { mode?: 'auto' | 'off' };
   retention?: { maxBytes?: number; minFreeBytes?: number };
@@ -44,6 +47,7 @@ export interface RecordingConfigMessage {
     railLowVolts?: number;
     railLowSecs?: number;
     escalateDwellSecs?: number;
+    escalateDutyPct?: number;
     restoreSecs?: number;
     railRestoreVolts?: number;
     maxShedsPerHour?: number;
