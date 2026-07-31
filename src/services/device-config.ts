@@ -36,6 +36,7 @@ export interface RecordingConfigMessage {
     // stage 2 of the boot policy. gpsGateMaxSecs 0 = no time cap.
     gpsGate?: 'auto' | 'always' | 'off';
     gpsGateMaxSecs?: number;
+    gpsGateNoProgressSecs?: number;
     spawnStaggerSecs?: number;
     // Per-camera capacity (optimize-system-process-cycle plan, Phase 6);
     // an absent key means enabled.
