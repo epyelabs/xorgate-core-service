@@ -111,6 +111,15 @@ export const recordingConfigSchema = z
         // `gpsGate` arms like bootDefer; `gpsGateMaxSecs` 0 = no time cap.
         gpsGate: z.enum(BOOT_DEFER_MODES).optional(),
         gpsGateMaxSecs: z.number().int().min(0).max(GPS_GATE_MAX_SECS_MAX).optional(),
+        // No-progress escape hatch (Phase 10 iter 2): release the gate once
+        // NEITHER a GPS fix NOR an LTE connection has arrived for this long.
+        // 0 = off (cap-only behavior).
+        gpsGateNoProgressSecs: z
+          .number()
+          .int()
+          .min(0)
+          .max(GPS_GATE_MAX_SECS_MAX)
+          .optional(),
         spawnStaggerSecs: z.number().int().min(0).max(SPAWN_STAGGER_SECS_MAX).optional(),
         // Per-camera capacity (Phase 6): `{"cam1": false}` turns that camera
         // off entirely (no capture, no bridge, no live master). An ABSENT key

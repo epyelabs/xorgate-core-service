@@ -392,6 +392,17 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   'Give-up cap on the GPS/LTE gate in seconds. Default 600; 0 = no time cap ' +
                   '(the other release conditions still apply).',
               },
+              gpsGateNoProgressSecs: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 3600,
+                description:
+                  'No-progress escape hatch for the GPS/LTE gate, in seconds. Releases the gate ' +
+                  'once NEITHER a GPS fix NOR an LTE connection has arrived for this long — the ' +
+                  'underground-garage case, where every other release condition is blind. ' +
+                  'Cannot fire while LTE is connected (that is the genuinely-acquiring case). ' +
+                  'Default 120; 0 = off, leaving only gpsGateMaxSecs.',
+              },
               spawnStaggerSecs: {
                 type: 'integer',
                 minimum: 0,
