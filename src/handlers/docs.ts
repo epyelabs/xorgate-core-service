@@ -571,6 +571,48 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           totalDurationMs: { type: 'integer', description: 'Rollup (list endpoint only).' },
         },
       },
+      RecordingRun: {
+        type: 'object',
+        required: ['key', 'fromTs', 'toTs', 'streamKeys', 'sessionCount', 'sessions'],
+        description:
+          'One drive, as a human means it: the media sessions whose intervals are within 60 s of each ' +
+          'other, clustered server-side. A session that is still open has no endedAt, so its interval ' +
+          'end is estimated as startedAt + the duration uploaded so far — which means an open run\'s ' +
+          'toTs grows as its backlog drains.',
+        properties: {
+          key: {
+            type: 'string',
+            format: 'uuid',
+            description:
+              'The earliest member session\'s id — a stable identity across polls. (There is no run row ' +
+              'in the database and no device-side run id.)',
+          },
+          fromTs: {
+            type: 'string',
+            format: 'date-time',
+            description: 'Earliest member startedAt. With toTs, the run\'s composite-replay window.',
+          },
+          toTs: { type: 'string', format: 'date-time', description: 'Latest member interval end.' },
+          streamKeys: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Every camera that recorded in this run, sorted.',
+          },
+          sessionCount: { type: 'integer' },
+          segmentCount: { type: 'integer', description: 'Summed over the members.' },
+          totalBytes: { type: 'integer', description: 'Summed over the members.' },
+          anyOpen: { type: 'boolean', description: 'Some member may still be receiving segments.' },
+          anyUnsynced: {
+            type: 'boolean',
+            description: 'Some member recorded with an unsynchronized device clock.',
+          },
+          sessions: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/MediaSession' },
+            description: 'The members, ordered by startedAt then streamKey.',
+          },
+        },
+      },
       MediaSegment: {
         type: 'object',
         required: ['id', 'deviceId', 'sessionId', 'streamKey', 's3Key', 'seq', 'startTs', 'durationMs'],
@@ -1819,9 +1861,23 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           'Sessions recorded on the device itself (offline recording plan) and uploaded segment-by-segment ' +
           'to S3. Filterable by streamKey, status (open|closed) and ' +
           'from/to; the time filter matches sessions OVERLAPPING [from, to), not just those started inside ' +
-          'it. Each row carries computed rollups (segmentCount, totalBytes, totalDurationMs).',
+          'it. Each row carries computed rollups (segmentCount, totalBytes, totalDurationMs). ' +
+          'Pass group=runs to paginate RECORDING RUNS instead of sessions: one drive with N cameras is ' +
+          'N sessions, and a run is the set of sessions whose intervals are within 60 s of each other. ' +
+          'Under group=runs the response returns `runs` instead of `sessions` (members nested), ' +
+          '`page.total` counts runs, and every filter selects which RUNS to return rather than which ' +
+          'sessions to cluster — so streamKey=cam0 returns the runs cam0 recorded in, with all of their ' +
+          'cameras present, and a from/to range returns overlapping runs whole rather than clipped.',
         tags: ['Media Sessions'],
         parameters: [
+          {
+            name: 'group',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['runs'] },
+            description:
+              'Group and paginate by recording run. Requires sort=startedAt (a run has no createdAt).',
+          },
           {
             name: 'streamKey',
             in: 'query',
@@ -1849,14 +1905,25 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         ],
         responses: {
           '200': {
-            description: 'Sessions with per-session rollups, newest first by default.',
+            description:
+              'Sessions with per-session rollups, newest first by default — or, with group=runs, ' +
+              'recording runs with their member sessions nested. `page.total` counts whichever noun ' +
+              'was returned.',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['sessions'],
                   properties: {
-                    sessions: { type: 'array', items: { $ref: '#/components/schemas/MediaSession' } },
+                    sessions: {
+                      type: 'array',
+                      items: { $ref: '#/components/schemas/MediaSession' },
+                      description: 'Present unless group=runs.',
+                    },
+                    runs: {
+                      type: 'array',
+                      description: 'Present only with group=runs.',
+                      items: { $ref: '#/components/schemas/RecordingRun' },
+                    },
                     page: {
                       type: 'object',
                       properties: {

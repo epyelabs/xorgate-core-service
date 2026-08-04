@@ -1,0 +1,1 @@
+CREATE INDEX "media_segments_session_idx" ON "media_segments" USING btree ("session_id");
