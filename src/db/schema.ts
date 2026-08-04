@@ -402,6 +402,11 @@ export const mediaSegments = pgTable(
   (t) => [
     index('media_segments_device_stream_start_idx').on(t.deviceId, t.streamKey, t.startTs),
     uniqueIndex('media_segments_s3key_idx').on(t.s3Key),
+    // The per-session rollups (`GET /devices/{id}/sessions`, and the run
+    // clustering's `agg` CTE) group by session_id, and the segments listing
+    // filters on it. Irrelevant at today's ~2 300 rows, cheap insurance before
+    // it grows.
+    index('media_segments_session_idx').on(t.sessionId),
   ],
 );
 

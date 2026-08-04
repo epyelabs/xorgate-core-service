@@ -169,6 +169,13 @@
       "when": 1785358197702,
       "tag": "0023_grey_the_hood",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785851259476,
+      "tag": "0024_unique_starbolt",
+      "breakpoints": true
     }
   ]
 }

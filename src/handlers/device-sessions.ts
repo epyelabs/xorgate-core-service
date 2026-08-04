@@ -5,10 +5,17 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, conflict, methodNotAllowed, notFound, ok } from '../utils/responses';
-import { pageMeta, parseListParams } from '../utils/list-params';
+import { pageMeta, parseListParams, type ListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { closeStaleMediaSessions } from '../services/media-sessions';
 import { buildSessionTimeline } from '../services/replay-manifest';
+import {
+  foldRunRows,
+  runCountQuery,
+  runPageQuery,
+  type RunFilters,
+  type RunPageRow,
+} from '../services/session-runs';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -39,6 +46,9 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
  * Phase 4 — the index Composite Replays will consume). Routes (all → this
  * Lambda; rows are populated by media-segment-ingest):
  *   GET    /devices/{id}/sessions                                  list + per-session rollups
+ *   GET    /devices/{id}/sessions?group=runs                       the same list paginated by
+ *            RECORDING RUN (time-clustered sessions), members nested — Phase 3
+ *            of improve-recording-history-fetching; services/session-runs.ts
  *   GET    /devices/{id}/sessions/{sessionId}/segments             ordered segment index
  *   GET    /devices/{id}/sessions/{sessionId}/segments/{seq}/playback  presigned GET
  *   GET    /devices/{id}/replay-manifest?sessionId=… | ?from&to[&streamKey]
@@ -121,6 +131,25 @@ export const handler = async (
       const sortCol =
         sortBy === 'createdAt' ? schema.mediaSessions.createdAt : schema.mediaSessions.startedAt;
 
+      // ?group=runs — paginate RECORDING RUNS instead of sessions (Phase 3).
+      // The card renders runs, so the API has to page runs or the page sizes
+      // come out uneven and boundary-straddling runs render twice. Opt-in on
+      // the existing route rather than a new one: it reuses requireOrgContext,
+      // the ownership check above, close-on-read, and parseListParams.
+      const group = event.queryStringParameters?.group;
+      if (group !== undefined && group !== '' && group !== 'runs') {
+        return badRequest('"group" must be "runs"');
+      }
+      if (group === 'runs') {
+        // A run has no created_at of its own — its members were received over
+        // whatever span the uploads took — so sorting runs by it is meaningless.
+        // Reject rather than silently ignore the caller's sort.
+        if (sortBy !== 'startedAt') {
+          return badRequest('"sort" must be "startedAt" when "group" is "runs"');
+        }
+        return listRuns(deviceId, parsed, { streamKey, status, from, to });
+      }
+
       // Time-range semantics: sessions that OVERLAP [from, to) — a session
       // spans a window, so filtering started_at alone would drop long sessions
       // that started before `from` but were still recording inside it.
@@ -147,30 +176,7 @@ export const handler = async (
         offset,
       });
 
-      // Per-session rollups for the page (computed, not stored — can't drift).
-      const ids = rows.map((r) => r.id);
-      const rollups = ids.length
-        ? await db
-            .select({
-              sessionId: schema.mediaSegments.sessionId,
-              segmentCount: sql<number>`count(*)::int`,
-              totalBytes: sql<number>`coalesce(sum(${schema.mediaSegments.sizeBytes}), 0)::bigint`,
-              totalDurationMs: sql<number>`coalesce(sum(${schema.mediaSegments.durationMs}), 0)::bigint`,
-            })
-            .from(schema.mediaSegments)
-            .where(inArray(schema.mediaSegments.sessionId, ids))
-            .groupBy(schema.mediaSegments.sessionId)
-        : [];
-      const bySession = new Map(rollups.map((r) => [r.sessionId, r]));
-      const sessions = rows.map((r) => {
-        const agg = bySession.get(r.id);
-        return {
-          ...r,
-          segmentCount: Number(agg?.segmentCount ?? 0),
-          totalBytes: Number(agg?.totalBytes ?? 0),
-          totalDurationMs: Number(agg?.totalDurationMs ?? 0),
-        };
-      });
+      const sessions = await withRollups(rows);
       return ok({ sessions, page: pageMeta(parsed, total) });
     }
 
@@ -258,6 +264,85 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, DELETE');
   }
 };
+
+/**
+ * Attach the per-session rollups (computed, not stored — so they can't drift
+ * from the segment rows) that the list endpoint's consumers depend on. Shared
+ * by both the session and the run branch so a run's members are byte-identical
+ * in shape to an ungrouped listing.
+ */
+async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
+  const ids = rows.map((r) => r.id);
+  const rollups = ids.length
+    ? await db
+        .select({
+          sessionId: schema.mediaSegments.sessionId,
+          segmentCount: sql<number>`count(*)::int`,
+          totalBytes: sql<number>`coalesce(sum(${schema.mediaSegments.sizeBytes}), 0)::bigint`,
+          totalDurationMs: sql<number>`coalesce(sum(${schema.mediaSegments.durationMs}), 0)::bigint`,
+        })
+        .from(schema.mediaSegments)
+        .where(inArray(schema.mediaSegments.sessionId, ids))
+        .groupBy(schema.mediaSegments.sessionId)
+    : [];
+  const bySession = new Map(rollups.map((r) => [r.sessionId, r]));
+  return rows.map((r) => {
+    const agg = bySession.get(r.id);
+    return {
+      ...r,
+      segmentCount: Number(agg?.segmentCount ?? 0),
+      totalBytes: Number(agg?.totalBytes ?? 0),
+      // The Data API returns bigint aggregates as strings on some paths — keep
+      // coercing, the frontend schema expects numbers.
+      totalDurationMs: Number(agg?.totalDurationMs ?? 0),
+    };
+  });
+}
+
+/**
+ * GET /devices/{id}/sessions?group=runs — the run-paginated listing.
+ *
+ * Three statements, in this order, all scoped to one device (services/
+ * session-runs.ts owns the clustering SQL and the equivalence proof):
+ *
+ *   1. count the matching RUNS → `page.total` (the footer counts runs now)
+ *   2. rank the runs and return the page's sessions, each tagged with its run
+ *   3. load those sessions in full + their rollups, then fold
+ *
+ * Step 3 goes through the same `findMany` + `withRollups` path the ungrouped
+ * branch uses, so `runs[].sessions[]` are exactly the objects a caller already
+ * knows how to read. The fold is deserialization, not clustering: step 2's rows
+ * arrive pre-assigned to runs, ordered, and contiguous.
+ */
+async function listRuns(
+  deviceId: string,
+  parsed: ListParams,
+  filters: RunFilters,
+): Promise<APIGatewayProxyResultV2> {
+  const { limit, offset, order } = parsed;
+
+  const totalRows = await db.execute<{ total: number } & Record<string, unknown>>(
+    runCountQuery(deviceId, filters),
+  );
+  const total = Number(totalRows.rows[0]?.total ?? 0);
+
+  const pageRows = await db.execute<RunPageRow>(
+    runPageQuery(deviceId, filters, { limit, offset, order }),
+  );
+  const rows = pageRows.rows ?? [];
+  if (rows.length === 0) return ok({ runs: [], page: pageMeta(parsed, total) });
+
+  const sessionRows = await db.query.mediaSessions.findMany({
+    where: inArray(
+      schema.mediaSessions.id,
+      rows.map((r) => r.session_id),
+    ),
+  });
+  const sessions = await withRollups(sessionRows);
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+
+  return ok({ runs: foldRunRows(rows, byId), page: pageMeta(parsed, total) });
+}
 
 /**
  * GET /devices/{id}/replay-manifest — everything the replay page needs to
