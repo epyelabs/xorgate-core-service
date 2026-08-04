@@ -55,6 +55,21 @@ const disableScheduledJobs =
       ? true
       : stage === 'dev';
 
+// Telemetry retention (improve-recording-history-fetching plan, phase 4).
+// SHIPS DORMANT AND STAYS DORMANT until someone opts in on the command line:
+//   npm run deploy:dev -- --context telemetryRetention=on
+//   [--context telemetryRetentionDays=180]
+// Deliberately NOT folded into scheduledJobs: dev wants the monthly maintenance
+// schedule on so future month partitions exist, and that must never imply
+// "start deleting history". There is no environment in which this defaults on;
+// the 90-day fallback window is a placeholder pending real production data
+// (plan Q4), and src/services/telemetry-partitions.ts refuses windows under 31
+// days and caps drops per run regardless.
+const telemetryRetention = app.node.tryGetContext('telemetryRetention') === 'on';
+const retentionDaysCtx = Number(app.node.tryGetContext('telemetryRetentionDays'));
+const telemetryRetentionDays =
+  Number.isFinite(retentionDaysCtx) && retentionDaysCtx > 0 ? retentionDaysCtx : undefined;
+
 if (stage === 'prod') {
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStack', { env, stage });
 
@@ -82,6 +97,8 @@ if (stage === 'prod') {
   new XorgateCoreApiStack(app, 'XorgateCoreApiStack', {
     env,
     stage,
+    telemetryRetention,
+    telemetryRetentionDays,
     vpc: storageStack.vpc,
     bucket: storageStack.bucket,
     distBucket: storageStack.distBucket,
@@ -123,6 +140,8 @@ if (stage === 'prod') {
     env,
     stage,
     disableScheduledJobs,
+    telemetryRetention,
+    telemetryRetentionDays,
     bucket: storageStack.bucket,
     distBucket: storageStack.distBucket,
     dbClusterArn: cdk.Fn.importValue('EpyeSandboxClusterArn'),
