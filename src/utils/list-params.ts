@@ -52,6 +52,19 @@ export interface PageMeta {
   offset: number;
   order: Order;
   total: number;
+  // Set when `total` is a cap rather than the true match count, i.e. more rows
+  // match than the endpoint will let you page to. Only
+  // `GET /devices/{id}/telemetry/readings` populates these three: it is the one
+  // list endpoint whose table is large enough that an exact count times out
+  // (see services/telemetry-readings.ts). Every other parseListParams consumer
+  // counts ≤ 3 000 rows and must keep its exact total — do not add the cap to
+  // them.
+  totalIsCapped?: boolean;
+  // ISO-8601 bounds of the addressable slice: the oldest and newest sample the
+  // caller can actually page to under this filter. Present whether or not the
+  // total is capped; absent when nothing matches.
+  coveredFrom?: string;
+  coveredTo?: string;
 }
 
 export function pageMeta(params: ListParams, total: number): PageMeta {

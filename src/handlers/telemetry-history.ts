@@ -3,6 +3,12 @@ import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
+import {
+  boundedTotalQuery,
+  capTotal,
+  READINGS_TOTAL_CAP,
+  type BoundedTotalRow,
+} from '../services/telemetry-readings';
 import { tsParam } from '../utils/sql';
 
 /**
@@ -17,8 +23,13 @@ import { tsParam } from '../utils/sql';
  * rows paginated over DISTINCT timestamps (one sample = one display row), so a
  * page boundary never splits a sample's metrics across two pages. It accepts
  * `limit`/`offset` (in timestamps), `order` (asc|desc by ts), and optional
- * `from`/`to`/`metric` filters, and returns a `page` block with the total
- * distinct-timestamp count for proper pagination.
+ * `from`/`to`/`metric` filters, and returns a `page` block with the
+ * distinct-timestamp count for pagination.
+ *
+ * ⚠ That count is BOUNDED at READINGS_TOTAL_CAP, and offsets past the cap
+ * short-circuit to an empty page — an exact total over this table's volume
+ * costs > 45 s and used to return 500. See services/telemetry-readings.ts for
+ * the measurements, the rejected alternatives, and what `total` now means.
  *
  * The /recent variant orders by ts DESC and returns the newest `limit` rows
  * (chronological in the response), so callers see the latest samples regardless
@@ -313,12 +324,37 @@ async function handleReadings(
   );
   const orderTs = order === 'asc' ? asc(t.ts) : desc(t.ts);
 
-  // Total distinct timestamps matching the filter (drives page count).
-  const totalRows = await db
-    .select({ total: sql<number>`count(distinct ${t.ts})::int` })
-    .from(t)
-    .where(where);
-  const total = Number(totalRows[0]?.total ?? 0);
+  // Distinct timestamps matching the filter, counted only up to the cap, plus
+  // the span they cover. `where`/`orderTs` are passed by reference so the count
+  // and the page query can never diverge.
+  const bounded = await db.execute<BoundedTotalRow>(boundedTotalQuery(where, order));
+  const boundedRow = bounded.rows[0];
+  const { total, totalIsCapped } = capTotal(Number(boundedRow?.total ?? 0));
+  const page = {
+    limit,
+    offset,
+    order,
+    total,
+    totalIsCapped,
+    ...(boundedRow?.covered_from ? { coveredFrom: boundedRow.covered_from } : {}),
+    ...(boundedRow?.covered_to ? { coveredTo: boundedRow.covered_to } : {}),
+  };
+
+  // Deep offsets are the second way this endpoint dies: offset 20 000 costs
+  // 273 ms but offset 100 000 exceeds 45 s, because the planner flips from
+  // Unique-over-index to a seq scan with a disk sort. Nothing past the cap is
+  // addressable anyway, so a stale bookmark short-circuits to an empty page
+  // rather than asking the DB. 200, not 400 — it should render an empty table,
+  // not an error toast.
+  if (offset >= READINGS_TOTAL_CAP) {
+    return ok({ readings: [], page });
+  }
+
+  // Never let a page reach past the addressable window. `total` says only
+  // READINGS_TOTAL_CAP timestamps exist and coveredFrom/coveredTo describe
+  // exactly that slice, so an overrunning page would both show rows the pager
+  // claims are not there and falsify the covered span.
+  const pageLimit = Math.min(limit, READINGS_TOTAL_CAP - offset);
 
   // The page's distinct timestamps.
   const tsRows = await db
@@ -326,11 +362,11 @@ async function handleReadings(
     .from(t)
     .where(where)
     .orderBy(orderTs)
-    .limit(limit)
+    .limit(pageLimit)
     .offset(offset);
 
   if (tsRows.length === 0) {
-    return ok({ readings: [], page: { limit, offset, order, total } });
+    return ok({ readings: [], page });
   }
 
   const epochs = tsRows.map((r) => r.ts.getTime());
@@ -355,7 +391,7 @@ async function handleReadings(
     value: r.value,
     unit: r.unit,
   }));
-  return ok({ readings, page: { limit, offset, order, total } });
+  return ok({ readings, page });
 }
 
 export const handler = async (
