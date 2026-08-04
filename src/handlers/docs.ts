@@ -2140,7 +2140,11 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           'Returns raw (un-averaged) telemetry_readings rows for one page, paginated over DISTINCT ' +
           'timestamps so a page boundary never splits a sample. Defaults to the latest samples ' +
           '(`order=desc`) with no time window. `limit`/`offset` count timestamps (samples), not rows. ' +
-          'The `page.total` field is the total distinct-timestamp count matching the filter.',
+          '`page.total` is the distinct-timestamp count, **bounded at 10,000**: when more samples ' +
+          'match, `page.totalIsCapped` is `true` and only the first 10,000 in the requested `order` ' +
+          'are addressable (newest first by default). `page.coveredFrom`/`coveredTo` give the ISO ' +
+          'span of that addressable slice. Narrow `from`/`to` to reach beyond it; an `offset` past ' +
+          'the cap returns an empty page, not an error.',
         tags: ['Devices'],
         parameters: [
           {
@@ -2198,12 +2202,31 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                     readings: { type: 'array', items: { $ref: '#/components/schemas/TelemetryReading' } },
                     page: {
                       type: 'object',
-                      required: ['limit', 'offset', 'order', 'total'],
+                      required: ['limit', 'offset', 'order', 'total', 'totalIsCapped'],
                       properties: {
                         limit: { type: 'integer' },
                         offset: { type: 'integer' },
                         order: { type: 'string', enum: ['asc', 'desc'] },
-                        total: { type: 'integer', description: 'Total distinct timestamps matching the filter.' },
+                        total: {
+                          type: 'integer',
+                          description:
+                            'Addressable distinct timestamps under this filter, capped at 10,000. ' +
+                            'Exact when totalIsCapped is false.',
+                        },
+                        totalIsCapped: {
+                          type: 'boolean',
+                          description: 'True when more samples match than `total` reports.',
+                        },
+                        coveredFrom: {
+                          type: 'string',
+                          format: 'date-time',
+                          description: 'Oldest addressable sample under this filter. Absent when nothing matches.',
+                        },
+                        coveredTo: {
+                          type: 'string',
+                          format: 'date-time',
+                          description: 'Newest addressable sample under this filter. Absent when nothing matches.',
+                        },
                       },
                     },
                   },

@@ -727,7 +727,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
       // Range queries scan monthly partitions; give them more headroom than the default.
       memorySize: 256,
-      timeout: cdk.Duration.seconds(15),
+      // Backstop only — every query here is index-bounded and returns in well
+      // under a second. 25 s is chosen against the RDS Data API's own ~45 s
+      // cancellation: a request that outlives 25 s is a query bug, not a
+      // capacity problem, and should surface as a Lambda timeout rather than be
+      // masked by a longer budget. (Was 15 s, which the old unbounded
+      // count(distinct ts) on /telemetry/readings blew through as a 500.)
+      timeout: cdk.Duration.seconds(25),
     });
 
     // SNS topic for operational alarms (kvs-webrtc-lts §13 T3). Alarms that fire on a
