@@ -837,6 +837,70 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           unit: { type: 'string', nullable: true, example: 'm/s^2' },
         },
       },
+      TelemetryTableColumn: {
+        type: 'object',
+        required: ['key', 'unit'],
+        description:
+          'One column of the history table. The array order IS the column order, and every ' +
+          'row\'s `v` array is positional against it.',
+        properties: {
+          key: { type: 'string', example: 'imu.accel_x' },
+          unit: {
+            type: 'string',
+            nullable: true,
+            example: 'm/s^2',
+            description:
+              'Taken from device_latest, so it is stable across pages rather than scraped from ' +
+              'whatever this page happened to contain. Null when the metric has no known unit.',
+          },
+        },
+      },
+      TelemetryTableRow: {
+        type: 'object',
+        required: ['ts', 'v'],
+        description:
+          'One sample: a timestamp and its values. `v` is POSITIONAL against `columns` and its ' +
+          'length always equals `columns.length` — trailing nulls are never trimmed.',
+        properties: {
+          ts: { type: 'string', format: 'date-time' },
+          v: {
+            type: 'array',
+            items: { type: 'number', nullable: true },
+            description: 'null means no reading for that column at this timestamp.',
+            example: [0.12, null, 47.3],
+          },
+        },
+      },
+      TelemetryReadingsPage: {
+        type: 'object',
+        required: ['limit', 'offset', 'order', 'total', 'totalIsCapped'],
+        description: 'Pagination block. `limit`/`offset` count timestamps (samples), not rows.',
+        properties: {
+          limit: { type: 'integer', description: 'The REQUESTED page size, even if the page was trimmed to the addressable window.' },
+          offset: { type: 'integer' },
+          order: { type: 'string', enum: ['asc', 'desc'] },
+          total: {
+            type: 'integer',
+            description:
+              'Addressable distinct timestamps under this filter, capped at 10,000. ' +
+              'Exact when totalIsCapped is false.',
+          },
+          totalIsCapped: {
+            type: 'boolean',
+            description: 'True when more samples match than `total` reports.',
+          },
+          coveredFrom: {
+            type: 'string',
+            format: 'date-time',
+            description: 'Oldest addressable sample under this filter. Absent when nothing matches.',
+          },
+          coveredTo: {
+            type: 'string',
+            format: 'date-time',
+            description: 'Newest addressable sample under this filter. Absent when nothing matches.',
+          },
+        },
+      },
       DeviceLatest: {
         type: 'object',
         required: ['ts', 'metric'],
@@ -2202,11 +2266,17 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
       get: {
         operationId: 'getDeviceTelemetryReadings',
-        summary: 'Paginated raw telemetry readings for the history table',
+        summary: 'One page of the telemetry history table',
         description:
-          'Returns raw (un-averaged) telemetry_readings rows for one page, paginated over DISTINCT ' +
+          'Returns raw (un-averaged) stored samples for one page, paginated over DISTINCT ' +
           'timestamps so a page boundary never splits a sample. Defaults to the latest samples ' +
-          '(`order=desc`) with no time window. `limit`/`offset` count timestamps (samples), not rows. ' +
+          '(`order=desc`) with no time window. `limit`/`offset` count timestamps (samples), not rows.\n\n' +
+          '**Two response shapes, selected by `shape`.** `shape=table` (the DEFAULT) returns the ' +
+          'table being displayed: an ordered `columns` list with stable units, and one `rows` entry ' +
+          'per timestamp whose `v` array is positional against `columns`. `shape=flat` returns the ' +
+          'original `readings: [{ts, metric, value, unit}]` rows — the same raw-rows contract as ' +
+          '`/telemetry` and `/telemetry/recent`. The table shape is roughly 10x smaller on the wire ' +
+          '(this API does not compress) and its column set does not vary with the page contents.\n\n' +
           '`page.total` is the distinct-timestamp count, **bounded at 10,000**: when more samples ' +
           'match, `page.totalIsCapped` is `true` and only the first 10,000 in the requested `order` ' +
           'are addressable (newest first by default). `page.coveredFrom`/`coveredTo` give the ISO ' +
@@ -2254,49 +2324,69 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             in: 'query',
             required: false,
             schema: { type: 'string' },
-            description: 'Comma-separated metric filter (max 20), e.g. `imu.accel_x,gps.lat`.',
+            description:
+              'Comma-separated metric filter (max 20), e.g. `imu.accel_x,gps.lat`. Under ' +
+              '`shape=table` this also fixes the column set (the columns and the filter are one ' +
+              'value). Omit it and the columns are derived from the device model\'s capabilities.',
+          },
+          {
+            name: 'shape',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['table', 'flat'], default: 'table' },
+            description:
+              'Response shape. `table` (default) returns `columns` + positional `rows`; `flat` ' +
+              'returns the raw `readings` rows.',
           },
         ],
         responses: {
           '200': {
-            description: 'One page of raw readings, ordered by ts then metric.',
+            description:
+              'One page of the history table (`shape=table`), or of raw readings ordered by ts ' +
+              'then metric (`shape=flat`).',
             content: {
               'application/json': {
                 schema: {
-                  type: 'object',
-                  required: ['readings', 'page'],
-                  properties: {
-                    readings: { type: 'array', items: { $ref: '#/components/schemas/TelemetryReading' } },
-                    page: {
+                  oneOf: [
+                    {
+                      title: 'Table shape (default)',
                       type: 'object',
-                      required: ['limit', 'offset', 'order', 'total', 'totalIsCapped'],
+                      required: ['columns', 'rows', 'columnSource', 'page'],
                       properties: {
-                        limit: { type: 'integer' },
-                        offset: { type: 'integer' },
-                        order: { type: 'string', enum: ['asc', 'desc'] },
-                        total: {
-                          type: 'integer',
+                        columns: {
+                          type: 'array',
+                          items: { $ref: '#/components/schemas/TelemetryTableColumn' },
+                        },
+                        rows: {
+                          type: 'array',
+                          items: { $ref: '#/components/schemas/TelemetryTableRow' },
+                        },
+                        columnSource: {
+                          type: 'string',
+                          enum: ['request', 'model', 'data'],
                           description:
-                            'Addressable distinct timestamps under this filter, capped at 10,000. ' +
-                            'Exact when totalIsCapped is false.',
+                            'Where the column set came from. `request` — your `metric` filter. ' +
+                            '`model` — the device model\'s io_capabilities. `data` — the model ' +
+                            'declares nothing usable, so columns were discovered from this page\'s ' +
+                            'rows and may vary between pages. `data` with an empty `columns` means ' +
+                            'the model declares nothing AND this page has no data.',
                         },
-                        totalIsCapped: {
-                          type: 'boolean',
-                          description: 'True when more samples match than `total` reports.',
-                        },
-                        coveredFrom: {
-                          type: 'string',
-                          format: 'date-time',
-                          description: 'Oldest addressable sample under this filter. Absent when nothing matches.',
-                        },
-                        coveredTo: {
-                          type: 'string',
-                          format: 'date-time',
-                          description: 'Newest addressable sample under this filter. Absent when nothing matches.',
-                        },
+                        page: { $ref: '#/components/schemas/TelemetryReadingsPage' },
                       },
                     },
-                  },
+                    {
+                      title: 'Flat shape (shape=flat)',
+                      type: 'object',
+                      required: ['readings', 'page'],
+                      properties: {
+                        readings: {
+                          type: 'array',
+                          items: { $ref: '#/components/schemas/TelemetryReading' },
+                        },
+                        page: { $ref: '#/components/schemas/TelemetryReadingsPage' },
+                      },
+                    },
+                  ],
                 },
               },
             },
