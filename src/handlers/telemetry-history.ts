@@ -9,6 +9,11 @@ import {
   READINGS_TOTAL_CAP,
   type BoundedTotalRow,
 } from '../services/telemetry-readings';
+import {
+  historyColumnKeys,
+  orderColumnsByModel,
+  pivotRows,
+} from '../services/telemetry-columns';
 import { tsParam } from '../utils/sql';
 
 /**
@@ -30,6 +35,32 @@ import { tsParam } from '../utils/sql';
  * short-circuit to an empty page — an exact total over this table's volume
  * costs > 45 s and used to return 500. See services/telemetry-readings.ts for
  * the measurements, the rejected alternatives, and what `total` now means.
+ *
+ * /readings serves TWO response shapes, selected by `?shape=`:
+ *
+ * - **`table` (the DEFAULT)** — the table being displayed: an ordered `columns`
+ *   list with authoritative units, and one `rows` entry per timestamp whose `v`
+ *   is POSITIONAL against `columns`. The server derives the column set from the
+ *   device model's io_capabilities, so it no longer depends on what one page
+ *   happened to contain.
+ * - **`flat`** — the original `readings: [{ts, metric, value, unit}]` rows, the
+ *   generic raw-rows contract shared with /telemetry and /telemetry/recent.
+ *
+ * The flat shape is unchanged and still available; it is no longer the default
+ * (product decision, 2026-08-04). Three defects motivated the table shape, and
+ * all three are properties of the flat shape rather than bugs in the client:
+ *
+ * 1. **Payload.** ~89 % of a flat page is the strings "ts"/"metric"/"value"/
+ *    "unit" and a re-serialised ISO timestamp repeated once per reading, and
+ *    this API does not gzip (HTTP APIs have no compression setting). Measured
+ *    141 814 B for a 100-timestamp page against 14 998 B pivoted.
+ * 2. **Round-trips.** The column set used to be derived client-side from the
+ *    device model, so the table needed getDevice → getDeviceModel → readings
+ *    before rendering a single row. The join here costs one indexed PK lookup
+ *    on a query the ownership check already had to run.
+ * 3. **Stability.** Units were scraped from whatever the page contained, so a
+ *    metric that was all-null on one page lost its unit and the header changed
+ *    as you paged. Units now come from device_latest.
  *
  * The /recent variant orders by ts DESC and returns the newest `limit` rows
  * (chronological in the response), so callers see the latest samples regardless
@@ -254,17 +285,54 @@ async function handleRecent(
   return ok({ readings, bucketSeconds: null, truncated });
 }
 
-// GET /devices/{id}/telemetry/readings — raw rows for one page of the history
-// table, paginated over DISTINCT timestamps. We first pull the page's distinct
+/**
+ * Authoritative units for the table shape's column headers.
+ *
+ * device_latest holds one row per (device, metric) — at most ~42 for a device —
+ * behind a unique index, so this is a point lookup, not a scan of the history
+ * table. Sourcing units here rather than from the page's rows is what stops the
+ * header changing as you page: a metric that is all-null on the current page
+ * keeps its unit.
+ */
+async function latestUnits(deviceId: string, metrics: string[]): Promise<Map<string, string>> {
+  const units = new Map<string, string>();
+  if (metrics.length === 0) return units;
+  const rows = await db
+    .select({ metric: schema.deviceLatest.metric, unit: schema.deviceLatest.unit })
+    .from(schema.deviceLatest)
+    .where(
+      and(
+        eq(schema.deviceLatest.deviceId, deviceId),
+        inArray(schema.deviceLatest.metric, metrics),
+      ),
+    );
+  for (const r of rows) if (r.unit) units.set(r.metric, r.unit);
+  return units;
+}
+
+// GET /devices/{id}/telemetry/readings — one page of the history table,
+// paginated over DISTINCT timestamps. We first pull the page's distinct
 // timestamps (ordered, limit/offset), then fetch every row within that page's
 // [minTs, maxTs] window: because the page is a contiguous ordered slice of the
 // distinct-ts set, no other matching timestamp falls between its bounds, so this
 // returns exactly the page's samples without splitting one across pages.
+//
+// `?shape=table` (default) returns columns + positional rows; `?shape=flat`
+// returns the original raw rows. See the header comment.
 async function handleReadings(
   deviceId: string,
   event: APIGatewayProxyEventV2,
+  ioCapabilities: unknown,
 ): Promise<APIGatewayProxyResultV2> {
   const qs = event.queryStringParameters ?? {};
+
+  let shape: 'table' | 'flat' = 'table';
+  if (qs.shape !== undefined) {
+    if (qs.shape !== 'table' && qs.shape !== 'flat') {
+      return badRequest('"shape" must be "table" or "flat"');
+    }
+    shape = qs.shape;
+  }
 
   let limit = READINGS_DEFAULT_LIMIT;
   if (qs.limit !== undefined) {
@@ -314,6 +382,43 @@ async function handleReadings(
     return badRequest('"from" must be earlier than "to"');
   }
 
+  // ⚠ Column/filter coupling. For the table shape the displayed columns and the
+  // `metric=` filter applied to the query are ONE value, resolved here and used
+  // for both. If they ever diverge the table renders columns that can never have
+  // data, or silently drops data it already paid to fetch.
+  //
+  //   request — the caller named metrics explicitly; we honour them and only
+  //             order them the way the model would present them
+  //   model   — derived from the device model's io_capabilities (the UI default)
+  //   data    — the model declares nothing usable, so columns are discovered
+  //             from the page's own rows. Reported so a client can tell this
+  //             apart from "there is no data".
+  let columnSource: 'request' | 'model' | 'data' = 'data';
+  let columns: string[] = [];
+  if (shape === 'table') {
+    if (metrics) {
+      columns = orderColumnsByModel(metrics, ioCapabilities);
+      metrics = columns;
+      columnSource = 'request';
+    } else {
+      const derived = historyColumnKeys(ioCapabilities);
+      if (derived.length > 0) {
+        // A server-derived list is not a client error, so clamp rather than 400
+        // — but say so, because the tail is silently unreachable.
+        if (derived.length > MAX_METRICS) {
+          console.warn(
+            `[telemetry/readings] device ${deviceId}: model declares ${derived.length} history columns, clamped to ${MAX_METRICS}`,
+          );
+        }
+        columns = derived.slice(0, MAX_METRICS);
+        metrics = columns;
+        columnSource = 'model';
+      }
+      // else: no usable capabilities — leave `metrics` null (fetch everything)
+      // and discover the columns from the rows below.
+    }
+  }
+
   const t = schema.telemetryReadings;
   // tsParam casts are load-bearing on the Data API — see the header comment.
   const where = and(
@@ -327,7 +432,14 @@ async function handleReadings(
   // Distinct timestamps matching the filter, counted only up to the cap, plus
   // the span they cover. `where`/`orderTs` are passed by reference so the count
   // and the page query can never diverge.
-  const bounded = await db.execute<BoundedTotalRow>(boundedTotalQuery(where, order));
+  //
+  // The unit lookup is independent of the count, so it rides along rather than
+  // adding a round-trip: the bounded count is ~140 ms of Data API time and the
+  // device_latest point lookup is a few ms behind it.
+  const [bounded, units] = await Promise.all([
+    db.execute<BoundedTotalRow>(boundedTotalQuery(where, order)),
+    shape === 'table' ? latestUnits(deviceId, columns) : Promise.resolve(new Map<string, string>()),
+  ]);
   const boundedRow = bounded.rows[0];
   const { total, totalIsCapped } = capTotal(Number(boundedRow?.total ?? 0));
   const page = {
@@ -346,8 +458,21 @@ async function handleReadings(
   // addressable anyway, so a stale bookmark short-circuits to an empty page
   // rather than asking the DB. 200, not 400 — it should render an empty table,
   // not an error toast.
+  // An empty page still carries the column set: the table keeps its headers (and
+  // their units) instead of collapsing to nothing while the user pages past the
+  // end or picks a range with no data.
+  const emptyPage = (): APIGatewayProxyResultV2 =>
+    shape === 'flat'
+      ? ok({ readings: [], page })
+      : ok({
+          columns: columns.map((key) => ({ key, unit: units.get(key) ?? null })),
+          rows: [],
+          columnSource,
+          page,
+        });
+
   if (offset >= READINGS_TOTAL_CAP) {
-    return ok({ readings: [], page });
+    return emptyPage();
   }
 
   // Never let a page reach past the addressable window. `total` says only
@@ -366,7 +491,7 @@ async function handleReadings(
     .offset(offset);
 
   if (tsRows.length === 0) {
-    return ok({ readings: [], page });
+    return emptyPage();
   }
 
   const epochs = tsRows.map((r) => r.ts.getTime());
@@ -385,13 +510,38 @@ async function handleReadings(
     )
     .orderBy(orderTs, asc(t.metric));
 
-  const readings = rows.map((r) => ({
-    ts: r.ts.toISOString(),
-    metric: r.metric,
-    value: r.value,
-    unit: r.unit,
-  }));
-  return ok({ readings, page });
+  if (shape === 'flat') {
+    const readings = rows.map((r) => ({
+      ts: r.ts.toISOString(),
+      metric: r.metric,
+      value: r.value,
+      unit: r.unit,
+    }));
+    return ok({ readings, page });
+  }
+
+  // No usable capabilities: discover the columns from the page itself. Only
+  // metrics that carried a value become columns — matching what the client used
+  // to do — and they are sorted for determinism, since without the model there
+  // is no declared order to follow.
+  if (columnSource === 'data') {
+    const present = new Set<string>();
+    for (const r of rows) if (r.value !== null) present.add(r.metric);
+    columns = [...present].sort();
+  }
+
+  return ok({
+    columns: columns.map((key) => ({
+      key,
+      // device_latest is authoritative; fall back to the page's own rows for a
+      // metric it has never seen (batch-ingested history writes readings but
+      // deliberately never touches device_latest).
+      unit: units.get(key) ?? rows.find((r) => r.metric === key && r.unit)?.unit ?? null,
+    })),
+    rows: pivotRows(rows, columns),
+    columnSource,
+    page,
+  });
 }
 
 export const handler = async (
@@ -416,17 +566,29 @@ export const handler = async (
 
   // Org-ownership check (same pattern as devices.ts): the device must belong to
   // a workspace in the caller's organization.
-  const device = await db.query.devices.findFirst({
-    where: and(
-      eq(schema.devices.id, id),
-      inArray(schema.devices.workspaceId, orgWorkspaceIds),
-    ),
-    columns: { id: true },
-  });
+  //
+  // The model's io_capabilities come along for the ride, because /readings
+  // derives the history table's column set from them (?shape=table). Folding it
+  // into a check that had to run anyway costs one join on an indexed PK instead
+  // of a second Data API round-trip. leftJoin, not innerJoin: a device must
+  // never 404 because its model row is missing.
+  const [device] = await db
+    .select({
+      id: schema.devices.id,
+      ioCapabilities: schema.deviceModels.ioCapabilities,
+    })
+    .from(schema.devices)
+    .leftJoin(schema.deviceModels, eq(schema.devices.deviceModelId, schema.deviceModels.id))
+    .where(
+      and(eq(schema.devices.id, id), inArray(schema.devices.workspaceId, orgWorkspaceIds)),
+    )
+    .limit(1);
   if (!device) return notFound(`Device "${id}" not found`);
 
   if (event.rawPath.endsWith('/telemetry/latest')) return handleLatest(id);
   if (event.rawPath.endsWith('/telemetry/recent')) return handleRecent(id, event);
-  if (event.rawPath.endsWith('/telemetry/readings')) return handleReadings(id, event);
+  if (event.rawPath.endsWith('/telemetry/readings')) {
+    return handleReadings(id, event, device.ioCapabilities);
+  }
   return handleHistory(id, event);
 };
