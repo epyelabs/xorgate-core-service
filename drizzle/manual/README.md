@@ -36,6 +36,25 @@ Apply after the latest generated migration, in filename order:
    Deliberately not a re-upsert: the live row has drifted from the seed (model
    renamed, camera labels changed), so it only touches the gps fields list.
 
+8. `manual/008_telemetry_partition_migrate.sql` — **NOT part of the fresh-cluster
+   sequence.** It converts an ALREADY-POPULATED `telemetry_readings` into the same
+   monthly-partitioned shape as `001`, without losing its rows. Read the choice
+   this way:
+
+   - **Fresh cluster, `telemetry_readings` genuinely empty** → apply `001` + `005`
+     as above, **before first ingestion**. Cheap, and no migration is needed.
+   - **Table already has rows** → apply `008` instead. `001` opens with
+     `DROP TABLE IF EXISTS "telemetry_readings" CASCADE` and would destroy every
+     one of them.
+
+   `008` is build-and-attach (per-month tables filled, indexed and CHECK-constrained
+   before they are attached, so the parent never serves a half-copied partition)
+   and is driven by `scripts/migrate-telemetry-partitions.mjs`, which issues the
+   copy one chunk per Data API call and verifies each chunk by row count.
+   Applied to `xorgatedb_dev` on 2026-08-04: 8 900 602 rows, zero lost. Full
+   rationale is in the file header;
+   `plans/improve-recording-history-fetching/PROGRESS.md` has the measurements.
+
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
 top); re-running all in order is safe — but note 004 re-seeds the original

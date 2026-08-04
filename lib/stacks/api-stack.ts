@@ -27,6 +27,14 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   // disabled. They poll the shared sandbox Aurora via the Data API and block
   // its auto-pause; defaults off in dev (see bin/app.ts).
   disableScheduledJobs?: boolean;
+  // Arms telemetry retention in PartitionMaintenanceFn. SEPARATE from
+  // disableScheduledJobs by design: turning the maintenance schedule on (which
+  // dev needs, so future month partitions get created) must not start deleting
+  // history as a side effect. Default OFF — the mechanism ships dormant until
+  // production data exists and someone sets a real window (plan Q4).
+  // `--context telemetryRetention=on [--context telemetryRetentionDays=180]`
+  telemetryRetention?: boolean;
+  telemetryRetentionDays?: number;
   bucket: s3.Bucket;
   // Public-read bucket holding device-agent tarballs; its URL is baked into the
   // per-request install.sh so devices can download the build without AWS creds.
@@ -798,14 +806,35 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // EventBridge monthly -> pre-create upcoming telemetry_readings partitions
     // (a missing month partition breaks ingestion). Mid-month cron: the +1/+2
     // partitions from the previous run still cover us if one run fails.
-    const partitionMaintenanceFn = new nodejs.NodejsFunction(
-      this,
-      "PartitionMaintenanceFn",
-      standardFnProps(
+    //
+    // The same function also owns TELEMETRY RETENTION, which SHIPS DORMANT.
+    // `telemetryRetention` is a SEPARATE switch from `scheduledJobs` on purpose:
+    // dev needs the schedule on so future months get created, and that must not
+    // start deleting history as a side effect. Nothing is dropped unless
+    // TELEMETRY_RETENTION_ENABLED is the literal string "true", so the env var
+    // is omitted entirely when the flag is off rather than set to "false".
+    // Window/ceiling defaults and the guardrails: src/services/telemetry-partitions.ts.
+    const partitionMaintenanceFn = new nodejs.NodejsFunction(this, "PartitionMaintenanceFn", {
+      ...standardFnProps(
         path.join(entryBase, "partition-maintenance.ts"),
-        "Schedule (monthly) -> ensure telemetry_readings month partitions",
+        "Schedule (monthly) -> ensure telemetry_readings month partitions" +
+          (props.telemetryRetention ? " + retention (ARMED)" : " (retention dormant)"),
       ),
-    );
+      // MERGED onto commonEnv, not replacing it — standardFnProps sets
+      // `environment: commonEnv` (DB_CLUSTER_ARN et al) and this function needs
+      // those to reach Aurora at all.
+      environment: {
+        ...commonEnv,
+        ...(props.telemetryRetention
+          ? {
+              TELEMETRY_RETENTION_ENABLED: "true",
+              ...(props.telemetryRetentionDays
+                ? { TELEMETRY_RETENTION_DAYS: String(props.telemetryRetentionDays) }
+                : {}),
+            }
+          : {}),
+      },
+    });
     new events.Rule(this, "PartitionMaintenanceSchedule", {
       description: "Pre-create monthly telemetry_readings partitions (P4)",
       enabled: !props.disableScheduledJobs,
