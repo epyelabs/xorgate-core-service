@@ -52,8 +52,8 @@ Apply after the latest generated migration, in filename order:
    and is driven by `scripts/migrate-telemetry-partitions.mjs`, which issues the
    copy one chunk per Data API call and verifies each chunk by row count.
    Applied to `xorgatedb_dev` on 2026-08-04: 8 900 602 rows, zero lost. Full
-   rationale is in the file header;
-   `plans/improve-recording-history-fetching/PROGRESS.md` has the measurements.
+   rationale is in the file header; the `improve-recording-history-fetching`
+   plan's PROGRESS.md (phase 4 notes) has the measurements.
 
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
