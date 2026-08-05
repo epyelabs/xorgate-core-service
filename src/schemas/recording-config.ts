@@ -61,6 +61,16 @@ export const SHED_ESCALATE_DWELL_SECS_MIN = 5;
 export const SHED_ESCALATE_DWELL_SECS_MAX = 600;
 export const SHED_ESCALATE_DUTY_PCT_MIN = 50;
 export const SHED_ESCALATE_DUTY_PCT_MAX = 100;
+// Thermal arm (power_management_improvements plan, Phase 1). Trigger tops out
+// at 90 °C because the Pi hard-throttles at 85 — a higher trip point would
+// never be reached before the firmware has already capped clocks; restore is
+// allowed lower (40) so a cool-running install can demand a real recovery.
+export const SHED_CPU_TEMP_C_MIN = 50;
+export const SHED_CPU_TEMP_C_MAX = 90;
+export const SHED_CPU_TEMP_RESTORE_C_MIN = 40;
+export const SHED_CPU_TEMP_RESTORE_C_MAX = 85;
+export const SHED_CPU_TEMP_SECS_MIN = 5;
+export const SHED_CPU_TEMP_SECS_MAX = 120;
 export const SHED_RESTORE_SECS_MIN = 10;
 export const SHED_RESTORE_SECS_MAX = 3600;
 export const SHED_MAX_SHEDS_PER_HOUR_MAX = 60;
@@ -172,6 +182,23 @@ export const recordingConfigSchema = z
           .int()
           .min(SHED_ESCALATE_DUTY_PCT_MIN)
           .max(SHED_ESCALATE_DUTY_PCT_MAX)
+          .optional(),
+        // Thermal arm (Phase 1): shed live streaming once the SoC has sat
+        // at/above cpuTempC for cpuTempSecs, restore only below
+        // cpuTempRestoreC. Validation surface only — no backend behavior
+        // change; without these keys the device never sees a cloud-set
+        // threshold, because unknown keys are rejected by `.strict()` above.
+        cpuTempC: z.number().min(SHED_CPU_TEMP_C_MIN).max(SHED_CPU_TEMP_C_MAX).optional(),
+        cpuTempRestoreC: z
+          .number()
+          .min(SHED_CPU_TEMP_RESTORE_C_MIN)
+          .max(SHED_CPU_TEMP_RESTORE_C_MAX)
+          .optional(),
+        cpuTempSecs: z
+          .number()
+          .int()
+          .min(SHED_CPU_TEMP_SECS_MIN)
+          .max(SHED_CPU_TEMP_SECS_MAX)
           .optional(),
         restoreSecs: z
           .number()

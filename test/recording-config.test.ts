@@ -129,6 +129,29 @@ describe('parseRecordingConfigBody', () => {
     ).toEqual({ value: { powerShedding: { railLowVolts: 4.5, maxShedsPerHour: 0 } } });
   });
 
+  it('accepts the thermal-arm knobs (power_management_improvements Phase 1)', () => {
+    const powerShedding = { cpuTempC: 80, cpuTempRestoreC: 70, cpuTempSecs: 15 };
+    expect(parseRecordingConfigBody({ powerShedding })).toEqual({ value: { powerShedding } });
+    // Temperatures are non-integers by nature, like the rail voltages.
+    expect(parseRecordingConfigBody({ powerShedding: { cpuTempC: 78.5 } })).toEqual({
+      value: { powerShedding: { cpuTempC: 78.5 } },
+    });
+  });
+
+  it.each([
+    { powerShedding: { cpuTempC: 49 } },
+    { powerShedding: { cpuTempC: 91 } },
+    { powerShedding: { cpuTempRestoreC: 39 } },
+    { powerShedding: { cpuTempRestoreC: 86 } },
+    { powerShedding: { cpuTempSecs: 4 } },
+    { powerShedding: { cpuTempSecs: 121 } },
+    { powerShedding: { cpuTempSecs: 15.5 } },
+    // Deliberately NOT built: rung 2 stays barred to thermal (D4 / PROGRESS Q8).
+    { powerShedding: { cpuTempCriticalC: 95 } },
+  ])('rejects out-of-bounds/unknown thermal value %j', (body) => {
+    expect(parseRecordingConfigBody(body)).toHaveProperty('error');
+  });
+
   it.each([
     { powerShedding: { uvSamples: 0 } },
     { powerShedding: { uvSamples: 61 } },
