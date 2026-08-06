@@ -217,9 +217,17 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             additionalProperties: true,
             nullable: true,
             description:
-              'Last config report from the device (effective post-clamp values + per-namespace ' +
-              'apply status). Populated by the reported plane; null until the device has ' +
-              'reported at least once.',
+              'Last config report from the device, mirrored off ' +
+              '`xorgate/devices/{id}/config/reported`; null until the device has reported at ' +
+              'least once (a pre-Phase-3 agent never does). Shape: `{ v, deviceId, ts, rev, ' +
+              'origin, effective, status }` — `rev` is the last desired revision the device ' +
+              'applied (0 = never received one), `origin` is `cloud`/`local`/`boot`, ' +
+              '`effective` holds the post-clamp values actually in force (an absent namespace ' +
+              'means device defaults, and `gnssAntBias` is the value the modem daemon applied, ' +
+              'not the one requested), and `status` carries a per-namespace ' +
+              '`{ state: applied|adjusted|rejected, at, detail?, reason? }`. There is no ' +
+              '`pending` state on the wire — the reader computes it as ' +
+              '`configRev > reportedConfig.rev` on an online device.',
           },
           reportedAt: { type: 'string', format: 'date-time', nullable: true },
           gnssAntBias: {

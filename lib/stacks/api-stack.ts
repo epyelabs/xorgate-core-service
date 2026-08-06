@@ -1075,6 +1075,80 @@ export class XorgateCoreApiStack extends cdk.Stack {
       action: "lambda:InvokeFunction",
     });
 
+    // --- Device config REPORT mirror (improve_device_settings_management,
+    // Phase 3): IoT Topic Rule -> Lambda -> devices.reported_config ---
+    // The agent publishes what it ACTUALLY applied to
+    // xorgate/devices/<id>/config/reported after every apply, on connect, and
+    // hourly. Mirroring it is what lets the UI say applied/adjusted/rejected
+    // instead of only "saved", and a report whose rev trails config_rev makes
+    // the Lambda republish the retained desired document — the self-heal that
+    // replaces the old 502 "re-save to retry" crutch.
+    //
+    // Bundles client-iot-data-plane for that republish. NO new IAM: the shared
+    // lambdaRole already carries iot:Publish + iot:RetainPublish on
+    // topic/xorgate/devices/*/config (sid IotPublishDeviceConfig above) — the
+    // same grant the devices handler publishes with.
+    const deviceConfigReportFnDlq = new sqs.Queue(this, "DeviceConfigReportFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const deviceConfigReportFn = new nodejs.NodejsFunction(this, "DeviceConfigReportFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-config-report.ts"),
+        "IoT rule -> devices.reported_config (+ republish desired when the device is behind)",
+      ),
+      timeout: cdk.Duration.seconds(20),
+      bundling: bundlingWithSdk,
+      // Captures a Lambda that ran and threw past its retries (DB down) — the
+      // failure the RULE DLQ below does not catch. Same two-layer posture as
+      // the telemetry path.
+      onFailure: new lambdaDestinations.SqsDestination(deviceConfigReportFnDlq),
+    });
+
+    const deviceConfigReportDlqAlarm = new cloudwatch.Alarm(
+      this,
+      "DeviceConfigReportFnDlqDepthAlarm",
+      {
+        metric: deviceConfigReportFnDlq.metricApproximateNumberOfMessagesVisible({
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        alarmDescription:
+          "DeviceConfigReportFn async invoke failed past retries (reported config not mirrored)",
+      },
+    );
+    deviceConfigReportDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+
+    const deviceConfigReportRule = new iot.CfnTopicRule(this, "DeviceConfigReportRule", {
+      ruleName: isProd ? "xorgate_device_config_report" : "xorgate_device_config_report_dev",
+      topicRulePayload: {
+        // topic(3) is the deviceId — `config/reported` occupies segments 4-5.
+        sql: "SELECT *, topic(3) AS topicDeviceId FROM 'xorgate/devices/+/config/reported'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: deviceConfigReportFn.functionArn } }],
+        // Reuse the low-volume telemetry rule DLQ + role (one error sink, one
+        // alarm), exactly as the device status rule above does.
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    deviceConfigReportFn.addPermission("AllowIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: deviceConfigReportRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
     const iotAttachPolicyFn = new nodejs.NodejsFunction(
       this,
       "IotAttachPolicyFn",

@@ -96,9 +96,11 @@ async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<Device
  * columns, publish the retained message.
  *
  * Publish failure still 502s (the DB row is already updated, so the operator
- * must know the device was NOT told). Phase 3 replaces the "re-save to retry"
- * crutch: the device reports its applied `rev` and the mirror Lambda
- * republishes whenever `config_rev > reported.rev`.
+ * must know the device was NOT told immediately) — but it is no longer a dead
+ * end. Since Phase 3 the device reports its applied `rev` and
+ * `handlers/device-config-report.ts` republishes whenever
+ * `config_rev > reported.rev`, so the divergence closes on the device's own
+ * next report (connect, or the hourly heartbeat) with no operator action.
  */
 async function writeConfig(
   id: string,
@@ -141,7 +143,8 @@ async function writeConfig(
     return errorResponse(
       502,
       'CONFIG_PUBLISH_FAILED',
-      'Setting saved, but delivering it to the device failed. Re-save to retry.',
+      'Setting saved, but delivering it to the device failed. It will be delivered ' +
+        'automatically the next time the device reports in.',
     );
   }
   return ok({ device: row });
