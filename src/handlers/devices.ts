@@ -17,55 +17,58 @@ import {
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { publishDeviceConfig } from '../services/device-config';
 import {
-  parseRecordingConfigBody,
-  type RecordingConfig,
-} from '../schemas/recording-config';
-import {
-  parseLteRecoveryConfigBody,
-  type LteRecoveryConfig,
-} from '../schemas/lte-recovery-config';
-import {
-  parseTimeSyncConfigBody,
-  type TimeSyncConfig,
-} from '../schemas/time-sync-config';
+  applyConfigPatch,
+  CONFIG_NAMESPACES,
+  initialConfigDocument,
+  parseUiPrefsPatch,
+  validateConfigPatch,
+  validateNamespaceValue,
+  type DeviceConfigDocument,
+} from '../config-registry/index';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
-const VALID_VIEW_TYPES = ['card', 'map'] as const;
 
-interface ImuMountBody {
-  enabled: boolean;
-  rollDeg: number;
-  pitchDeg: number;
-  yawDeg: number;
+/**
+ * Legacy `PUT /devices/{id}` body field -> config namespace, for the transition
+ * window. A pre-Phase-2 client (or a script) may still send `recordingConfig`
+ * etc.; they are validated through the SAME registry schema and forwarded into
+ * `config`, with a deprecation log line. New clients use
+ * `PATCH /devices/{id}/config`.
+ */
+const LEGACY_PUT_FIELDS: { field: string; namespace: string }[] = CONFIG_NAMESPACES.filter(
+  (ns) => ns.legacyPutField,
+).map((ns) => ({ field: ns.legacyPutField as string, namespace: ns.key }));
+
+/** Old cloud-only PUT fields, now `PATCH /devices/{id}/ui-prefs`. */
+const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
+
+/**
+ * The pre-consolidation columns are DUAL-WRITTEN alongside `config` /
+ * `ui_prefs` for the whole transition window: the deployed frontend and any
+ * out-of-band script still read them off `GET /devices/{id}`. A follow-up
+ * migration drops both the columns and these two functions (cf. drizzle/0022,
+ * which dropped the pre-recording columns the same way).
+ *
+ * Each mirrors ONLY its own half, and is called only when that half is actually
+ * being written — mirroring ui_prefs on a config-only write would reset
+ * `active_streams_view_type` to its default for any row whose ui_prefs had not
+ * been backfilled.
+ */
+function legacyConfigColumns(config: DeviceConfigDocument): Record<string, unknown> {
+  return {
+    gnssAntBias: config.gnssAntBias ?? false,
+    imuMount: config.imuMount ?? null,
+    recordingConfig: config.recording ?? null,
+    lteRecoveryConfig: config.lteRecovery ?? null,
+    timeSyncConfig: config.timeSync ?? null,
+  };
 }
 
-interface ImuViewBody {
-  azimuthDeg: number;
-  elevationDeg: number;
-}
-
-const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-
-// null clears the setting; 'invalid' rejects the request. Mirrors the device
-// agent's parseImuMount so both ends accept exactly the same shape.
-function parseImuMountBody(v: unknown): ImuMountBody | null | 'invalid' {
-  if (v === null) return null;
-  if (!v || typeof v !== 'object') return 'invalid';
-  const o = v as Record<string, unknown>;
-  if (typeof o.enabled !== 'boolean') return 'invalid';
-  if (!finite(o.rollDeg) || !finite(o.pitchDeg) || !finite(o.yawDeg)) return 'invalid';
-  return { enabled: o.enabled, rollDeg: o.rollDeg, pitchDeg: o.pitchDeg, yawDeg: o.yawDeg };
-}
-
-function parseImuViewBody(v: unknown): ImuViewBody | null | 'invalid' {
-  if (v === null) return null;
-  if (!v || typeof v !== 'object') return 'invalid';
-  const o = v as Record<string, unknown>;
-  if (!finite(o.azimuthDeg) || !finite(o.elevationDeg)) return 'invalid';
-  // Clamp elevation shy of the poles: at ±90° the view's look-at up-vector
-  // degenerates and the camera flips.
-  const elevationDeg = Math.max(-85, Math.min(85, o.elevationDeg));
-  return { azimuthDeg: o.azimuthDeg, elevationDeg };
+function legacyUiPrefColumns(uiPrefs: Record<string, unknown>): Record<string, unknown> {
+  return {
+    activeStreamsViewType: (uiPrefs.activeStreamsViewType as string | undefined) ?? 'card',
+    imuView: (uiPrefs.imuView as DeviceRow['imuView']) ?? null,
+  };
 }
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
@@ -76,15 +79,85 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+type DeviceRow = typeof schema.devices.$inferSelect;
+
+async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
+  if (orgWorkspaceIds.length === 0) return undefined;
+  return db.query.devices.findFirst({
+    where: and(
+      eq(schema.devices.id, id),
+      inArray(schema.devices.workspaceId, orgWorkspaceIds),
+    ),
+  });
+}
+
+/**
+ * Write a new config document: bump `config_rev`, dual-write the legacy
+ * columns, publish the retained message.
+ *
+ * Publish failure still 502s (the DB row is already updated, so the operator
+ * must know the device was NOT told). Phase 3 replaces the "re-save to retry"
+ * crutch: the device reports its applied `rev` and the mirror Lambda
+ * republishes whenever `config_rev > reported.rev`.
+ */
+async function writeConfig(
+  id: string,
+  orgWorkspaceIds: string[],
+  nextConfig: DeviceConfigDocument,
+  extra: { updates?: Record<string, unknown>; uiPrefs?: Record<string, unknown> } = {},
+): Promise<APIGatewayProxyResultV2> {
+  const now = new Date();
+  const updated = await db
+    .update(schema.devices)
+    .set({
+      ...(extra.updates ?? {}),
+      config: nextConfig,
+      configRev: sql`${schema.devices.configRev} + 1`,
+      configUpdatedAt: now,
+      updatedAt: now,
+      ...legacyConfigColumns(nextConfig),
+      ...(extra.uiPrefs
+        ? { uiPrefs: extra.uiPrefs, ...legacyUiPrefColumns(extra.uiPrefs) }
+        : {}),
+    })
+    .where(
+      and(
+        eq(schema.devices.id, id),
+        inArray(schema.devices.workspaceId, orgWorkspaceIds),
+      ),
+    )
+    .returning();
+  if (updated.length === 0) return notFound(`Device "${id}" not found`);
+
+  const row = updated[0];
+  try {
+    await publishDeviceConfig(id, row.config, row.configRev);
+  } catch (err) {
+    console.error('device config publish failed', {
+      deviceId: id,
+      rev: row.configRev,
+      err,
+    });
+    return errorResponse(
+      502,
+      'CONFIG_PUBLISH_FAILED',
+      'Setting saved, but delivering it to the device failed. Re-save to retry.',
+    );
+  }
+  return ok({ device: row });
+}
+
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
+  const routeKey = event.routeKey; // e.g. "PATCH /devices/{id}/config"
   const id = event.pathParameters?.id;
 
   let auth;
   try {
-    const writeMethod = method === 'POST' || method === 'PUT' || method === 'DELETE';
+    const writeMethod =
+      method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
     auth = await requireOrgContext(
       event,
       writeMethod ? ['owner', 'admin', 'member'] : undefined,
@@ -96,16 +169,71 @@ export const handler = async (
 
   const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
 
+  // ---- Sub-resource routes (config / ui-prefs) -------------------------------
+  if (routeKey === 'PATCH /devices/{id}/config') {
+    if (!id) return badRequest('device id required in path');
+    let body: unknown;
+    try {
+      body = JSON.parse(event.body ?? '{}');
+    } catch {
+      return badRequest('Invalid JSON body');
+    }
+    const parsed = validateConfigPatch(body);
+    if ('error' in parsed) return badRequest(parsed.error);
+
+    const device = await findDevice(id, orgWorkspaceIds);
+    if (!device) return notFound(`Device "${id}" not found`);
+
+    const nextConfig = applyConfigPatch(device.config, parsed.value) as DeviceConfigDocument;
+    return writeConfig(id, orgWorkspaceIds, nextConfig);
+  }
+
+  if (routeKey === 'PATCH /devices/{id}/ui-prefs') {
+    if (!id) return badRequest('device id required in path');
+    let body: unknown;
+    try {
+      body = JSON.parse(event.body ?? '{}');
+    } catch {
+      return badRequest('Invalid JSON body');
+    }
+    const parsed = parseUiPrefsPatch(body);
+    if ('error' in parsed) return badRequest(parsed.error);
+
+    const device = await findDevice(id, orgWorkspaceIds);
+    if (!device) return notFound(`Device "${id}" not found`);
+
+    // Cloud-only: no publish, and deliberately NO config_rev bump — nothing
+    // here ever reaches a device, so it must not make one look out of date.
+    const nextPrefs: Record<string, unknown> = { ...(device.uiPrefs ?? {}) };
+    for (const [key, value] of Object.entries(parsed.value)) {
+      if (value === null) delete nextPrefs[key];
+      else nextPrefs[key] = value;
+    }
+    const now = new Date();
+    const updated = await db
+      .update(schema.devices)
+      .set({
+        uiPrefs: nextPrefs,
+        updatedAt: now,
+        // Transition window: keep the old cloud-only columns in step.
+        ...legacyUiPrefColumns(nextPrefs),
+      })
+      .where(
+        and(
+          eq(schema.devices.id, id),
+          inArray(schema.devices.workspaceId, orgWorkspaceIds),
+        ),
+      )
+      .returning();
+    if (updated.length === 0) return notFound(`Device "${id}" not found`);
+    return ok({ device: updated[0] });
+  }
+
   switch (method) {
     case 'GET': {
       if (id) {
         if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
-        const row = await db.query.devices.findFirst({
-          where: and(
-            eq(schema.devices.id, id),
-            inArray(schema.devices.workspaceId, orgWorkspaceIds),
-          ),
-        });
+        const row = await findDevice(id, orgWorkspaceIds);
         if (!row) return notFound(`Device "${id}" not found`);
         return ok({ device: row });
       }
@@ -198,148 +326,159 @@ export const handler = async (
           name: body.name ?? null,
           firmwareVersion: body.firmwareVersion ?? null,
           status,
+          config: initialConfigDocument(),
+          configRev: 1,
+          configUpdatedAt: new Date(),
+          uiPrefs: {},
         })
         .returning();
+
+      // Publish the initial retained config so a device that connects before
+      // anyone opens the settings page still converges (previously the topic
+      // stayed empty until the first save, and the agent had nothing to apply).
+      // A publish failure must NOT fail the create — the row exists, the
+      // registration flow continues, and any later save (or Phase 3's
+      // reported-rev self-heal) republishes.
+      try {
+        await publishDeviceConfig(row.id, row.config, row.configRev);
+      } catch (err) {
+        console.error('initial device config publish failed', {
+          deviceId: row.id,
+          rev: row.configRev,
+          err,
+        });
+      }
       return created({ device: row });
     }
     case 'PUT': {
       if (!id) return badRequest('device id required in path');
-      let body: {
-        name?: string;
-        firmwareVersion?: string;
-        status?: string;
-        lastSeenAt?: string;
-        gnssAntBias?: boolean;
-        activeStreamsViewType?: string;
-        imuMount?: unknown;
-        imuView?: unknown;
-        recordingConfig?: unknown;
-        lteRecoveryConfig?: unknown;
-        timeSyncConfig?: unknown;
-      };
+      let body: Record<string, unknown>;
       try {
-        body = JSON.parse(event.body ?? '{}');
+        body = JSON.parse(event.body ?? '{}') as Record<string, unknown>;
       } catch {
         return badRequest('Invalid JSON body');
       }
 
-      if (body.status !== undefined &&
-          !VALID_STATUSES.includes(body.status as (typeof VALID_STATUSES)[number])) {
-        return badRequest(`status must be one of: ${VALID_STATUSES.join(', ')}`);
+      // PUT is metadata-only now (design.md Q3: status is machine-managed by
+      // telemetry ingest / LWT / the offline sweeper, and `lastSeenAt` is
+      // ingest-owned — nothing legitimate set either through this API).
+      if (body.status !== undefined) {
+        return badRequest(
+          'status is not settable via the API — it is derived from device connectivity',
+        );
       }
-
-      if (body.gnssAntBias !== undefined && typeof body.gnssAntBias !== 'boolean') {
-        return badRequest('gnssAntBias must be a boolean');
-      }
-
-      if (body.activeStreamsViewType !== undefined &&
-          !VALID_VIEW_TYPES.includes(body.activeStreamsViewType as (typeof VALID_VIEW_TYPES)[number])) {
-        return badRequest(`activeStreamsViewType must be one of: ${VALID_VIEW_TYPES.join(', ')}`);
-      }
-
-      let imuMount: ImuMountBody | null | undefined;
-      if (body.imuMount !== undefined) {
-        const parsed = parseImuMountBody(body.imuMount);
-        if (parsed === 'invalid') {
-          return badRequest(
-            'imuMount must be null or { enabled: boolean, rollDeg, pitchDeg, yawDeg: finite numbers }',
-          );
-        }
-        imuMount = parsed;
-      }
-
-      let recordingConfig: RecordingConfig | null | undefined;
-      if (body.recordingConfig !== undefined) {
-        const parsed = parseRecordingConfigBody(body.recordingConfig);
-        if ('error' in parsed) return badRequest(parsed.error);
-        recordingConfig = parsed.value;
-      }
-
-      let lteRecoveryConfig: LteRecoveryConfig | null | undefined;
-      if (body.lteRecoveryConfig !== undefined) {
-        const parsed = parseLteRecoveryConfigBody(body.lteRecoveryConfig);
-        if ('error' in parsed) return badRequest(parsed.error);
-        lteRecoveryConfig = parsed.value;
-      }
-
-      let timeSyncConfig: TimeSyncConfig | null | undefined;
-      if (body.timeSyncConfig !== undefined) {
-        const parsed = parseTimeSyncConfigBody(body.timeSyncConfig);
-        if ('error' in parsed) return badRequest(parsed.error);
-        timeSyncConfig = parsed.value;
-      }
-
-      let imuView: ImuViewBody | null | undefined;
-      if (body.imuView !== undefined) {
-        const parsed = parseImuViewBody(body.imuView);
-        if (parsed === 'invalid') {
-          return badRequest(
-            'imuView must be null or { azimuthDeg, elevationDeg: finite numbers }',
-          );
-        }
-        imuView = parsed;
+      if (body.lastSeenAt !== undefined) {
+        return badRequest('lastSeenAt is not settable via the API — telemetry ingest owns it');
       }
 
       const updates: Record<string, unknown> = {};
-      if (body.name !== undefined) updates.name = body.name;
-      if (body.firmwareVersion !== undefined) updates.firmwareVersion = body.firmwareVersion;
-      if (body.status !== undefined) updates.status = body.status;
-      if (body.lastSeenAt !== undefined) updates.lastSeenAt = new Date(body.lastSeenAt);
-      if (body.gnssAntBias !== undefined) updates.gnssAntBias = body.gnssAntBias;
-      if (body.activeStreamsViewType !== undefined) updates.activeStreamsViewType = body.activeStreamsViewType;
-      if (imuMount !== undefined) updates.imuMount = imuMount;
-      if (imuView !== undefined) updates.imuView = imuView;
-      if (recordingConfig !== undefined) updates.recordingConfig = recordingConfig;
-      if (lteRecoveryConfig !== undefined) updates.lteRecoveryConfig = lteRecoveryConfig;
-      if (timeSyncConfig !== undefined) updates.timeSyncConfig = timeSyncConfig;
-      if (Object.keys(updates).length === 0) return badRequest('No updatable fields provided');
-      updates.updatedAt = new Date();
+      if (body.name !== undefined) {
+        if (body.name !== null && typeof body.name !== 'string') {
+          return badRequest('name must be a string or null');
+        }
+        updates.name = body.name;
+      }
+      if (body.firmwareVersion !== undefined) {
+        if (body.firmwareVersion !== null && typeof body.firmwareVersion !== 'string') {
+          return badRequest('firmwareVersion must be a string or null');
+        }
+        updates.firmwareVersion = body.firmwareVersion;
+      }
+
+      // ---- Transition window: legacy config fields on PUT ---------------------
+      const configPatch: Record<string, unknown> = {};
+      const deprecated: string[] = [];
+      for (const { field, namespace } of LEGACY_PUT_FIELDS) {
+        if (body[field] === undefined) continue;
+        const parsed = validateNamespaceValue(namespace, body[field], field);
+        if ('error' in parsed) return badRequest(parsed.error);
+        configPatch[namespace] = parsed.value;
+        deprecated.push(field);
+      }
+      const uiPrefsPatch: Record<string, unknown> = {};
+      for (const field of LEGACY_UI_PREF_FIELDS) {
+        if (body[field] === undefined) continue;
+        const parsed = parseUiPrefsPatch({ [field]: body[field] });
+        if ('error' in parsed) return badRequest(parsed.error);
+        Object.assign(uiPrefsPatch, parsed.value);
+        deprecated.push(field);
+      }
+
+      const unknownFields = Object.keys(body).filter(
+        (k) =>
+          k !== 'name' &&
+          k !== 'firmwareVersion' &&
+          !LEGACY_PUT_FIELDS.some((f) => f.field === k) &&
+          !(LEGACY_UI_PREF_FIELDS as readonly string[]).includes(k),
+      );
+      if (unknownFields.length > 0) {
+        return badRequest(`unknown field(s): ${unknownFields.join(', ')}`);
+      }
+
+      const touchesConfig = Object.keys(configPatch).length > 0;
+      const touchesPrefs = Object.keys(uiPrefsPatch).length > 0;
+      if (Object.keys(updates).length === 0 && !touchesConfig && !touchesPrefs) {
+        return badRequest('No updatable fields provided');
+      }
+
+      if (deprecated.length > 0) {
+        console.warn('deprecated config fields on PUT /devices/{id}', {
+          deviceId: id,
+          fields: deprecated,
+          hint: 'use PATCH /devices/{id}/config and /ui-prefs',
+        });
+      }
 
       if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
-      const updated = await db
-        .update(schema.devices)
-        .set(updates)
-        .where(
-          and(
-            eq(schema.devices.id, id),
-            inArray(schema.devices.workspaceId, orgWorkspaceIds),
-          ),
-        )
-        .returning();
-      if (updated.length === 0) return notFound(`Device "${id}" not found`);
 
-      // Deliver device-facing settings (GNSS antenna power, IMU mount) as a
-      // retained MQTT config message (thing name = device id). Retained means
-      // an offline device picks it up on next connect. The message always
-      // carries the FULL device config from the updated row, so publishing on
-      // either field's change keeps the retained copy complete. Publish
-      // failure is surfaced as a 502 so the operator knows the device was NOT
-      // told — the DB row is already updated; re-saving retries the publish.
-      if (
-        body.gnssAntBias !== undefined ||
-        imuMount !== undefined ||
-        recordingConfig !== undefined ||
-        lteRecoveryConfig !== undefined ||
-        timeSyncConfig !== undefined
-      ) {
-        try {
-          await publishDeviceConfig(id, {
-            gnssAntBias: updated[0].gnssAntBias,
-            imuMount: updated[0].imuMount,
-            recording: updated[0].recordingConfig,
-            lteRecovery: updated[0].lteRecoveryConfig,
-            timeSync: updated[0].timeSyncConfig,
-          });
-        } catch (err) {
-          console.error('device config publish failed', { deviceId: id, err });
-          return errorResponse(
-            502,
-            'CONFIG_PUBLISH_FAILED',
-            'Setting saved, but delivering it to the device failed. Re-save to retry.',
-          );
-        }
+      if (!touchesConfig && !touchesPrefs) {
+        updates.updatedAt = new Date();
+        const updated = await db
+          .update(schema.devices)
+          .set(updates)
+          .where(
+            and(
+              eq(schema.devices.id, id),
+              inArray(schema.devices.workspaceId, orgWorkspaceIds),
+            ),
+          )
+          .returning();
+        if (updated.length === 0) return notFound(`Device "${id}" not found`);
+        return ok({ device: updated[0] });
       }
-      return ok({ device: updated[0] });
+
+      const device = await findDevice(id, orgWorkspaceIds);
+      if (!device) return notFound(`Device "${id}" not found`);
+
+      const nextPrefs: Record<string, unknown> = { ...(device.uiPrefs ?? {}) };
+      for (const [key, value] of Object.entries(uiPrefsPatch)) {
+        if (value === null) delete nextPrefs[key];
+        else nextPrefs[key] = value;
+      }
+
+      if (!touchesConfig) {
+        updates.updatedAt = new Date();
+        updates.uiPrefs = nextPrefs;
+        Object.assign(updates, legacyUiPrefColumns(nextPrefs));
+        const updated = await db
+          .update(schema.devices)
+          .set(updates)
+          .where(
+            and(
+              eq(schema.devices.id, id),
+              inArray(schema.devices.workspaceId, orgWorkspaceIds),
+            ),
+          )
+          .returning();
+        if (updated.length === 0) return notFound(`Device "${id}" not found`);
+        return ok({ device: updated[0] });
+      }
+
+      const nextConfig = applyConfigPatch(device.config, configPatch) as DeviceConfigDocument;
+      return writeConfig(id, orgWorkspaceIds, nextConfig, {
+        updates,
+        ...(touchesPrefs ? { uiPrefs: nextPrefs } : {}),
+      });
     }
     case 'DELETE': {
       if (!id) return badRequest('device id required in path');
@@ -357,6 +496,6 @@ export const handler = async (
       return { statusCode: 204, body: '' };
     }
     default:
-      return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
+      return methodNotAllowed(method, 'GET, POST, PUT, PATCH, DELETE');
   }
 };

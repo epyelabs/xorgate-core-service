@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { parseLteRecoveryConfigBody } from '../src/schemas/lte-recovery-config';
+import { validateNamespaceValue } from '../src/config-registry/index';
+
+const parseLteRecoveryConfigBody = (v: unknown) =>
+  validateNamespaceValue('lteRecovery', v, 'lteRecoveryConfig');
 
 describe('parseLteRecoveryConfigBody', () => {
   it('accepts null (clears the column)', () => {
@@ -18,7 +21,8 @@ describe('parseLteRecoveryConfigBody', () => {
     expect(parseLteRecoveryConfigBody({ deadZoneProfile: 'aggressive' })).toEqual({
       value: { deadZoneProfile: 'aggressive' },
     });
-    expect(parseLteRecoveryConfigBody({})).toEqual({ value: {} });
+    // `{}` is rejected (Phase 2): an empty namespace is never an erase.
+    expect(parseLteRecoveryConfigBody({})).toHaveProperty('error');
   });
 
   it('rejects unknown values (operator typos must surface, not save)', () => {

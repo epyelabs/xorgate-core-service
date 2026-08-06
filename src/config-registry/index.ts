@@ -1,0 +1,168 @@
+/**
+ * The device-config registry — ONE list that drives cloud-side validation, the
+ * retained publish document, the OpenAPI blocks, and the committed
+ * `config-contract.json` that the frontend imports and the device agent
+ * contract-tests against (design.md §3).
+ *
+ * Adding a knob:
+ *   1. add/extend the zod field in the namespace module (with `.describe()` —
+ *      the OpenAPI text is generated from it),
+ *   2. add its default to that module's `*_DEFAULTS`,
+ *   3. `npm run contract:generate` and commit the artifact (the contract test
+ *      fails if you forget),
+ *   4. add the UI row.
+ * Adding a whole namespace: one new module + one line in CONFIG_NAMESPACES.
+ *
+ * What used to be needed instead — a new column, a new schema file, a new
+ * handler branch, a hand-written docs block and a publish key — is why the
+ * thermal-shed keys shipped present in 2 of 5 places.
+ */
+import type { ConfigNamespaceSpec } from './types';
+import { gnssAntBiasNamespace } from './gnss-ant-bias';
+import { imuMountNamespace, type ImuMountConfig } from './imu-mount';
+import { recordingNamespace, type RecordingConfig } from './recording';
+import { lteRecoveryNamespace, type LteRecoveryConfig } from './lte-recovery';
+import { timeSyncNamespace, type TimeSyncConfig } from './time-sync';
+
+export * from './types';
+export * from './gnss-ant-bias';
+export * from './imu-mount';
+export * from './recording';
+export * from './lte-recovery';
+export * from './time-sync';
+export * from './ui-prefs';
+
+/**
+ * Registry order is the publish order — keep it stable so the retained
+ * payload's key order doesn't churn between deploys (it makes journal diffs on
+ * the device readable).
+ */
+export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
+  gnssAntBiasNamespace,
+  imuMountNamespace,
+  recordingNamespace,
+  lteRecoveryNamespace,
+  timeSyncNamespace,
+];
+
+export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
+
+export function configNamespace(key: string): ConfigNamespaceSpec | undefined {
+  return CONFIG_NAMESPACES.find((n) => n.key === key);
+}
+
+/**
+ * The stored `devices.config` document — one key per namespace, all optional
+ * (absent = "device defaults", which is why nothing is materialized on create).
+ * Namespace keys are the WIRE keys; the doc is published as-is.
+ */
+export interface DeviceConfigDocument {
+  gnssAntBias?: boolean;
+  imuMount?: ImuMountConfig;
+  recording?: RecordingConfig;
+  lteRecovery?: LteRecoveryConfig;
+  timeSync?: TimeSyncConfig;
+}
+
+/** Loose view of the same document, for generic namespace-keyed manipulation. */
+export type ConfigDocument = Record<string, unknown>;
+
+/**
+ * Validate one namespace value.
+ *
+ * - `null`      → revert to device defaults (the key is deleted from the doc
+ *                 and omitted from the publish message).
+ * - `{}`        → REJECTED for object namespaces. An empty object is never an
+ *                 erase; `null` is. This closes today's ambiguity where an
+ *                 all-invalid namespace could erase local device state.
+ * - everything else is validated whole (replace-whole-namespace semantics,
+ *   matching how the device merges).
+ *
+ * `label` prefixes the error path so the same validator can serve both
+ * `PATCH /config` (`recording.video.preset`) and the transitional PUT body
+ * field names (`recordingConfig.video.preset`).
+ */
+export function validateNamespaceValue(
+  key: string,
+  value: unknown,
+  label = key,
+): { value: unknown } | { error: string } {
+  const spec = configNamespace(key);
+  if (!spec) return { error: `unknown config namespace "${key}"` };
+  if (value === null) return { value: null };
+  if (
+    spec.kind === 'object' &&
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0
+  ) {
+    return {
+      error: `${label}: must not be empty — send null to revert this namespace to device defaults`,
+    };
+  }
+  const parsed = spec.schema.safeParse(value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path.length ? `${label}.${issue.path.join('.')}` : label;
+    return { error: `${path}: ${issue?.message ?? 'invalid'}` };
+  }
+  return { value: parsed.data };
+}
+
+/**
+ * Validate a partial config document (a `PATCH /devices/{id}/config` body).
+ * All-or-nothing: the first invalid namespace fails the whole request, so a
+ * multi-namespace save can never half-commit.
+ */
+export function validateConfigPatch(
+  body: unknown,
+): { value: Record<string, unknown> } | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'body must be a partial config document' };
+  }
+  const src = body as Record<string, unknown>;
+  const keys = Object.keys(src);
+  if (keys.length === 0) return { error: 'no config namespaces provided' };
+  const unknown = keys.filter((k) => !configNamespace(k));
+  if (unknown.length > 0) {
+    return {
+      error: `unknown config namespace(s): ${unknown.join(', ')} (known: ${CONFIG_NAMESPACE_KEYS.join(', ')})`,
+    };
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const parsed = validateNamespaceValue(key, src[key]);
+    if ('error' in parsed) return parsed;
+    out[key] = parsed.value;
+  }
+  return { value: out };
+}
+
+/**
+ * Apply a validated patch to a stored document: present namespaces replace
+ * whole, `null` deletes, absent leaves untouched.
+ */
+export function applyConfigPatch(
+  doc: DeviceConfigDocument | ConfigDocument | null | undefined,
+  patch: Record<string, unknown>,
+): ConfigDocument {
+  const next: ConfigDocument = { ...(doc ?? {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete next[key];
+    else next[key] = value;
+  }
+  return next;
+}
+
+/**
+ * The config document a brand-new device starts from. Empty by design: an
+ * absent namespace means "device defaults", and materializing defaults into the
+ * doc would freeze today's values into every fielded device (a later default
+ * change would then never reach them). `POST /devices` still publishes this —
+ * a retained `{v:1, rev:1, gnssAntBias:false, …}` message so a device
+ * converges on first connect instead of waiting for a first settings save.
+ */
+export function initialConfigDocument(): ConfigDocument {
+  return {};
+}

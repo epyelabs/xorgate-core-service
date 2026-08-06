@@ -1,4 +1,9 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import {
+  configOpenApiSchemas,
+  configPatchRequestSchema,
+  uiPrefsPatchRequestSchema,
+} from '../config-registry/openapi';
 
 const OPENAPI_SPEC = (baseUrl: string) => ({
   openapi: '3.0.3',
@@ -188,38 +193,59 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             enum: ['provisioned', 'online', 'offline', 'decommissioned'],
           },
           lastSeenAt: { type: 'string', format: 'date-time', nullable: true },
+          config: {
+            allOf: [{ $ref: '#/components/schemas/DeviceConfig' }],
+            description:
+              'Everything this device is told, in one namespaced document. Written by ' +
+              'PATCH /devices/{id}/config and published as a retained MQTT message.',
+          },
+          configRev: {
+            type: 'integer',
+            description:
+              'Monotonic config revision, bumped on every config write and carried on the ' +
+              'retained message as `rev`. The device applies a document newer than its ' +
+              'last-applied rev; `configRev > reportedConfig.rev` on an online device means the ' +
+              'change is still pending.',
+          },
+          configUpdatedAt: { type: 'string', format: 'date-time', nullable: true },
+          uiPrefs: {
+            allOf: [{ $ref: '#/components/schemas/DeviceUiPrefs' }],
+            description: 'Cloud-only presentation preferences. Never delivered to the device.',
+          },
+          reportedConfig: {
+            type: 'object',
+            additionalProperties: true,
+            nullable: true,
+            description:
+              'Last config report from the device (effective post-clamp values + per-namespace ' +
+              'apply status). Populated by the reported plane; null until the device has ' +
+              'reported at least once.',
+          },
+          reportedAt: { type: 'string', format: 'date-time', nullable: true },
           gnssAntBias: {
             type: 'boolean',
+            deprecated: true,
             description:
-              'GPS antenna mode: true powers an active antenna (DC bias over the coax), false (default) = passive antenna, bias off. ' +
-              'Changes are delivered to the device via a retained MQTT config message.',
+              'DEPRECATED — read `config.gnssAntBias`. Dual-written during the transition window ' +
+              'and dropped by a follow-up migration.',
           },
           activeStreamsViewType: {
             type: 'string',
             enum: ['card', 'map'],
-            description: 'Layout for the Active Streams tab: card grid (default) or location-first map view.',
+            deprecated: true,
+            description: 'DEPRECATED — read `uiPrefs.activeStreamsViewType`.',
           },
           imuMount: {
-            type: 'object',
+            allOf: [{ $ref: '#/components/schemas/ImuMountConfig' }],
             nullable: true,
-            description:
-              'IMU mounting correction: how the sensor is physically rotated relative to the vehicle ' +
-              '(ZYX euler, degrees). Delivered to the device via a retained MQTT config message; when ' +
-              'enabled, the agent publishes vehicle-frame euler angles (the raw quaternion stays sensor-frame). ' +
-              'null = never configured.',
-            properties: {
-              enabled: { type: 'boolean' },
-              rollDeg: { type: 'number' },
-              pitchDeg: { type: 'number' },
-              yawDeg: { type: 'number' },
-            },
+            deprecated: true,
+            description: 'DEPRECATED — read `config.imuMount`.',
           },
           imuView: {
             type: 'object',
             nullable: true,
-            description:
-              'Camera direction for the web 3D orientation view (azimuth/elevation, degrees). ' +
-              'Cloud-only; null = the built-in default 3/4 angle.',
+            deprecated: true,
+            description: 'DEPRECATED — read `uiPrefs.imuView`.',
             properties: {
               azimuthDeg: { type: 'number' },
               elevationDeg: { type: 'number' },
@@ -228,309 +254,32 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           recordingConfig: {
             allOf: [{ $ref: '#/components/schemas/RecordingConfig' }],
             nullable: true,
-            description:
-              'On-device recording config. Delivered to the device via a retained MQTT config ' +
-              'message and applied live by the agent. null = never configured from the cloud ' +
-              '(recording off by default; any device-local settings are left untouched).',
+            deprecated: true,
+            description: 'DEPRECATED — read `config.recording`.',
           },
           lteRecoveryConfig: {
             allOf: [{ $ref: '#/components/schemas/LteRecoveryConfig' }],
             nullable: true,
-            description:
-              'LTE recovery policy. Delivered to the device via a retained MQTT config message ' +
-              'and read live by the modem daemon at each recovery decision. null = never ' +
-              'configured from the cloud (device defaults: defer / balanced).',
+            deprecated: true,
+            description: 'DEPRECATED — read `config.lteRecovery`.',
           },
           timeSyncConfig: {
             allOf: [{ $ref: '#/components/schemas/TimeSyncConfig' }],
             nullable: true,
-            description:
-              'Offline time sources policy. Delivered to the device via a retained MQTT config ' +
-              'message and read live by the agent clock stepper. null = never configured from ' +
-              'the cloud (device defaults: stepping on, 10 s threshold, 4 steps/boot).',
+            deprecated: true,
+            description: 'DEPRECATED — read `config.timeSync`.',
           },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
       },
-      TimeSyncConfig: {
-        type: 'object',
-        additionalProperties: false,
-        description:
-          'Offline time sources (`timeSync` namespace): while NTP is unsynced this boot, the agent ' +
-          'may step the system clock from GPS (valid GNSS fix) or the modem NITZ clock, then stand ' +
-          'down for the boot once NTP synchronizes. All fields optional; omitted fields fall back ' +
-          'to the device defaults.',
-        properties: {
-          offlineSources: {
-            type: 'boolean',
-            description:
-              'Kill switch: false disables GPS/NITZ clock stepping entirely (device default: true).',
-          },
-          stepThresholdSecs: {
-            type: 'integer',
-            minimum: 2,
-            maximum: 600,
-            description:
-              'Step only when the measured clock offset exceeds this many seconds (device default 10). ' +
-              'A battery-backed RTC boots inside the threshold, making the feature a natural no-op.',
-          },
-          maxStepsPerBoot: {
-            type: 'integer',
-            minimum: 1,
-            maximum: 20,
-            description: 'Hard cap on clock steps per boot (device default 4; bounds a flapping source).',
-          },
-        },
-      },
-      LteRecoveryConfig: {
-        type: 'object',
-        additionalProperties: false,
-        description:
-          'LTE recovery policy (`lteRecovery` namespace): how aggressively the device connection ' +
-          'manager may use the GNSS-destructive full modem reset. Both fields optional; omitted ' +
-          'fields fall back to the device defaults.',
-        properties: {
-          gpsFixResetPolicy: {
-            type: 'string',
-            enum: ['defer', 'veto-deadzone'],
-            description:
-              'With a live GPS fix: "defer" (default) allows a modem reset only after 30+ min of ' +
-              'unusable LTE; "veto-deadzone" additionally never resets while parked in a dead zone.',
-          },
-          deadZoneProfile: {
-            type: 'string',
-            enum: ['conservative', 'balanced', 'aggressive'],
-            description:
-              'Dead-zone recovery pacing: conservative (nudge every 15-120 min, never resets), ' +
-              'balanced (default; 10-60 min, reset only after 3 failed radio cycles), aggressive ' +
-              '(10-20 min, reset after 1 failed cycle).',
-          },
-        },
-      },
-      RecordingConfig: {
-        type: 'object',
-        additionalProperties: false,
-        description:
-          'On-device recording settings (`recording` namespace). All fields optional — omitted ' +
-          'fields fall back to device defaults. Unknown keys and out-of-range values are rejected.',
-        properties: {
-          telemetry: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              enabled: { type: 'boolean', description: 'Record telemetry locally (default false).' },
-              rateHz: {
-                type: 'integer',
-                minimum: 1,
-                maximum: 20,
-                description:
-                  'Target sample rate. Each sensor group is additionally capped by its native cadence ' +
-                  '(IMU 20 Hz, GPS 1 Hz, system 1 Hz). Default 10.',
-              },
-            },
-          },
-          video: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              enabled: { type: 'boolean', description: 'Record camera video locally (default false).' },
-              preset: {
-                type: 'string',
-                enum: [
-                  '1080p30-4mbps',
-                  '1080p15-2mbps',
-                  '720p30-2mbps',
-                  '720p15-2mbps',
-                  '720p15-1mbps',
-                ],
-                description: 'Closed quality preset table (bounded CPU cost). Default 1080p15-2mbps.',
-              },
-              segmentSeconds: {
-                type: 'integer',
-                minimum: 10,
-                maximum: 300,
-                description: 'Segment length — the unit of upload, retry and eviction. Default 60.',
-              },
-              bootDefer: {
-                type: 'string',
-                enum: ['auto', 'always', 'off'],
-                description:
-                  'Boot power staging: auto (default) defers heavy encoders at boot only when the ' +
-                  'negotiated PSU budget is below bootDeferMinBudgetMa; always defers every boot; ' +
-                  'off starts everything immediately.',
-              },
-              bootDeferMaxSecs: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 600,
-                description: 'Hard cap on the boot defer in seconds. Default 90; 0 = feature off.',
-              },
-              bootDeferMinBudgetMa: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 10000,
-                description:
-                  'auto mode skips the defer when the negotiated supply budget (mA) is at or above ' +
-                  'this. Default 5000 (a true 5 V/5 A PD supply).',
-              },
-              gpsGate: {
-                type: 'string',
-                enum: ['auto', 'always', 'off'],
-                description:
-                  'GPS/LTE video gate: hold video (recording AND live) until the modem stops ' +
-                  'converting power into value — LTE connected with a GPS fix, a declared dead ' +
-                  'zone, a sustained no-signal sky, or gpsGateMaxSecs. auto (default) applies it ' +
-                  'only below bootDeferMinBudgetMa; always gates every boot; off disables it. ' +
-                  'Telemetry recording is never gated.',
-              },
-              gpsGateMaxSecs: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 3600,
-                description:
-                  'Give-up cap on the GPS/LTE gate in seconds. Default 600; 0 = no time cap ' +
-                  '(the other release conditions still apply).',
-              },
-              gpsGateNoProgressSecs: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 3600,
-                description:
-                  'No-progress escape hatch for the GPS/LTE gate, in seconds. Releases the gate ' +
-                  'once NEITHER a GPS fix NOR an LTE connection has arrived for this long — the ' +
-                  'underground-garage case, where every other release condition is blind. ' +
-                  'Cannot fire while LTE is connected (that is the genuinely-acquiring case). ' +
-                  'Default 120; 0 = off, leaving only gpsGateMaxSecs.',
-              },
-              spawnStaggerSecs: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 30,
-                description:
-                  'Delay between camera encoder spawns in seconds (flattens the start-up power ' +
-                  'transient). Default 4; 0 = simultaneous.',
-              },
-              cameras: {
-                type: 'object',
-                additionalProperties: { type: 'boolean' },
-                description:
-                  'Per-camera enable keyed by stream key (e.g. {"cam1": false}). A disabled camera ' +
-                  'gets no pipeline at all — no recording, no shm bridge, no live stream. An absent ' +
-                  'key means enabled, so {} is every detected camera (the default). Use it to match ' +
-                  'camera count to the supply (one camera on a 3 A install, two on 5 A).',
-              },
-            },
-          },
-          upload: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              mode: {
-                type: 'string',
-                enum: ['auto', 'off'],
-                description: 'auto (default): drain segments to S3 whenever connected; off: keep local only.',
-              },
-            },
-          },
-          retention: {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              maxBytes: {
-                type: 'integer',
-                minimum: 536870912,
-                maximum: 1099511627776,
-                description: 'Local recordings quota in bytes (oldest segments evicted first). Default 10 GiB.',
-              },
-              minFreeBytes: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 68719476736,
-                description: 'Free-disk floor in bytes; recording evicts/stops before crossing it. Default 2 GiB.',
-              },
-            },
-          },
-          powerShedding: {
-            type: 'object',
-            additionalProperties: false,
-            description:
-              'Runtime undervoltage load shedding: when the 5 V rail measurably fails, the device sheds ' +
-              'live streaming first, then video recording (bridge-only), and restores in reverse with ' +
-              'hysteresis. Telemetry recording is never shed. All thresholds are starting values for the ' +
-              'field-tuning loop.',
-            properties: {
-              enabled: { type: 'boolean', description: 'Master switch. Default true.' },
-              uvSamples: {
-                type: 'integer',
-                minimum: 1,
-                maximum: 60,
-                description:
-                  'Shed when this many ~1 Hz samples with the CURRENT undervoltage bit land within ' +
-                  'uvWindowSecs. Default 3.',
-              },
-              uvWindowSecs: {
-                type: 'integer',
-                minimum: 5,
-                maximum: 300,
-                description: 'Undervoltage counting window in seconds. Default 30.',
-              },
-              railLowVolts: {
-                type: 'number',
-                minimum: 4,
-                maximum: 5.2,
-                description: 'Alternative trigger: 5 V rail below this, sustained railLowSecs. Default 4.85.',
-              },
-              railLowSecs: {
-                type: 'integer',
-                minimum: 3,
-                maximum: 120,
-                description: 'How long the rail must stay below railLowVolts to trigger. Default 15.',
-              },
-              escalateDwellSecs: {
-                type: 'integer',
-                minimum: 5,
-                maximum: 600,
-                description:
-                  'Trailing window (seconds) evaluated for escalation to the next rung ' +
-                  '(no-live → bridge-only). Default 60.',
-              },
-              escalateDutyPct: {
-                type: 'integer',
-                minimum: 50,
-                maximum: 100,
-                description:
-                  'Escalate when the supply was bad (shed trigger, or an individual undervoltage/' +
-                  'low-rail sample) for at least this percentage of the trailing escalateDwellSecs ' +
-                  'window. Default 70; 100 requires a continuously bad supply, which a noisy rail ' +
-                  'never provides.',
-              },
-              restoreSecs: {
-                type: 'integer',
-                minimum: 10,
-                maximum: 3600,
-                description:
-                  'Clean interval (zero undervoltage samples, rail at/above railRestoreVolts) required ' +
-                  'to restore one rung. Default 120.',
-              },
-              railRestoreVolts: {
-                type: 'number',
-                minimum: 4,
-                maximum: 5.4,
-                description: 'Rail must be at/above this for a sample to count as clean. Default 4.95.',
-              },
-              maxShedsPerHour: {
-                type: 'integer',
-                minimum: 0,
-                maximum: 60,
-                description:
-                  'Shed cycles per rolling hour before the device parks at its shed level (no ' +
-                  'auto-restore until reboot or a settings change). Default 4.',
-              },
-            },
-          },
-        },
-      },
+      // ---- Device config blocks: GENERATED from src/config-registry ----------
+      // Bounds, enums, additionalProperties and every field description come
+      // from the same zod schemas that validate the request and build the
+      // retained MQTT message. The hand-written blocks these replace had
+      // drifted: `powerShedding` claimed additionalProperties:false while
+      // omitting the three thermal keys the API already accepted.
+      ...configOpenApiSchemas(),
       MediaSession: {
         type: 'object',
         required: ['id', 'deviceId', 'streamKey', 'startedAt', 'status'],
@@ -1706,7 +1455,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
       },
       put: {
         operationId: 'updateDevice',
-        summary: 'Update mutable device fields',
+        summary: 'Update device metadata (name / firmware)',
+        description:
+          'Metadata only. `status` and `lastSeenAt` are machine-managed (telemetry ingest, the ' +
+          'MQTT last-will, and the offline sweeper own them) and are rejected 400. Device config ' +
+          'moved to PATCH /devices/{id}/config and PATCH /devices/{id}/ui-prefs; the old ' +
+          'per-namespace body fields are still accepted for the transition window, forwarded ' +
+          'through the same validation into `config`/`uiPrefs`, and logged as deprecated.',
         tags: ['Devices'],
         requestBody: {
           required: true,
@@ -1714,37 +1469,33 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
             'application/json': {
               schema: {
                 type: 'object',
+                additionalProperties: false,
+                minProperties: 1,
                 properties: {
                   name: { type: 'string', nullable: true },
                   firmwareVersion: { type: 'string', nullable: true },
-                  status: {
-                    type: 'string',
-                    enum: ['provisioned', 'online', 'offline', 'decommissioned'],
+                  gnssAntBias: {
+                    type: 'boolean',
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/config.',
                   },
-                  lastSeenAt: { type: 'string', format: 'date-time' },
-                  gnssAntBias: { type: 'boolean' },
                   activeStreamsViewType: {
                     type: 'string',
                     enum: ['card', 'map'],
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/ui-prefs.',
                   },
                   imuMount: {
-                    type: 'object',
+                    allOf: [{ $ref: '#/components/schemas/ImuMountConfig' }],
                     nullable: true,
-                    description:
-                      'IMU mounting correction (ZYX euler, degrees); null clears it. ' +
-                      'Delivered to the device as a retained MQTT config message.',
-                    properties: {
-                      enabled: { type: 'boolean' },
-                      rollDeg: { type: 'number' },
-                      pitchDeg: { type: 'number' },
-                      yawDeg: { type: 'number' },
-                    },
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/config.',
                   },
                   imuView: {
                     type: 'object',
                     nullable: true,
-                    description:
-                      '3D orientation view camera (degrees); elevation is clamped to ±85. null resets to default.',
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/ui-prefs.',
                     properties: {
                       azimuthDeg: { type: 'number' },
                       elevationDeg: { type: 'number' },
@@ -1753,30 +1504,20 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   recordingConfig: {
                     allOf: [{ $ref: '#/components/schemas/RecordingConfig' }],
                     nullable: true,
-                    description:
-                      'On-device recording settings. Validated strictly (closed preset table, bounded ' +
-                      'numbers, unknown keys rejected 400) and delivered to the device as a retained MQTT ' +
-                      'config message; the agent applies it live within a few seconds. null clears the ' +
-                      'cloud-managed config (the device keeps its current local settings). Note: toggling ' +
-                      'video recording or changing its preset briefly restarts the live stream.',
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/config (`recording`).',
                   },
                   lteRecoveryConfig: {
                     allOf: [{ $ref: '#/components/schemas/LteRecoveryConfig' }],
                     nullable: true,
-                    description:
-                      'LTE recovery policy. Validated strictly (unknown keys/values rejected 400) and ' +
-                      'delivered to the device as a retained MQTT config message; the modem daemon reads ' +
-                      'it live at its next recovery decision — no device restart. null clears the ' +
-                      'cloud-managed policy (the device falls back to its safe defaults).',
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/config (`lteRecovery`).',
                   },
                   timeSyncConfig: {
                     allOf: [{ $ref: '#/components/schemas/TimeSyncConfig' }],
                     nullable: true,
-                    description:
-                      'Offline time sources policy. Validated strictly (unknown keys/out-of-range values ' +
-                      'rejected 400) and delivered to the device as a retained MQTT config message; the ' +
-                      'agent clock stepper reads it live within ~30 s — no device restart. null clears ' +
-                      'the cloud-managed policy (the device falls back to its defaults).',
+                    deprecated: true,
+                    description: 'DEPRECATED — use PATCH /devices/{id}/config (`timeSync`).',
                   },
                 },
               },
@@ -1808,6 +1549,81 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
         tags: ['Devices'],
         responses: {
           '204': { $ref: '#/components/responses/NoContent' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/devices/{id}/config': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      patch: {
+        operationId: 'patchDeviceConfig',
+        summary: 'Update device config namespaces',
+        description:
+          'Writes one or more namespaces of the device config document, bumps `configRev`, and ' +
+          'publishes the whole document as a retained MQTT message on ' +
+          '`xorgate/devices/{id}/config`. Each present namespace is validated and replaced ' +
+          'WHOLE — the device replaces namespaces the same way, so a partial namespace would ' +
+          'silently drop the keys it omits. `null` reverts a namespace to device defaults. ' +
+          'Returns 502 when the row was written but the retained publish failed (the device has ' +
+          'NOT been told — re-save to retry).',
+        tags: ['Devices'],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: configPatchRequestSchema() } },
+        },
+        responses: {
+          '200': {
+            description: 'Config updated and published',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['device'],
+                  properties: { device: { $ref: '#/components/schemas/Device' } },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '502': {
+            description: 'Saved, but delivering it to the device failed',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+          },
+        },
+      },
+    },
+    '/devices/{id}/ui-prefs': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      patch: {
+        operationId: 'patchDeviceUiPrefs',
+        summary: 'Update cloud-only presentation preferences',
+        description:
+          'Cloud-only: nothing here is delivered to the device, nothing is published, and ' +
+          '`configRev` is not bumped. `null` resets a pref to its default.',
+        tags: ['Devices'],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: uiPrefsPatchRequestSchema() } },
+        },
+        responses: {
+          '200': {
+            description: 'Preferences updated',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['device'],
+                  properties: { device: { $ref: '#/components/schemas/Device' } },
+                },
+              },
+            },
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },

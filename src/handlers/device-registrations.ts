@@ -16,6 +16,8 @@ import {
 } from '../utils/responses';
 import { generateRegistrationCode } from '../utils/registration-code';
 import { provisionDevice, deleteThing } from '../services/iot-provisioning';
+import { publishDeviceConfig } from '../services/device-config';
+import { initialConfigDocument } from '../config-registry/index';
 
 const REGISTRATION_TTL_MS = 15 * 60 * 1000;
 
@@ -233,6 +235,11 @@ async function claimRegistration(
         serial,
         name,
         // status omitted: column DEFAULT 'provisioned' fires.
+        // rev 1 (not the 0 default) marks "the cloud has published a document";
+        // rev 0 means the topic was never written. See step 5 below.
+        config: initialConfigDocument(),
+        configRev: 1,
+        configUpdatedAt: new Date(),
       })
       .returning();
   } catch (err) {
@@ -265,6 +272,24 @@ async function claimRegistration(
     .update(schema.deviceRegistrations)
     .set({ deviceId: device!.id, serial })
     .where(eq(schema.deviceRegistrations.id, reg.id));
+
+  // Step 5: seed the retained config topic (improve_device_settings_management,
+  // Phase 2). Before this, the topic stayed EMPTY until someone opened the
+  // settings page and saved — a freshly-onboarded device had nothing to apply
+  // and no way to tell "no config yet" from "cloud says defaults". The document
+  // is empty on purpose (absent namespace = device defaults), so this is a
+  // `{v:1, rev:1, gnssAntBias:false, …}` marker, not a values freeze.
+  // Best-effort: a publish failure must never fail a claim that has already
+  // created the row, the thing and the cert — the next save republishes.
+  try {
+    await publishDeviceConfig(device!.id, device!.config, device!.configRev);
+  } catch (err) {
+    console.error('initial device config publish failed', {
+      deviceId: device!.id,
+      rev: device!.configRev,
+      err,
+    });
+  }
 
   return ok({
     deviceId: device!.id,
