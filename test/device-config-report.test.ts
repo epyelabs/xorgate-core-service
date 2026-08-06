@@ -137,12 +137,6 @@ describe('device-config-report: self-heal republish', () => {
     expect(publishDeviceConfig).not.toHaveBeenCalled();
   });
 
-  it('does not republish over a local edit (that mirroring is Phase 4)', async () => {
-    rowAt(15);
-    await handler(report({ rev: 12, origin: 'local' }));
-    expect(publishDeviceConfig).not.toHaveBeenCalled();
-  });
-
   it('still stores a local-origin report', async () => {
     rowAt(15);
     await handler(report({ rev: 12, origin: 'local' }));
@@ -173,5 +167,122 @@ describe('device-config-report: self-heal republish', () => {
       throw new Error('data api timeout');
     };
     await expect(handler(report())).rejects.toThrow('data api timeout');
+  });
+});
+
+/**
+ * Phase 4: a local writer on the box (`xorgate set`, the manage TUI, vim) is
+ * folded back into the DESIRED document, so it stops being reverted on the next
+ * reconnect and starts showing up in the web UI.
+ */
+describe('device-config-report: origin=local mirroring', () => {
+  /** Queue per-update-call results: [0] = the report store, [1] = the merge. */
+  function rows(...results: { config: unknown; configRev: number }[][]): void {
+    let i = 0;
+    returning = async () => results[Math.min(i++, results.length - 1)];
+  }
+
+  function local(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return report({ origin: 'local', rev: 12, ...overrides });
+  }
+
+  /** The second `set()` call is the config merge; the first stored the report. */
+  function mergeWrite(): Record<string, unknown> | undefined {
+    return set.mock.calls[1]?.[0] as Record<string, unknown> | undefined;
+  }
+
+  it('merges the changed namespace, bumps the rev and republishes', async () => {
+    rows(
+      [{ config: { gnssAntBias: true }, configRev: 12 }],
+      [{ config: { gnssAntBias: false }, configRev: 13 }],
+    );
+    await handler(local({ changed: { gnssAntBias: false } }));
+
+    expect(mergeWrite()).toMatchObject({ config: { gnssAntBias: false } });
+    expect(publishDeviceConfig).toHaveBeenCalledWith(DEVICE, { gnssAntBias: false }, 13);
+  });
+
+  it('dual-writes the legacy columns the settings UI still reads', async () => {
+    rows(
+      [{ config: {}, configRev: 12 }],
+      [{ config: { timeSync: { offlineSources: false } }, configRev: 13 }],
+    );
+    await handler(local({ changed: { timeSync: { offlineSources: false } } }));
+    expect(mergeWrite()).toMatchObject({ timeSyncConfig: { offlineSources: false } });
+  });
+
+  it('treats null as "revert this namespace to device defaults"', async () => {
+    rows(
+      [{ config: { gnssAntBias: true, timeSync: { offlineSources: true } }, configRev: 12 }],
+      [{ config: { gnssAntBias: true }, configRev: 13 }],
+    );
+    await handler(local({ changed: { timeSync: null } }));
+    expect(mergeWrite()?.config).toEqual({ gnssAntBias: true });
+  });
+
+  it('does not write or republish when the merge changes nothing (loop guard)', async () => {
+    // The round trip that ends the exchange: we republished, the device applied
+    // a JSON-equal document. Without this the two would trade messages forever.
+    rows([{ config: { gnssAntBias: true }, configRev: 12 }]);
+    await handler(local({ changed: { gnssAntBias: true } }));
+    expect(set).toHaveBeenCalledTimes(1); // the report store only
+    expect(publishDeviceConfig).not.toHaveBeenCalled();
+  });
+
+  it('discards a local change that a newer cloud rev already overtook', async () => {
+    // The documented conflict rule: cloud PATCH wins ties via rev ordering.
+    rows([{ config: { gnssAntBias: true }, configRev: 15 }]);
+    await handler(local({ rev: 12, changed: { gnssAntBias: false } }));
+    expect(set).toHaveBeenCalledTimes(1);
+    // …and the device is behind, so the authoritative document is re-sent.
+    expect(publishDeviceConfig).toHaveBeenCalledWith(DEVICE, { gnssAntBias: true }, 15);
+  });
+
+  it('skips a namespace the registry rejects but keeps the rest', async () => {
+    // The device clamps where the cloud rejects, so a locally-set value can sit
+    // outside the accepted range. It must not poison the desired document.
+    rows(
+      [{ config: {}, configRev: 12 }],
+      [{ config: { gnssAntBias: false }, configRev: 13 }],
+    );
+    await handler(
+      local({
+        changed: {
+          gnssAntBias: false,
+          recording: { telemetry: { rateHz: 9999 } },
+        },
+      }),
+    );
+    expect(mergeWrite()?.config).toEqual({ gnssAntBias: false });
+  });
+
+  it('ignores an unknown namespace entirely', async () => {
+    rows([{ config: { gnssAntBias: true }, configRev: 12 }]);
+    await handler(local({ changed: { somethingNew: { a: 1 } } }));
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(publishDeviceConfig).not.toHaveBeenCalled();
+  });
+
+  it('stands down when a cloud write lands between the read and the merge', async () => {
+    // The optimistic `configRev` guard on the update matched no row.
+    rows([{ config: {}, configRev: 12 }], []);
+    await expect(handler(local({ changed: { gnssAntBias: false } }))).resolves.toBeUndefined();
+    expect(publishDeviceConfig).not.toHaveBeenCalled();
+  });
+
+  it('swallows a republish failure after a successful merge', async () => {
+    rows(
+      [{ config: {}, configRev: 12 }],
+      [{ config: { gnssAntBias: false }, configRev: 13 }],
+    );
+    publishDeviceConfig.mockRejectedValueOnce(new Error('iot down') as never);
+    await expect(handler(local({ changed: { gnssAntBias: false } }))).resolves.toBeUndefined();
+  });
+
+  it('stores a local report from an agent that sends no `changed` at all', async () => {
+    rows([{ config: { gnssAntBias: true }, configRev: 12 }]);
+    await handler(local());
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(publishDeviceConfig).not.toHaveBeenCalled();
   });
 });

@@ -25,6 +25,7 @@ import {
   validateNamespaceValue,
   type DeviceConfigDocument,
 } from '../config-registry/index';
+import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
@@ -41,35 +42,6 @@ const LEGACY_PUT_FIELDS: { field: string; namespace: string }[] = CONFIG_NAMESPA
 
 /** Old cloud-only PUT fields, now `PATCH /devices/{id}/ui-prefs`. */
 const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
-
-/**
- * The pre-consolidation columns are DUAL-WRITTEN alongside `config` /
- * `ui_prefs` for the whole transition window: the deployed frontend and any
- * out-of-band script still read them off `GET /devices/{id}`. A follow-up
- * migration drops both the columns and these two functions (cf. drizzle/0022,
- * which dropped the pre-recording columns the same way).
- *
- * Each mirrors ONLY its own half, and is called only when that half is actually
- * being written — mirroring ui_prefs on a config-only write would reset
- * `active_streams_view_type` to its default for any row whose ui_prefs had not
- * been backfilled.
- */
-function legacyConfigColumns(config: DeviceConfigDocument): Record<string, unknown> {
-  return {
-    gnssAntBias: config.gnssAntBias ?? false,
-    imuMount: config.imuMount ?? null,
-    recordingConfig: config.recording ?? null,
-    lteRecoveryConfig: config.lteRecovery ?? null,
-    timeSyncConfig: config.timeSync ?? null,
-  };
-}
-
-function legacyUiPrefColumns(uiPrefs: Record<string, unknown>): Record<string, unknown> {
-  return {
-    activeStreamsViewType: (uiPrefs.activeStreamsViewType as string | undefined) ?? 'card',
-    imuView: (uiPrefs.imuView as DeviceRow['imuView']) ?? null,
-  };
-}
 
 async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
   const rows = await db.query.workspaces.findMany({

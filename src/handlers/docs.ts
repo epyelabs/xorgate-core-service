@@ -227,7 +227,13 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               'not the one requested), and `status` carries a per-namespace ' +
               '`{ state: applied|adjusted|rejected, at, detail?, reason? }`. There is no ' +
               '`pending` state on the wire — the reader computes it as ' +
-              '`configRev > reportedConfig.rev` on an online device.',
+              '`configRev > reportedConfig.rev` on an online device. `effective.agent.mode` is ' +
+              'reported-only (`sim`/`real`): it is never cloud-settable and never gets a ' +
+              '`status` entry. An `origin: "local"` report additionally carries `changed`, the ' +
+              'namespaces a local writer altered on the device (`null` = reverted to device ' +
+              'defaults); those are validated and merged into `config`, which bumps `configRev` ' +
+              'and republishes — unless a newer cloud revision already landed, in which case ' +
+              'the cloud value wins and the local change is discarded.',
           },
           reportedAt: { type: 'string', format: 'date-time', nullable: true },
           gnssAntBias: {

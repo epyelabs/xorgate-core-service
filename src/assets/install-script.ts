@@ -177,8 +177,9 @@ KEY_PATH=$CONF_DIR/device.key.pem
 CA_PATH=$CONF_DIR/root-ca.pem
 MODE=real
 # KVS WebRTC media runtime (supervised by the agent's media collector; it reuses
-# the IoT cert above for KVS creds — channels/endpoints live in kvs.json). Off
-# until the operator runs \`xorgate set media on\`.
+# the IoT cert above for KVS creds — channels/endpoints live in kvs.json). On for
+# every provisioned device; turn a camera off with
+# \`xorgate set recording.video.cameras.<streamKey> off\` or from the web UI.
 KVS_RUNTIME_BIN=$INSTALL_PREFIX/media/xorgate-kvs-webrtc
 KVS_RUNTIME_LIB_DIR=$INSTALL_PREFIX/media/lib
 KVS_MANIFEST=$CONF_DIR/kvs.json
@@ -379,7 +380,7 @@ fi
 #    the IMU (1b) and SIM7600 (7) steps: a device that won't stream still installs
 #    cleanly. The aarch64 \`xorgate-kvs-webrtc\` binary ships in the tarball under
 #    media/; its KVS SDK .so libs are supplied separately into media/lib. The media
-#    collector stays inert until enabled (\`xorgate set media on\`) and the libs land.
+#    collector self-gates on arch/binary/manifest, so it stays inert until the libs land.
 log "installing KVS WebRTC media runtime deps"
 case "\${ID:-}\${ID_LIKE:-}" in
   *debian*|*ubuntu*)
@@ -431,7 +432,7 @@ fi
 # if the user-supplied KVS SDK .so libs aren't present yet.
 if [ -f "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" ]; then
   chmod 0755 "$INSTALL_PREFIX/media/xorgate-kvs-webrtc" || true
-  log "media runtime staged; enable streaming with: xorgate set media on"
+  log "media runtime staged; streams start once the KVS SDK libs and kvs.json are in place"
   if ! ls "$INSTALL_PREFIX"/media/lib/*.so* >/dev/null 2>&1; then
     log "NOTE: KVS SDK .so libs missing in $INSTALL_PREFIX/media/lib; supply them to enable streaming"
   fi
