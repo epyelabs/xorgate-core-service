@@ -1,140 +1,107 @@
 import { PublishCommand } from '@aws-sdk/client-iot-data-plane';
 import { iotDataClient } from './iot-data';
+import {
+  CONFIG_NAMESPACES,
+  GNSS_ANT_BIAS_DEFAULT,
+  type DeviceConfigDocument,
+} from '../config-registry/index';
 
 /**
- * Cloud -> device config delivery. Publishes the device's full config object
+ * Cloud -> device config delivery. Publishes the device's full config document
  * to `xorgate/devices/{deviceId}/config` with the MQTT retain flag, so an
  * offline device receives the latest config on its next connect — no shadow
- * service or reconciliation loop. The payload is the complete config (not a
+ * service or reconciliation loop. The payload is the complete document (not a
  * delta) so redelivery is idempotent and self-contained.
  *
  * The device IoT policy already allows subscribe/receive on
  * `xorgate/devices/${thingName}/*` (thingName = deviceId), so no policy change
- * is needed device-side. The Lambda role needs `iot:Publish` on the config
- * topic (granted in api-stack.ts).
+ * is needed device-side. The Lambda role needs `iot:Publish` AND the separate
+ * `iot:RetainPublish` action on the config topic (granted in api-stack.ts).
+ *
+ * ⚠️ The message is built FROM THE REGISTRY (src/config-registry), not from a
+ * hand-maintained interface. The old `DeviceConfigMessage`/`RecordingConfigMessage`
+ * types that lived here were a parallel copy of the schema and drifted: the
+ * thermal-shed keys were delivered but absent from them for two releases.
+ * Namespaces are spread in registry order, so the wire shape is byte-identical
+ * to v1 for every existing key — Phase 2 only ADDS `rev`.
  */
 
-export interface ImuMountConfig {
-  enabled: boolean;
-  rollDeg: number;
-  pitchDeg: number;
-  yawDeg: number;
-}
-
-/** The README `recording` settings shape (offline recording plan, D7). */
-export interface RecordingConfigMessage {
-  telemetry?: { enabled?: boolean; rateHz?: number };
-  video?: {
-    enabled?: boolean;
-    preset?: string;
-    segmentSeconds?: number;
-    // Boot power staging (optimize-system-process-cycle plan, Phase 2).
-    bootDefer?: 'auto' | 'always' | 'off';
-    bootDeferMaxSecs?: number;
-    bootDeferMinBudgetMa?: number;
-    // GPS/LTE video gate (optimize-system-process-cycle plan, Phase 7):
-    // stage 2 of the boot policy. gpsGateMaxSecs 0 = no time cap.
-    gpsGate?: 'auto' | 'always' | 'off';
-    gpsGateMaxSecs?: number;
-    gpsGateNoProgressSecs?: number;
-    spawnStaggerSecs?: number;
-    // Per-camera capacity (optimize-system-process-cycle plan, Phase 6);
-    // an absent key means enabled.
-    cameras?: Record<string, boolean>;
-  };
-  upload?: { mode?: 'auto' | 'off' };
-  retention?: { maxBytes?: number; minFreeBytes?: number };
-  // Runtime undervoltage load shedding (optimize-system-process-cycle plan, Phase 3).
-  powerShedding?: {
-    enabled?: boolean;
-    uvSamples?: number;
-    uvWindowSecs?: number;
-    railLowVolts?: number;
-    railLowSecs?: number;
-    escalateDwellSecs?: number;
-    escalateDutyPct?: number;
-    restoreSecs?: number;
-    railRestoreVolts?: number;
-    maxShedsPerHour?: number;
-  };
-}
-
-/** LTE recovery policy shape (lte_gnss_recovery plan, R8). */
-export interface LteRecoveryConfigMessage {
-  gpsFixResetPolicy?: 'defer' | 'veto-deadzone';
-  deadZoneProfile?: 'conservative' | 'balanced' | 'aggressive';
-}
-
-/** Offline time sources shape (optimize-system-process-cycle plan, Phase 4). */
-export interface TimeSyncConfigMessage {
-  offlineSources?: boolean;
-  stepThresholdSecs?: number;
-  maxStepsPerBoot?: number;
-}
-
-export interface DeviceConfigMessage {
+/** Envelope fields; the namespaces themselves come from the config document. */
+export interface DeviceConfigEnvelope {
+  /**
+   * Wire version. Stays 1: `rev` is additive, old agents ignore unknown keys
+   * and new agents treat a missing `rev` as 0 (always apply) until the fleet is
+   * upgraded (design.md §4).
+   */
   v: 1;
-  gnssAntBias: boolean;
-  /** Omitted (not null) when the device has never had a mount configured. */
-  imuMount?: ImuMountConfig;
   /**
-   * On-device recording config (offline recording plan, Phase 5). Omitted when
-   * `devices.recording_config` is NULL — the device then keeps its local
-   * settings untouched; when present the agent REPLACES its settings.json
-   * `recording` namespace with this value (cloud is authoritative once set).
+   * `devices.config_rev` — monotonic per device. The Phase 4 agent skips a
+   * redelivered document whose rev it has already applied, which is what stops
+   * reconnect-redelivery from reverting newer local state.
    */
-  recording?: RecordingConfigMessage;
-  /**
-   * LTE recovery policy (lte_gnss_recovery plan, R8). Omitted when
-   * `devices.lte_recovery_config` is NULL — the device then keeps its local
-   * settings; when present the agent REPLACES its settings.json `lteRecovery`
-   * namespace with this value (cloud is authoritative once set). The
-   * sim7600-lte daemon re-reads the file at each recovery decision, so a
-   * change applies without any device restart.
-   */
-  lteRecovery?: LteRecoveryConfigMessage;
-  /**
-   * Offline time sources (optimize-system-process-cycle plan, Phase 4).
-   * Omitted when `devices.time_sync_config` is NULL — the device then keeps
-   * its local settings; when present the agent REPLACES its settings.json
-   * `timeSync` namespace with this value (cloud is authoritative once set).
-   * The agent's clock stepper re-reads the file each tick, so a change —
-   * including the kill switch — applies without any device restart.
-   */
-  timeSync?: TimeSyncConfigMessage;
+  rev: number;
   /**
    * Segment-upload S3 bucket (offline recording plan, Phase 6.2). The install
    * script writes this into kvs.json for NEW devices; carrying it on the
-   * retained config message backfills devices fielded before Phase 2 (the
-   * agent persists it into kvs.json and arms its uploader live). Sourced from
-   * the Lambda's BUCKET_NAME env; omitted if that is unset.
+   * retained config message backfills devices fielded before that. Sourced from
+   * the Lambda's BUCKET_NAME env; omitted if unset. Not a config namespace —
+   * it is environment-derived and lands in kvs.json, not settings.json.
    */
   uploadBucket?: string;
   ts: number;
 }
 
-/** Publish the retained per-device config message. Throws on failure. */
+export type DeviceConfigMessage = DeviceConfigEnvelope & DeviceConfigDocument;
+
+/**
+ * Build the retained message for a stored config document.
+ *
+ * `gnssAntBias` is emitted even when absent from the document (falling back to
+ * the registry default) because it has ALWAYS been present on this topic and
+ * the modem daemon reads it unconditionally — omitting it would be the one
+ * non-additive change in an otherwise byte-compatible v1 message. Every other
+ * namespace keeps today's semantics: absent from the document = omitted from
+ * the message = the device keeps its local value.
+ */
+export function buildDeviceConfigMessage(
+  doc: DeviceConfigDocument | null | undefined,
+  rev: number,
+  now: number = Date.now(),
+): DeviceConfigMessage {
+  const source = (doc ?? {}) as Record<string, unknown>;
+  // Registry order is the wire order, and gnssAntBias is first in both — keep
+  // the emitted key order stable so consecutive entries in the device's
+  // "cloud config applied" journal diff cleanly.
+  const namespaces: Record<string, unknown> = { gnssAntBias: GNSS_ANT_BIAS_DEFAULT };
+  for (const ns of CONFIG_NAMESPACES) {
+    const value = source[ns.key];
+    if (value !== undefined && value !== null) namespaces[ns.key] = value;
+  }
+  const uploadBucket = process.env.BUCKET_NAME;
+  return {
+    v: 1,
+    rev,
+    ...(namespaces as DeviceConfigDocument),
+    ...(uploadBucket ? { uploadBucket } : {}),
+    ts: now,
+  } as DeviceConfigMessage;
+}
+
+/**
+ * Publish the retained per-device config message. Throws on failure.
+ *
+ * A failed publish leaves the DB ahead of the device; today the handler turns
+ * that into a 502 telling the operator to re-save. Phase 3 removes that crutch:
+ * the device's reported `rev` lets the mirror Lambda notice `config_rev >
+ * reported.rev` and republish by itself. The rev is logged on failure so that
+ * reconciliation has something to match on.
+ */
 export async function publishDeviceConfig(
   deviceId: string,
-  config: {
-    gnssAntBias: boolean;
-    imuMount?: ImuMountConfig | null;
-    recording?: RecordingConfigMessage | null;
-    lteRecovery?: LteRecoveryConfigMessage | null;
-    timeSync?: TimeSyncConfigMessage | null;
-  },
+  doc: DeviceConfigDocument | null | undefined,
+  rev: number,
 ): Promise<void> {
-  const uploadBucket = process.env.BUCKET_NAME;
-  const message: DeviceConfigMessage = {
-    v: 1,
-    gnssAntBias: config.gnssAntBias,
-    ...(config.imuMount ? { imuMount: config.imuMount } : {}),
-    ...(config.recording ? { recording: config.recording } : {}),
-    ...(config.lteRecovery ? { lteRecovery: config.lteRecovery } : {}),
-    ...(config.timeSync ? { timeSync: config.timeSync } : {}),
-    ...(uploadBucket ? { uploadBucket } : {}),
-    ts: Date.now(),
-  };
+  const message = buildDeviceConfigMessage(doc, rev);
   const client = await iotDataClient();
   await client.send(
     new PublishCommand({

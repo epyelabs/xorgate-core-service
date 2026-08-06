@@ -55,6 +55,14 @@ Apply after the latest generated migration, in filename order:
    rationale is in the file header; the `improve-recording-history-fetching`
    plan's PROGRESS.md (phase 4 notes) has the measurements.
 
+9. `manual/009_device_config_backfill.sql` — folds the five device-delivered
+   `devices` columns into the new `config` jsonb document and the two cloud-only
+   columns into `ui_prefs` (improve_device_settings_management plan, Phase 2).
+   Apply **after** the generated `0025_slim_iron_lad.sql`, which adds the
+   columns. Idempotent (only touches rows still holding the `'{}'` default);
+   one statement, no chunking needed. The old columns are KEPT and dual-written
+   during the transition window — a follow-up migration drops them.
+
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
 top); re-running all in order is safe — but note 004 re-seeds the original

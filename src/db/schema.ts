@@ -11,6 +11,9 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
 import type { InferSelectModel, InferInsertModel } from 'drizzle-orm';
+// Type-only: the consolidated `devices.config` document shape lives with the
+// config registry that validates and publishes it (Phase 2).
+import type { DeviceConfigDocument } from '../config-registry/index';
 
 // Cognito sub as primary key. Identity-level table; org membership lives in `memberships`.
 export const users = pgTable('users', {
@@ -165,6 +168,17 @@ export const devices = pgTable(
         railLowSecs?: number;
         escalateDwellSecs?: number;
         escalateDutyPct?: number;
+        /**
+         * Thermal arm (power_management_improvements plan, Phase 1). These three
+         * shipped accepted-and-delivered but were missing from this `$type`, from
+         * the publish message interface, from the OpenAPI block and from the CLI
+         * allowlist — the drift this plan's registry exists to prevent. The
+         * registry (src/config-registry/recording.ts) is now the single source;
+         * this column is transition-only and dropped in a follow-up migration.
+         */
+        cpuTempC?: number;
+        cpuTempRestoreC?: number;
+        cpuTempSecs?: number;
         restoreSecs?: number;
         railRestoreVolts?: number;
         maxShedsPerHour?: number;
@@ -197,6 +211,30 @@ export const devices = pgTable(
       azimuthDeg: number;
       elevationDeg: number;
     }>(),
+    // ---- Consolidated config (improve_device_settings_management, Phase 2) ----
+    // ONE document for everything the device is told, namespaced exactly as the
+    // wire/settings.json keys (never renamed — the modem daemon greps those
+    // paths). Validated by src/config-registry and published verbatim on
+    // xorgate/devices/{id}/config. An ABSENT namespace means "device defaults",
+    // so nothing is materialized on create. The six columns above are kept and
+    // DUAL-WRITTEN during the transition window; a follow-up migration drops
+    // them once no client reads them (cf. drizzle/0022).
+    config: jsonb('config').$type<DeviceConfigDocument>().default({}).notNull(),
+    // Monotonic, bumped on every config write. Rides the retained message as
+    // `rev`; the device (Phase 4) skips a redelivered doc it has already
+    // applied, which is what stops reconnect-redelivery reverting newer local
+    // state. Also the ordering primitive the reported plane reconciles against
+    // (`pending` = config_rev > reported.rev && device online).
+    configRev: integer('config_rev').default(0).notNull(),
+    configUpdatedAt: timestamp('config_updated_at', { withTimezone: true }),
+    // Last device report of what it actually applied (Phase 3 fills these; the
+    // columns land now so the reported plane needs no second migration).
+    reportedConfig: jsonb('reported_config').$type<Record<string, unknown>>(),
+    reportedAt: timestamp('reported_at', { withTimezone: true }),
+    // Cloud-only presentation prefs, fenced off from `config` so "delivered to
+    // the device" vs "never leaves the cloud" is visible in the schema instead
+    // of only in the publish trigger list. { activeStreamsViewType, imuView }.
+    uiPrefs: jsonb('ui_prefs').$type<Record<string, unknown>>().default({}).notNull(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { parseTimeSyncConfigBody } from '../src/schemas/time-sync-config';
+import { validateNamespaceValue } from '../src/config-registry/index';
+
+const parseTimeSyncConfigBody = (v: unknown) =>
+  validateNamespaceValue('timeSync', v, 'timeSyncConfig');
 
 describe('parseTimeSyncConfigBody', () => {
   it('accepts null (clears the column)', () => {
@@ -15,7 +18,8 @@ describe('parseTimeSyncConfigBody', () => {
     expect(parseTimeSyncConfigBody({ offlineSources: true })).toEqual({
       value: { offlineSources: true },
     });
-    expect(parseTimeSyncConfigBody({})).toEqual({ value: {} });
+    // `{}` is rejected (Phase 2): an empty namespace is never an erase.
+    expect(parseTimeSyncConfigBody({})).toHaveProperty('error');
   });
 
   it('rejects out-of-range values (reject posture — device clamps, cloud 400s)', () => {

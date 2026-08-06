@@ -660,6 +660,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "device registrations — create/poll/claim",
       ),
       timeout: cdk.Duration.seconds(30),
+      // Bundles @aws-sdk/client-iot-data-plane: the claim seeds the retained
+      // config topic for the new device (same reason DevicesFn bundles it).
+      bundling: bundlingWithSdk,
     });
 
     // GET /get/{code} — serves the per-request install.sh as text/x-shellscript.
@@ -1598,6 +1601,20 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.PUT,
         apigwv2.HttpMethod.DELETE,
       ],
+      integration: devicesInt,
+    });
+    // Config writes are their own routes (improve_device_settings_management,
+    // Phase 2): PATCH /config validates + publishes the retained document and
+    // bumps config_rev; PATCH /ui-prefs is cloud-only and does neither. Both go
+    // to the devices Lambda, which dispatches on event.routeKey.
+    this.api.addRoutes({
+      path: "/devices/{id}/config",
+      methods: [apigwv2.HttpMethod.PATCH],
+      integration: devicesInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/ui-prefs",
+      methods: [apigwv2.HttpMethod.PATCH],
       integration: devicesInt,
     });
     this.api.addRoutes({

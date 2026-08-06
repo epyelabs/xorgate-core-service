@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import {
-  parseRecordingConfigBody,
-  VIDEO_PRESET_NAMES,
-} from '../src/schemas/recording-config';
+import { validateNamespaceValue, VIDEO_PRESET_NAMES } from '../src/config-registry/index';
+
+// The `recording` namespace validator, labelled as the legacy PUT body field so
+// the error-path assertions below still read the way an API client sees them
+// (`PATCH /config` labels the same errors `recording.*`).
+const parseRecordingConfigBody = (v: unknown) =>
+  validateNamespaceValue('recording', v, 'recordingConfig');
 
 describe('parseRecordingConfigBody', () => {
   it('accepts null (clears the column)', () => {
@@ -24,8 +27,12 @@ describe('parseRecordingConfigBody', () => {
     expect(parseRecordingConfigBody(partial)).toEqual({ value: partial });
   });
 
-  it('accepts an empty object', () => {
-    expect(parseRecordingConfigBody({})).toEqual({ value: {} });
+  // Phase 2 rule (design.md §3): `{}` is NOT an erase — `null` is. Before, an
+  // all-invalid namespace could reach the device as an empty object and wipe
+  // its local state.
+  it('rejects an empty namespace object (null is the erase)', () => {
+    expect(parseRecordingConfigBody({})).toHaveProperty('error');
+    expect(parseRecordingConfigBody(null)).toEqual({ value: null });
   });
 
   it('rejects unknown top-level keys', () => {
