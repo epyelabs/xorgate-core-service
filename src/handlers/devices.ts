@@ -21,6 +21,7 @@ import {
   CONFIG_NAMESPACES,
   initialConfigDocument,
   parseUiPrefsPatch,
+  publicConfigDocument,
   validateConfigPatch,
   validateNamespaceValue,
   type DeviceConfigDocument,
@@ -52,6 +53,20 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
 }
 
 type DeviceRow = typeof schema.devices.$inferSelect;
+
+/**
+ * A device row as it leaves the API.
+ *
+ * Cleared config namespaces (`null`, settings_sync_hardening finding 2) are
+ * stripped, so every client keeps seeing the two states the OpenAPI contract
+ * documents: a namespace is either configured or absent. The marker exists so
+ * the PUBLISHER can tell "reverted" from "never configured"; nothing outside
+ * this service needs it, and the deployed frontend would read a present-but-
+ * null key as "the cloud manages this".
+ */
+function deviceResponse(row: DeviceRow): DeviceRow {
+  return { ...row, config: publicConfigDocument(row.config) as DeviceConfigDocument };
+}
 
 async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
   if (orgWorkspaceIds.length === 0) return undefined;
@@ -119,7 +134,7 @@ async function writeConfig(
         'automatically the next time the device reports in.',
     );
   }
-  return ok({ device: row });
+  return ok({ device: deviceResponse(row) });
 }
 
 export const handler = async (
@@ -201,7 +216,7 @@ export const handler = async (
       )
       .returning();
     if (updated.length === 0) return notFound(`Device "${id}" not found`);
-    return ok({ device: updated[0] });
+    return ok({ device: deviceResponse(updated[0]) });
   }
 
   switch (method) {
@@ -210,7 +225,7 @@ export const handler = async (
         if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
         const row = await findDevice(id, orgWorkspaceIds);
         if (!row) return notFound(`Device "${id}" not found`);
-        return ok({ device: row });
+        return ok({ device: deviceResponse(row) });
       }
       // Standardized list dialect (utils/list-params): limit/offset/order/sort/
       // status, plus a `page` block. Default order preserves the prior behaviour
@@ -264,7 +279,7 @@ export const handler = async (
         limit,
         offset,
       });
-      return ok({ devices: rows, page: pageMeta(parsed, total) });
+      return ok({ devices: rows.map(deviceResponse), page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: {
@@ -323,7 +338,7 @@ export const handler = async (
           err,
         });
       }
-      return created({ device: row });
+      return created({ device: deviceResponse(row) });
     }
     case 'PUT': {
       if (!id) return badRequest('device id required in path');
@@ -419,7 +434,7 @@ export const handler = async (
           )
           .returning();
         if (updated.length === 0) return notFound(`Device "${id}" not found`);
-        return ok({ device: updated[0] });
+        return ok({ device: deviceResponse(updated[0]) });
       }
 
       const device = await findDevice(id, orgWorkspaceIds);
@@ -446,7 +461,7 @@ export const handler = async (
           )
           .returning();
         if (updated.length === 0) return notFound(`Device "${id}" not found`);
-        return ok({ device: updated[0] });
+        return ok({ device: deviceResponse(updated[0]) });
       }
 
       const nextConfig = applyConfigPatch(device.config, configPatch) as DeviceConfigDocument;

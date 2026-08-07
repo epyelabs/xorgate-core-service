@@ -4,6 +4,7 @@ import {
   CONFIG_NAMESPACES,
   GNSS_ANT_BIAS_DEFAULT,
   type DeviceConfigDocument,
+  type PublishedConfigDocument,
 } from '../config-registry/index';
 
 /**
@@ -51,7 +52,7 @@ export interface DeviceConfigEnvelope {
   ts: number;
 }
 
-export type DeviceConfigMessage = DeviceConfigEnvelope & DeviceConfigDocument;
+export type DeviceConfigMessage = DeviceConfigEnvelope & PublishedConfigDocument;
 
 /**
  * Build the retained message for a stored config document.
@@ -59,9 +60,24 @@ export type DeviceConfigMessage = DeviceConfigEnvelope & DeviceConfigDocument;
  * `gnssAntBias` is emitted even when absent from the document (falling back to
  * the registry default) because it has ALWAYS been present on this topic and
  * the modem daemon reads it unconditionally — omitting it would be the one
- * non-additive change in an otherwise byte-compatible v1 message. Every other
- * namespace keeps today's semantics: absent from the document = omitted from
- * the message = the device keeps its local value.
+ * non-additive change in an otherwise byte-compatible v1 message. It is also
+ * why nulling `gnssAntBias` has always genuinely reverted the device while the
+ * object namespaces silently did not.
+ *
+ * The three stored states map to three wire states
+ * (settings_sync_hardening, finding 2):
+ *
+ * - **absent** → omitted. The device keeps its local value. Unchanged, and
+ *   load-bearing: it is what stops the cloud wiping settings it doesn't manage.
+ * - **a value** → emitted as-is. Unchanged.
+ * - **`null`** (explicitly cleared) → emitted as `{}`, which the device's
+ *   tolerant parser has always read as "drop your local key".
+ *
+ * ⚠️ The absent → omitted rule is the one thing in this file that can do fleet-
+ * wide damage. Emitting `{}` for a namespace nobody configured would tell every
+ * device on the next publish to wipe settings the cloud never managed. The
+ * `hasOwnProperty` guard below is the only thing standing between those two
+ * cases, and `device-config.test.ts` pins it.
  */
 export function buildDeviceConfigMessage(
   doc: DeviceConfigDocument | null | undefined,
@@ -74,14 +90,23 @@ export function buildDeviceConfigMessage(
   // "cloud config applied" journal diff cleanly.
   const namespaces: Record<string, unknown> = { gnssAntBias: GNSS_ANT_BIAS_DEFAULT };
   for (const ns of CONFIG_NAMESPACES) {
+    if (!Object.prototype.hasOwnProperty.call(source, ns.key)) continue;
     const value = source[ns.key];
-    if (value !== undefined && value !== null) namespaces[ns.key] = value;
+    if (value === undefined) continue;
+    if (value === null) {
+      // Cleared. A scalar namespace reverts by falling back to the registry
+      // default, which gnssAntBias is already seeded with above — emitting `{}`
+      // for it would just be an invalid boolean the device would drop.
+      if (ns.kind === 'object') namespaces[ns.key] = {};
+      continue;
+    }
+    namespaces[ns.key] = value;
   }
   const uploadBucket = process.env.BUCKET_NAME;
   return {
     v: 1,
     rev,
-    ...(namespaces as DeviceConfigDocument),
+    ...(namespaces as PublishedConfigDocument),
     ...(uploadBucket ? { uploadBucket } : {}),
     ts: now,
   } as DeviceConfigMessage;

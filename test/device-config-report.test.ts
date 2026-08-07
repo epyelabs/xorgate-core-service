@@ -214,10 +214,16 @@ describe('device-config-report: origin=local mirroring', () => {
   it('treats null as "revert this namespace to device defaults"', async () => {
     rows(
       [{ config: { gnssAntBias: true, timeSync: { offlineSources: true } }, configRev: 12 }],
-      [{ config: { gnssAntBias: true }, configRev: 13 }],
+      [{ config: { gnssAntBias: true, timeSync: null }, configRev: 13 }],
     );
     await handler(local({ changed: { timeSync: null } }));
-    expect(mergeWrite()?.config).toEqual({ gnssAntBias: true });
+    // Stored as the cleared marker rather than deleted (settings_sync_hardening
+    // finding 2): the operator deleted the key on the box, so the cloud now
+    // records a deliberate revert and republishes it as `{}`. The legacy column
+    // still nulls, exactly as it did when the key was deleted outright.
+    const write = mergeWrite();
+    expect(write?.config).toEqual({ gnssAntBias: true, timeSync: null });
+    expect(write).toMatchObject({ timeSyncConfig: null });
   });
 
   it('does not write or republish when the merge changes nothing (loop guard)', async () => {

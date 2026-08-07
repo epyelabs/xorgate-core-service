@@ -52,8 +52,9 @@ export function configOpenApiSchemas(): Record<string, unknown> {
 /**
  * `PATCH /devices/{id}/config` request body: the same document, but each
  * namespace additionally accepts `null` — "revert this namespace to device
- * defaults" (the key is deleted from the stored doc and omitted from the
- * published message). An empty object is rejected; it is never an erase.
+ * defaults". The namespace stops being cloud-managed AND the device is told to
+ * drop its local value, so both sides land on the defaults. An empty object is
+ * rejected in a REQUEST; it is never an erase there.
  */
 export function configPatchRequestSchema(): Record<string, unknown> {
   return {
@@ -62,9 +63,10 @@ export function configPatchRequestSchema(): Record<string, unknown> {
     minProperties: 1,
     description:
       'Partial config document. Present namespaces are validated and replaced WHOLE (matching ' +
-      'how the device merges); `null` reverts a namespace to device defaults; absent namespaces ' +
-      'are untouched; `{}` is rejected. All-or-nothing: any invalid namespace fails the whole ' +
-      'request, so a multi-namespace save can never half-commit.',
+      'how the device merges); `null` reverts a namespace to device defaults on BOTH sides — ' +
+      'the cloud stops managing it and the device is told to drop its local value; absent ' +
+      'namespaces are untouched; `{}` is rejected. All-or-nothing: any invalid namespace fails ' +
+      'the whole request, so a multi-namespace save can never half-commit.',
     properties: Object.fromEntries(
       CONFIG_NAMESPACES.map((ns) => [
         ns.key,

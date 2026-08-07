@@ -4,9 +4,11 @@ import {
   CONFIG_NAMESPACE_KEYS,
   initialConfigDocument,
   parseUiPrefsPatch,
+  publicConfigDocument,
   validateConfigPatch,
   validateNamespaceValue,
 } from '../src/config-registry/index';
+import { legacyConfigColumns } from '../src/config-registry/legacy-columns';
 import { buildDeviceConfigMessage } from '../src/services/device-config';
 
 describe('config registry — namespaces', () => {
@@ -89,9 +91,52 @@ describe('config registry — patch application', () => {
     });
   });
 
-  it('null deletes the namespace (revert to device defaults)', () => {
+  // settings_sync_hardening finding 2. `null` used to DELETE the key, which
+  // made "the operator reverted this" and "never configured" the same stored
+  // state — and since the publisher omits what it does not have, the device
+  // never heard about the revert.
+  it('null stores a cleared marker (revert to device defaults)', () => {
     const doc = { gnssAntBias: true, timeSync: { offlineSources: false } };
-    expect(applyConfigPatch(doc, { timeSync: null })).toEqual({ gnssAntBias: true });
+    expect(applyConfigPatch(doc, { timeSync: null })).toEqual({
+      gnssAntBias: true,
+      timeSync: null,
+    });
+  });
+
+  it('the marker survives a later patch to a different namespace', () => {
+    // The publisher rebuilds the whole message every time, so a cleared
+    // namespace has to stay cleared on the wire until someone sets a value.
+    const cleared = applyConfigPatch({ timeSync: { offlineSources: false } }, { timeSync: null });
+    const next = applyConfigPatch(cleared, { gnssAntBias: true });
+    expect(next.timeSync).toBeNull();
+    expect(buildDeviceConfigMessage(next, 3).timeSync).toEqual({});
+  });
+
+  it('setting a value again clears the marker', () => {
+    const cleared = applyConfigPatch({ timeSync: { offlineSources: false } }, { timeSync: null });
+    const next = applyConfigPatch(cleared, { timeSync: { offlineSources: true } });
+    expect(next).toEqual({ timeSync: { offlineSources: true } });
+  });
+
+  it('hides the marker from every reader — cleared reads exactly like absent', () => {
+    const cleared = publicConfigDocument({ gnssAntBias: true, timeSync: null });
+    expect(cleared).toEqual({ gnssAntBias: true });
+    expect('timeSync' in cleared).toBe(false);
+  });
+
+  it('maps a cleared namespace to the same legacy column value as an absent one', () => {
+    expect(legacyConfigColumns({ imuMount: null, gnssAntBias: null })).toEqual(
+      legacyConfigColumns({}),
+    );
+    expect(legacyConfigColumns({ recording: null, lteRecovery: null, timeSync: null })).toEqual(
+      legacyConfigColumns({}),
+    );
+  });
+
+  it('accepts the marker on read-back — the registry must not reject it', () => {
+    for (const ns of CONFIG_NAMESPACE_KEYS) {
+      expect(validateNamespaceValue(ns, null)).toEqual({ value: null });
+    }
   });
 
   it('does not mutate the input document', () => {
@@ -168,6 +213,64 @@ describe('retained config message', () => {
     expect(msg.imuMount).toBeUndefined();
     expect(msg.lteRecovery).toBeUndefined();
     expect(msg.timeSync).toEqual({ offlineSources: false });
+  });
+
+  // ---- cleared vs never-configured (settings_sync_hardening finding 2) ------
+  //
+  // ⚠️ This pair is the whole safety property of the phase. Emitting `{}` for a
+  // namespace nobody configured would tell EVERY device in the fleet, on the
+  // next publish, to wipe settings the cloud never managed.
+
+  it('NEVER emits {} for a namespace that was never configured', () => {
+    const msg = buildDeviceConfigMessage({}, 1, 1_700_000_000_000) as Record<string, unknown>;
+    for (const ns of CONFIG_NAMESPACE_KEYS) {
+      if (ns === 'gnssAntBias') continue; // always emitted, always a boolean
+      expect(msg[ns]).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(msg, ns)).toBe(false);
+    }
+    // Belt and braces: nothing anywhere in the payload is an empty object.
+    expect(Object.values(msg).some((v) => v !== null && typeof v === 'object' &&
+      !Array.isArray(v) && Object.keys(v as object).length === 0)).toBe(false);
+  });
+
+  it('emits {} for an explicitly cleared object namespace', () => {
+    const msg = buildDeviceConfigMessage(
+      { imuMount: null, recording: null, lteRecovery: null, timeSync: null },
+      9,
+      1_700_000_000_000,
+    );
+    // The device's tolerant parser reads an empty object as "drop your local
+    // key and fall back to defaults" — see agent/cloud-config.ts.
+    expect(msg).toEqual({
+      v: 1,
+      rev: 9,
+      gnssAntBias: false,
+      imuMount: {},
+      recording: {},
+      lteRecovery: {},
+      timeSync: {},
+      ts: 1_700_000_000_000,
+    });
+  });
+
+  it('reverts a cleared scalar namespace to the registry default, not {}', () => {
+    // gnssAntBias is a bare boolean on the wire; `{}` would just be an invalid
+    // value the device drops. It is already seeded with the default, which IS
+    // the revert — and is why nulling it has always worked.
+    const msg = buildDeviceConfigMessage({ gnssAntBias: null }, 4, 1_700_000_000_000);
+    expect(msg).toEqual({ v: 1, rev: 4, gnssAntBias: false, ts: 1_700_000_000_000 });
+  });
+
+  it('keeps cleared and configured namespaces apart in one document', () => {
+    const msg = buildDeviceConfigMessage(
+      { imuMount: null, timeSync: { offlineSources: false } },
+      5,
+      1_700_000_000_000,
+    );
+    expect(msg.imuMount).toEqual({});
+    expect(msg.timeSync).toEqual({ offlineSources: false });
+    expect(msg.recording).toBeUndefined();
+    expect(msg.lteRecovery).toBeUndefined();
   });
 
   it('carries uploadBucket from the environment when set', () => {

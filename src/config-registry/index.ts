@@ -52,16 +52,55 @@ export function configNamespace(key: string): ConfigNamespaceSpec | undefined {
 }
 
 /**
- * The stored `devices.config` document — one key per namespace, all optional
- * (absent = "device defaults", which is why nothing is materialized on create).
- * Namespace keys are the WIRE keys; the doc is published as-is.
+ * The stored `devices.config` document — one key per namespace, all optional.
+ * Namespace keys are the WIRE keys.
+ *
+ * THREE states per namespace, not two (settings_sync_hardening, finding 2):
+ *
+ * - **absent** — never configured from the cloud. Omitted from the published
+ *   message, which the device reads as "leave your local value alone". Nothing
+ *   is materialized on create, so this is where every device starts.
+ * - **a value** — cloud-managed; published and replaced whole.
+ * - **`null`** — explicitly CLEARED by `PATCH {ns: null}`. Published as `{}`,
+ *   which the device reads as "drop your local key and fall back to defaults".
+ *
+ * Absent and `null` look identical to every READER (both mean "the cloud
+ * manages nothing here" — `legacyConfigColumns` maps both to the column
+ * default, and the API strips `null` before it leaves the service). They differ
+ * only to the PUBLISHER, and that difference is the whole point: without it,
+ * "revert this namespace to device defaults" reverted the cloud and left the
+ * device running what it had, with no badge anywhere to say so.
  */
 export interface DeviceConfigDocument {
-  gnssAntBias?: boolean;
-  imuMount?: ImuMountConfig;
-  recording?: RecordingConfig;
-  lteRecovery?: LteRecoveryConfig;
-  timeSync?: TimeSyncConfig;
+  gnssAntBias?: boolean | null;
+  imuMount?: ImuMountConfig | null;
+  recording?: RecordingConfig | null;
+  lteRecovery?: LteRecoveryConfig | null;
+  timeSync?: TimeSyncConfig | null;
+}
+
+/**
+ * The document as PUBLISHED. A cleared namespace travels as `{}` and never as
+ * `null` — the device's tolerant parser has always mapped an empty object to
+ * "clear this namespace", so the marker needs no new wire vocabulary.
+ */
+export type PublishedConfigDocument = {
+  [K in keyof DeviceConfigDocument]?: NonNullable<DeviceConfigDocument[K]> | Record<string, never>;
+};
+
+/**
+ * The document as it leaves the API. Cleared namespaces are stripped, so every
+ * reader — the settings UI, an operator's script, the OpenAPI contract — keeps
+ * seeing exactly two states, and `null` stays an internal publisher detail.
+ */
+export function publicConfigDocument(
+  doc: DeviceConfigDocument | ConfigDocument | null | undefined,
+): ConfigDocument {
+  const out: ConfigDocument = {};
+  for (const [key, value] of Object.entries(doc ?? {})) {
+    if (value !== null && value !== undefined) out[key] = value;
+  }
+  return out;
 }
 
 /** Loose view of the same document, for generic namespace-keyed manipulation. */
@@ -70,8 +109,9 @@ export type ConfigDocument = Record<string, unknown>;
 /**
  * Validate one namespace value.
  *
- * - `null`      → revert to device defaults (the key is deleted from the doc
- *                 and omitted from the publish message).
+ * - `null`      → revert to device defaults (stored as an explicit cleared
+ *                 marker and published as `{}`, which tells the device to drop
+ *                 its local key — see `DeviceConfigDocument`).
  * - `{}`        → REJECTED for object namespaces. An empty object is never an
  *                 erase; `null` is. This closes today's ambiguity where an
  *                 all-invalid namespace could erase local device state.
@@ -141,7 +181,12 @@ export function validateConfigPatch(
 
 /**
  * Apply a validated patch to a stored document: present namespaces replace
- * whole, `null` deletes, absent leaves untouched.
+ * whole, `null` stores the cleared marker, absent leaves untouched.
+ *
+ * `null` used to DELETE the key, which made "the operator reverted this" and
+ * "this was never configured" the same stored state — and since the publisher
+ * omits what it does not have, the device never heard about the revert. Keeping
+ * the marker is what lets `buildDeviceConfigMessage` tell those two apart.
  */
 export function applyConfigPatch(
   doc: DeviceConfigDocument | ConfigDocument | null | undefined,
@@ -149,8 +194,7 @@ export function applyConfigPatch(
 ): ConfigDocument {
   const next: ConfigDocument = { ...(doc ?? {}) };
   for (const [key, value] of Object.entries(patch)) {
-    if (value === null) delete next[key];
-    else next[key] = value;
+    next[key] = value;
   }
   return next;
 }
