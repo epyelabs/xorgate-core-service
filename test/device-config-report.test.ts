@@ -92,6 +92,48 @@ describe('device-config-report: mirroring', () => {
     });
   });
 
+  it('mirrors REPORTED-ONLY effective keys that are not namespaces at all', async () => {
+    // `agent.mode`, and since manage_sim_card_info Phase 1 also `sim` and
+    // `uplink`: device facts that ride `effective` because they can never be
+    // SET (you cannot write an ICCID). `effective` is stored opaquely and is
+    // deliberately not validated against the config registry, which is what
+    // lets a key like this ship with no namespace, no contract regeneration and
+    // no migration. Pinned here so a future tightening of the schema has to
+    // notice it is breaking them.
+    const sim = {
+      present: 1,
+      state: 'ready',
+      iccid: '8912230000507537488',
+      carrier: 'Public Mobile',
+      registration: 'home',
+    };
+    await handler(
+      report({
+        effective: { agent: { mode: 'real' }, sim, uplink: { primary: 'wlan0', modem_only: 0 } },
+      }),
+    );
+    const written = set.mock.calls[0][0] as { reportedConfig: Record<string, unknown> };
+    expect(written.reportedConfig.effective).toEqual({
+      agent: { mode: 'real' },
+      sim,
+      uplink: { primary: 'wlan0', modem_only: 0 },
+    });
+  });
+
+  it('never folds a reported-only key into the desired config document', async () => {
+    // A local report merges `changed`, never `effective` — so even a device
+    // that reported `sim` cannot cause `sim` to be written into devices.config.
+    await handler(
+      report({
+        origin: 'local',
+        effective: { sim: { present: 0, state: 'not-detected' } },
+        changed: { sim: { present: 0 } },
+      }),
+    );
+    // One update: the report mirror. No second update writing the config doc.
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
   it('drops a payload whose body deviceId contradicts the topic', async () => {
     await handler(report({ deviceId: 'someone-else' }));
     expect(update).not.toHaveBeenCalled();
