@@ -229,7 +229,12 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               '`pending` state on the wire — the reader computes it as ' +
               '`configRev > reportedConfig.rev` on an online device. `effective.agent.mode` is ' +
               'reported-only (`sim`/`real`): it is never cloud-settable and never gets a ' +
-              '`status` entry. An `origin: "local"` report additionally carries `changed`, the ' +
+              '`status` entry. `effective.sim` (SIM presence, state, ICCID, phone number, ' +
+              'carrier, registration) and `effective.uplink` (which interface carries the ' +
+              'default route) are reported-only in exactly the same way — a device cannot be ' +
+              'TOLD its ICCID, so neither is a config namespace and neither ever carries a ' +
+              '`status`. Both are ABSENT when the device has not reported them, which means ' +
+              'unknown and never "no SIM". An `origin: "local"` report additionally carries `changed`, the ' +
               'namespaces a local writer altered on the device (`null` = reverted to device ' +
               'defaults); those are validated and merged into `config`, which bumps `configRev` ' +
               'and republishes — unless a newer cloud revision already landed, in which case ' +
