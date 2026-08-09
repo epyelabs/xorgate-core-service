@@ -234,7 +234,14 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
               'default route) are reported-only in exactly the same way — a device cannot be ' +
               'TOLD its ICCID, so neither is a config namespace and neither ever carries a ' +
               '`status`. Both are ABSENT when the device has not reported them, which means ' +
-              'unknown and never "no SIM". An `origin: "local"` report additionally carries `changed`, the ' +
+              'unknown and never "no SIM". `effective.apn` is reported-only too: the modem ' +
+              "daemon's APN apply machinery — `{ applied, requested?, state: " +
+              'in-force|applying|rolled-back|rejected, last_error?, changed_at? }`. `applied` is ' +
+              "the APN actually in the modem's data context (the `cellular` namespace's " +
+              '`effective.cellular.apn` mirrors it while a change is in flight); an ABSENT ' +
+              '`apn` block means the daemon predates the rollback machinery, and a UI must ' +
+              'refuse to write the `cellular` namespace to such a device — there is no safety ' +
+              'net there. An `origin: "local"` report additionally carries `changed`, the ' +
               'namespaces a local writer altered on the device (`null` = reverted to device ' +
               'defaults); those are validated and merged into `config`, which bumps `configRev` ' +
               'and republishes — unless a newer cloud revision already landed, in which case ' +
@@ -718,7 +725,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   format: 'uuid',
                   description: 'Replay key. The device refuses to execute the same one twice.',
                 },
-                command: { type: 'string', enum: ['reboot', 'power_off'] },
+                command: { type: 'string', enum: ['reboot', 'power_off', 'refresh'] },
                 expiresAt: {
                   type: 'integer',
                   format: 'int64',
@@ -1709,6 +1716,29 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           'Publishes a one-shot power-off command to the device over MQTT. Same delivery semantics and guards as ' +
           'the reboot command, but NOT remotely recoverable: the device stays off until someone physically powers ' +
           'it back on. The device must be online (409 otherwise).',
+        tags: ['Devices'],
+        responses: {
+          '202': { $ref: '#/components/responses/DeviceCommandAccepted' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+          '502': { $ref: '#/components/responses/DeviceCommandPublishFailed' },
+        },
+      },
+    },
+    '/devices/{id}/refresh-state': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      post: {
+        operationId: 'refreshDeviceState',
+        summary: 'Ask the device to re-probe and re-report its state now',
+        description:
+          'Publishes a one-shot READ-ONLY refresh command over MQTT: the device re-probes what it can ' +
+          '(SIM identity, applied APN, antenna bias) and publishes a fresh config report immediately, ' +
+          'instead of on its hourly heartbeat. 202 means the command was delivered to the broker; observe ' +
+          'the outcome by re-reading the device until `reportedAt` advances. The device rate-limits ' +
+          'refreshes (~1 per 30 s) and a re-probe takes up to ~45 s to land. Ordinary member access — ' +
+          'nothing on the device changes. The device must be online (409 otherwise).',
         tags: ['Devices'],
         responses: {
           '202': { $ref: '#/components/responses/DeviceCommandAccepted' },

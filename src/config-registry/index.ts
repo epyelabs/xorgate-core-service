@@ -23,6 +23,7 @@ import { imuMountNamespace, type ImuMountConfig } from './imu-mount';
 import { recordingNamespace, type RecordingConfig } from './recording';
 import { lteRecoveryNamespace, type LteRecoveryConfig } from './lte-recovery';
 import { timeSyncNamespace, type TimeSyncConfig } from './time-sync';
+import { cellularNamespace, type CellularConfig } from './cellular';
 
 export * from './types';
 export * from './gnss-ant-bias';
@@ -30,6 +31,7 @@ export * from './imu-mount';
 export * from './recording';
 export * from './lte-recovery';
 export * from './time-sync';
+export * from './cellular';
 export * from './ui-prefs';
 
 /**
@@ -43,6 +45,7 @@ export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
   recordingNamespace,
   lteRecoveryNamespace,
   timeSyncNamespace,
+  cellularNamespace,
 ];
 
 export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
@@ -77,6 +80,7 @@ export interface DeviceConfigDocument {
   recording?: RecordingConfig | null;
   lteRecovery?: LteRecoveryConfig | null;
   timeSync?: TimeSyncConfig | null;
+  cellular?: CellularConfig | null;
 }
 
 /**
