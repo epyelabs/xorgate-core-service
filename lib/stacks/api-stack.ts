@@ -626,7 +626,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-commands.ts"),
-        "POST /devices/{id}/reboot|power-off — one-shot device commands",
+        "POST /devices/{id}/reboot|power-off|refresh-state — one-shot device commands",
       ),
       // Bundles @aws-sdk/client-iot-data-plane (command publish), which isn't
       // guaranteed in the Lambda runtime SDK.
@@ -1705,6 +1705,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     this.api.addRoutes({
       path: "/devices/{id}/power-off",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    this.api.addRoutes({
+      path: "/devices/{id}/refresh-state",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });

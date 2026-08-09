@@ -26,7 +26,15 @@ import { iotDataClient } from './iot-data';
  * (granted in api-stack.ts). No `iot:RetainPublish` — we never retain here.
  */
 
-export type DeviceCommandName = 'reboot' | 'power_off';
+/**
+ * `refresh` (manage_sim_card_info plan, Phase 2 §4d) is the one read-only
+ * command: it asks the device to re-probe what it can (SIM identity, applied
+ * APN, antenna bias) and publish a fresh config report NOW instead of on the
+ * hourly heartbeat. Same one-shot semantics as the others — an offline device
+ * misses it, which is fine, because a refresh of a device that cannot report
+ * is meaningless.
+ */
+export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh';
 
 /**
  * How long a command stays valid. Generous next to a sub-second publish, tight

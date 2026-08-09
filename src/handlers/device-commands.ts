@@ -19,17 +19,21 @@ async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
 const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/reboot': 'reboot',
   'POST /devices/{id}/power-off': 'power_off',
+  'POST /devices/{id}/refresh-state': 'refresh',
 };
 
 /**
  * One-shot device commands. Routes (all -> this Lambda):
  *   POST /devices/{id}/reboot
  *   POST /devices/{id}/power-off
+ *   POST /devices/{id}/refresh-state
  *
- * Restricted to owner/admin, unlike the other device writes which effectively
- * allow any member. Power-off in particular is not remotely recoverable —
- * someone has to physically walk to the device and press a button — so it gets
- * the same gate as provisioning rather than the ordinary write gate.
+ * Reboot/power-off are restricted to owner/admin, unlike the other device
+ * writes which effectively allow any member. Power-off in particular is not
+ * remotely recoverable — someone has to physically walk to the device and press
+ * a button — so it gets the same gate as provisioning rather than the ordinary
+ * write gate. `refresh` is READ-ONLY (the device just re-probes and re-reports
+ * its state), so it takes the ordinary member gate.
  *
  * Ownership: the device must belong to a workspace in the caller's org (same
  * check as devices.ts / device-sessions.ts); cross-org reads surface as 404.
@@ -46,7 +50,10 @@ export const handler = async (
 
   let auth;
   try {
-    auth = await requireOrgContext(event, ['owner', 'admin']);
+    auth =
+      command === 'refresh'
+        ? await requireOrgContext(event)
+        : await requireOrgContext(event, ['owner', 'admin']);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;
