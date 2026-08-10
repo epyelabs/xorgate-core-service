@@ -679,6 +679,21 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     installScriptFn.addEnvironment("DEVICE_DIST_VERSION", "latest");
 
+    // GET /device-dist/latest — the CI-published build manifest, so the web UI
+    // can say "update available" instead of only showing what is installed.
+    // Read is scoped to the one key: this Lambda has no business with the
+    // tarballs themselves.
+    const deviceDistFn = new nodejs.NodejsFunction(
+      this,
+      "DeviceDistFn",
+      standardFnProps(
+        path.join(entryBase, "device-dist.ts"),
+        "GET /device-dist/latest — latest published agent build manifest",
+      ),
+    );
+    deviceDistFn.addEnvironment("DEVICE_DIST_BUCKET", distBucket.bucketName);
+    distBucket.grantRead(deviceDistFn, "latest.json");
+
     // GET /devices/{id}/kvs-channels (P3) — returns the device's KVS signaling
     // channels so the browser can run a WebRTC VIEWER. Reads Postgres only (no KVS
     // call, no new IAM); the browser mints its own scoped creds via Cognito.
@@ -1518,6 +1533,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "InstallScriptInt",
       installScriptFn,
     );
+    const deviceDistInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceDistInt",
+      deviceDistFn,
+    );
     const deviceKvsChannelsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceKvsChannelsInt",
       deviceKvsChannelsFn,
@@ -1712,6 +1731,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/refresh-state",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
+    });
+
+    // Fleet-wide, not per-device: what the newest published agent build is.
+    this.api.addRoutes({
+      path: "/device-dist/latest",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceDistInt,
     });
 
     // Device registration (onboarding). The {code}/claim route is reached

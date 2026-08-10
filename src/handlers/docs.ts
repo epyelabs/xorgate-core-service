@@ -187,7 +187,20 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           deviceModelId: { type: 'string', format: 'uuid' },
           serial: { type: 'string' },
           name: { type: 'string', nullable: true },
-          firmwareVersion: { type: 'string', nullable: true },
+          agentVersion: {
+            type: 'string',
+            nullable: true,
+            description:
+              'Installed xorgate-device-agent build (CI short sha on dev, release tag on ' +
+              'prod), mirrored from the device\'s own config report — read-only. ' +
+              'null until the device reports a build.',
+          },
+          firmwareVersion: {
+            type: 'string',
+            nullable: true,
+            deprecated: true,
+            description: 'DEPRECATED alias for agentVersion; removed once clients migrate.',
+          },
           status: {
             type: 'string',
             enum: ['provisioned', 'online', 'offline', 'decommissioned'],
@@ -1425,7 +1438,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   deviceModelId: { type: 'string', format: 'uuid' },
                   serial: { type: 'string' },
                   name: { type: 'string', nullable: true },
-                  firmwareVersion: { type: 'string', nullable: true },
                   status: {
                     type: 'string',
                     enum: ['provisioned', 'online', 'offline', 'decommissioned'],
@@ -1499,7 +1511,6 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                 minProperties: 1,
                 properties: {
                   name: { type: 'string', nullable: true },
-                  firmwareVersion: { type: 'string', nullable: true },
                   gnssAntBias: {
                     type: 'boolean',
                     deprecated: true,
@@ -1747,6 +1758,49 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           '404': { $ref: '#/components/responses/NotFound' },
           '409': { $ref: '#/components/responses/Conflict' },
           '502': { $ref: '#/components/responses/DeviceCommandPublishFailed' },
+        },
+      },
+    },
+    '/device-dist/latest': {
+      parameters: [{ $ref: '#/components/parameters/OrganizationIdHeader' }],
+      get: {
+        operationId: 'getLatestAgentBuild',
+        summary: 'The newest published device-agent build',
+        description:
+          'Returns the manifest the device-agent CI publishes alongside the `latest` tarball alias, i.e. exactly ' +
+          'what a device update would install for this stage. Compare `version` against a device\'s reported ' +
+          'build (`reportedConfig.effective.agent.build.version`, mirrored to `agentVersion`) by STRING EQUALITY ' +
+          'only — shas do not order, and a dev sha and a prod release tag are not comparable. 404 means CI has ' +
+          'not published a manifest for this stage yet; treat that as "latest unknown", not as an error.',
+        tags: ['Devices'],
+        responses: {
+          '200': {
+            description: 'The latest published build.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['latest'],
+                  properties: {
+                    latest: {
+                      type: 'object',
+                      required: ['version'],
+                      properties: {
+                        version: { type: 'string', example: 'a1b2c3d' },
+                        channel: { type: 'string', nullable: true, example: 'dev' },
+                        builtAt: { type: 'string', format: 'date-time', nullable: true },
+                        packageVersion: { type: 'string', nullable: true, example: '0.2.0' },
+                        tarball: { type: 'string', nullable: true },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
         },
       },
     },

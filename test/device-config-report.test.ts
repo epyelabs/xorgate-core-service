@@ -162,6 +162,67 @@ describe('device-config-report: mirroring', () => {
   });
 });
 
+describe('device-config-report: agent_version mirror', () => {
+  const build = (over: Record<string, unknown> = {}) => ({
+    agent: {
+      mode: 'real',
+      build: {
+        version: 'a1b2c3d',
+        channel: 'dev',
+        builtAt: '2026-08-10T14:00:00Z',
+        packageVersion: '0.2.0',
+        ...over,
+      },
+    },
+  });
+
+  it('mirrors the reported build into the column, in the same statement', async () => {
+    await handler(report({ effective: build() }));
+    expect(update).toHaveBeenCalledTimes(1);
+    const written = set.mock.calls[0][0] as Record<string, unknown>;
+    expect(written.agentVersion).toBe('a1b2c3d');
+    expect(written).toHaveProperty('reportedConfig');
+  });
+
+  it('leaves an existing value alone when the report carries no build', async () => {
+    // An agent predating the build manifest. Nulling the column here would lose
+    // a version the cloud already knew, for no gain.
+    await handler(report({ effective: { agent: { mode: 'real' } } }));
+    const written = set.mock.calls[0][0] as Record<string, unknown>;
+    expect(written).not.toHaveProperty('agentVersion');
+  });
+
+  it.each([
+    ['a non-string version', { version: 42 }],
+    ['an empty version', { version: '   ' }],
+    ['an implausibly long version', { version: 'x'.repeat(65) }],
+  ])('ignores %s rather than storing it', async (_label, over) => {
+    await handler(report({ effective: build(over) }));
+    const written = set.mock.calls[0][0] as Record<string, unknown>;
+    expect(written).not.toHaveProperty('agentVersion');
+    // The report itself is still mirrored — a junk version does not cost the
+    // device its whole report.
+    expect(written).toHaveProperty('reportedConfig');
+  });
+
+  it.each([
+    ['agent is not an object', { agent: 'real' }],
+    ['build is not an object', { agent: { mode: 'real', build: 'a1b2c3d' } }],
+    ['build is an array', { agent: { mode: 'real', build: ['a1b2c3d'] } }],
+    ['there is no agent block at all', { gnssAntBias: true }],
+  ])('ignores a report where %s', async (_label, effective) => {
+    await handler(report({ effective }));
+    const written = set.mock.calls[0][0] as Record<string, unknown>;
+    expect(written).not.toHaveProperty('agentVersion');
+  });
+
+  it('trims surrounding whitespace', async () => {
+    await handler(report({ effective: build({ version: '  a1b2c3d\n' }) }));
+    const written = set.mock.calls[0][0] as Record<string, unknown>;
+    expect(written.agentVersion).toBe('a1b2c3d');
+  });
+});
+
 describe('device-config-report: self-heal republish', () => {
   it('republishes the desired document when the device is behind', async () => {
     rowAt(15, { gnssAntBias: true, timeSync: { offlineSources: true } });
