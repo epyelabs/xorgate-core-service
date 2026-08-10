@@ -1732,6 +1732,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
+    this.api.addRoutes({
+      path: "/devices/{id}/update",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
 
     // Fleet-wide, not per-device: what the newest published agent build is.
     this.api.addRoutes({

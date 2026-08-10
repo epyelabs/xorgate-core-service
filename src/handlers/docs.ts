@@ -738,7 +738,7 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
                   format: 'uuid',
                   description: 'Replay key. The device refuses to execute the same one twice.',
                 },
-                command: { type: 'string', enum: ['reboot', 'power_off', 'refresh'] },
+                command: { type: 'string', enum: ['reboot', 'power_off', 'refresh', 'update'] },
                 expiresAt: {
                   type: 'integer',
                   format: 'int64',
@@ -1750,6 +1750,34 @@ const OPENAPI_SPEC = (baseUrl: string) => ({
           'the outcome by re-reading the device until `reportedAt` advances. The device rate-limits ' +
           'refreshes (~1 per 30 s) and a re-probe takes up to ~45 s to land. Ordinary member access — ' +
           'nothing on the device changes. The device must be online (409 otherwise).',
+        tags: ['Devices'],
+        responses: {
+          '202': { $ref: '#/components/responses/DeviceCommandAccepted' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+          '502': { $ref: '#/components/responses/DeviceCommandPublishFailed' },
+        },
+      },
+    },
+    '/devices/{id}/update': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }, { $ref: '#/components/parameters/OrganizationIdHeader' }],
+      post: {
+        operationId: 'updateDeviceAgent',
+        summary: 'Install the latest agent build on a device (owner/admin only)',
+        description:
+          'Publishes a one-shot update command over MQTT. The device starts a systemd one-shot that downloads ' +
+          'the latest published build (see GET /device-dist/latest), installs it, and restarts the agent — so ' +
+          'the device drops offline for roughly a minute or two. Latest-only: there is no version parameter. ' +
+          'A failed install rolls back, leaving the device on its current build. ' +
+          'IMPORTANT: 202 means the command reached the broker, NOT that the update succeeded, and the ack ' +
+          'could not tell you either (the agent is restarted mid-update). Observe the outcome by polling ' +
+          'GET /devices/{id} until `agentVersion` / `reportedConfig.effective.agent.build.version` changes; ' +
+          'an unchanged build after the device returns online means the update failed and rolled back ' +
+          '(diagnose on the device with `journalctl -u xorgate-updater`). ' +
+          'The device must be online (409 otherwise). Pressing this twice is harmless: `systemctl start` on ' +
+          'an already-running one-shot coalesces into the run in flight.',
         tags: ['Devices'],
         responses: {
           '202': { $ref: '#/components/responses/DeviceCommandAccepted' },

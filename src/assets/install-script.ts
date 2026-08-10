@@ -277,6 +277,32 @@ if [ -f "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" ]; then
   install -m 0644 -o root -g root "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" /etc/cron.d/xorgate-fake-hwclock
 fi
 
+# 6a2. Remote update rail (device_update_management plan, Phase 3): a oneshot
+#      unit that runs \`xorgate update\` as root, plus a sudoers grant letting the
+#      unprivileged agent START THAT ONE UNIT and nothing else. The agent cannot
+#      update itself in-process (it is not root) and cannot spawn the updater as
+#      a child (the child would die with its own \`systemctl restart
+#      xorgate-agent\`), so systemd owns the job. Never enabled — started on
+#      demand only.
+if [ -f "$INSTALL_PREFIX/systemd/xorgate-updater.service" ]; then
+  install -m 0644 -o root -g root "$INSTALL_PREFIX/systemd/xorgate-updater.service" \\
+    /etc/systemd/system/xorgate-updater.service
+  SUDOERS_TMP="\$(mktemp)"
+  cat > "\$SUDOERS_TMP" <<EOF
+# Installed by xorgate. Allows the agent (running as $SVC_USER) to start the
+# one-shot self-update unit on a cloud-issued 'update' command, and nothing
+# else. Exact-args on purpose: no wildcard, so this cannot become "run any unit
+# as root". See device-agent src/agent/commands.ts.
+$SVC_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block xorgate-updater.service
+EOF
+  if visudo -cf "\$SUDOERS_TMP" >/dev/null 2>&1; then
+    install -m 0440 -o root -g root "\$SUDOERS_TMP" /etc/sudoers.d/022_xorgate-update
+  else
+    log "WARN: update sudoers drop-in failed validation; remote updates will not work"
+  fi
+  rm -f "\$SUDOERS_TMP"
+fi
+
 # 6b. Keep POSIX shared memory alive across ssh logouts. logind's default
 #     RemoveIPC=yes deletes a user's shm segments when their last login session
 #     ends — that destroys the shmsink bridge areas of bridged camera pipelines

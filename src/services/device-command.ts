@@ -34,7 +34,18 @@ import { iotDataClient } from './iot-data';
  * misses it, which is fine, because a refresh of a device that cannot report
  * is meaningless.
  */
-export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh';
+/**
+ * `update` (device_update_management plan, Phase 3) asks the device to install
+ * the latest published agent build: it starts a one-shot systemd unit that runs
+ * `xorgate update` as root, then restarts the agent. Latest-only by design —
+ * there is no version argument, because pinning would require a wildcard
+ * sudoers grant on the device, i.e. arbitrary root installs.
+ *
+ * Completion is NOT observable from the ack (the agent is restarted mid-update,
+ * and nothing consumes `command/response` yet): the outcome signal is the new
+ * build in the device's next config report, mirrored to `devices.agent_version`.
+ */
+export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update';
 
 /**
  * How long a command stays valid. Generous next to a sub-second publish, tight
