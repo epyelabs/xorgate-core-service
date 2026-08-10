@@ -29,7 +29,7 @@ export function configOpenApiSchemas(): Record<string, unknown> {
     additionalProperties: false,
     description:
       'The consolidated device config document (`devices.config`). One key per namespace, all ' +
-      'optional — an ABSENT namespace means the device uses its own defaults. Namespace keys are ' +
+      'optional: an ABSENT namespace means the device uses its own defaults. Namespace keys are ' +
       'the wire/settings.json keys and are never renamed. Published verbatim (plus `v`, `rev`, ' +
       '`uploadBucket`, `ts`) as a retained MQTT message on `xorgate/devices/{id}/config`.',
     properties: Object.fromEntries(
@@ -63,7 +63,7 @@ export function configPatchRequestSchema(): Record<string, unknown> {
     minProperties: 1,
     description:
       'Partial config document. Present namespaces are validated and replaced WHOLE (matching ' +
-      'how the device merges); `null` reverts a namespace to device defaults on BOTH sides — ' +
+      'how the device merges); `null` reverts a namespace to device defaults on BOTH sides, so ' +
       'the cloud stops managing it and the device is told to drop its local value; absent ' +
       'namespaces are untouched; `{}` is rejected. All-or-nothing: any invalid namespace fails ' +
       'the whole request, so a multi-namespace save can never half-commit.',

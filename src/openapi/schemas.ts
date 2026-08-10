@@ -1,0 +1,806 @@
+import { configOpenApiSchemas } from '../config-registry/openapi';
+import { namespaceJsonSchema } from '../config-registry/contract';
+import { ioCapabilitiesSchema } from '../schemas/capabilities';
+
+/**
+ * `components.schemas`. One place for every response/request object the paths
+ * modules `$ref` into.
+ *
+ * The device-config blocks are GENERATED from `src/config-registry`: bounds,
+ * enums, `additionalProperties` and field descriptions all come from the same
+ * zod schemas that validate the request and build the retained MQTT message, so
+ * they cannot drift. Everything else is hand-written against its handler.
+ */
+export function openApiSchemas(): Record<string, unknown> {
+  return {
+    ApiError: {
+      type: 'object',
+      required: ['error'],
+      description:
+        'The uniform error envelope. Every non-2xx response in this API has this shape; ' +
+        '`code` is stable and machine-readable, `message` is human-facing and may change.',
+      properties: {
+        error: {
+          type: 'object',
+          required: ['code', 'message'],
+          properties: {
+            code: {
+              type: 'string',
+              description:
+                'Stable error code. The full set a client can see: `UNAUTHORIZED` (401), ' +
+                '`ORGANIZATION_REQUIRED` (400, multi-org caller sent no `X-Organization-Id`), ' +
+                '`BAD_REQUEST` (400), `FORBIDDEN` / `NO_ORGANIZATION` / `INSUFFICIENT_ROLE` (403), ' +
+                '`NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405), `CONFLICT` (409), ' +
+                '`CONFIG_PUBLISH_FAILED` / `COMMAND_PUBLISH_FAILED` / `DIST_MANIFEST_UNAVAILABLE` / ' +
+                '`DIST_MANIFEST_INVALID` (502).',
+              example: 'NOT_FOUND',
+            },
+            message: { type: 'string' },
+            details: {
+              type: 'object',
+              additionalProperties: true,
+              description: 'Present only on the errors that carry structured context.',
+            },
+          },
+        },
+      },
+    },
+    PageMeta: {
+      type: 'object',
+      required: ['limit', 'offset', 'order', 'total'],
+      description:
+        'Pagination block returned alongside the items by every endpoint that speaks the list ' +
+        'dialect (see the `limit`/`offset`/`order`/`sort` parameters). `limit` and `offset` echo ' +
+        'the REQUEST after clamping, and `total` is the exact match count under the same filters, ' +
+        'except on `GET /devices/{id}/telemetry/readings`, the one endpoint whose table is large ' +
+        'enough that an exact count times out, which caps it and says so via `totalIsCapped`.',
+      properties: {
+        limit: { type: 'integer', example: 100 },
+        offset: { type: 'integer', example: 0 },
+        order: { type: 'string', enum: ['asc', 'desc'] },
+        total: { type: 'integer' },
+        totalIsCapped: {
+          type: 'boolean',
+          description:
+            'Only `GET /devices/{id}/telemetry/readings` sets this. True means more rows match ' +
+            'than `total` reports and only the first `total` are addressable.',
+        },
+        coveredFrom: {
+          type: 'string',
+          format: 'date-time',
+          description:
+            'Only `GET /devices/{id}/telemetry/readings`. Oldest addressable sample under this ' +
+            'filter; absent when nothing matches.',
+        },
+        coveredTo: {
+          type: 'string',
+          format: 'date-time',
+          description:
+            'Only `GET /devices/{id}/telemetry/readings`. Newest addressable sample under this ' +
+            'filter; absent when nothing matches.',
+        },
+      },
+    },
+    User: {
+      type: 'object',
+      required: ['id', 'email', 'tier', 'role'],
+      properties: {
+        id: { type: 'string', description: 'Cognito sub' },
+        email: { type: 'string', format: 'email' },
+        name: { type: 'string', nullable: true },
+        tier: { type: 'string', enum: ['free', 'pro', 'team'] },
+        role: {
+          type: 'string',
+          enum: ['user', 'admin'],
+          description:
+            'PLATFORM role, distinct from the per-organization membership role. Only `admin` may ' +
+            'write the device-model catalog.',
+        },
+        created_at: {
+          type: 'string',
+          format: 'date-time',
+          description:
+            'snake_case on the wire: `GET /me` serializes the users row verbatim. The SDKs ' +
+            'normalize it to `createdAt`.',
+        },
+      },
+    },
+    Organization: {
+      type: 'object',
+      required: ['id', 'name', 'slug'],
+      description:
+        'Organization rows serialize verbatim from Postgres, so their timestamps are snake_case ' +
+        'while most of this API is camelCase. The SDKs normalize; the wire format stays as-is.',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        name: { type: 'string' },
+        slug: { type: 'string' },
+        created_at: { type: 'string', format: 'date-time' },
+        updated_at: { type: 'string', format: 'date-time' },
+      },
+    },
+    Membership: {
+      type: 'object',
+      required: ['id', 'userId', 'organizationId', 'role'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        userId: { type: 'string' },
+        organizationId: { type: 'string', format: 'uuid' },
+        role: { type: 'string', enum: ['owner', 'admin', 'member', 'viewer'] },
+        createdAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    // A membership enriched with its member's identity, as returned by the
+    // GET /memberships roster. `user` is null only if the referenced user row
+    // is missing (normally impossible: a membership cascades with its user).
+    MembershipWithUser: {
+      type: 'object',
+      required: ['id', 'userId', 'organizationId', 'role', 'user'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        userId: { type: 'string' },
+        organizationId: { type: 'string', format: 'uuid' },
+        role: { type: 'string', enum: ['owner', 'admin', 'member', 'viewer'] },
+        createdAt: { type: 'string', format: 'date-time' },
+        user: {
+          type: 'object',
+          nullable: true,
+          required: ['id', 'email', 'name'],
+          properties: {
+            id: { type: 'string' },
+            email: { type: 'string', format: 'email' },
+            name: { type: 'string', nullable: true },
+          },
+        },
+      },
+    },
+    ApiKey: {
+      type: 'object',
+      required: ['id', 'organizationId', 'name', 'scope', 'createdAt'],
+      description:
+        'API key metadata. `hashedKey` is never returned; the plaintext key is shown exactly once, ' +
+        'at creation. Keys are MINT-ONLY today: nothing in this API verifies one yet, so `scope` is ' +
+        'recorded but not enforced, `lastUsedAt` never advances, and there is no expiry. Server-to-' +
+        'server callers still have to use a Cognito ID token.',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        organizationId: { type: 'string', format: 'uuid' },
+        name: { type: 'string' },
+        scope: {
+          type: 'string',
+          enum: ['edge', 'cloud', 'client'],
+          description: 'Validated on create, but not enforced anywhere yet.',
+        },
+        lastUsedAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description: 'Always null today: no code path verifies a key, so nothing stamps this.',
+        },
+        revokedAt: { type: 'string', format: 'date-time', nullable: true },
+        createdAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    Workspace: {
+      type: 'object',
+      required: ['id', 'organizationId', 'name', 'slug'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        organizationId: { type: 'string', format: 'uuid' },
+        name: { type: 'string' },
+        slug: { type: 'string' },
+        description: { type: 'string', nullable: true },
+        createdAt: { type: 'string', format: 'date-time' },
+        updatedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    // GENERATED from src/schemas/capabilities.ts, the same zod schema
+    // iot-provisioning parses this document with. Hand-writing it would be a
+    // second copy of a contract that already exists in code.
+    IoCapabilities: {
+      ...(namespaceJsonSchema(ioCapabilitiesSchema) as Record<string, unknown>),
+      description:
+        'What a device model can do (`device_models.io_capabilities`). Each declared leaf maps to ' +
+        'one telemetry metric namespace and/or one media stream key, and every section is ' +
+        'optional so partial-capability hardware is describable. `media.video[].key` is what ' +
+        'becomes a KVS signaling channel at provisioning time; `sensors.imu` field lists become ' +
+        'the `imu.<prefix>_<field>` metrics; `comm` and `system` field lists become the `gps`, ' +
+        '`signal` and `system` metric namespaces.\n\n' +
+        'IMPORTANT: this shape is NOT enforced when you write a device model. ' +
+        '`POST`/`PUT /device-models` accept any JSON object here. It IS parsed at provisioning ' +
+        'time, and a document that fails to parse yields NO video stream keys, so the device is ' +
+        'provisioned with zero KVS channels and live video silently never works. Validate against ' +
+        'this schema yourself before writing.',
+    },
+    DeviceModel: {
+      type: 'object',
+      required: ['id', 'name', 'sku'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        name: { type: 'string' },
+        sku: { type: 'string' },
+        ioCapabilities: {
+          allOf: [{ $ref: '#/components/schemas/IoCapabilities' }],
+          nullable: true,
+        },
+        firmwareChannel: { type: 'string', nullable: true },
+        createdAt: { type: 'string', format: 'date-time' },
+        updatedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    Device: {
+      type: 'object',
+      required: ['id', 'workspaceId', 'deviceModelId', 'serial', 'status'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        workspaceId: { type: 'string', format: 'uuid' },
+        deviceModelId: { type: 'string', format: 'uuid' },
+        serial: { type: 'string' },
+        name: { type: 'string', nullable: true },
+        agentVersion: {
+          type: 'string',
+          nullable: true,
+          description:
+            'Installed xorgate-device-agent build (CI short sha on dev, release tag on ' +
+            "prod), mirrored from the device's own config report, and read-only. " +
+            'null until the device reports a build.',
+        },
+        firmwareVersion: {
+          type: 'string',
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED alias for agentVersion; removed once clients migrate.',
+        },
+        status: {
+          type: 'string',
+          enum: ['provisioned', 'online', 'offline', 'decommissioned'],
+          description:
+            'Machine-managed: telemetry ingest, the MQTT last-will and the offline sweeper own ' +
+            'this. Writing it through `PUT /devices/{id}` is rejected 400.',
+        },
+        lastSeenAt: { type: 'string', format: 'date-time', nullable: true },
+        config: {
+          allOf: [{ $ref: '#/components/schemas/DeviceConfig' }],
+          description:
+            'Everything this device is told, in one namespaced document. Written by ' +
+            'PATCH /devices/{id}/config and published as a retained MQTT message. Namespaces the ' +
+            'cloud has reverted are STRIPPED from this view, so a namespace is either configured ' +
+            'or absent, never present-but-null.',
+        },
+        configRev: {
+          type: 'integer',
+          description:
+            'Monotonic config revision, bumped on every config write and carried on the ' +
+            'retained message as `rev`. The device applies a document newer than its ' +
+            'last-applied rev; `configRev > reportedConfig.rev` on an online device means the ' +
+            'change is still pending.',
+        },
+        configUpdatedAt: { type: 'string', format: 'date-time', nullable: true },
+        uiPrefs: {
+          allOf: [{ $ref: '#/components/schemas/DeviceUiPrefs' }],
+          description: 'Cloud-only presentation preferences. Never delivered to the device.',
+        },
+        reportedConfig: {
+          type: 'object',
+          additionalProperties: true,
+          nullable: true,
+          description:
+            'Last config report from the device, mirrored off ' +
+            '`xorgate/devices/{id}/config/reported`; null until the device has reported at ' +
+            'least once (a pre-Phase-3 agent never does). Shape: `{ v, deviceId, ts, rev, ' +
+            'origin, effective, status }`. `rev` is the last desired revision the device ' +
+            'applied (0 = never received one), `origin` is `cloud`/`local`/`boot`, ' +
+            '`effective` holds the post-clamp values actually in force (an absent namespace ' +
+            'means device defaults, and `gnssAntBias` is the value the modem daemon applied, ' +
+            'not the one requested), and `status` carries a per-namespace ' +
+            '`{ state: applied|adjusted|rejected, at, detail?, reason? }`. There is no ' +
+            '`pending` state on the wire: the reader computes it as ' +
+            '`configRev > reportedConfig.rev` on an online device. `effective.agent.mode` is ' +
+            'reported-only (`sim`/`real`): it is never cloud-settable and never gets a ' +
+            '`status` entry. `effective.sim` (SIM presence, state, ICCID, phone number, ' +
+            'carrier, registration) and `effective.uplink` (which interface carries the ' +
+            'default route) are reported-only in exactly the same way, because a device cannot be ' +
+            'TOLD its ICCID, so neither is a config namespace and neither ever carries a ' +
+            '`status`. Both are ABSENT when the device has not reported them, which means ' +
+            'unknown and never "no SIM". `effective.apn` is reported-only too: the modem ' +
+            "daemon's APN apply machinery: `{ applied, requested?, state: " +
+            'in-force|applying|rolled-back|rejected, last_error?, changed_at? }`. `applied` is ' +
+            "the APN actually in the modem's data context (the `cellular` namespace's " +
+            '`effective.cellular.apn` mirrors it while a change is in flight); an ABSENT ' +
+            '`apn` block means the daemon predates the rollback machinery, and a UI must ' +
+            'refuse to write the `cellular` namespace to such a device, since there is no safety ' +
+            'net there. An `origin: "local"` report additionally carries `changed`, the ' +
+            'namespaces a local writer altered on the device (`null` = reverted to device ' +
+            'defaults); those are validated and merged into `config`, which bumps `configRev` ' +
+            'and republishes, unless a newer cloud revision already landed, in which case ' +
+            'the cloud value wins and the local change is discarded.',
+        },
+        reportedAt: { type: 'string', format: 'date-time', nullable: true },
+        gnssAntBias: {
+          type: 'boolean',
+          deprecated: true,
+          description:
+            'DEPRECATED. Read `config.gnssAntBias`. Dual-written during the transition window ' +
+            'and dropped by a follow-up migration.',
+        },
+        activeStreamsViewType: {
+          type: 'string',
+          enum: ['card', 'map'],
+          deprecated: true,
+          description: 'DEPRECATED. Read `uiPrefs.activeStreamsViewType`.',
+        },
+        imuMount: {
+          allOf: [{ $ref: '#/components/schemas/ImuMountConfig' }],
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED. Read `config.imuMount`.',
+        },
+        imuView: {
+          type: 'object',
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED. Read `uiPrefs.imuView`.',
+          properties: {
+            azimuthDeg: { type: 'number' },
+            elevationDeg: { type: 'number' },
+          },
+        },
+        recordingConfig: {
+          allOf: [{ $ref: '#/components/schemas/RecordingConfig' }],
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED. Read `config.recording`.',
+        },
+        lteRecoveryConfig: {
+          allOf: [{ $ref: '#/components/schemas/LteRecoveryConfig' }],
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED. Read `config.lteRecovery`.',
+        },
+        timeSyncConfig: {
+          allOf: [{ $ref: '#/components/schemas/TimeSyncConfig' }],
+          nullable: true,
+          deprecated: true,
+          description: 'DEPRECATED. Read `config.timeSync`.',
+        },
+        createdAt: { type: 'string', format: 'date-time' },
+        updatedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    // ---- Device config blocks: GENERATED from src/config-registry ----------
+    // Bounds, enums, additionalProperties and every field description come
+    // from the same zod schemas that validate the request and build the
+    // retained MQTT message. The hand-written blocks these replace had
+    // drifted: `powerShedding` claimed additionalProperties:false while
+    // omitting the three thermal keys the API already accepted.
+    ...configOpenApiSchemas(),
+    DeviceIdentity: {
+      type: 'object',
+      required: ['iotThingName', 'certificateId', 'policyName', 'roleAlias', 'status'],
+      description:
+        "The device's AWS IoT X.509 identity, non-secret fields only. `certificateArn` and " +
+        '`credentialEndpoint` are deliberately withheld, and the private key is never stored ' +
+        'server-side at all (it is returned exactly once, at provisioning time).',
+      properties: {
+        iotThingName: {
+          type: 'string',
+          description: 'Equals the device id, and is also the MQTT client id.',
+        },
+        certificateId: { type: 'string' },
+        policyName: { type: 'string' },
+        roleAlias: {
+          type: 'string',
+          description: 'IoT role alias the device assumes for KVS + S3 access.',
+        },
+        status: { type: 'string', enum: ['active', 'revoked'] },
+        createdAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    DeviceRegistration: {
+      type: 'object',
+      required: ['code', 'status', 'deviceId', 'expiresAt', 'installUrl'],
+      description:
+        'A short-lived onboarding code. The operator runs `installUrl` on the device; the install ' +
+        'script claims the code, which creates the device row and provisions its IoT identity.',
+      properties: {
+        code: { type: 'string', description: 'The registration code, unique across the platform.' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'claimed', 'expired'],
+          description:
+            'A stale `pending` row flips to `expired` lazily, when it is read, and there is no ' +
+            'sweeper, so a code can be past `expiresAt` and still read `pending` until someone ' +
+            'fetches it.',
+        },
+        deviceId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description: 'The device created by the claim; null until then.',
+        },
+        expiresAt: {
+          type: 'string',
+          format: 'date-time',
+          description: '15 minutes after the code was minted.',
+        },
+        installUrl: {
+          type: 'string',
+          format: 'uri',
+          description:
+            'The one-liner target: `<api base>/get/{code}`, which serves the install script. ' +
+            'That route is internal to the installer and is not part of the public API.',
+        },
+      },
+    },
+    SearchResult: {
+      type: 'object',
+      required: ['type', 'id', 'title', 'subtitle'],
+      description:
+        'One hit, normalized across resource types so a caller renders any of them from one code ' +
+        'path. `id` addresses the resource of that `type`.',
+      properties: {
+        type: {
+          type: 'string',
+          enum: ['device', 'workflow-template', 'workflow-instance'],
+          description:
+            'The workflow types are returned by the endpoint but their resources are not part of ' +
+            'this documented API surface yet.',
+        },
+        id: { type: 'string', format: 'uuid' },
+        title: { type: 'string', description: 'Device name (falling back to serial), or template name.' },
+        subtitle: { type: 'string', nullable: true, description: 'Device serial, or template slug.' },
+      },
+    },
+    MediaSession: {
+      type: 'object',
+      required: ['id', 'deviceId', 'streamKey', 'startedAt', 'status'],
+      description:
+        'A continuous on-device recording run for one camera (offline recording plan). Sessions are ' +
+        'per-camera: a dual-camera drive is two sessions with near-identical startedAt. `status` is ' +
+        'advisory: a session closes ~10 min after segments stop arriving and reopens if a straggler ' +
+        'segment lands later.',
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'Device-minted UUIDv7 (sorts by start time).' },
+        deviceId: { type: 'string', format: 'uuid' },
+        streamKey: { type: 'string', example: 'cam0' },
+        startedAt: { type: 'string', format: 'date-time' },
+        endedAt: { type: 'string', format: 'date-time', nullable: true },
+        codec: { type: 'string', nullable: true, example: 'h264' },
+        width: { type: 'integer', nullable: true },
+        height: { type: 'integer', nullable: true },
+        fps: { type: 'integer', nullable: true },
+        bitrateKbps: { type: 'integer', nullable: true },
+        source: { type: 'string', nullable: true, example: 'device-offline' },
+        status: { type: 'string', enum: ['open', 'closed'] },
+        timeSource: {
+          type: 'string',
+          nullable: true,
+          enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'],
+          description:
+            'Device clock quality at session start; "unsynced" timestamps may be wrong wall-clock. "gps"/"nitz" = offline clock step from GNSS / modem NITZ time while NTP was pending.',
+        },
+        lastSegmentAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description: 'Server-side arrival time of the most recent segment (upload can lag recording).',
+        },
+        createdAt: { type: 'string', format: 'date-time' },
+        segmentCount: { type: 'integer', description: 'Rollup (list endpoint only).' },
+        totalBytes: { type: 'integer', description: 'Rollup (list endpoint only).' },
+        totalDurationMs: { type: 'integer', description: 'Rollup (list endpoint only).' },
+      },
+    },
+    RecordingRun: {
+      type: 'object',
+      required: ['key', 'fromTs', 'toTs', 'streamKeys', 'sessionCount', 'sessions'],
+      description:
+        'One drive, as a human means it: the media sessions whose intervals are within 60 s of each ' +
+        'other, clustered server-side. A session that is still open has no endedAt, so its interval ' +
+        "end is estimated as startedAt + the duration uploaded so far, which means an open run's " +
+        'toTs grows as its backlog drains.',
+      properties: {
+        key: {
+          type: 'string',
+          format: 'uuid',
+          description:
+            "The earliest member session's id, a stable identity across polls. (There is no run row " +
+            'in the database and no device-side run id.)',
+        },
+        fromTs: {
+          type: 'string',
+          format: 'date-time',
+          description: "Earliest member startedAt. With toTs, the run's composite-replay window.",
+        },
+        toTs: { type: 'string', format: 'date-time', description: 'Latest member interval end.' },
+        streamKeys: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Every camera that recorded in this run, sorted.',
+        },
+        sessionCount: { type: 'integer' },
+        segmentCount: { type: 'integer', description: 'Summed over the members.' },
+        totalBytes: { type: 'integer', description: 'Summed over the members.' },
+        anyOpen: { type: 'boolean', description: 'Some member may still be receiving segments.' },
+        anyUnsynced: {
+          type: 'boolean',
+          description: 'Some member recorded with an unsynchronized device clock.',
+        },
+        sessions: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/MediaSession' },
+          description: 'The members, ordered by startedAt then streamKey.',
+        },
+      },
+    },
+    MediaSegment: {
+      type: 'object',
+      required: ['id', 'deviceId', 'sessionId', 'streamKey', 's3Key', 'seq', 'startTs', 'durationMs'],
+      description:
+        'One ~60 s MP4 segment of a media session. `finalized: false` = crash-cut partial ' +
+        "(fragmented MP4, playable up to the cut). When stitching, prefer the next segment's " +
+        'startTs delta over durationMs (segment 0 includes ~2 s pipeline startup). ' +
+        'Ingest drops segments whose startTs is more than MEDIA_SEGMENT_MAX_FUTURE_MS ' +
+        '(default 24 h) ahead of server time: a device with a catastrophically wrong ' +
+        'clock is rejected loudly rather than indexed where no query will find it.',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        deviceId: { type: 'string', format: 'uuid' },
+        sessionId: { type: 'string', format: 'uuid' },
+        streamKey: { type: 'string', example: 'cam0' },
+        s3Key: {
+          type: 'string',
+          description: 'media-sessions/v1/<deviceId>/<streamKey>/<sessionId>/<seq>.mp4',
+        },
+        seq: { type: 'integer' },
+        startTs: { type: 'string', format: 'date-time' },
+        durationMs: { type: 'integer' },
+        keyframe: { type: 'boolean' },
+        sizeBytes: { type: 'integer', nullable: true },
+        finalized: { type: 'boolean' },
+        meta: {
+          type: 'object',
+          additionalProperties: true,
+          nullable: true,
+          description: 'Sidecar provenance passthrough (anchor, timeSource, startMono).',
+        },
+        uploadedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    ReplayManifest: {
+      type: 'object',
+      required: ['deviceId', 'from', 'to', 'sessions', 'urlExpiresAt'],
+      description:
+        'Everything a replay player needs in one response: per-session gap-aware timelines plus a ' +
+        'presigned GET URL per segment. All timestamps are epoch milliseconds (the replay-clock unit), ' +
+        'unlike the ISO strings elsewhere in this API. Format-neutral by design: no codec strings or ' +
+        'playlist syntax, so clients parse media details from the segment bytes.',
+      properties: {
+        deviceId: { type: 'string', format: 'uuid' },
+        from: {
+          type: 'integer',
+          description:
+            'Epoch ms start of the whole replay: the requested range (range mode) or the earliest ' +
+            'covered instant incl. any evicted-head gap (session mode).',
+        },
+        to: { type: 'integer', description: 'Epoch ms end of the whole replay.' },
+        urlExpiresAt: {
+          type: 'integer',
+          description:
+            'Epoch ms after which segment URLs may stop working (real TTL minus a safety margin). ' +
+            'Refetch the manifest before this.',
+        },
+        sessions: {
+          type: 'array',
+          description:
+            'One entry per session with media in the replay (a dual-camera range yields two). A ' +
+            'sessionId request whose segments have all expired returns the session with empty ' +
+            'segments/gaps, for telemetry-only replay.',
+          items: {
+            type: 'object',
+            required: ['id', 'streamKey', 'status', 'segments', 'gaps'],
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              streamKey: { type: 'string', example: 'cam0' },
+              status: { type: 'string', enum: ['open', 'closed'] },
+              timeSource: {
+                type: 'string',
+                nullable: true,
+                enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'],
+                description:
+                  '"unsynced" = wall-clock correlation with telemetry is untrustworthy; "gps"/"nitz" = offline clock step while NTP was pending.',
+              },
+              codec: { type: 'string', nullable: true, example: 'h264' },
+              width: { type: 'integer', nullable: true },
+              height: { type: 'integer', nullable: true },
+              fps: { type: 'integer', nullable: true },
+              segments: {
+                type: 'array',
+                description: 'Ordered by startTs. Segment i covers [startTs, startTs + effectiveDurationMs).',
+                items: {
+                  type: 'object',
+                  required: ['seq', 'startTs', 'effectiveDurationMs', 'finalized', 'url'],
+                  properties: {
+                    seq: { type: 'integer' },
+                    startTs: { type: 'integer', description: 'Epoch ms.' },
+                    effectiveDurationMs: {
+                      type: 'integer',
+                      description:
+                        'Next-segment startTs delta when contiguous, else the recorded durationMs. ' +
+                        'Deltas beat durations (rotation timestamps are accurate; durations drift).',
+                    },
+                    finalized: {
+                      type: 'boolean',
+                      description: 'False = crash-cut partial; playable up to the cut.',
+                    },
+                    anchor: {
+                      type: 'string',
+                      nullable: true,
+                      enum: ['fstat', 'computed', 'boundary'],
+                      description:
+                        'startTs provenance. "fstat" seq-0 rows include ~2 s of pipeline startup, so ' +
+                        'the first seam may hold a ~2 s buffered hole.',
+                    },
+                    sizeBytes: { type: 'integer', nullable: true, description: 'For prefetch budgeting.' },
+                    url: { type: 'string', format: 'uri', description: 'Presigned S3 GET for the MP4.' },
+                  },
+                },
+              },
+              gaps: {
+                type: 'array',
+                description:
+                  'Holes > 2 s with no media, computed server-side so every client renders the same ' +
+                  'timeline; the replay clock free-runs (or skips) across them.',
+                items: {
+                  type: 'object',
+                  required: ['fromTs', 'toTs', 'reason'],
+                  properties: {
+                    fromTs: { type: 'integer', description: 'Epoch ms.' },
+                    toTs: { type: 'integer', description: 'Epoch ms.' },
+                    reason: { type: 'string', enum: ['missing-segments', 'evicted-head'] },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    DeviceProvisioning: {
+      type: 'object',
+      required: ['device', 'iot', 'mqtt', 'kvs'],
+      description:
+        'One-shot credential bundle returned by POST /devices/{id}/provision. ' +
+        'certificatePem and privateKey are shown only here and are never stored server-side.',
+      properties: {
+        device: {
+          type: 'object',
+          required: ['id', 'thingName'],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            thingName: { type: 'string', description: 'AWS IoT thing name (equals the device id).' },
+          },
+        },
+        iot: {
+          type: 'object',
+          required: ['dataEndpoint', 'credentialEndpoint', 'roleAlias', 'certificatePem', 'caUrl'],
+          properties: {
+            dataEndpoint: {
+              type: 'string',
+              description: 'AWS IoT Core data endpoint (iot:Data-ATS); MQTT over mTLS on port 8883.',
+            },
+            credentialEndpoint: {
+              type: 'string',
+              description: 'AWS IoT credential-provider endpoint used with the role alias to obtain short-lived AWS creds.',
+            },
+            roleAlias: { type: 'string', description: 'IoT role alias the device assumes for KVS + S3 access.' },
+            certificatePem: { type: 'string', description: 'X.509 device certificate (PEM). Shown once.' },
+            privateKey: {
+              type: 'string',
+              nullable: true,
+              description: 'Device private key (PEM). Shown once, never stored.',
+            },
+            caUrl: { type: 'string', format: 'uri', description: 'Amazon Root CA 1 download URL.' },
+          },
+        },
+        mqtt: {
+          type: 'object',
+          required: ['telemetryTopic', 'statusTopic'],
+          properties: {
+            telemetryTopic: { type: 'string', example: 'xorgate/devices/{id}/telemetry' },
+            statusTopic: { type: 'string', example: 'xorgate/devices/{id}/status' },
+          },
+        },
+        kvs: {
+          type: 'object',
+          required: ['region', 'channels'],
+          properties: {
+            region: { type: 'string' },
+            channels: {
+              type: 'array',
+              description: 'One signaling channel per declared video stream.',
+              items: {
+                type: 'object',
+                required: ['streamKey', 'channelName', 'channelArn'],
+                properties: {
+                  streamKey: { type: 'string', example: 'cam0' },
+                  channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
+                  channelArn: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    KvsChannel: {
+      type: 'object',
+      required: ['streamKey', 'channelName', 'channelArn', 'region'],
+      description: 'A KVS WebRTC signaling channel for the browser viewer.',
+      properties: {
+        streamKey: { type: 'string', example: 'cam0' },
+        channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
+        channelArn: { type: 'string' },
+        region: { type: 'string', example: 'us-east-1' },
+      },
+    },
+    TelemetryReading: {
+      type: 'object',
+      required: ['ts', 'metric'],
+      description:
+        'One telemetry reading (raw) or one downsample bucket (when `interval` was given; ' +
+        '`value` is then the bucket average and `ts` the bucket start).',
+      properties: {
+        ts: { type: 'string', format: 'date-time' },
+        metric: { type: 'string', example: 'imu.z' },
+        value: { type: 'number', nullable: true },
+        unit: { type: 'string', nullable: true, example: 'm/s^2' },
+      },
+    },
+    TelemetryTableColumn: {
+      type: 'object',
+      required: ['key', 'unit'],
+      description:
+        'One column of the history table. The array order IS the column order, and every ' +
+        "row's `v` array is positional against it.",
+      properties: {
+        key: { type: 'string', example: 'imu.accel_x' },
+        unit: {
+          type: 'string',
+          nullable: true,
+          example: 'm/s^2',
+          description:
+            'Taken from device_latest, so it is stable across pages rather than scraped from ' +
+            'whatever this page happened to contain. Null when the metric has no known unit.',
+        },
+      },
+    },
+    TelemetryTableRow: {
+      type: 'object',
+      required: ['ts', 'v'],
+      description:
+        'One sample: a timestamp and its values. `v` is POSITIONAL against `columns` and its ' +
+        'length always equals `columns.length`, and trailing nulls are never trimmed.',
+      properties: {
+        ts: { type: 'string', format: 'date-time' },
+        v: {
+          type: 'array',
+          items: { type: 'number', nullable: true },
+          description: 'null means no reading for that column at this timestamp.',
+          example: [0.12, null, 47.3],
+        },
+      },
+    },
+    DeviceLatest: {
+      type: 'object',
+      required: ['ts', 'metric'],
+      description: 'The most recent reading for one (device, metric) pair.',
+      properties: {
+        metric: { type: 'string', example: 'system.cpu_temp' },
+        value: { type: 'number', nullable: true },
+        unit: { type: 'string', nullable: true, example: '°C' },
+        ts: { type: 'string', format: 'date-time' },
+      },
+    },
+  };
+}

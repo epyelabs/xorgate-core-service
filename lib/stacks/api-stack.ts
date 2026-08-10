@@ -139,6 +139,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "https://d3u971sluio616.cloudfront.net",
       "https://dev.xorgate.io",
       "https://www.xorgate.io",
+      // Docs site (frontend/xorgate-docs). Its API-reference playground calls
+      // this API straight from the browser, so the docs origins must be
+      // allowed. localhost:3000 is the Next dev server. Add the CloudFront
+      // distribution domains here too if the site is reached that way before
+      // DNS points at it.
+      "http://localhost:3000",
+      "http://docs.xorgate.io.s3-website-us-east-1.amazonaws.com",
+      "http://docs-dev.xorgate.io.s3-website-us-east-1.amazonaws.com",
+      "https://docs.xorgate.io",
+      "https://docs-dev.xorgate.io",
     ];
 
     let lambdaSG: ec2.SecurityGroup | undefined;

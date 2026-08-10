@@ -24,3 +24,7 @@ cdk.out
 # Logs
 *.log
 npm-debug.log*
+
+# Local output of `npm run openapi:emit`. The document is served from
+# GET /openapi.json; the docs site keeps its own committed snapshot of it.
+/openapi.json
