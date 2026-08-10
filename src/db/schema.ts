@@ -113,7 +113,10 @@ export const devices = pgTable(
       .notNull(),
     serial: text('serial').notNull(),
     name: text('name'),
-    firmwareVersion: text('firmware_version'),
+    // The installed xorgate-device-agent build, MIRRORED from the device's own
+    // config report (`effective.agent.build.version`) — never written by an
+    // operator. Named for what it is: the agent isn't firmware.
+    agentVersion: text('agent_version'),
     status: text('status').default('provisioned').notNull(),
     // GNSS antenna bias: true powers an active GPS antenna's LNA via the modem's
     // VDD_AUX LDO (AT+CVAUXV/AT+CVAUXS). False (default) = passive antenna, bias

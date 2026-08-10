@@ -64,8 +64,17 @@ type DeviceRow = typeof schema.devices.$inferSelect;
  * this service needs it, and the deployed frontend would read a present-but-
  * null key as "the cloud manages this".
  */
-function deviceResponse(row: DeviceRow): DeviceRow {
-  return { ...row, config: publicConfigDocument(row.config) as DeviceConfigDocument };
+function deviceResponse(row: DeviceRow): DeviceRow & { firmwareVersion: string | null } {
+  return {
+    ...row,
+    config: publicConfigDocument(row.config) as DeviceConfigDocument,
+    // TODO(agent-version-alias): drop `firmwareVersion` once the renamed
+    // frontend is deployed (device_update_management, Phase 4). Its zod device
+    // schema is strict — `firmwareVersion: z.string().nullable()` with no
+    // `.catch` — so serving only the new name would fail the parse for every
+    // browser still holding the old bundle, breaking the whole device page.
+    firmwareVersion: row.agentVersion,
+  };
 }
 
 async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
@@ -287,7 +296,6 @@ export const handler = async (
         deviceModelId?: string;
         serial?: string;
         name?: string;
-        firmwareVersion?: string;
         status?: string;
       };
       try {
@@ -314,7 +322,9 @@ export const handler = async (
           deviceModelId: body.deviceModelId,
           serial: body.serial,
           name: body.name ?? null,
-          firmwareVersion: body.firmwareVersion ?? null,
+          // No `agentVersion` here on purpose: it is mirrored from the device's
+          // config report, so a claimed device fills it in for itself and an
+          // operator-supplied value could only ever be a guess.
           status,
           config: initialConfigDocument(),
           configRev: 1,
@@ -368,12 +378,12 @@ export const handler = async (
         }
         updates.name = body.name;
       }
-      if (body.firmwareVersion !== undefined) {
-        if (body.firmwareVersion !== null && typeof body.firmwareVersion !== 'string') {
-          return badRequest('firmwareVersion must be a string or null');
-        }
-        updates.firmwareVersion = body.firmwareVersion;
-      }
+      // `firmwareVersion`/`agentVersion` are deliberately NOT settable: the
+      // column is now mirrored from the device's config report (README §2.3), so
+      // an operator write would be overwritten by the device's next report and
+      // is only ever misinformation in the meantime. Nothing in the frontend
+      // ever wrote it; a request carrying it falls through to the unknown-field
+      // check below and 400s.
 
       // ---- Transition window: legacy config fields on PUT ---------------------
       const configPatch: Record<string, unknown> = {};
@@ -397,7 +407,6 @@ export const handler = async (
       const unknownFields = Object.keys(body).filter(
         (k) =>
           k !== 'name' &&
-          k !== 'firmwareVersion' &&
           !LEGACY_PUT_FIELDS.some((f) => f.field === k) &&
           !(LEGACY_UI_PREF_FIELDS as readonly string[]).includes(k),
       );

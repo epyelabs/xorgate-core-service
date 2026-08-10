@@ -20,6 +20,7 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/reboot': 'reboot',
   'POST /devices/{id}/power-off': 'power_off',
   'POST /devices/{id}/refresh-state': 'refresh',
+  'POST /devices/{id}/update': 'update',
 };
 
 /**
@@ -27,13 +28,15 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  *   POST /devices/{id}/reboot
  *   POST /devices/{id}/power-off
  *   POST /devices/{id}/refresh-state
+ *   POST /devices/{id}/update
  *
- * Reboot/power-off are restricted to owner/admin, unlike the other device
+ * Reboot/power-off/update are restricted to owner/admin, unlike the other device
  * writes which effectively allow any member. Power-off in particular is not
  * remotely recoverable — someone has to physically walk to the device and press
  * a button — so it gets the same gate as provisioning rather than the ordinary
- * write gate. `refresh` is READ-ONLY (the device just re-probes and re-reports
- * its state), so it takes the ordinary member gate.
+ * write gate. `update` replaces the software the device runs, which is the same
+ * class of decision. `refresh` is READ-ONLY (the device just re-probes and
+ * re-reports its state), so it takes the ordinary member gate.
  *
  * Ownership: the device must belong to a workspace in the caller's org (same
  * check as devices.ts / device-sessions.ts); cross-org reads surface as 404.

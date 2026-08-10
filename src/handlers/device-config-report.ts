@@ -141,9 +141,19 @@ export const handler = async (event: unknown): Promise<void> => {
   // an older one must not overwrite a newer one. `ts` is monotonic within a
   // boot; across a clock step it can jump backwards, which at worst drops one
   // report — the next one (or the hourly heartbeat) repairs it.
+  //
+  // The installed build rides along in the SAME statement (no extra round
+  // trip). Absent — an agent predating the build manifest — leaves the column
+  // untouched rather than nulling it, so a mixed-version fleet never loses a
+  // version it already knew.
+  const agentVersion = reportedAgentVersion(report);
   const updated = await db
     .update(schema.devices)
-    .set({ reportedConfig: report, reportedAt: new Date() })
+    .set({
+      reportedConfig: report,
+      reportedAt: new Date(),
+      ...(agentVersion === null ? {} : { agentVersion }),
+    })
     .where(
       and(
         eq(schema.devices.id, deviceId),
@@ -206,6 +216,28 @@ export const handler = async (event: unknown): Promise<void> => {
     console.error('device-config-report: republish failed', { deviceId, configRev, err });
   }
 };
+
+/**
+ * The installed agent build out of a report, or null when there isn't a usable
+ * one (device_update_management, README §2.3).
+ *
+ * `effective` is an opaque, DEVICE-AUTHORED document, so this validates rather
+ * than trusts: non-empty string only, trimmed, and clamped to 64 chars — long
+ * enough for a release tag, short enough that a misbehaving device cannot grow
+ * the column. Anything else is treated as absent, which leaves the stored value
+ * alone.
+ */
+export function reportedAgentVersion(report: DeviceConfigReport): string | null {
+  const agent = report.effective?.agent;
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return null;
+  const build = (agent as { build?: unknown }).build;
+  if (!build || typeof build !== 'object' || Array.isArray(build)) return null;
+  const version = (build as { version?: unknown }).version;
+  if (typeof version !== 'string') return null;
+  const trimmed = version.trim();
+  if (trimmed.length === 0 || trimmed.length > 64) return null;
+  return trimmed;
+}
 
 /** Structural equality for two config documents (key order is not meaningful). */
 function sameDocument(a: unknown, b: unknown): boolean {
