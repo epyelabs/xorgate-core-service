@@ -440,19 +440,38 @@ install -d -m 0755 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR/pipelines"
 
 # Default per-stream pipelines for the current fleet hardware: CM5 carrier with
 # two IMX290 sensors on the cam0 (i2c@88000) and cam1 (i2c@70000) connectors,
-# H.264 via x264enc at 1280x720@15. Written only if absent so a later
-# \`xorgate pipeline set\` customization is never clobbered. Hardware-specific by
-# design (pairs with the imx290 overlays in step 8b) — revisit for other sensors.
-if [ ! -f "$CONF_DIR/pipelines/cam0.gst" ]; then
-  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/cam0.gst" <<'GST'
-libcamerasrc name=cam0 camera-name=/base/axi/pcie@1000120000/rp1/i2c@88000/imx290@1a ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
+# H.264 via x264enc at 1280x720@15. Installed in BRIDGED form — the same three
+# files \`xorgate pipeline bridge <streamKey>\` writes — so video RECORDING works
+# out of the box: the agent's capture daemon owns the camera and feeds raw
+# frames over POSIX shm, and the KVS master's .gst consumes shmsrc. A direct
+# .gst here would leave the recorder permanently idle (it only ever owns
+# bridged cameras — rollout safety in device-agent recording/video-capture.ts).
+# With recording off the daemon runs bridge-only (raw passthrough, near-zero
+# CPU), so live streaming behaves the same either way. Per camera:
+#   camN.gst         shmsrc consumer the KVS master loads
+#   camN.camera      libcamera identity the capture daemon opens
+#   camN.gst.direct  direct pipeline \`xorgate pipeline direct camN\` restores
+# Written only if the .gst is absent so a later \`xorgate pipeline ...\`
+# customization is never clobbered. Hardware-specific by design (pairs with the
+# imx290 overlays in step 8b) — revisit for other sensors.
+# shm sockets live under XORGATE_HOME/shm (device-agent recording/config.ts);
+# XORGATE_HOME is the agent's systemd StateDirectory, /var/lib/xorgate.
+XORGATE_SHM_DIR=/var/lib/xorgate/shm
+write_bridged_pipeline() {
+  key="$1"; camera_name="$2"
+  [ -f "$CONF_DIR/pipelines/$key.gst" ] && return 0
+  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/$key.gst" <<GST
+shmsrc socket-path=$XORGATE_SHM_DIR/$key.sock is-live=true do-timestamp=true ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc name=sampleVideoEncoder bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
 GST
-fi
-if [ ! -f "$CONF_DIR/pipelines/cam1.gst" ]; then
-  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/cam1.gst" <<'GST'
-libcamerasrc name=cam1 camera-name=/base/axi/pcie@1000120000/rp1/i2c@70000/imx290@1a ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
+  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/$key.camera" <<CAM
+$camera_name
+CAM
+  install -m 0644 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/pipelines/$key.gst.direct" <<GST
+libcamerasrc name=$key camera-name=$camera_name ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
 GST
-fi
+}
+write_bridged_pipeline cam0 /base/axi/pcie@1000120000/rp1/i2c@88000/imx290@1a
+write_bridged_pipeline cam1 /base/axi/pcie@1000120000/rp1/i2c@70000/imx290@1a
 
 # Stage the runtime binary (tar preserves the +x bit, but be defensive) and warn
 # if the user-supplied KVS SDK .so libs aren't present yet.
