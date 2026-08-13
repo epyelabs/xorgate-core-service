@@ -63,6 +63,14 @@ Apply after the latest generated migration, in filename order:
    one statement, no chunking needed. The old columns are KEPT and dual-written
    during the transition window — a follow-up migration drops them.
 
+10. `manual/011_iot_policy_attachments.sql` — creates `iot_policy_attachments`
+    (platform-auth-and-live-plane plan, Phase 1). Idempotent, three statements,
+    no dependency on any other migration beyond `users` existing. **Until it is
+    applied, the code that reads it degrades rather than fails**: granting live
+    access still works and only the detach-on-last-membership-removal path is
+    inert (it logs and finds nothing to detach). `DELETE /live/access`, which
+    resolves the identity from the caller's own token, works either way.
+
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
 top); re-running all in order is safe — but note 004 re-seeds the original

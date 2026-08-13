@@ -13,6 +13,7 @@ import {
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { revokeLiveAccessForUser } from '../services/live-access';
 import type { MembershipRole } from '../types/index';
 import {
   badRequest,
@@ -213,6 +214,34 @@ export const handler = async (
       }
 
       await db.delete(schema.memberships).where(eq(schema.memberships.id, id));
+
+      // Removing the last membership must also revoke live-plane access. The
+      // browser IoT policy is attached to the user's Cognito IDENTITY, not to
+      // their membership, so without this it survives the removal forever and a
+      // former member keeps subscribing to telemetry for as long as they can
+      // mint a token. Only on the LAST membership: the policy is org-blind, so
+      // a user still in another org is still entitled to it.
+      //
+      // Best-effort. The membership is already gone and re-running the DELETE
+      // is not possible (404), so failing the response here would leave the
+      // caller unable to retry the part that did not happen. The sweep this
+      // needs as a backstop is not built; noted in the phase handoff.
+      const remaining = await db.query.memberships.findFirst({
+        where: eq(schema.memberships.userId, m.userId),
+      });
+      if (!remaining) {
+        try {
+          const detached = await revokeLiveAccessForUser(m.userId);
+          if (detached.length) {
+            console.log(
+              `[memberships] revoked live access for ${m.userId}: ${detached.join(', ')}`,
+            );
+          }
+        } catch (err) {
+          console.error('[memberships] live-access revoke failed', err);
+        }
+      }
+
       return { statusCode: 204, body: '' };
     }
     default:
