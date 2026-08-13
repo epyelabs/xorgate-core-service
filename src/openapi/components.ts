@@ -62,7 +62,10 @@ const headerAndPathParameters = {
       'Active organization UUID. Resolution order: this header if present (it must match one of ' +
       'your memberships, else `403 FORBIDDEN`), otherwise your sole membership. A caller who ' +
       'belongs to more than one organization and omits it gets `400 ORGANIZATION_REQUIRED`, and a ' +
-      'caller who belongs to none gets `403 NO_ORGANIZATION`. Practically: always send it.',
+      'caller who belongs to none gets `403 NO_ORGANIZATION`. Practically: always send it. ' +
+      'When the credential is an API key the organization comes from the key itself, so this ' +
+      'header is optional and never required; sending one that is not the key\'s organization is ' +
+      '`403 FORBIDDEN`, deliberately not a silent override.',
   },
   WorkspaceIdHeader: {
     name: 'X-Workspace-Id',
@@ -116,17 +119,40 @@ export function openApiComponents(): Record<string, unknown> {
         bearerFormat: 'JWT',
         description:
           'A Cognito **ID** token (not an access token). Users are created just-in-time on first ' +
-          'successful verification. API keys exist but are not accepted as credentials yet. See ' +
-          'the API Keys section.',
+          'successful verification. This is what a signed-in browser session sends. A handful of ' +
+          'operations accept ONLY this, because they describe or act on a person: `GET /me`, both ' +
+          '`/organizations` collection operations, and the two live-access operations.',
+      },
+      ApiKeyAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'xorgate API key',
+        description:
+          'An API key from `POST /api-keys`, sent in the same header as a token: ' +
+          '`Authorization: Bearer xg_...`. The server tells the two apart by the `xg_` prefix, so ' +
+          'no extra header is involved. A key is bound to one organization by the row it was ' +
+          'minted from, which makes `X-Organization-Id` redundant; sending a DIFFERENT ' +
+          'organization is `403 FORBIDDEN` rather than an ignored header. The key acts with its ' +
+          'own `role` (default `member`), so every role gate in this document applies to it ' +
+          'unchanged. Keys carry no user, so operations that need one refuse them with ' +
+          '`401 USER_CREDENTIAL_REQUIRED`.',
       },
     },
     parameters: { ...headerAndPathParameters, ...listParameters },
     schemas: openApiSchemas(),
     responses: {
-      Unauthorized: errorResponse('Missing, malformed, or expired bearer token (`UNAUTHORIZED`).'),
+      Unauthorized: errorResponse(
+        'No usable credential. `UNAUTHORIZED` for a missing, malformed or expired bearer token; ' +
+          '`INVALID_API_KEY`, `API_KEY_REVOKED` or `API_KEY_EXPIRED` for an `xg_` key that does ' +
+          'not verify; `USER_CREDENTIAL_REQUIRED` when a key was sent to an operation that needs ' +
+          'a signed-in user; `SESSION_TOKEN_UNSUPPORTED` for an `xgs_` token, which nothing mints ' +
+          'yet.',
+      ),
       Forbidden: errorResponse(
         'Not a member of the requested organization (`FORBIDDEN`), a member of none ' +
-          '(`NO_ORGANIZATION`), or a member without the required role (`INSUFFICIENT_ROLE`).',
+          '(`NO_ORGANIZATION`), or a member without the required role (`INSUFFICIENT_ROLE`). ' +
+          'An API key sent with an `X-Organization-Id` other than its own is `FORBIDDEN`, and a ' +
+          'key whose `role` is below the operation is `INSUFFICIENT_ROLE`.',
       ),
       NotFound: errorResponse(
         'No such resource, or it belongs to another organization. Cross-tenant reads are ' +

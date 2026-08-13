@@ -5,9 +5,11 @@ export const apiKeysPaths = {
       operationId: 'listApiKeys',
       summary: 'List API keys for the active organization',
       description:
-        'Unpaginated, newest first. The envelope key is `api_keys` (snake_case, mirroring the ' +
-        'Postgres table name) while its contents are camelCase. That inconsistency is deliberate ' +
-        'and stays on the wire; the SDKs present it as `apiKeys`.',
+        'Unpaginated, newest first, and includes revoked and expired keys. The envelope key is ' +
+        '`api_keys` (snake_case, mirroring the Postgres table name) while its contents are ' +
+        'camelCase. That inconsistency is deliberate and stays on the wire; the SDKs present it ' +
+        'as `apiKeys`. `keyPrefix` is null on keys minted before that column existed and cannot ' +
+        'be recovered for them.',
       tags: ['API Keys'],
       responses: {
         '200': {
@@ -34,9 +36,11 @@ export const apiKeysPaths = {
       summary: 'Mint a new API key (owner/admin only)',
       description:
         'Returns the plaintext key exactly once, as `plaintext_key`. Only its SHA-256 is stored, ' +
-        'so a lost key cannot be recovered, only replaced. Note that minting is currently all a ' +
-        'key does: no endpoint accepts one as a credential yet, so a key is useful for provisioning ' +
-        'ahead of that work rather than for calling this API today.',
+        'so a lost key cannot be recovered, only replaced. Send the result as ' +
+        '`Authorization: Bearer xg_...` to any organization-scoped operation in this document.\n\n' +
+        'A key may not be minted more privileged than the caller minting it: an `admin` cannot ' +
+        'mint an `owner` key (`403`), because that would be a one-step escalation to deleting the ' +
+        'organization.',
       tags: ['API Keys'],
       requestBody: {
         required: true,
@@ -51,6 +55,24 @@ export const apiKeysPaths = {
                   type: 'string',
                   enum: ['edge', 'cloud', 'client'],
                   description: 'Recorded on the key. Nothing enforces it yet.',
+                },
+                role: {
+                  type: 'string',
+                  enum: ['owner', 'admin', 'member', 'viewer'],
+                  default: 'member',
+                  description:
+                    'The role the key acts with. Defaults to `member`, which is the right level ' +
+                    'for a data-plane consumer: it can register and manage devices and ' +
+                    'workspaces but cannot manage people, keys or the organization itself. ' +
+                    'Capped at the minting caller\'s own role.',
+                },
+                expiresAt: {
+                  type: 'string',
+                  format: 'date-time',
+                  nullable: true,
+                  description:
+                    'Opt-in expiry, ISO-8601, must be in the future. Omit or send null for a key ' +
+                    'that never expires.',
                 },
               },
             },
@@ -93,7 +115,9 @@ export const apiKeysPaths = {
       summary: 'Permanently delete an API key (owner/admin only)',
       description:
         'A hard delete, not a revocation: the row is removed and `revokedAt` is never used by this ' +
-        'endpoint.',
+        'endpoint. The key stops authenticating immediately and thereafter reads as unknown ' +
+        '(`401 INVALID_API_KEY`) rather than revoked. Rotation is therefore mint-then-delete, and ' +
+        'a deleted key leaves no record of having existed.',
       tags: ['API Keys'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

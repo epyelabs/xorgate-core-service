@@ -3,7 +3,7 @@ import { desc, eq } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
-  requireAuth,
+  requirePrincipal,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import {
@@ -15,8 +15,12 @@ import {
   ok,
 } from '../utils/responses';
 
-// device_models is a platform-wide catalog: any authenticated user can read.
-// Mutations require `users.role === 'admin'` (platform admin), regardless of org membership.
+// device_models is a platform-wide catalog: any authenticated caller can read,
+// including an API-key caller (`requirePrincipal`, not `requireAuth`) — the
+// catalog is org-blind data a consumer legitimately needs before registering a
+// device. Mutations require `users.role === 'admin'` (platform admin),
+// regardless of org membership, and an API-key principal is always platform
+// role `'user'`, so writes stay closed to keys with no extra check.
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
@@ -25,7 +29,7 @@ export const handler = async (
 
   let auth;
   try {
-    auth = await requireAuth(event);
+    auth = await requirePrincipal(event);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

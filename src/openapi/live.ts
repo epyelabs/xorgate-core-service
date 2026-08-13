@@ -66,8 +66,12 @@ export const livePaths = {
         'Note the current policy is org-blind in what it lets you SUBSCRIBE to: it authorizes the ' +
         'telemetry topic space broadly rather than per organization, so it is safe for first-party ' +
         'use and NOT yet safe to hand to a third party. Narrowing the subscribe scope is tracked ' +
-        'as platform-readiness work. Connect scoping and revocation are done.',
+        'as platform-readiness work. Connect scoping and revocation are done.\n\n' +
+        '**Cognito ID token only.** The grant attaches to the caller\'s Cognito identity, which an ' +
+        'API key does not have; a key is refused with `401 USER_CREDENTIAL_REQUIRED`. Live-plane ' +
+        'access for key-authenticated consumers is separate work.',
       tags: ['Live'],
+      security: [{ BearerAuth: [] }],
       responses: {
         '200': {
           description: 'Policy attached to the caller identity.',
@@ -113,8 +117,11 @@ export const livePaths = {
         'user still belongs to another organization, because the browser policy is one shared ' +
         'org-blind policy and they remain entitled to it.\n\n' +
         'Unlike the grant, this needs only a valid token and no organization membership: someone ' +
-        'who has just lost their last membership must still be able to clean up after themselves.',
+        'who has just lost their last membership must still be able to clean up after themselves.' +
+        '\n\n**Cognito ID token only**, for the same reason as the grant: there is no Cognito ' +
+        'identity behind an API key to detach from (`401 USER_CREDENTIAL_REQUIRED`).',
       tags: ['Live'],
+      security: [{ BearerAuth: [] }],
       responses: {
         '200': {
           description: 'Policy detached from the caller identity.',

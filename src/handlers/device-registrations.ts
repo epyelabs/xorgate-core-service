@@ -120,7 +120,10 @@ async function createRegistration(
       organizationId: auth.organizationId,
       workspaceId,
       deviceModelId: model.id,
+      // Exactly one of these is set. An API-key caller has no `users` row to
+      // point at, so attribution moves to the key rather than being dropped.
       createdByUserId: auth.userId,
+      createdByApiKeyId: auth.apiKeyId,
       expiresAt: new Date(Date.now() + REGISTRATION_TTL_MS),
       // status omitted: column DEFAULT 'pending' fires.
     })

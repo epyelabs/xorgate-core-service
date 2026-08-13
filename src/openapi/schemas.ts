@@ -156,12 +156,12 @@ export function openApiSchemas(): Record<string, unknown> {
     },
     ApiKey: {
       type: 'object',
-      required: ['id', 'organizationId', 'name', 'scope', 'createdAt'],
+      required: ['id', 'organizationId', 'name', 'scope', 'role', 'createdAt'],
       description:
         'API key metadata. `hashedKey` is never returned; the plaintext key is shown exactly once, ' +
-        'at creation. Keys are MINT-ONLY today: nothing in this API verifies one yet, so `scope` is ' +
-        'recorded but not enforced, `lastUsedAt` never advances, and there is no expiry. Server-to-' +
-        'server callers still have to use a Cognito ID token.',
+        'at creation. A key is a real credential: send it as `Authorization: Bearer xg_...` to any ' +
+        'organization-scoped operation, and it acts with its own `role` inside the organization it ' +
+        'was minted from. `scope` remains recorded but unenforced.',
       properties: {
         id: { type: 'string', format: 'uuid' },
         organizationId: { type: 'string', format: 'uuid' },
@@ -169,15 +169,56 @@ export function openApiSchemas(): Record<string, unknown> {
         scope: {
           type: 'string',
           enum: ['edge', 'cloud', 'client'],
-          description: 'Validated on create, but not enforced anywhere yet.',
+          description:
+            'Validated on create, but not enforced anywhere: every key behaves as `cloud` ' +
+            '(server-to-server) regardless of what is recorded here.',
+        },
+        role: {
+          type: 'string',
+          enum: ['owner', 'admin', 'member', 'viewer'],
+          default: 'member',
+          description:
+            'The role this key acts with, using the same vocabulary and the same gates as a ' +
+            'membership role. The default `member` can write devices, workspaces and device ' +
+            'registrations, and read everything, but cannot touch memberships, API keys or ' +
+            'organization settings. A key is never a PLATFORM admin, so device-model writes are ' +
+            'closed to every key regardless of this field.',
+        },
+        keyPrefix: {
+          type: 'string',
+          nullable: true,
+          example: 'xg_A1b2C',
+          description:
+            'The first 8 characters of the plaintext, stored so you can tell which key a holder ' +
+            'has. **Null for any key minted before this field existed** and unbackfillable, ' +
+            'because only the SHA-256 was ever stored. Show those as unknown rather than guessing.',
+        },
+        expiresAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description:
+            'When the key stops authenticating. Null means never, which is what every key minted ' +
+            'before this field existed is. After it passes, requests get `401 API_KEY_EXPIRED`.',
         },
         lastUsedAt: {
           type: 'string',
           format: 'date-time',
           nullable: true,
-          description: 'Always null today: no code path verifies a key, so nothing stamps this.',
+          description:
+            'Roughly when this key last authenticated a request, and null until it does. ' +
+            'Deliberately approximate: the write is throttled to at most once per minute per ' +
+            'serving process and is fire-and-forget, so it never delays or fails a request. Read ' +
+            'it as a liveness hint for finding unused keys, not as an audit log.',
         },
-        revokedAt: { type: 'string', format: 'date-time', nullable: true },
+        revokedAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description:
+            'Set means the key is dead: requests get `401 API_KEY_REVOKED`. No endpoint sets this ' +
+            'today; `DELETE /api-keys/{id}` removes the row outright instead.',
+        },
         createdAt: { type: 'string', format: 'date-time' },
       },
     },

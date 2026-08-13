@@ -10,6 +10,7 @@ import {
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import type { InferSelectModel, InferInsertModel } from 'drizzle-orm';
 // Type-only: the consolidated `devices.config` document shape lives with the
 // config registry that validates and publishes it (Phase 2).
@@ -92,11 +93,28 @@ export const apiKeys = pgTable(
     name: text('name').notNull(),
     hashedKey: text('hashed_key').notNull(),
     scope: text('scope').notNull(),
+    // The membership role the key acts with. Same vocabulary as
+    // `memberships.role`, same storage (plain text, validated in the handler).
+    // A key is not a member row: it has no user, so it cannot be found by any
+    // membership query, and this column is the only thing that answers "what may
+    // this credential do".
+    role: text('role').default('member').notNull(),
+    // Opt-in expiry. NULL means never.
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    // First 8 characters of the plaintext (`xg_` + 5), for display only. NULL on
+    // every key minted before Phase 2, and unbackfillable: only the hash was
+    // ever stored.
+    keyPrefix: text('key_prefix'),
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [uniqueIndex('api_keys_hashed_key_idx').on(t.hashedKey)],
+  (t) => [
+    uniqueIndex('api_keys_hashed_key_idx').on(t.hashedKey),
+    index('api_keys_org_active_idx')
+      .on(t.organizationId)
+      .where(sql`${t.revokedAt} is null`),
+  ],
 );
 
 export const workspaces = pgTable(
@@ -297,9 +315,15 @@ export const deviceRegistrations = pgTable(
     deviceModelId: uuid('device_model_id')
       .references(() => deviceModels.id, { onDelete: 'restrict' })
       .notNull(),
-    createdByUserId: text('created_by_user_id')
-      .references(() => users.id, { onDelete: 'cascade' })
-      .notNull(),
+    // Exactly one of the two creator columns is set. A Cognito-authenticated
+    // caller sets the user; an API-key caller sets the key, because a key has no
+    // `users` row to point at. Nullable since Phase 2 for that reason.
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'cascade',
+    }),
+    createdByApiKeyId: uuid('created_by_api_key_id').references(() => apiKeys.id, {
+      onDelete: 'set null',
+    }),
     status: text('status').default('pending').notNull(), // pending | claimed | expired
     // Set on claim. onDelete set null so deleting a claimed device leaves the
     // (now historical) registration row intact.
