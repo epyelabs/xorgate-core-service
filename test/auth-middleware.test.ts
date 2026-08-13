@@ -4,9 +4,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /**
  * `requireOrgContext` is the shared entry point of every handler, so this is the
  * one place where "the Cognito path is unchanged" can be asserted rather than
- * believed. The matrix is the one design note N1 asked for, widened to the
- * cases Phase 2 actually introduced: session-token stub, role gates, and the
- * mismatched-tenancy header.
+ * believed. The matrix is the one design note N1 asked for, widened twice: by
+ * Phase 2 (the API-key path, role gates, the mismatched-tenancy header) and by
+ * Phase 3 (session tokens, the minting-key cascade, and workspace scope).
+ *
+ * The workspace fixture has TWO workspaces on the organization on purpose. A
+ * scoping test that passes because there is only one workspace proves nothing:
+ * every filter looks correct when there is nothing to exclude. The assertions
+ * that matter are the negative ones.
  *
  * Both dependencies are faked at the module boundary: the JWT verifier (so no
  * Cognito) and the drizzle handle (so no database). Everything in between is the
