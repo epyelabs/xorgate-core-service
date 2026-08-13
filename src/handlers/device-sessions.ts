@@ -4,6 +4,7 @@ import { DeleteObjectsCommand, GetObjectCommand, S3Client } from '@aws-sdk/clien
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, conflict, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams, type ListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
@@ -32,14 +33,6 @@ const REPLAY_MAX_RANGE_MS = 24 * 60 * 60 * 1000;
 // safety margin so they refresh BEFORE URLs actually die mid-scrub.
 const REPLAY_URL_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 /**
  * APIs over device-recorded media sessions/segments (offline recording plan,
@@ -82,7 +75,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${deviceId}" not found`);
 
   const device = await db.query.devices.findFirst({

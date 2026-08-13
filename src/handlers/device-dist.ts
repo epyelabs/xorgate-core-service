@@ -1,6 +1,6 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 
 /**
@@ -41,7 +41,7 @@ export const handler = async (
   }
 
   try {
-    await requireOrgContext(event);
+    await requireOrgWideContext(event);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

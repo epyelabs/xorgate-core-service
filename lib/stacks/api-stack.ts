@@ -613,6 +613,20 @@ export class XorgateCoreApiStack extends cdk.Stack {
       standardFnProps(path.join(entryBase, "api-keys.ts"), "CRUD /api-keys"),
     );
 
+    // POST /auth/session-tokens — exchange an `xg_` key for a short-lived
+    // `xgs_` token a third party's browser may hold (platform-auth Phase 3).
+    // Calls iot:DescribeEndpoint once per container so the response can carry
+    // the live-plane coordinates; that grant is already on the shared role for
+    // device provisioning.
+    const authSessionTokensFn = new nodejs.NodejsFunction(
+      this,
+      "AuthSessionTokensFn",
+      standardFnProps(
+        path.join(entryBase, "auth-session-tokens.ts"),
+        "POST /auth/session-tokens — mint a short-lived session token",
+      ),
+    );
+
     const workspacesFn = new nodejs.NodejsFunction(
       this,
       "WorkspacesFn",
@@ -1526,6 +1540,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "ApiKeysInt",
       apiKeysFn,
     );
+    const authSessionTokensInt = new apigwv2int.HttpLambdaIntegration(
+      "AuthSessionTokensInt",
+      authSessionTokensFn,
+    );
     const workspacesInt = new apigwv2int.HttpLambdaIntegration(
       "WorkspacesInt",
       workspacesFn,
@@ -1673,6 +1691,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/api-keys/{id}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: apiKeysInt,
+    });
+
+    this.api.addRoutes({
+      path: "/auth/session-tokens",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: authSessionTokensInt,
     });
 
     this.api.addRoutes({

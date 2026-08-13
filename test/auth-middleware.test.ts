@@ -39,11 +39,27 @@ interface FakeApiKey {
   expiresAt: Date | null;
   hashedKey: string;
 }
+interface FakeSessionToken {
+  id: string;
+  organizationId: string;
+  workspaceId: string | null;
+  role: string;
+  createdByKeyId: string;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  hashedToken: string;
+}
+interface FakeWorkspace {
+  id: string;
+  organizationId: string;
+}
 
 const store = {
   users: [] as FakeUser[],
   memberships: [] as FakeMembership[],
   apiKeys: [] as FakeApiKey[],
+  sessionTokens: [] as FakeSessionToken[],
+  workspaces: [] as FakeWorkspace[],
 };
 /** Every `where` the middleware builds, in call order, for assertions below. */
 const lookups: string[] = [];
@@ -84,12 +100,55 @@ vi.mock('../src/db/index', async () => {
     },
   });
 
+  // `verifySessionToken` is the one query in the middleware that is a builder
+  // chain rather than a relational `findFirst`, because it JOINs the minting key
+  // (that join is what makes key revocation cascade without a second round
+  // trip). Faked as a chain that ignores everything except the `where`, which is
+  // always the token hash.
+  const selectChain = () => ({
+    from: () => ({
+      innerJoin: () => ({
+        where: (where: unknown) => {
+          const values = matcher(where);
+          lookups.push(`sessionTokens:${values.join(',')}`);
+          return {
+            limit: async () => {
+              const token = store.sessionTokens.find((t) =>
+                values.every((v) => String(t.hashedToken) === v),
+              );
+              if (!token) return [];
+              const key = store.apiKeys.find((k) => k.id === token.createdByKeyId);
+              // INNER JOIN: no key row, no result. This is the hard-delete path.
+              if (!key) return [];
+              return [
+                {
+                  id: token.id,
+                  organizationId: token.organizationId,
+                  workspaceId: token.workspaceId,
+                  role: token.role,
+                  createdByKeyId: token.createdByKeyId,
+                  expiresAt: token.expiresAt,
+                  revokedAt: token.revokedAt,
+                  keyRole: key.role,
+                  keyRevokedAt: key.revokedAt,
+                  keyExpiresAt: key.expiresAt,
+                },
+              ];
+            },
+          };
+        },
+      }),
+    }),
+  });
+
   return {
     db: {
+      select: selectChain,
       query: {
         users: table(() => store.users, 'users', ['id']),
         memberships: table(() => store.memberships, 'memberships', ['userId', 'organizationId']),
         apiKeys: table(() => store.apiKeys, 'apiKeys', ['hashedKey']),
+        workspaces: table(() => store.workspaces, 'workspaces', ['id', 'organizationId']),
       },
       insert: () => ({
         values: (row: FakeUser) => ({
@@ -112,15 +171,33 @@ vi.mock('../src/db/index', async () => {
   };
 });
 
-const { AuthError, requireAuth, requireOrgContext, requirePrincipal } = await import(
-  '../src/middleware/auth'
-);
+const {
+  assertOrgWideScope,
+  AuthError,
+  requireAuth,
+  requireOrgContext,
+  requireOrgWideContext,
+  requirePrincipal,
+} = await import('../src/middleware/auth');
 const { hashApiKey, resetLastUsedThrottle } = await import('../src/services/api-key-auth');
+const { hashSessionToken } = await import('../src/services/session-token-auth');
+const { isWorkspaceScoped, resolveWorkspaceScope } = await import(
+  '../src/services/workspace-scope'
+);
 
 const ORG_A = 'aaaaaaaa-0000-0000-0000-000000000000';
 const ORG_B = 'bbbbbbbb-0000-0000-0000-000000000000';
 const KEY_ID = 'kkkkkkkk-0000-0000-0000-000000000000';
 const PLAINTEXT = 'xg_TestKeyTestKeyTestKeyTestKeyTe';
+// Two workspaces on ORG_A. A scoping test with one workspace proves nothing:
+// every filter looks correct when there is nothing to exclude.
+const WS_1 = '11111111-0000-0000-0000-000000000000';
+const WS_2 = '22222222-0000-0000-0000-000000000000';
+const TOKEN_ID = 'tttttttt-0000-0000-0000-000000000000';
+/** Org-scoped: no workspace. Behaves exactly like the key that minted it. */
+const ORG_TOKEN = 'xgs_OrgScopedOrgScopedOrgScopedOrgS';
+/** Workspace-scoped to WS_1, and provably unable to see WS_2. */
+const WS_TOKEN = 'xgs_WorkspaceScopedWorkspaceScopedW';
 
 function event(token?: string, headers: Record<string, string> = {}): APIGatewayProxyEventV2 {
   return {
@@ -152,6 +229,35 @@ beforeEach(() => {
       revokedAt: null,
       expiresAt: null,
       hashedKey: hashApiKey(PLAINTEXT),
+    },
+  ];
+  store.workspaces = [
+    { id: WS_1, organizationId: ORG_A },
+    { id: WS_2, organizationId: ORG_A },
+    // A workspace in the OTHER organization, so "the org filter still applies"
+    // is a claim the fixture can actually falsify.
+    { id: '33333333-0000-0000-0000-000000000000', organizationId: ORG_B },
+  ];
+  store.sessionTokens = [
+    {
+      id: TOKEN_ID,
+      organizationId: ORG_A,
+      workspaceId: null,
+      role: 'member',
+      createdByKeyId: KEY_ID,
+      expiresAt: new Date(Date.now() + 900_000),
+      revokedAt: null,
+      hashedToken: hashSessionToken(ORG_TOKEN),
+    },
+    {
+      id: 'ssssssss-0000-0000-0000-000000000000',
+      organizationId: ORG_A,
+      workspaceId: WS_1,
+      role: 'member',
+      createdByKeyId: KEY_ID,
+      expiresAt: new Date(Date.now() + 900_000),
+      revokedAt: null,
+      hashedToken: hashSessionToken(WS_TOKEN),
     },
   ];
   lookups.length = 0;
@@ -305,14 +411,254 @@ describe('the API-key path', () => {
   });
 });
 
-describe('session tokens are stubbed, not fallen through', () => {
-  it('401 SESSION_TOKEN_UNSUPPORTED from every gate', async () => {
-    const token = 'xgs_whatever';
-    await refusal(requireOrgContext(event(token)), 401, 'SESSION_TOKEN_UNSUPPORTED');
-    await refusal(requireAuth(event(token)), 401, 'SESSION_TOKEN_UNSUPPORTED');
-    await refusal(requirePrincipal(event(token)), 401, 'SESSION_TOKEN_UNSUPPORTED');
-    // The point of the stub: it must not read as "your token expired".
+describe('the session-token path', () => {
+  it('resolves the organization and role from the token row', async () => {
+    const auth = await requireOrgContext(event(ORG_TOKEN));
+    expect(auth).toMatchObject({
+      organizationId: ORG_A,
+      membershipRole: 'member',
+      principal: 'sessionToken',
+      sessionTokenId: TOKEN_ID,
+      // Attribution follows the KEY: it is the credential a human issued, and it
+      // is what `device_registrations.created_by_api_key_id` should record.
+      apiKeyId: KEY_ID,
+      userId: null,
+      email: null,
+      role: 'user',
+      allowedWorkspaceId: null,
+    });
+  });
+
+  it('never runs a membership query and never reaches the JWT verifier', async () => {
+    await requireOrgContext(event(ORG_TOKEN));
+    expect(lookups.filter((l) => l.startsWith('memberships:'))).toEqual([]);
     expect(verify).not.toHaveBeenCalled();
+  });
+
+  it('carries the workspace when it has one', async () => {
+    const auth = await requireOrgContext(event(WS_TOKEN));
+    expect(auth.allowedWorkspaceId).toBe(WS_1);
+    expect(isWorkspaceScoped(auth)).toBe(true);
+  });
+
+  it('applies the same role gates a key would', async () => {
+    await refusal(requireOrgContext(event(ORG_TOKEN), ['owner', 'admin']), 403, 'INSUFFICIENT_ROLE');
+    store.apiKeys[0]!.role = 'admin';
+    store.sessionTokens[0]!.role = 'admin';
+    expect((await requireOrgContext(event(ORG_TOKEN), ['owner', 'admin'])).membershipRole).toBe(
+      'admin',
+    );
+  });
+
+  it('401s a revoked token, an expired token, and a token nothing matches', async () => {
+    store.sessionTokens[0]!.revokedAt = new Date('2026-01-01T00:00:00Z');
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'SESSION_TOKEN_REVOKED');
+
+    store.sessionTokens[0]!.revokedAt = null;
+    store.sessionTokens[0]!.expiresAt = new Date('2026-01-01T00:00:00Z');
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'SESSION_TOKEN_EXPIRED');
+
+    await refusal(requireOrgContext(event('xgs_nothing-matches-this')), 401, 'INVALID_SESSION_TOKEN');
+    await refusal(requireOrgContext(event('xgs_')), 401, 'INVALID_SESSION_TOKEN');
+    expect(verify).not.toHaveBeenCalled();
+  });
+
+  it('ignores a matching X-Organization-Id and refuses a different one', async () => {
+    expect(
+      (await requireOrgContext(event(ORG_TOKEN, { 'x-organization-id': ORG_A }))).organizationId,
+    ).toBe(ORG_A);
+    await refusal(
+      requireOrgContext(event(ORG_TOKEN, { 'x-organization-id': ORG_B })),
+      403,
+      'FORBIDDEN',
+    );
+  });
+
+  it('stamps the MINTING KEY lastUsedAt, and never on a refusal', async () => {
+    // The token's own liveness is its expiry; `last_used_at` answers "is this
+    // key still in service", and an exchange-and-use is exactly that.
+    await requireOrgContext(event(ORG_TOKEN));
+    expect(updates).toEqual([`update:${KEY_ID}`]);
+
+    updates.length = 0;
+    resetLastUsedThrottle();
+    await refusal(requireOrgContext(event(ORG_TOKEN), ['owner']), 403, 'INSUFFICIENT_ROLE');
+    await refusal(requireOrgContext(event('xgs_nope')), 401, 'INVALID_SESSION_TOKEN');
+    expect(updates).toEqual([]);
+  });
+});
+
+describe('the minting key cascades into its tokens', () => {
+  it('dies with a revoked key, reported as a token problem', async () => {
+    store.apiKeys[0]!.revokedAt = new Date('2026-01-01T00:00:00Z');
+    // Not API_KEY_REVOKED: the browser holding this never saw the key and can do
+    // nothing about it. "Get a new token" is the actionable answer.
+    const err = await refusal(
+      requireOrgContext(event(ORG_TOKEN)),
+      401,
+      'SESSION_TOKEN_REVOKED',
+    );
+    expect(err.message).toMatch(/API key/i);
+  });
+
+  it('dies with an expired key', async () => {
+    store.apiKeys[0]!.expiresAt = new Date('2026-01-01T00:00:00Z');
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'SESSION_TOKEN_EXPIRED');
+  });
+
+  it('dies with a DELETED key, which is the real revocation story', async () => {
+    // `DELETE /api-keys/{id}` is a hard delete. The FK is ON DELETE CASCADE so
+    // in Postgres the token row is gone too; the INNER JOIN makes the outcome
+    // the same either way, which is what this asserts.
+    store.apiKeys = [];
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'INVALID_SESSION_TOKEN');
+  });
+
+  it('takes the LOWER of the token role and the key CURRENT role', async () => {
+    store.sessionTokens[0]!.role = 'admin';
+    store.apiKeys[0]!.role = 'admin';
+    expect((await requireOrgContext(event(ORG_TOKEN))).membershipRole).toBe('admin');
+
+    // The key is downgraded after the token was minted. The hour-old token must
+    // not keep acting as an admin.
+    store.apiKeys[0]!.role = 'viewer';
+    expect((await requireOrgContext(event(ORG_TOKEN))).membershipRole).toBe('viewer');
+    await refusal(requireOrgContext(event(ORG_TOKEN), ['owner', 'admin']), 403, 'INSUFFICIENT_ROLE');
+
+    // And the reverse: upgrading the key does not elevate a token minted below it.
+    store.sessionTokens[0]!.role = 'viewer';
+    store.apiKeys[0]!.role = 'owner';
+    expect((await requireOrgContext(event(ORG_TOKEN))).membershipRole).toBe('viewer');
+  });
+
+  it('treats an unrecognised role on either row as an invalid token', async () => {
+    store.sessionTokens[0]!.role = 'superuser';
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'INVALID_SESSION_TOKEN');
+    store.sessionTokens[0]!.role = 'member';
+    store.apiKeys[0]!.role = 'superuser';
+    await refusal(requireOrgContext(event(ORG_TOKEN)), 401, 'INVALID_SESSION_TOKEN');
+  });
+});
+
+describe('workspace scope is a boundary, not a filter', () => {
+  it('an org-scoped caller sees every workspace in its organization and no others', async () => {
+    for (const credential of ['good-jwt', PLAINTEXT, ORG_TOKEN]) {
+      const auth = await requireOrgContext(event(credential));
+      const ids = await resolveWorkspaceScope(auth);
+      expect(ids.sort()).toEqual([WS_1, WS_2].sort());
+    }
+  });
+
+  it('a workspace-scoped token sees ONLY its own workspace', async () => {
+    const auth = await requireOrgContext(event(WS_TOKEN));
+    const ids = await resolveWorkspaceScope(auth);
+    expect(ids).toEqual([WS_1]);
+    // The negative half, which is the half that matters: WS_2 exists, is in the
+    // same organization, and is still not in the set.
+    expect(ids).not.toContain(WS_2);
+  });
+
+  it('resolves to the empty set if the scoped workspace was deleted', async () => {
+    // Never trust `allowedWorkspaceId` as a filter without re-reading it: a
+    // dangling id must fail closed, not open.
+    const auth = await requireOrgContext(event(WS_TOKEN));
+    store.workspaces = store.workspaces.filter((w) => w.id !== WS_1);
+    expect(await resolveWorkspaceScope(auth)).toEqual([]);
+  });
+
+  it('403s an X-Workspace-Id that contradicts the token, and allows the matching one', async () => {
+    const auth = await requireOrgContext(event(WS_TOKEN, { 'x-workspace-id': WS_1 }));
+    expect(auth.allowedWorkspaceId).toBe(WS_1);
+
+    const err = await refusal(
+      requireOrgContext(event(WS_TOKEN, { 'x-workspace-id': WS_2 })),
+      403,
+      'WORKSPACE_MISMATCH',
+    );
+    expect(err.message).toContain(WS_2);
+  });
+
+  it('leaves X-Workspace-Id alone for every other credential', async () => {
+    // For a user or a key the header is still an advisory filter; an out-of-scope
+    // value yields an empty page in the handler, not an error here.
+    expect((await requireOrgContext(event('good-jwt', { 'x-workspace-id': WS_2 }))).organizationId)
+      .toBe(ORG_A);
+    expect((await requireOrgContext(event(PLAINTEXT, { 'x-workspace-id': WS_2 }))).organizationId)
+      .toBe(ORG_A);
+    expect((await requireOrgContext(event(ORG_TOKEN, { 'x-workspace-id': WS_2 }))).organizationId)
+      .toBe(ORG_A);
+  });
+
+  it('refuses a workspace-scoped token on organization-wide operations, at any role', async () => {
+    for (const role of ['owner', 'admin', 'member', 'viewer']) {
+      store.apiKeys[0]!.role = role;
+      store.sessionTokens[1]!.role = role;
+      await refusal(requireOrgWideContext(event(WS_TOKEN)), 403, 'WORKSPACE_SCOPED');
+    }
+  });
+
+  it('lets every other credential through the organization-wide gate', async () => {
+    for (const credential of ['good-jwt', PLAINTEXT, ORG_TOKEN]) {
+      expect((await requireOrgWideContext(event(credential))).organizationId).toBe(ORG_A);
+    }
+  });
+
+  it('applies the role gate BEFORE the scope gate is reached, not instead of it', async () => {
+    // A viewer workspace-scoped token on an owner/admin route gets the role
+    // refusal; the same token on an unrestricted org-wide route still gets the
+    // scope refusal. Neither can swallow the other.
+    store.sessionTokens[1]!.role = 'viewer';
+    store.apiKeys[0]!.role = 'viewer';
+    await refusal(
+      requireOrgWideContext(event(WS_TOKEN), ['owner', 'admin']),
+      403,
+      'INSUFFICIENT_ROLE',
+    );
+    await refusal(requireOrgWideContext(event(WS_TOKEN)), 403, 'WORKSPACE_SCOPED');
+  });
+
+  it('assertOrgWideScope is the same refusal, usable per-method', async () => {
+    // `workspaces.ts` reads are scoped and its writes are not, so it applies the
+    // refusal itself rather than choosing a gate for the whole handler.
+    const scoped = await requireOrgContext(event(WS_TOKEN));
+    expect(() => assertOrgWideScope(scoped)).toThrow(AuthError);
+    const orgWide = await requireOrgContext(event(ORG_TOKEN));
+    expect(() => assertOrgWideScope(orgWide)).not.toThrow();
+  });
+});
+
+describe('a session token is not a person', () => {
+  it('requireAuth refuses it on shape alone, with the same code a key gets', async () => {
+    const err = await refusal(requireAuth(event(WS_TOKEN)), 401, 'USER_CREDENTIAL_REQUIRED');
+    expect(err.message).toMatch(/session token/i);
+    // No lookup: a valid and an invalid token are indistinguishable here, and it
+    // must not read as "your token expired".
+    expect(lookups).toEqual([]);
+    expect(verify).not.toHaveBeenCalled();
+  });
+});
+
+describe('requirePrincipal accepts a session token', () => {
+  it('resolves it with no organization and never platform admin', async () => {
+    const auth = await requirePrincipal(event(WS_TOKEN));
+    expect(auth).toMatchObject({
+      principal: 'sessionToken',
+      apiKeyId: KEY_ID,
+      userId: null,
+      allowedWorkspaceId: WS_1,
+    });
+    // The PLATFORM role. Device-model writes gate on it, so a token being 'user'
+    // is what keeps that endpoint closed to tokens.
+    expect(auth.role).toBe('user');
+    expect(auth).not.toHaveProperty('organizationId');
+  });
+
+  it('still enforces token validity and the key cascade', async () => {
+    store.sessionTokens[1]!.revokedAt = new Date('2026-01-01T00:00:00Z');
+    await refusal(requirePrincipal(event(WS_TOKEN)), 401, 'SESSION_TOKEN_REVOKED');
+    store.sessionTokens[1]!.revokedAt = null;
+    store.apiKeys[0]!.revokedAt = new Date('2026-01-01T00:00:00Z');
+    await refusal(requirePrincipal(event(WS_TOKEN)), 401, 'SESSION_TOKEN_REVOKED');
   });
 });
 

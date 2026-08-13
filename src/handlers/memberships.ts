@@ -10,7 +10,7 @@ import {
 import {
   AuthError,
   authErrorResponse,
-  requireOrgContext,
+  requireOrgWideContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { revokeLiveAccessForUser } from '../services/live-access';
@@ -102,7 +102,7 @@ export const handler = async (
   let auth;
   try {
     const writeMethod = method === 'POST' || method === 'DELETE';
-    auth = await requireOrgContext(
+    auth = await requireOrgWideContext(
       event,
       writeMethod ? ['owner', 'admin'] : undefined,
     );

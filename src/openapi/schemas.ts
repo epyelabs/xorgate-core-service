@@ -222,6 +222,89 @@ export function openApiSchemas(): Record<string, unknown> {
         createdAt: { type: 'string', format: 'date-time' },
       },
     },
+    CreateSessionTokenInput: {
+      type: 'object',
+      description: 'Every field is optional; an empty body mints an org-scoped token at the default TTL.',
+      properties: {
+        workspaceId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description:
+            'Confine the token to one workspace. Omit (or null) for the whole organization. A ' +
+            'workspace outside the key\'s organization is `403`, and so is one that does not ' +
+            'exist — telling those two apart would confirm other organizations\' workspace ids.',
+        },
+        ttlSeconds: {
+          type: 'integer',
+          minimum: 60,
+          maximum: 3600,
+          default: 900,
+          description:
+            'Lifetime in seconds. Out-of-range values are REJECTED rather than clamped: a ' +
+            'credential lifetime you believe you got and did not is a bug that surfaces as ' +
+            'mysterious 401s later. Mint a fresh token rather than reaching for the maximum.',
+        },
+      },
+    },
+    SessionToken: {
+      type: 'object',
+      required: ['id', 'token', 'expiresAt', 'workspaceId', 'role', 'live'],
+      description:
+        'A minted session token. Flat rather than wrapped in a named envelope, because it is a ' +
+        'credential rather than a resource and there is nothing to read back later.',
+      properties: {
+        id: {
+          type: 'string',
+          format: 'uuid',
+          description:
+            'Identifies the token in your own logs. It is NOT a credential and cannot be ' +
+            'exchanged for one.',
+        },
+        token: {
+          type: 'string',
+          example: 'xgs_1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P7q8R',
+          description:
+            'The credential. Returned exactly once — only its SHA-256 is stored. Send it as ' +
+            '`Authorization: Bearer xgs_...`, the same header everything else uses.',
+        },
+        expiresAt: {
+          type: 'string',
+          format: 'date-time',
+          description:
+            'After this, requests get `401 SESSION_TOKEN_EXPIRED`. Refresh before it, not after.',
+        },
+        workspaceId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description: 'Echo of the requested scope. Null means the token sees the whole organization.',
+        },
+        role: {
+          type: 'string',
+          enum: ['owner', 'admin', 'member', 'viewer'],
+          description:
+            'Inherited from the minting key. The role actually in force on a request is the lower ' +
+            'of this and the key\'s role at that moment.',
+        },
+        live: {
+          type: 'object',
+          required: ['region', 'realtimeEndpoint'],
+          description:
+            'Coordinates for the live plane, which does not flow through this API. They ride ' +
+            'along with the token so a client\'s configuration is just the API base URL, and so ' +
+            'that moving them needs no consumer redeploy.',
+          properties: {
+            region: { type: 'string', example: 'us-east-1' },
+            realtimeEndpoint: {
+              type: 'string',
+              example: 'a1b2c3d4e5f6g7-ats.iot.us-east-1.amazonaws.com',
+              description: 'Host for the live telemetry stream (MQTT over WebSockets).',
+            },
+          },
+        },
+      },
+    },
     Workspace: {
       type: 'object',
       required: ['id', 'organizationId', 'name', 'slug'],

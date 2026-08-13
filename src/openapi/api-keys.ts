@@ -117,7 +117,11 @@ export const apiKeysPaths = {
         'A hard delete, not a revocation: the row is removed and `revokedAt` is never used by this ' +
         'endpoint. The key stops authenticating immediately and thereafter reads as unknown ' +
         '(`401 INVALID_API_KEY`) rather than revoked. Rotation is therefore mint-then-delete, and ' +
-        'a deleted key leaves no record of having existed.',
+        'a deleted key leaves no record of having existed.\n\n' +
+        '**Every session token minted from this key dies with it, immediately.** That cascade is ' +
+        'the emergency stop for a leaked browser credential: there is no per-token revoke ' +
+        'endpoint, so if you need to end sessions now, delete the key they came from. Mint the ' +
+        'replacement key first if you also need the integration to keep working.',
       tags: ['API Keys'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

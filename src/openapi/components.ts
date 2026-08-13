@@ -75,7 +75,12 @@ const headerAndPathParameters = {
     description:
       'Optional workspace UUID. On `GET /devices` it filters the result to that workspace (a ' +
       'workspace outside the active organization yields an EMPTY page, not an error). Required on ' +
-      '`POST /device-registrations`.',
+      '`POST /device-registrations`.\n\n' +
+      'One credential changes what this header means. For a **workspace-scoped session token** ' +
+      'the workspace is already fixed, so the header is redundant: sending the token\'s own ' +
+      'workspace is accepted, sending a different one is `403 WORKSPACE_MISMATCH` rather than an ' +
+      'empty result, and omitting it on `POST /device-registrations` is fine because the token ' +
+      'supplies it.',
   },
   IdPath: {
     name: 'id',
@@ -137,6 +142,24 @@ export function openApiComponents(): Record<string, unknown> {
           'unchanged. Keys carry no user, so operations that need one refuse them with ' +
           '`401 USER_CREDENTIAL_REQUIRED`.',
       },
+      SessionTokenAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'xorgate session token',
+        description:
+          'A short-lived token from `POST /auth/session-tokens`, sent in the same header as the ' +
+          'other two: `Authorization: Bearer xgs_...`. This is the only xorgate credential a ' +
+          'browser or a mobile binary should ever hold — your server exchanges its API key for ' +
+          'one, per end user, per request if you like.\n\n' +
+          'It carries the key\'s organization and the key\'s role (never more), expires within ' +
+          'the hour, and dies the moment the key that minted it is deleted. It can also be ' +
+          'confined to ONE workspace, which is the only place in this API where a workspace is a ' +
+          'boundary rather than a filter: such a token sees that workspace\'s devices and ' +
+          'nothing else, gets `403 WORKSPACE_MISMATCH` for an `X-Workspace-Id` naming another ' +
+          'workspace, and `403 WORKSPACE_SCOPED` on organization-wide operations regardless of ' +
+          'its role. Like a key it has no user, so person-scoped operations refuse it with ' +
+          '`401 USER_CREDENTIAL_REQUIRED`.',
+      },
     },
     parameters: { ...headerAndPathParameters, ...listParameters },
     schemas: openApiSchemas(),
@@ -144,15 +167,22 @@ export function openApiComponents(): Record<string, unknown> {
       Unauthorized: errorResponse(
         'No usable credential. `UNAUTHORIZED` for a missing, malformed or expired bearer token; ' +
           '`INVALID_API_KEY`, `API_KEY_REVOKED` or `API_KEY_EXPIRED` for an `xg_` key that does ' +
-          'not verify; `USER_CREDENTIAL_REQUIRED` when a key was sent to an operation that needs ' +
-          'a signed-in user; `SESSION_TOKEN_UNSUPPORTED` for an `xgs_` token, which nothing mints ' +
-          'yet.',
+          'not verify; `INVALID_SESSION_TOKEN`, `SESSION_TOKEN_REVOKED` or ' +
+          '`SESSION_TOKEN_EXPIRED` for an `xgs_` token that does not (revoked also covers a token ' +
+          'whose minting key was revoked or deleted, and expired covers one whose key expired — ' +
+          'the holder cannot act on the key either way, so the token-shaped code is the useful ' +
+          'one); `USER_CREDENTIAL_REQUIRED` when a key or a token was sent to an operation that ' +
+          'needs a signed-in user; and `API_KEY_REQUIRED` on `POST /auth/session-tokens`, which ' +
+          'takes only a key.',
       ),
       Forbidden: errorResponse(
         'Not a member of the requested organization (`FORBIDDEN`), a member of none ' +
           '(`NO_ORGANIZATION`), or a member without the required role (`INSUFFICIENT_ROLE`). ' +
           'An API key sent with an `X-Organization-Id` other than its own is `FORBIDDEN`, and a ' +
-          'key whose `role` is below the operation is `INSUFFICIENT_ROLE`.',
+          'key whose `role` is below the operation is `INSUFFICIENT_ROLE`. A workspace-scoped ' +
+          'session token adds two of its own, neither of which a role can satisfy: ' +
+          '`WORKSPACE_MISMATCH` for an `X-Workspace-Id` that contradicts the token, and ' +
+          '`WORKSPACE_SCOPED` for an operation that is organization-wide.',
       ),
       NotFound: errorResponse(
         'No such resource, or it belongs to another organization. Cross-tenant reads are ' +

@@ -6,6 +6,7 @@ import {
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import {
   badRequest,
   created,
@@ -43,14 +44,6 @@ const LEGACY_PUT_FIELDS: { field: string; namespace: string }[] = CONFIG_NAMESPA
 
 /** Old cloud-only PUT fields, now `PATCH /devices/{id}/ui-prefs`. */
 const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 type DeviceRow = typeof schema.devices.$inferSelect;
 
@@ -166,7 +159,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
 
   // ---- Sub-resource routes (config / ui-prefs) -------------------------------
   if (routeKey === 'PATCH /devices/{id}/config') {

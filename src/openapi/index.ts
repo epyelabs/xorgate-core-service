@@ -4,6 +4,7 @@ import { usersPaths } from './users';
 import { organizationsPaths } from './organizations';
 import { membershipsPaths } from './memberships';
 import { apiKeysPaths } from './api-keys';
+import { authPaths } from './auth';
 import { workspacesPaths } from './workspaces';
 import { deviceModelsPaths } from './device-models';
 import { devicesPaths } from './devices';
@@ -65,9 +66,18 @@ const TAGS = [
       'organization-scoped operation, at the role the key was minted with.',
   },
   {
+    name: 'Auth',
+    'x-displayName': 'Auth',
+    description:
+      'Exchanging an API key for a short-lived token your client can hold. The one endpoint a ' +
+      'third-party integration is built on.',
+  },
+  {
     name: 'Workspaces',
     'x-displayName': 'Workspaces',
-    description: 'The grouping devices belong to, one level below an organization.',
+    description:
+      'The grouping devices belong to, one level below an organization. Also the tenancy unit ' +
+      'for a consumer running its own multi-tenancy: a session token can be confined to one.',
   },
   {
     name: 'Device Models',
@@ -116,21 +126,35 @@ const DESCRIPTION = [
   'recorded media, and stored telemetry.',
   '',
   '**Authentication.** Every endpoint except `/health` and this document requires',
-  '`Authorization: Bearer <credential>`, and there are two kinds. A Cognito **ID** token (not an',
-  'access token) authenticates a person; a user row is created on first successful verification.',
-  'An **API key** from `POST /api-keys` authenticates a program: it carries the `xg_` prefix, which',
-  'is how the server tells the two apart in the one header, and it acts inside the organization it',
-  'was minted from with its own `role`. Four operations accept only an ID token, because they',
-  'describe or act on a person: `GET /me`, `GET`/`POST /organizations`, and the two live-access',
-  'operations. Everything else takes either. A third prefix, `xgs_`, is reserved for short-lived',
-  'session tokens and currently returns `401 SESSION_TOKEN_UNSUPPORTED`.',
+  '`Authorization: Bearer <credential>`, and there are three kinds, told apart by their prefix in',
+  'that one header. A Cognito **ID** token (not an access token) authenticates a person; a user',
+  'row is created on first successful verification. An **API key** from `POST /api-keys` (`xg_`)',
+  'authenticates a program and acts inside the organization it was minted from with its own',
+  '`role`; it is a server-side credential and must never reach a browser. A **session token**',
+  'from `POST /auth/session-tokens` (`xgs_`) is what a browser or a mobile app holds instead: your',
+  'server exchanges its key for one, it expires within the hour, it is never more privileged than',
+  'the key, and it can be confined to a single workspace.',
+  '',
+  'Most operations take any of the three. The exceptions are narrow and deliberate: five',
+  'operations accept only an ID token, because they describe or act on a person (`GET /me`,',
+  '`GET`/`POST /organizations`, and the two live-access operations), and',
+  '`POST /auth/session-tokens` accepts only an API key.',
   '',
   '**Tenancy.** Org-scoped endpoints resolve the active organization from the `X-Organization-Id`',
   'header, falling back to your sole membership if you have exactly one. A caller in more than one',
   'organization who omits the header gets `400 ORGANIZATION_REQUIRED`, so clients should always',
-  'send it. An API key needs no header at all: its organization is fixed by the key row, and a',
-  'header naming a different organization is `403 FORBIDDEN`. `X-Workspace-Id` narrows',
-  '`GET /devices` and is required by `POST /device-registrations`.',
+  'send it. An API key or session token needs no header at all: its organization is fixed by the',
+  'row behind it, and a header naming a different organization is `403 FORBIDDEN`.',
+  '`X-Workspace-Id` narrows `GET /devices` and is required by `POST /device-registrations`.',
+  '',
+  '**Workspaces are a filter, with one exception.** For a person or an API key, every workspace in',
+  'the organization is visible and `X-Workspace-Id` merely narrows a list. For a session token',
+  'minted with a `workspaceId` it is an enforced BOUNDARY: device reads and writes are confined to',
+  'that workspace, a contradicting `X-Workspace-Id` is `403 WORKSPACE_MISMATCH`, and',
+  'organization-wide operations (memberships, API keys, organization settings, workspace writes)',
+  'are `403 WORKSPACE_SCOPED` whatever role the token carries. That is how a consumer running its',
+  'own multi-tenancy maps its customers onto workspaces and hands each one a credential that',
+  'cannot reach the others.',
   '',
   '**Envelopes.** Responses are always a named object, never a bare array: `{devices, page}`,',
   '`{device}`, `{organizations}`. Fields are camelCase; three envelope KEYS are snake_case',
@@ -158,17 +182,18 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
-      // 0.3.0: API keys became a real credential (a second security scheme, a
-      // per-key role/expiry/prefix). Same reason 0.1.0 -> 0.2.0 was bumped:
-      // the surface this document describes materially changed.
-      version: '0.3.0',
+      // 0.4.0: session tokens. A third security scheme, a new endpoint, and
+      // workspace becoming an enforced boundary for one credential kind — the
+      // same bar 0.2.0 and 0.3.0 were bumped for.
+      version: '0.4.0',
       description: DESCRIPTION,
     },
     servers: [{ url: baseUrl }],
-    // Either credential, on every operation that does not say otherwise. The
-    // exceptions are the operations that need a PERSON, and each one overrides
-    // this with `security: [{ BearerAuth: [] }]` in its own module.
-    security: [{ BearerAuth: [] }, { ApiKeyAuth: [] }],
+    // Any of the three credentials, on every operation that does not say
+    // otherwise. Two kinds of exception, each overriding this in its own module:
+    // the operations that need a PERSON take `[{ BearerAuth: [] }]`, and the
+    // token-minting endpoint takes `[{ ApiKeyAuth: [] }]`.
+    security: [{ BearerAuth: [] }, { ApiKeyAuth: [] }, { SessionTokenAuth: [] }],
     tags: TAGS,
     components: openApiComponents(),
     // Spread order is the reading order: it decides the order of the generated
@@ -178,6 +203,7 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...organizationsPaths,
       ...membershipsPaths,
       ...apiKeysPaths,
+      ...authPaths,
       ...workspacesPaths,
       ...deviceModelsPaths,
       ...devicesPaths,

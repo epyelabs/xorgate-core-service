@@ -7,7 +7,7 @@ import {
   PutSecretValueCommand,
   SecretsManagerClient,
 } from '@aws-sdk/client-secrets-manager';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { badRequest, conflict, errorResponse, methodNotAllowed, ok } from '../utils/responses';
 import {
   CREDENTIAL_PROVIDERS,
@@ -141,7 +141,7 @@ export const handler = async (
 
   let auth;
   try {
-    auth = await requireOrgContext(event, method === 'GET' ? undefined : ['owner', 'admin']);
+    auth = await requireOrgWideContext(event, method === 'GET' ? undefined : ['owner', 'admin']);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

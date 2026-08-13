@@ -4,6 +4,7 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
@@ -17,14 +18,6 @@ const BUCKET = process.env.BUCKET_NAME;
 const ARTIFACT_URL_EXPIRES_SECONDS = 300;
 
 const RUN_STATUSES = ['running', 'succeeded', 'failed'] as const;
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 // Summary select shared by the workspace list and the per-device list.
 const summaryColumns = {
@@ -136,7 +129,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
 
   switch (routeKey) {
     case 'GET /workflow-runs': {

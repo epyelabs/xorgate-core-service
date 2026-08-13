@@ -1,6 +1,6 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
 import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
@@ -230,7 +230,7 @@ export const handler = async (
   let auth;
   try {
     const writeMethod = method === 'POST' || method === 'PUT' || method === 'DELETE';
-    auth = await requireOrgContext(event, writeMethod ? ['owner', 'admin', 'member'] : undefined);
+    auth = await requireOrgWideContext(event, writeMethod ? ['owner', 'admin', 'member'] : undefined);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

@@ -2,15 +2,8 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { methodNotAllowed, notFound, ok } from '../utils/responses';
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 // GET /devices/{id}/kvs-channels — the device's KVS signaling channels (name/ARN/region)
 // so the browser can run a WebRTC VIEWER. The browser mints its own scoped AWS creds via
@@ -32,7 +25,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
 
   // Org-ownership check (same pattern as devices.ts): the device must belong to a
