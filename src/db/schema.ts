@@ -53,6 +53,35 @@ export const memberships = pgTable(
   (t) => [uniqueIndex('memberships_user_org_idx').on(t.userId, t.organizationId)],
 );
 
+// Which AWS IoT policies are attached to which Cognito identity, and for whom.
+// AWS is the source of truth for the attachment itself; this table exists only
+// because AWS cannot answer "which identity belongs to user X" — GetId needs
+// the user's own token, so a membership-removal path (which has a user id and
+// no token) has no other way to find the identity it must detach from.
+// One row per (user, identity, policy). Cardinality is one in practice today
+// (GetId is stable per identity pool + provider + sub, verified 2026-08-13),
+// but the policy dimension is real: Phase 4 evaluates per-workspace policy
+// variants, and a detach must then know which named policies to remove.
+export const iotPolicyAttachments = pgTable(
+  'iot_policy_attachments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: text('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    identityId: text('identity_id').notNull(),
+    policyName: text('policy_name').notNull(),
+    attachedAt: timestamp('attached_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('iot_policy_attachments_identity_policy_idx').on(
+      t.identityId,
+      t.policyName,
+    ),
+    index('iot_policy_attachments_user_idx').on(t.userId),
+  ],
+);
+
 export const apiKeys = pgTable(
   'api_keys',
   {
@@ -663,6 +692,8 @@ export type Organization = InferSelectModel<typeof organizations>;
 export type NewOrganization = InferInsertModel<typeof organizations>;
 export type Membership = InferSelectModel<typeof memberships>;
 export type NewMembership = InferInsertModel<typeof memberships>;
+export type IotPolicyAttachment = InferSelectModel<typeof iotPolicyAttachments>;
+export type NewIotPolicyAttachment = InferInsertModel<typeof iotPolicyAttachments>;
 export type ApiKey = InferSelectModel<typeof apiKeys>;
 export type NewApiKey = InferInsertModel<typeof apiKeys>;
 export type Workspace = InferSelectModel<typeof workspaces>;

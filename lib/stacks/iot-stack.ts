@@ -125,12 +125,25 @@ export class XorgateCoreIotStack extends cdk.Stack {
       },
     });
 
+    // Browser MQTT client ids are scoped to the caller's own Cognito identity id
+    // (`<identityId>-<role>-<uuid>`; see frontend/xorgate-web/src/lib/iot-wss.ts
+    // `browserClientId`). The trailing `*` is load-bearing: one identity needs
+    // SEVERAL concurrent connections (telemetry feed, workflow-run progress,
+    // webcam ingest, and one per open tab — two tabs of the same user resolve to
+    // the SAME identity id, verified 2026-08-13), and an exact-match resource
+    // would make them displace each other the way devices are displaced today.
+    // Device ids are bare UUIDs and can never carry the `us-east-1:` identity
+    // prefix, so no browser client id can collide with a thing name.
+    const browserClientArn = `arn:aws:iot:${region}:${account}:client/\${cognito-identity.amazonaws.com:sub}*`;
+
     // --- Browser IoT policy (attached to each Cognito identity via AttachPolicy) ---
     // AWS IoT does NOT authorize MQTT for Cognito-federated principals via their
     // IAM role policy — it requires an AWS IoT policy attached to the *identity*.
     // The backend `POST /iot/attach-policy` attaches this to the caller's identity.
-    // v1 broad-but-authenticated (any authed user → any device telemetry); per-tenant
-    // scoping via policy variables is the P7 hardening hook.
+    // Connect is identity-scoped (platform-auth-and-live-plane Phase 1); Subscribe
+    // and Receive are still broad-but-authenticated (any authed user → any device
+    // telemetry), which Phase 4 narrows. Publish was already scoped to the
+    // workflow-simulator ingest suffix.
     new iot.CfnPolicy(this, 'BrowserPolicy', {
       policyName: this.browserPolicyName,
       policyDocument: {
@@ -140,7 +153,7 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Sid: 'Connect',
             Effect: 'Allow',
             Action: 'iot:Connect',
-            Resource: `arn:aws:iot:${region}:${account}:client/*`,
+            Resource: browserClientArn,
           },
           {
             Sid: 'Subscribe',
@@ -222,11 +235,14 @@ export class XorgateCoreIotStack extends cdk.Stack {
       new iam.PolicyStatement({
         sid: 'IotTelemetrySubscribe',
         actions: ['iot:Connect', 'iot:Subscribe', 'iot:Receive'],
-        // v1: any authenticated user can subscribe to any device's telemetry
-        // and any simulator progress topic. Per-tenant scoping (policy
-        // variables / identity-scoped topics) is the P7 hardening hook.
+        // A Cognito-federated principal's effective MQTT permission is the
+        // INTERSECTION of this role policy and the IoT policy attached to the
+        // identity, so Connect is scoped in both places rather than relying on
+        // the attached policy alone. Subscribe/Receive stay broad-but-
+        // authenticated (any authed user → any device's telemetry and any
+        // workflow progress topic); narrowing those is Phase 4's job.
         resources: [
-          `arn:aws:iot:${region}:${account}:client/*`,
+          browserClientArn,
           `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,

@@ -422,10 +422,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // identity so the browser can connect/subscribe over MQTT-over-WSS. iot:AttachPolicy
     // authorizes against the *target* (a Cognito identity id, not an ARN) → resource "*";
     // the handler only ever attaches the fixed BROWSER_IOT_POLICY_NAME.
+    // DetachPolicy is the revoke half (DELETE /live/access and the last-membership
+    // removal path); same target-shaped authorization, same fixed policy name.
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "IotAttachBrowserPolicy",
-        actions: ["iot:AttachPolicy"],
+        actions: ["iot:AttachPolicy", "iot:DetachPolicy"],
         resources: ["*"],
       }),
     );
@@ -1183,6 +1185,19 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     );
 
+    // The revoke half. Named live/access, not iot/detach-policy: consumer-facing
+    // surfaces must not require knowing xorgate runs on AWS IoT (design note
+    // N11). The grant keeps its older AWS-shaped path until the /v1 cut folds
+    // both into /v1/live/access.
+    const liveAccessFn = new nodejs.NodejsFunction(
+      this,
+      "LiveAccessFn",
+      standardFnProps(
+        path.join(entryBase, "live-access.ts"),
+        "DELETE /live/access — revoke the caller's own live-plane access",
+      ),
+    );
+
     // --- Workflows (user-defined processing pipelines) ---
     // Org-scoped template CRUD + versioning. Reads/writes Postgres only (no new
     // IAM). The run-execution Lambdas (dispatch/finalize/scheduler) land with M3–M5.
@@ -1567,6 +1582,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
     );
+    const liveAccessInt = new apigwv2int.HttpLambdaIntegration(
+      "LiveAccessInt",
+      liveAccessFn,
+    );
     const workflowTemplatesInt = new apigwv2int.HttpLambdaIntegration(
       "WorkflowTemplatesInt",
       workflowTemplatesFn,
@@ -1841,6 +1860,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/iot/attach-policy",
       methods: [apigwv2.HttpMethod.POST],
       integration: iotAttachPolicyInt,
+    });
+    this.api.addRoutes({
+      path: "/live/access",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: liveAccessInt,
     });
 
     // Workflow templates (org-scoped) + versioning.

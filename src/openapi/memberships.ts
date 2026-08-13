@@ -90,7 +90,11 @@ export const membershipsPaths = {
       summary: 'Remove a member (owner/admin only)',
       description:
         'Removing the last remaining owner is refused with a 403, so an organization can never be ' +
-        'left ownerless.',
+        'left ownerless.\n\n' +
+        'Side effect: if this removal takes away the member\'s LAST organization membership, their ' +
+        'live-plane access is revoked too (see `DELETE /live/access`), and any live subscription ' +
+        'they hold dies on its next reconnect. Members who still belong to another organization ' +
+        'keep live access.',
       tags: ['Memberships'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

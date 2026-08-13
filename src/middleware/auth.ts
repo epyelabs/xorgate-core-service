@@ -134,6 +134,35 @@ export async function requireOrgContext(
   };
 }
 
+/**
+ * Authenticate, and require the caller to belong to at least ONE organization
+ * without caring which.
+ *
+ * For endpoints whose effect is org-blind, this is the honest gate.
+ * `requireOrgContext` would be wrong twice over: it rejects a multi-org caller
+ * who sent no `X-Organization-Id` (a 400 for a request that needs no org), and
+ * it implies a per-org effect the endpoint does not have. The live-plane grant
+ * is the case in point — the browser IoT policy is one shared, org-blind policy
+ * until Phase 4 narrows it, so "is this person still a member of anything?" is
+ * exactly the question worth asking.
+ */
+export async function requireAnyMembership(
+  event: APIGatewayProxyEventV2,
+): Promise<AuthContext> {
+  const auth = await requireAuth(event);
+  const membership = await db.query.memberships.findFirst({
+    where: eq(memberships.userId, auth.userId),
+  });
+  if (!membership) {
+    throw new AuthError(
+      'No organization for this user. Create one via POST /organizations.',
+      403,
+      'NO_ORGANIZATION',
+    );
+  }
+  return auth;
+}
+
 export function unauthorizedResponse(message = 'Unauthorized'): APIGatewayProxyResultV2 {
   return {
     statusCode: 401,
