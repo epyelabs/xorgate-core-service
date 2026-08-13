@@ -70,6 +70,7 @@ Apply after the latest generated migration, in filename order:
     access still works and only the detach-on-last-membership-removal path is
     inert (it logs and finds nothing to detach). `DELETE /live/access`, which
     resolves the identity from the caller's own token, works either way.
+    **Applied to `xorgatedb_dev` 2026-08-13. Not applied to prod.**
 
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
