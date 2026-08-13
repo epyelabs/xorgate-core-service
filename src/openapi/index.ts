@@ -60,7 +60,9 @@ const TAGS = [
   {
     name: 'API Keys',
     'x-displayName': 'API Keys',
-    description: 'Organization-scoped keys. Mint-only today: no endpoint accepts one as a credential yet.',
+    description:
+      'Organization-scoped keys. Send one as `Authorization: Bearer xg_...` to authenticate any ' +
+      'organization-scoped operation, at the role the key was minted with.',
   },
   {
     name: 'Workspaces',
@@ -114,15 +116,21 @@ const DESCRIPTION = [
   'recorded media, and stored telemetry.',
   '',
   '**Authentication.** Every endpoint except `/health` and this document requires',
-  '`Authorization: Bearer <token>`, where the token is a Cognito **ID** token (not an access',
-  'token). A user row is created on first successful verification. API keys can be minted but',
-  'are not yet accepted as credentials.',
+  '`Authorization: Bearer <credential>`, and there are two kinds. A Cognito **ID** token (not an',
+  'access token) authenticates a person; a user row is created on first successful verification.',
+  'An **API key** from `POST /api-keys` authenticates a program: it carries the `xg_` prefix, which',
+  'is how the server tells the two apart in the one header, and it acts inside the organization it',
+  'was minted from with its own `role`. Four operations accept only an ID token, because they',
+  'describe or act on a person: `GET /me`, `GET`/`POST /organizations`, and the two live-access',
+  'operations. Everything else takes either. A third prefix, `xgs_`, is reserved for short-lived',
+  'session tokens and currently returns `401 SESSION_TOKEN_UNSUPPORTED`.',
   '',
   '**Tenancy.** Org-scoped endpoints resolve the active organization from the `X-Organization-Id`',
   'header, falling back to your sole membership if you have exactly one. A caller in more than one',
   'organization who omits the header gets `400 ORGANIZATION_REQUIRED`, so clients should always',
-  'send it. `X-Workspace-Id` narrows `GET /devices` and is required by',
-  '`POST /device-registrations`.',
+  'send it. An API key needs no header at all: its organization is fixed by the key row, and a',
+  'header naming a different organization is `403 FORBIDDEN`. `X-Workspace-Id` narrows',
+  '`GET /devices` and is required by `POST /device-registrations`.',
   '',
   '**Envelopes.** Responses are always a named object, never a bare array: `{devices, page}`,',
   '`{device}`, `{organizations}`. Fields are camelCase; three envelope KEYS are snake_case',
@@ -154,7 +162,10 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       description: DESCRIPTION,
     },
     servers: [{ url: baseUrl }],
-    security: [{ BearerAuth: [] }],
+    // Either credential, on every operation that does not say otherwise. The
+    // exceptions are the operations that need a PERSON, and each one overrides
+    // this with `security: [{ BearerAuth: [] }]` in its own module.
+    security: [{ BearerAuth: [] }, { ApiKeyAuth: [] }],
     tags: TAGS,
     components: openApiComponents(),
     // Spread order is the reading order: it decides the order of the generated

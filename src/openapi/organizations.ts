@@ -5,8 +5,12 @@ export const organizationsPaths = {
       summary: 'List organizations the caller is a member of',
       description:
         'Unpaginated: the whole set comes back in one `organizations` array with no `page` block. ' +
-        'A user belongs to a handful of organizations at most.',
+        'A user belongs to a handful of organizations at most.\n\n' +
+        '**Cognito ID token only.** The result is defined by the caller\'s memberships, which an ' +
+        'API key does not have; a key is refused with `401 USER_CREDENTIAL_REQUIRED`. A key ' +
+        'already knows its one organization.',
       tags: ['Organizations'],
+      security: [{ BearerAuth: [] }],
       responses: {
         '200': {
           description: 'List of organizations',
@@ -32,8 +36,14 @@ export const organizationsPaths = {
       description:
         'Bootstraps an organization for the caller and inserts a `memberships` row with ' +
         '`role: owner`. Does NOT require `X-Organization-Id` (the caller may have no orgs yet), ' +
-        'which makes it the one write a brand-new user can perform.',
+        'which makes it the one write a brand-new user can perform.\n\n' +
+        '**Cognito ID token only** (`401 USER_CREDENTIAL_REQUIRED` for an API key). The new ' +
+        'organization needs an owner, and an owner is a user. This is a known limit for a ' +
+        'consumer that wants to onboard its own customers programmatically: today it maps them ' +
+        'onto WORKSPACES inside its one organization, which a default `member` key can create. ' +
+        'Organizations for a consumer are provisioned out of band.',
       tags: ['Organizations'],
+      security: [{ BearerAuth: [] }],
       requestBody: {
         required: true,
         content: {

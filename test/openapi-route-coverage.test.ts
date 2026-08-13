@@ -158,6 +158,38 @@ describe('OpenAPI document shape', () => {
     expect(untagged).toEqual([]);
   });
 
+  it('names only declared security schemes', () => {
+    // A security requirement naming a scheme that does not exist is not an
+    // error in any renderer: the operation simply shows as needing nothing.
+    // That reads as "this endpoint is public", which is the worst possible way
+    // for a typo to fail.
+    const schemes = new Set(
+      Object.keys(
+        (doc.components as unknown as { securitySchemes: Record<string, unknown> })
+          .securitySchemes,
+      ),
+    );
+    const used = new Set<string>();
+    const collect = (requirements: unknown) => {
+      for (const requirement of (requirements ?? []) as Record<string, unknown>[]) {
+        for (const name of Object.keys(requirement)) used.add(name);
+      }
+    };
+    collect((doc as unknown as { security?: unknown }).security);
+    for (const item of Object.values(doc.paths)) {
+      for (const [key, value] of Object.entries(item)) {
+        if (!HTTP_METHODS.includes(key)) continue;
+        collect((value as { security?: unknown }).security);
+      }
+    }
+    expect([...used].filter((name) => !schemes.has(name)), 'undeclared security scheme').toEqual(
+      [],
+    );
+    // Both schemes are meant to be reachable; an unused one means an override
+    // swallowed it everywhere.
+    expect([...schemes].filter((name) => !used.has(name)), 'unused security scheme').toEqual([]);
+  });
+
   it('resolves every local $ref', () => {
     const serialized = JSON.stringify(doc);
     const refs = new Set(

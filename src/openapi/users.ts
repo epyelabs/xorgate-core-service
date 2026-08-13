@@ -9,8 +9,12 @@ export const usersPaths = {
         'sight) and returns every organization the caller belongs to, which is how a client learns ' +
         'what to put in `X-Organization-Id`. `memberships` are the plain rows, not the enriched ' +
         'roster shape that `GET /memberships` returns. This is the only org-aware endpoint that ' +
-        'never needs the tenancy header.',
+        'never needs the tenancy header.\n\n' +
+        '**Cognito ID token only.** An `xg_` API key is refused here with ' +
+        '`401 USER_CREDENTIAL_REQUIRED`: this operation describes a person, and a key has no ' +
+        'user behind it.',
       tags: ['Users'],
+      security: [{ BearerAuth: [] }],
       responses: {
         '200': {
           description: 'Current user payload',
