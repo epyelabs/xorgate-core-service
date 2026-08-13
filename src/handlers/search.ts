@@ -6,6 +6,7 @@ import {
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { isWorkspaceScoped, resolveWorkspaceScope } from '../services/workspace-scope';
 import { methodNotAllowed, ok } from '../utils/responses';
 
 // Global cross-resource search. `GET /search?q=<term>` returns a flat, normalized
@@ -32,14 +33,6 @@ interface SearchResult {
 // small; the UI is a jump-to-detail navigator, not a full result browser.
 const PER_TYPE_LIMIT = 6;
 
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
-
 // Escape LIKE/ILIKE wildcards so a user typing "%" or "_" matches literally
 // (default ESCAPE is backslash).
 function escapeLike(value: string): string {
@@ -64,7 +57,7 @@ export const handler = async (
   if (!q || q.length < 2) return ok({ results: [] });
   const pat = `%${escapeLike(q)}%`;
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   const hasWorkspaces = orgWorkspaceIds.length > 0;
 
   const [devices, templates, runs] = await Promise.all([
@@ -82,19 +75,29 @@ export const handler = async (
       : Promise.resolve([]),
 
     // Workflow templates (org-scoped): match name, slug, or description.
-    db.query.workflowTemplates.findMany({
-      where: and(
-        eq(schema.workflowTemplates.organizationId, auth.organizationId),
-        or(
-          ilike(schema.workflowTemplates.name, pat),
-          ilike(schema.workflowTemplates.slug, pat),
-          ilike(schema.workflowTemplates.description, pat),
-        ),
-      ),
-      columns: { id: true, name: true, slug: true },
-      orderBy: [desc(schema.workflowTemplates.updatedAt)],
-      limit: PER_TYPE_LIMIT,
-    }),
+    //
+    // Suppressed entirely for a workspace-scoped session token. Templates have
+    // no workspace column, so there is nothing to intersect: the choice is
+    // "every template in the consumer's organization" or "none". Search is the
+    // one endpoint where an org-wide resource rides along with scoped ones, and
+    // silently returning a tenant every other organization-wide route refuses
+    // would make this the hole in the boundary. The devices and runs sections
+    // are unaffected.
+    isWorkspaceScoped(auth)
+      ? Promise.resolve([])
+      : db.query.workflowTemplates.findMany({
+          where: and(
+            eq(schema.workflowTemplates.organizationId, auth.organizationId),
+            or(
+              ilike(schema.workflowTemplates.name, pat),
+              ilike(schema.workflowTemplates.slug, pat),
+              ilike(schema.workflowTemplates.description, pat),
+            ),
+          ),
+          columns: { id: true, name: true, slug: true },
+          orderBy: [desc(schema.workflowTemplates.updatedAt)],
+          limit: PER_TYPE_LIMIT,
+        }),
 
     // Workflow runs (workspace-owned, joined): match template name, device name,
     // or device serial. Reuses the join shape from workflow-runs.ts.

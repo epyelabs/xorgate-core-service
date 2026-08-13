@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import {
   badRequest,
   conflict,
@@ -19,14 +20,6 @@ import {
 } from '../services/workflow-capabilities';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import { desc } from 'drizzle-orm';
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 type AttachmentRow = typeof schema.workflowAttachments.$inferSelect;
 
@@ -81,7 +74,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${deviceId}" not found`);
 
   // Load the device (with its model's io_capabilities) inside the caller's org.

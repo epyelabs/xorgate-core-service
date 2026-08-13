@@ -117,6 +117,57 @@ export const apiKeys = pgTable(
   ],
 );
 
+// Short-lived credential a consumer's BROWSER or mobile app may hold
+// (platform-auth-and-live-plane, Phase 3). Minted by presenting an `xg_` key to
+// `POST /auth/session-tokens`; presented as `Authorization: Bearer xgs_…`.
+//
+// DB-backed and hashed, exactly like `api_keys`, rather than a stateless signed
+// token. Three reasons, in order: revocation is a row update instead of a
+// key-rotation event; the minting key's own lifecycle can cascade (the FK below
+// is ON DELETE CASCADE and the verify path joins the key row, so deleting,
+// revoking or expiring a key kills every token it minted); and the auth
+// middleware already does one indexed lookup per request for keys, so the cost
+// model is unchanged.
+//
+// `workspace_id` is the whole point of the table. It is NULL for an org-scoped
+// token, which then behaves exactly like the key that minted it; when set, it is
+// an ENFORCED boundary rather than the advisory filter `X-Workspace-Id` is for
+// every other caller. See `services/workspace-scope.ts`.
+export const sessionTokens = pgTable(
+  'session_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    // SHA-256 hex of the plaintext, same construction as `api_keys.hashed_key`.
+    hashedToken: text('hashed_token').notNull(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    // NULL = org-scoped. Set = the token may only see this workspace.
+    // ON DELETE CASCADE: a deleted workspace must not leave tokens naming it.
+    workspaceId: uuid('workspace_id').references(() => workspaces.id, {
+      onDelete: 'cascade',
+    }),
+    // Inherited from the minting key, never elevated. The EFFECTIVE role is the
+    // lower of this and the key's current role, so downgrading a key downgrades
+    // its live tokens too (services/session-token-auth.ts).
+    role: text('role').notNull(),
+    // The `xg_` key this was exchanged from. CASCADE is the revocation story:
+    // `DELETE /api-keys/{id}` is a hard delete, so it takes the tokens with it.
+    createdByKeyId: uuid('created_by_key_id')
+      .references(() => apiKeys.id, { onDelete: 'cascade' })
+      .notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('session_tokens_hashed_token_idx').on(t.hashedToken),
+    // The expiry sweep in `offline-sweeper.ts` scans on this.
+    index('session_tokens_expires_at_idx').on(t.expiresAt),
+    index('session_tokens_created_by_key_idx').on(t.createdByKeyId),
+  ],
+);
+
 export const workspaces = pgTable(
   'workspaces',
   {
@@ -720,6 +771,8 @@ export type IotPolicyAttachment = InferSelectModel<typeof iotPolicyAttachments>;
 export type NewIotPolicyAttachment = InferInsertModel<typeof iotPolicyAttachments>;
 export type ApiKey = InferSelectModel<typeof apiKeys>;
 export type NewApiKey = InferInsertModel<typeof apiKeys>;
+export type SessionToken = InferSelectModel<typeof sessionTokens>;
+export type NewSessionToken = InferInsertModel<typeof sessionTokens>;
 export type Workspace = InferSelectModel<typeof workspaces>;
 export type NewWorkspace = InferInsertModel<typeof workspaces>;
 export type DeviceModel = InferSelectModel<typeof deviceModels>;

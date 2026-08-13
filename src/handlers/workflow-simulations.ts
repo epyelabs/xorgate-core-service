@@ -3,7 +3,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, eq } from 'drizzle-orm';
 import { S3Client } from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { badRequest, created, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
 import { dispatchV2Run, materializeHistoryInputs } from '../services/workflow-engine-v2';
@@ -73,7 +73,7 @@ export const handler = async (
 
   let auth;
   try {
-    auth = await requireOrgContext(event, ['owner', 'admin', 'member']);
+    auth = await requireOrgWideContext(event, ['owner', 'admin', 'member']);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

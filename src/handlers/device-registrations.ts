@@ -1,11 +1,12 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq, gt, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import type { DeviceRegistration } from '../db/schema';
 import {
   badRequest,
@@ -45,14 +46,6 @@ function toView(row: DeviceRegistration): RegistrationView {
   };
 }
 
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
-
 // Router: POST /device-registrations, GET /device-registrations/{code},
 // POST /device-registrations/{code}/claim. All four routes hit this one Lambda;
 // the gateway has no authorizer, so the claim branch simply skips requireOrgContext.
@@ -83,12 +76,20 @@ async function createRegistration(
     throw err;
   }
 
+  // This is the one route where `X-Workspace-Id` is mandatory rather than a
+  // filter. A workspace-scoped session token supplies it implicitly: the
+  // credential already names exactly one workspace, so demanding a header the
+  // caller has no freedom to choose differently would be ceremony. Sending a
+  // CONTRADICTING one is still a 403, refused in the middleware before this runs.
   const workspaceId =
-    event.headers['x-workspace-id'] ?? event.headers['X-Workspace-Id'];
+    event.headers['x-workspace-id'] ??
+    event.headers['X-Workspace-Id'] ??
+    auth.allowedWorkspaceId ??
+    undefined;
   if (!workspaceId) {
     return badRequest('Select a workspace first (missing X-Workspace-Id header)');
   }
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (!orgWorkspaceIds.includes(workspaceId)) {
     return badRequest('workspaceId does not belong to the active organization');
   }
@@ -146,10 +147,18 @@ async function getRegistration(
     throw err;
   }
 
+  // Org filter plus the workspace intersection. The registration row carries a
+  // `workspace_id`, so this is the same narrowing every device read gets: a
+  // workspace-scoped token polling a code minted for another tenant reads it as
+  // missing, indistinguishable from another organization's.
+  const visibleWorkspaceIds = await resolveWorkspaceScope(auth);
+  if (visibleWorkspaceIds.length === 0) return notFound('Registration not found');
+
   const row = await db.query.deviceRegistrations.findFirst({
     where: and(
       eq(schema.deviceRegistrations.code, code),
       eq(schema.deviceRegistrations.organizationId, auth.organizationId),
+      inArray(schema.deviceRegistrations.workspaceId, visibleWorkspaceIds),
     ),
   });
   if (!row) return notFound('Registration not found');

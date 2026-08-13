@@ -4,7 +4,7 @@ import {
   AuthError,
   authErrorResponse,
   requireAuth,
-  requireOrgContext,
+  requireOrgWideContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import {
@@ -83,10 +83,15 @@ export const handler = async (
   }
 
   // Everything else requires an active org context with appropriate role.
+  //
+  // Org-WIDE: an organization is above the workspace boundary in every
+  // direction, so a workspace-scoped session token is refused here (403
+  // `WORKSPACE_SCOPED`) regardless of the role it carries. The collection
+  // operations above are stricter still — user-only, via `requireAuth`.
   let auth;
   try {
     const writeMethod = method === 'PUT' || method === 'DELETE';
-    auth = await requireOrgContext(
+    auth = await requireOrgWideContext(
       event,
       writeMethod ? ['owner', 'admin'] : undefined,
     );

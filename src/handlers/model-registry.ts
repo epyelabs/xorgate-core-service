@@ -1,6 +1,6 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { S3Client } from '@aws-sdk/client-s3';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { methodNotAllowed, ok } from '../utils/responses';
 import { MODEL_REGISTRY_PREFIX, type ModelManifest } from '../workflows/models/registry';
 import { listModelManifests } from '../workflows/models/store';
@@ -29,7 +29,7 @@ export const handler = async (
   if (method !== 'GET') return methodNotAllowed(method, 'GET');
 
   try {
-    await requireOrgContext(event);
+    await requireOrgWideContext(event);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;

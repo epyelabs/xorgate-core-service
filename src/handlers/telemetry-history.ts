@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
 import {
   boundedTotalQuery,
@@ -87,14 +88,6 @@ const RECENT_DEFAULT = 500; // rows returned by /recent when no limit is given
 const RECENT_MAX = 5_000;
 const READINGS_DEFAULT_LIMIT = 100; // timestamps per page for /readings
 const READINGS_MAX_LIMIT = 500;
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 interface HistoryQuery {
   fromIso: string;
@@ -561,7 +554,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
 
   // Org-ownership check (same pattern as devices.ts): the device must belong to

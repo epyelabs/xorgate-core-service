@@ -6,7 +6,10 @@ export const workspacesPaths = {
       summary: 'List workspaces in the active organization',
       description:
         'Unpaginated. Workspaces are the unit devices belong to, so this is usually the second ' +
-        'call a client makes after `GET /me`.',
+        'call a client makes after `GET /me`.\n\n' +
+        'A workspace-scoped session token lists exactly one workspace: its own. Any other reads ' +
+        'as `404` from `GET /workspaces/{id}`, indistinguishable from a workspace in another ' +
+        'organization.',
       tags: ['Workspaces'],
       responses: {
         '200': {
@@ -31,6 +34,14 @@ export const workspacesPaths = {
     post: {
       operationId: 'createWorkspace',
       summary: 'Create a workspace in the active organization',
+      description:
+        'Open to role `member`, which is what makes programmatic customer onboarding work: a ' +
+        'consumer running its own multi-tenancy creates one workspace per customer with its ' +
+        'default-role API key.\n\n' +
+        'Workspace WRITES are organization-wide, so a workspace-scoped session token is refused ' +
+        'with `403 WORKSPACE_SCOPED` whatever role it carries. Creating and deleting tenants is ' +
+        "your backend's job, done with the key; a browser-held credential that could delete its " +
+        'own tenant would be a liability with no matching use.',
       tags: ['Workspaces'],
       requestBody: {
         required: true,
@@ -97,7 +108,9 @@ export const workspacesPaths = {
     put: {
       operationId: 'updateWorkspace',
       summary: 'Update a workspace',
-      description: 'Partial update. An empty body is a 400.',
+      description:
+        'Partial update. An empty body is a 400. Organization-wide, like every workspace write: a ' +
+        'workspace-scoped session token gets `403 WORKSPACE_SCOPED`.',
       tags: ['Workspaces'],
       requestBody: {
         required: true,
@@ -137,7 +150,10 @@ export const workspacesPaths = {
     delete: {
       operationId: 'deleteWorkspace',
       summary: 'Delete a workspace',
-      description: 'Cascades to the devices in it, and to their sessions and telemetry.',
+      description:
+        'Cascades to the devices in it, and to their sessions and telemetry, and to any session ' +
+        'token scoped to it. Organization-wide: a workspace-scoped session token gets ' +
+        '`403 WORKSPACE_SCOPED`.',
       tags: ['Workspaces'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

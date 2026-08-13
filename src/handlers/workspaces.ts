@@ -1,11 +1,13 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import {
+  assertOrgWideScope,
   AuthError,
   authErrorResponse,
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import {
   badRequest,
   created,
@@ -14,6 +16,19 @@ import {
   ok,
 } from '../utils/responses';
 
+/**
+ * Workspaces are the one resource that is BOTH sides of the boundary, which is
+ * why this handler mixes the two gates rather than picking one:
+ *
+ * - **Reads** are scoped. A workspace-scoped session token lists exactly one
+ *   workspace (its own) and reads any other as `404`, indistinguishable from a
+ *   workspace in another organization. A consumer's browser legitimately needs
+ *   the name of the tenant it is looking at.
+ * - **Writes** are organization-wide. Creating, renaming or deleting a tenant is
+ *   the consumer's BACKEND's job, done with the `xg_` key that mints tokens in
+ *   the first place. A browser-held credential that could delete its own tenant
+ *   is a liability with no matching use.
+ */
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
@@ -27,6 +42,7 @@ export const handler = async (
       event,
       writeMethod ? ['owner', 'admin', 'member'] : undefined,
     );
+    if (writeMethod) assertOrgWideScope(auth);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;
@@ -34,7 +50,15 @@ export const handler = async (
 
   switch (method) {
     case 'GET': {
+      // The same intersection every device handler applies, one level up: for an
+      // org-scoped caller this is every workspace in the organization, and for a
+      // workspace-scoped token it is the single row it is bound to.
+      const visibleIds = await resolveWorkspaceScope(auth);
+      if (visibleIds.length === 0) {
+        return id ? notFound(`Workspace "${id}" not found`) : ok({ workspaces: [] });
+      }
       if (id) {
+        if (!visibleIds.includes(id)) return notFound(`Workspace "${id}" not found`);
         const row = await db.query.workspaces.findFirst({
           where: and(
             eq(schema.workspaces.id, id),
@@ -45,7 +69,10 @@ export const handler = async (
         return ok({ workspace: row });
       }
       const rows = await db.query.workspaces.findMany({
-        where: eq(schema.workspaces.organizationId, auth.organizationId),
+        where: and(
+          eq(schema.workspaces.organizationId, auth.organizationId),
+          inArray(schema.workspaces.id, visibleIds),
+        ),
         orderBy: [desc(schema.workspaces.updatedAt)],
       });
       return ok({ workspaces: rows });

@@ -2,19 +2,12 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { accepted, conflict, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
 import {
   publishDeviceCommand,
   type DeviceCommandName,
 } from '../services/device-command';
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/reboot': 'reboot',
@@ -62,7 +55,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${deviceId}" not found`);
 
   const device = await db.query.devices.findFirst({

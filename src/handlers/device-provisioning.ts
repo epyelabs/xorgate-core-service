@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { and, eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import { resolveWorkspaceScope } from '../services/workspace-scope';
 import {
   badRequest,
   conflict,
@@ -10,14 +11,6 @@ import {
   notFound,
 } from '../utils/responses';
 import { provisionDevice } from '../services/iot-provisioning';
-
-async function workspaceIdsForOrg(organizationId: string): Promise<string[]> {
-  const rows = await db.query.workspaces.findMany({
-    where: eq(schema.workspaces.organizationId, organizationId),
-    columns: { id: true },
-  });
-  return rows.map((r) => r.id);
-}
 
 // POST /devices/{id}/provision — mint an IoT thing + X.509 cert + KVS channels so the
 // device can obtain short-lived AWS creds via the IoT credential provider (no raw keys).
@@ -39,7 +32,7 @@ export const handler = async (
     throw err;
   }
 
-  const orgWorkspaceIds = await workspaceIdsForOrg(auth.organizationId);
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
 
   const device = await db.query.devices.findFirst({

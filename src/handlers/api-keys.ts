@@ -4,7 +4,7 @@ import { and, desc, eq } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
-  requireOrgContext,
+  requireOrgWideContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { API_KEY_PREFIX, apiKeyPrefix, hashApiKey } from '../services/api-key-auth';
@@ -53,7 +53,7 @@ export const handler = async (
   let auth;
   try {
     const writeMethod = method === 'POST' || method === 'DELETE';
-    auth = await requireOrgContext(
+    auth = await requireOrgWideContext(
       event,
       writeMethod ? ['owner', 'admin'] : undefined,
     );

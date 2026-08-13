@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { methodNotAllowed } from '../utils/responses';
 import { buildCatalogPayload } from '../workflows/catalog/serialize';
 
@@ -24,7 +24,7 @@ export const handler = async (
   if (method !== 'GET') return methodNotAllowed(method, 'GET');
 
   try {
-    await requireOrgContext(event);
+    await requireOrgWideContext(event);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;
