@@ -158,7 +158,10 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
-      version: '0.2.0',
+      // 0.3.0: API keys became a real credential (a second security scheme, a
+      // per-key role/expiry/prefix). Same reason 0.1.0 -> 0.2.0 was bumped:
+      // the surface this document describes materially changed.
+      version: '0.3.0',
       description: DESCRIPTION,
     },
     servers: [{ url: baseUrl }],

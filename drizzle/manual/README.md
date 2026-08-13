@@ -72,6 +72,19 @@ Apply after the latest generated migration, in filename order:
     resolves the identity from the caller's own token, works either way.
     **Applied to `xorgatedb_dev` 2026-08-13. Not applied to prod.**
 
+11. `manual/012_api_key_verification.sql` — makes a minted `xg_` key a usable
+    credential (platform-auth-and-live-plane plan, Phase 2). Adds `role`,
+    `expires_at` and `key_prefix` to `api_keys` plus a partial index, and on
+    `device_registrations` drops the NOT NULL from `created_by_user_id` while
+    adding `created_by_api_key_id` (a key has no `users` row to point at).
+    Idempotent, six statements. **Unlike `011`, the code does NOT degrade
+    without it**: `requireOrgContext` selects the three new columns on every
+    key-authenticated request, so an unmigrated database turns every
+    `Bearer xg_` request into a 500 rather than a 401. The Cognito path never
+    reads `api_keys` and is unaffected either way, so an unmigrated deployment
+    still serves xorgate-web and every existing caller exactly as before.
+    **Applied to `xorgatedb_dev` 2026-08-13. Not applied to prod.**
+
 The capability re-upserts (002 → 003 → 004) each carry the full `io_capabilities`
 forward, so applying only the latest is enough on a fresh cluster (then 006 on
 top); re-running all in order is safe — but note 004 re-seeds the original
