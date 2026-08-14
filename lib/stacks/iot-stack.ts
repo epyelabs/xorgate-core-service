@@ -379,24 +379,6 @@ export class XorgateCoreIotStack extends cdk.Stack {
       }),
     );
 
-    // Prototype escape hatch, OFF unless asked for explicitly on the command
-    // line (`--context probeTrust=<iam-arn>`), dev only, and self-clearing: a
-    // plain `npm run deploy:dev` passes no such context and removes whatever a
-    // probe run added. It exists so the Phase 4 mechanism evaluation could
-    // assume this role from a workstation and speak MQTT/KVS directly, instead
-    // of round-tripping every measurement through a deployed Lambda. Nothing in
-    // the product depends on it; delete the block if it stops being useful.
-    const probeTrust = this.node.tryGetContext('probeTrust') as string | undefined;
-    if (probeTrust && !isProd) {
-      liveVendRole.assumeRolePolicy?.addStatements(
-        new iam.PolicyStatement({
-          sid: 'ProbeTrust',
-          principals: [new iam.ArnPrincipal(probeTrust)],
-          actions: ['sts:AssumeRole', 'sts:TagSession'],
-        }),
-      );
-    }
-
     new cdk.CfnOutput(this, 'LiveVendRoleArn', { value: liveVendRole.roleArn });
 
     // --- Outputs ---
