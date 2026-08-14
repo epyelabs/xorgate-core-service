@@ -170,10 +170,17 @@ const DESCRIPTION = [
   "segment index. `GET /devices/{id}/telemetry` is not a list endpoint either. It caps rows and",
   'reports `truncated`.',
   '',
-  '**What is not here.** Live telemetry and live video bypass this API entirely: the client',
-  'subscribes to AWS IoT Core over MQTT-over-WSS and connects to Kinesis Video Streams WebRTC',
-  'with its own credentials. See the Live section for the two endpoints that bootstrap that. The',
-  'Workflows and AI surface is deliberately undocumented while it is still moving.',
+  '**The live plane.** Live telemetry and live video do not flow through this API: they are',
+  'streaming protocols the client speaks directly, entered with a signed connection rather than',
+  'with a bearer token. `POST /auth/live-credentials` is what signs it, and any of the three',
+  'credentials may call it. What comes back is confined to the same tenant the calling credential',
+  'is: a credential vended for a workspace receives that workspace\'s devices and is refused a',
+  'sibling workspace\'s, on both planes and by the credential itself. Treat the response as',
+  'opaque. The two operations in the Live section are the first-party dashboard\'s own path and',
+  'are not part of a third-party integration.',
+  '',
+  '**What is not here.** The Workflows and AI surface is deliberately undocumented while it is',
+  'still moving.',
 ].join('\n');
 
 /** Build the served document. `baseUrl` becomes the single `servers` entry. */
@@ -182,10 +189,10 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
-      // 0.4.0: session tokens. A third security scheme, a new endpoint, and
-      // workspace becoming an enforced boundary for one credential kind — the
-      // same bar 0.2.0 and 0.3.0 were bumped for.
-      version: '0.4.0',
+      // 0.5.0: scoped live credentials. A new endpoint, and the live plane
+      // stops being first-party-only — the same bar the previous three bumps
+      // were held to.
+      version: '0.5.0',
       description: DESCRIPTION,
     },
     servers: [{ url: baseUrl }],

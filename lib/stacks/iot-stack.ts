@@ -24,6 +24,8 @@ export class XorgateCoreIotStack extends cdk.Stack {
   public readonly roleAliasName: string;
   public readonly identityPoolId: string;
   public readonly userPoolProviderName: string;
+  public readonly liveVendRoleName: string;
+  public readonly liveVendRoleArn: string;
 
   constructor(scope: Construct, id: string, props: XorgateCoreIotStackProps) {
     super(scope, id, props);
@@ -110,6 +112,31 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Resource: `${thingTopic('topic')}/*`,
           },
           {
+            // The tenant-scoped telemetry topic (platform-auth Phase 4). The
+            // historical topic above carries no organization and no workspace,
+            // so no topic-pattern IAM policy can express a tenant boundary over
+            // it, and a third party's credential therefore could not be scoped
+            // at all. Devices publish here instead.
+            //
+            // The scope comes from THING ATTRIBUTES rather than from the
+            // message, which is what makes it enforcement rather than a
+            // convention: the backend writes `xgOrgId`/`xgWorkspaceId` onto the
+            // thing (`services/device-scope.ts`) and a device can only ever
+            // publish under its own. A device whose attributes are unset — one
+            // provisioned before this phase and not yet reached by a config
+            // publish — resolves the variables to nothing and is refused, so it
+            // stays on the topic above. Fails closed, and the fleet migrates
+            // one device at a time rather than on a flag day.
+            Sid: 'PublishScopedTelemetry',
+            Effect: 'Allow',
+            Action: 'iot:Publish',
+            Resource:
+              `arn:aws:iot:${region}:${account}:topic/xorgate/orgs/` +
+              '${iot:Connection.Thing.Attributes[xgOrgId]}/ws/' +
+              '${iot:Connection.Thing.Attributes[xgWorkspaceId]}/devices/' +
+              '${iot:Connection.Thing.ThingName}/telemetry',
+          },
+          {
             Sid: 'Subscribe',
             Effect: 'Allow',
             Action: 'iot:Subscribe',
@@ -161,6 +188,13 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Action: 'iot:Subscribe',
             Resource: [
               `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
+              // The tenant-scoped telemetry plane devices move onto
+              // (platform-auth Phase 4). Same broad-but-authenticated stance as
+              // the line above and for the same reason: the first-party
+              // dashboard is org-blind here, and narrowing it is 4.3's decision
+              // rather than this one's. The browser subscribes to BOTH while
+              // the fleet crosses over, so both have to be allowed.
+              `arn:aws:iot:${region}:${account}:topicfilter/xorgate/orgs/*/ws/*/devices/*/telemetry`,
               // Workflow progress planes: simulator wf/sim/<orgId>/<runId>/...
               // (M3) and production runs wf/run/<orgId>/<runId>/... (M6).
               // Same v1 broad-but-authenticated stance as telemetry; per-org
@@ -175,6 +209,7 @@ export class XorgateCoreIotStack extends cdk.Stack {
             Action: 'iot:Receive',
             Resource: [
               `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
+              `arn:aws:iot:${region}:${account}:topic/xorgate/orgs/*/ws/*/devices/*/telemetry`,
               `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
               `arn:aws:iot:${region}:${account}:topic/wf/run/*`,
             ],
@@ -245,6 +280,12 @@ export class XorgateCoreIotStack extends cdk.Stack {
           browserClientArn,
           `arn:aws:iot:${region}:${account}:topicfilter/xorgate/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topic/xorgate/devices/*/telemetry`,
+          // The scoped plane, in BOTH layers. A Cognito-federated principal's
+          // MQTT permission is the INTERSECTION of this role policy and the
+          // attached IoT policy (Phase 1 found this the hard way), so adding it
+          // to only one of them silently authorizes nothing.
+          `arn:aws:iot:${region}:${account}:topicfilter/xorgate/orgs/*/ws/*/devices/*/telemetry`,
+          `arn:aws:iot:${region}:${account}:topic/xorgate/orgs/*/ws/*/devices/*/telemetry`,
           `arn:aws:iot:${region}:${account}:topicfilter/wf/sim/*`,
           `arn:aws:iot:${region}:${account}:topic/wf/sim/*`,
           `arn:aws:iot:${region}:${account}:topicfilter/wf/run/*`,
@@ -266,6 +307,79 @@ export class XorgateCoreIotStack extends cdk.Stack {
       identityPoolId: identityPool.ref,
       roles: { authenticated: browserAuthRole.roleArn },
     });
+
+    // --- Scoped live-credential vending role (platform-auth Phase 4) ---
+    //
+    // The credential a third party's browser gets for the live plane. It is a
+    // plain STS assumed role, NOT a Cognito identity, which is the whole point:
+    // an assumed role's MQTT authorization is its IAM policy alone (no attached
+    // AWS IoT policy is involved), so `AssumeRole`'s inline session policy — the
+    // thing `GetCredentialsForIdentity` does not have, and the constraint design
+    // note N2 recorded — becomes available as the per-request narrowing
+    // mechanism.
+    //
+    // This role is therefore the CEILING, not the grant: every vend narrows it
+    // with a session policy naming one organization and (optionally) one
+    // workspace, and the effective permission is the intersection. Nothing here
+    // may be broader than "some xorgate tenant's live plane".
+    //
+    // `roleName` is fixed so the api-stack can build the ARN without a
+    // cross-stack export cycle (this stack is created before the api stack and
+    // the Lambda execution role lives over there).
+    this.liveVendRoleName = `XorgateLiveVend${nameSuffix}`;
+    this.liveVendRoleArn = `arn:aws:iam::${account}:role/${this.liveVendRoleName}`;
+
+    const liveVendRole = new iam.Role(this, 'LiveVendRole', {
+      roleName: this.liveVendRoleName,
+      // Delegated to the account: any principal here that ALSO carries
+      // `sts:AssumeRole` on this ARN in its own identity policy may vend. The
+      // api-stack grants exactly that to the shared Lambda execution role and
+      // to nothing else, so the identity policy is the real gate.
+      assumedBy: new iam.AccountPrincipal(account),
+      maxSessionDuration: cdk.Duration.hours(1),
+      description:
+        'Ceiling role for scoped live-plane credentials. Every vend narrows it ' +
+        'with an inline session policy naming one org/workspace.',
+    });
+
+    liveVendRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'LiveConnect',
+        actions: ['iot:Connect'],
+        // Vended client ids are `xgl-<uuid>`. The prefix cannot collide with a
+        // thing name (device ids are bare UUIDs) nor with a browser client id
+        // (those start `us-east-1:`), so a vended credential can never displace
+        // a device's or a first-party browser's MQTT session.
+        resources: [`arn:aws:iot:${region}:${account}:client/xgl-*`],
+      }),
+    );
+    liveVendRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'LiveTelemetrySubscribe',
+        actions: ['iot:Subscribe', 'iot:Receive'],
+        resources: [
+          `arn:aws:iot:${region}:${account}:topicfilter/xorgate/orgs/*/ws/*/devices/*/telemetry`,
+          `arn:aws:iot:${region}:${account}:topic/xorgate/orgs/*/ws/*/devices/*/telemetry`,
+        ],
+      }),
+    );
+    liveVendRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'LiveVideoViewer',
+        actions: [
+          'kinesisvideo:DescribeSignalingChannel',
+          'kinesisvideo:GetSignalingChannelEndpoint',
+          'kinesisvideo:GetIceServerConfig',
+          'kinesisvideo:ConnectAsViewer',
+        ],
+        // Narrowed per vend to the caller's own devices' channels by the session
+        // policy. No `ConnectAsMaster` and no channel mutation, matching the
+        // browser role: a viewer credential can watch and can change nothing.
+        resources: [channelArnAll],
+      }),
+    );
+
+    new cdk.CfnOutput(this, 'LiveVendRoleArn', { value: liveVendRole.roleArn });
 
     // --- Outputs ---
     new cdk.CfnOutput(this, 'IotThingTypeName', { value: this.thingTypeName });

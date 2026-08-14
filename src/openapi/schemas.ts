@@ -305,6 +305,98 @@ export function openApiSchemas(): Record<string, unknown> {
         },
       },
     },
+    CreateLiveCredentialsInput: {
+      type: 'object',
+      description:
+        'Every field is optional. An empty body vends for whatever the calling credential ' +
+        'already reaches: one workspace if it is a workspace-scoped session token, the whole ' +
+        'organization otherwise.',
+      properties: {
+        workspaceId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description:
+            'Narrow the credentials to one workspace. This is how the PROXIED shape works: your ' +
+            'server holds one API key for your whole organization and vends per customer. It can ' +
+            'only ever narrow — a workspace outside the calling credential\'s scope is ' +
+            '`403 WORKSPACE_NOT_IN_SCOPE`.',
+        },
+        ttlSeconds: {
+          type: 'integer',
+          minimum: 300,
+          maximum: 3600,
+          default: 3600,
+          description:
+            'Lifetime in seconds. Out-of-range values are REJECTED rather than clamped, same as ' +
+            'for session tokens. The floor is higher than a session token\'s because a live ' +
+            'connection that outlives its credentials has to be torn down and re-established.',
+        },
+      },
+    },
+    LiveCredentials: {
+      type: 'object',
+      required: [
+        'accessKeyId',
+        'secretAccessKey',
+        'sessionToken',
+        'expiration',
+        'organizationId',
+        'workspaceId',
+        'live',
+      ],
+      description:
+        'Credentials for the live plane. **Opaque**: pass the object to the SDK and do not read ' +
+        'or persist individual fields. Flat rather than wrapped, because it is a credential ' +
+        'rather than a resource and there is nothing to read back later.',
+      properties: {
+        accessKeyId: { type: 'string', description: 'Part of the signature. Do not interpret.' },
+        secretAccessKey: {
+          type: 'string',
+          description:
+            'Part of the signature. Do not interpret, do not log, and do not store beyond the ' +
+            'lifetime below.',
+        },
+        sessionToken: { type: 'string', description: 'Part of the signature. Do not interpret.' },
+        expiration: {
+          type: 'string',
+          format: 'date-time',
+          description:
+            'When these stop working. Mint again shortly before it; a live connection is not ' +
+            'renewed in place, it is re-established.',
+        },
+        organizationId: {
+          type: 'string',
+          format: 'uuid',
+          description: 'Echo of the scope these credentials were vended for.',
+        },
+        workspaceId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description:
+            'Echo of the requested scope. Null means the whole organization. Worth asserting on ' +
+            'in the proxied shape: it is the confirmation that you vended for the customer you ' +
+            'meant to.',
+        },
+        live: {
+          type: 'object',
+          required: ['region', 'realtimeEndpoint'],
+          description:
+            'The same coordinates `POST /auth/session-tokens` returns, repeated here because the ' +
+            'proxied shape never calls that endpoint and would otherwise have nowhere to learn ' +
+            'them.',
+          properties: {
+            region: { type: 'string', example: 'us-east-1' },
+            realtimeEndpoint: {
+              type: 'string',
+              example: 'a1b2c3d4e5f6g7-ats.iot.us-east-1.amazonaws.com',
+              description: 'Host for the live telemetry stream (MQTT over WebSockets).',
+            },
+          },
+        },
+      },
+    },
     Workspace: {
       type: 'object',
       required: ['id', 'organizationId', 'name', 'slug'],

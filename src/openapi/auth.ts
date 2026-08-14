@@ -1,7 +1,9 @@
 /**
- * The credential-exchange endpoint. One operation, and it is the seam a
- * third-party integration is built on: a consumer's server turns the API key it
- * must never ship into a short-lived token its browser may hold.
+ * The credential-exchange endpoints. Two operations, and between them they are
+ * the seam a third-party integration is built on: a consumer's server turns the
+ * API key it must never ship into a short-lived token its browser may hold, and
+ * either of those is exchanged again for the credentials the live plane is
+ * entered with.
  */
 export const authPaths = {
   '/auth/session-tokens': {
@@ -53,6 +55,64 @@ export const authPaths = {
           content: {
             'application/json': {
               schema: { $ref: '#/components/schemas/SessionToken' },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
+  '/auth/live-credentials': {
+    post: {
+      operationId: 'createLiveCredentials',
+      summary: 'Vend credentials for the live plane, scoped to one tenant',
+      description:
+        'Returns the short-lived credentials the **live plane** is entered with. Live telemetry ' +
+        'and live video are streaming protocols that this API does not carry, so they are not ' +
+        'authorized by a bearer token the way the endpoints above are; they are entered with a ' +
+        'signed connection, and this is what signs it.\n\n' +
+        '**Treat the response as opaque.** Hand the object to the SDK and never read a field. ' +
+        'The field names are dictated by the signing algorithm rather than chosen, which is ' +
+        'exactly why they are not something to build against.\n\n' +
+        '**Any credential may call this**, and which one you use is the difference between the ' +
+        'two integration shapes. A session token is the DIRECT shape: your client holds the ' +
+        'token and calls this itself. An API key is the PROXIED shape: your server calls this ' +
+        'with the target `workspaceId` and hands the result to your client, which then touches ' +
+        'no xorgate endpoint at all. A signed-in user session works too, and gets its ' +
+        'organization.\n\n' +
+        '**The scope is the boundary, on both planes.** Credentials vended for a workspace ' +
+        'receive that workspace\'s devices\' telemetry and can view that workspace\'s devices\' ' +
+        'video, and are refused a sibling workspace\'s — not filtered, refused, by the ' +
+        'credential itself rather than by anything you have to remember to do. A ' +
+        'workspace-scoped session token can only ever vend for its own workspace; anything else ' +
+        'is `403 WORKSPACE_NOT_IN_SCOPE`.\n\n' +
+        '**Lifetime is at most an hour and there is no refresh.** Cache what you get and mint ' +
+        'again shortly before `expiration`; the SDK does this for you. There is no revoke ' +
+        'endpoint, for the same reason session tokens have none — deleting the API key behind ' +
+        'the credential is the emergency stop, and nothing vended survives an hour anyway.\n\n' +
+        '**A device whose video has never been viewed under this scheme may need one extra ' +
+        'call to become viewable**: the video plane is scoped by labels written onto the ' +
+        'signalling channels, and vending is what reconciles them. If a channel comes back ' +
+        'unviewable, vend again.',
+      tags: ['Auth'],
+      requestBody: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/CreateLiveCredentialsInput' },
+          },
+        },
+      },
+      responses: {
+        '201': {
+          description:
+            'Credentials minted. Opaque; pass them to the SDK unread.',
+          content: {
+            'application/json': {
+              schema: { $ref: '#/components/schemas/LiveCredentials' },
             },
           },
         },

@@ -54,6 +54,12 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   iotRoleAlias: string;
   cognitoIdentityPoolId: string;
   cognitoUserPoolProvider: string;
+  /**
+   * Ceiling role for scoped live credentials (platform-auth Phase 4). Created
+   * in the IoT stack next to the browser role; passed as an ARN string rather
+   * than an IRole because it is only ever named in a policy and in an env var.
+   */
+  liveVendRoleArn: string;
   // Shared Fargate cluster/network — see recorder-stack.ts. Historic `recorder`
   // naming; the engine runner is the only thing that launches here now (the
   // cloud viewer-recorder's four task-only props went in Phase 5).
@@ -95,6 +101,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       iotRoleAlias,
       cognitoIdentityPoolId,
       cognitoUserPoolProvider,
+      liveVendRoleArn,
       recorderClusterArn,
       recorderClusterName,
       recorderSecurityGroupId,
@@ -208,6 +215,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
         actions: [
           "iot:CreateThing",
           "iot:DescribeThing",
+          // Tenancy attributes (`xgOrgId`/`xgWorkspaceId`) that the device
+          // policy's scoped-telemetry topic variables resolve against
+          // (platform-auth Phase 4, services/device-scope.ts).
+          "iot:UpdateThing",
           "iot:AttachThingPrincipal",
           "iot:AttachPolicy",
           "iot:UpdateCertificate",
@@ -431,6 +442,29 @@ export class XorgateCoreApiStack extends cdk.Stack {
         resources: ["*"],
       }),
     );
+    // Scoped live-credential vending (platform-auth Phase 4). The ceiling role
+    // trusts this account and delegates to identity policies, so THIS statement
+    // is the gate on who may vend — keep it to the one role ARN. `sts:TagSession`
+    // is deliberately NOT granted: scoping is carried by the inline session
+    // policy, and a principal tag that nothing reads is a trap for whoever adds
+    // a tag-conditioned statement later.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "LiveCredentialVend",
+        actions: ["sts:AssumeRole"],
+        resources: [liveVendRoleArn],
+      }),
+    );
+    // Video scoping is a tag condition on the signalling channel, so the vend
+    // path has to be able to write those tags. Read is granted alongside for
+    // operator debugging; nothing in the code path calls it.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "KvsScopeTags",
+        actions: ["kinesisvideo:TagResource", "kinesisvideo:ListTagsForResource"],
+        resources: [`arn:aws:kinesisvideo:${this.region}:${this.account}:channel/*`],
+      }),
+    );
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "CognitoGetId",
@@ -482,6 +516,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       IOT_ROLE_ALIAS: iotRoleAlias,
       COGNITO_IDENTITY_POOL_ID: cognitoIdentityPoolId,
       COGNITO_USER_POOL_PROVIDER: cognitoUserPoolProvider,
+      LIVE_VEND_ROLE_ARN: liveVendRoleArn,
+      // Session policies name account-qualified ARNs, and Lambda does not set
+      // the account id in the environment the way it sets AWS_REGION.
+      AWS_ACCOUNT_ID: this.account,
       AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1",
       // Shared Fargate cluster/network. Historic RECORDER_* names (the cloud
       // recorder that owned them is gone): RECORDER_CLUSTER_ARN is read
@@ -626,6 +664,21 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "POST /auth/session-tokens — mint a short-lived session token",
       ),
     );
+
+    // POST /auth/live-credentials — exchange a xorgate credential for AWS
+    // credentials scoped to one org/workspace's live plane (platform-auth
+    // Phase 4). Calls sts:AssumeRole with an inline session policy, tags
+    // signalling channels on the way through, and reuses the DescribeEndpoint
+    // grant the token endpoint already relies on.
+    const authLiveCredentialsFn = new nodejs.NodejsFunction(this, "AuthLiveCredentialsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "auth-live-credentials.ts"),
+        "POST /auth/live-credentials — vend scoped live-plane credentials",
+      ),
+      // Bundles @aws-sdk/client-sts and @aws-sdk/client-kinesis-video, neither
+      // of which is guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
 
     const workspacesFn = new nodejs.NodejsFunction(
       this,
@@ -954,6 +1007,53 @@ export class XorgateCoreApiStack extends cdk.Stack {
     telemetryIngestFn.addPermission("AllowIotRuleInvoke", {
       principal: new iam.ServicePrincipal("iot.amazonaws.com"),
       sourceArn: telemetryRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
+    // --- The same ingest, on the tenant-scoped telemetry plane ---
+    //
+    // Devices move to `xorgate/orgs/{org}/ws/{ws}/devices/{id}/telemetry` one at
+    // a time, as each receives its scope on the retained config channel
+    // (platform-auth Phase 4). So for the length of the migration the fleet is
+    // split across two topics and persistence has to be indifferent to which.
+    //
+    // A SECOND RULE rather than a widened filter, and that is forced rather
+    // than stylistic: an MQTT `+` matches exactly one level, so no single
+    // filter matches both a four-level and an eight-level topic, and the only
+    // filter that does (`xorgate/#`) would also catch config, status, commands
+    // and config-reports. Two rules, one Lambda, same DLQ, same error posture.
+    // `topic(7)` is the device id here, exactly as `topic(3)` is over there, so
+    // the handler cannot tell the difference.
+    //
+    // DELETE THIS RULE'S SIBLING, not this one, when the fleet has finished
+    // moving — and not before: a device that never received its scope still
+    // publishes to the legacy topic, and dropping that rule first would stop
+    // persisting it, silently.
+    const telemetryScopedRule = new iot.CfnTopicRule(this, "TelemetryIngestScopedRule", {
+      ruleName: isProd
+        ? "xorgate_telemetry_ingest_scoped"
+        : "xorgate_telemetry_ingest_scoped_dev",
+      topicRulePayload: {
+        sql:
+          "SELECT *, topic(7) AS topicDeviceId " +
+          "FROM 'xorgate/orgs/+/ws/+/devices/+/telemetry'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: telemetryIngestFn.functionArn } }],
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    telemetryIngestFn.addPermission("AllowScopedIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: telemetryScopedRule.attrArn,
       sourceAccount: this.account,
       action: "lambda:InvokeFunction",
     });
@@ -1544,6 +1644,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "AuthSessionTokensInt",
       authSessionTokensFn,
     );
+    const authLiveCredentialsInt = new apigwv2int.HttpLambdaIntegration(
+      "AuthLiveCredentialsInt",
+      authLiveCredentialsFn,
+    );
     const workspacesInt = new apigwv2int.HttpLambdaIntegration(
       "WorkspacesInt",
       workspacesFn,
@@ -1697,6 +1801,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/auth/session-tokens",
       methods: [apigwv2.HttpMethod.POST],
       integration: authSessionTokensInt,
+    });
+    this.api.addRoutes({
+      path: "/auth/live-credentials",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: authLiveCredentialsInt,
     });
 
     this.api.addRoutes({
