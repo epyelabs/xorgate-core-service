@@ -404,6 +404,14 @@ export const kvsChannels = pgTable(
     channelName: text('channel_name').notNull(), // `${deviceId}-${streamKey}`
     channelArn: text('channel_arn').notNull(),
     region: text('region').notNull(),
+    // The workspace whose id was last written onto the channel as an AWS
+    // resource TAG (platform-auth Phase 4). Scoped live credentials authorize
+    // video with a tag condition rather than a channel list, because a channel
+    // name carries only `{deviceId}-{streamKey}` and has no tenant text to
+    // match on. NULL means "tags unknown", which is the state of every channel
+    // created before that phase and of every channel whose device has just
+    // moved workspace; the next vend reconciles it.
+    taggedWorkspaceId: uuid('tagged_workspace_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [uniqueIndex('kvs_channels_device_stream_idx').on(t.deviceId, t.streamKey)],

@@ -114,6 +114,7 @@ if (stage === 'prod') {
     iotRoleAlias: iotStack.roleAliasName,
     cognitoIdentityPoolId: iotStack.identityPoolId,
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
+    liveVendRoleArn: iotStack.liveVendRoleArn,
     ...recorderProps(recorderStack),
   });
 } else {
@@ -155,6 +156,7 @@ if (stage === 'prod') {
     iotRoleAlias: iotStack.roleAliasName,
     cognitoIdentityPoolId: iotStack.identityPoolId,
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
+    liveVendRoleArn: iotStack.liveVendRoleArn,
     ...recorderProps(recorderStack),
   });
 }

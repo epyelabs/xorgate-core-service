@@ -284,4 +284,20 @@ describe('retained config message', () => {
       else process.env.BUCKET_NAME = prev;
     }
   });
+
+  it('carries the tenant scope when there is one, and omits it rather than nulling it', () => {
+    const scope = {
+      organizationId: '1d2b4514-7408-4234-af5f-83b9451575ea',
+      workspaceId: 'c2e2a967-6dbe-464c-b45d-c6ef6087875b',
+    };
+    expect(buildDeviceConfigMessage({}, 1, 1_700_000_000_000, scope).scope).toEqual(scope);
+    // Omitted, not null: an older agent and a newer one must see the same
+    // absence, and `scope: null` would be a third state neither parses.
+    const without = buildDeviceConfigMessage({}, 1, 1_700_000_000_000, null) as Record<
+      string,
+      unknown
+    >;
+    expect('scope' in without).toBe(false);
+    expect('scope' in (buildDeviceConfigMessage({}, 1) as Record<string, unknown>)).toBe(false);
+  });
 });

@@ -1,0 +1,65 @@
+-- Scoped live credentials: KVS channel tag bookkeeping
+-- (platform-auth-and-live-plane plan, Phase 4).
+--
+-- ONE nullable column on an existing table. Nothing else moves.
+--
+--   kvs_channels.tagged_workspace_id
+--     The workspace id last written onto the signalling channel as an AWS
+--     resource TAG (`xorgate:workspaceId`, alongside `xorgate:organizationId`).
+--
+-- Why a tag at all, since every other boundary in this plan is a database
+-- filter: a vended live credential is an AWS credential, so its video half is
+-- authorized by IAM rather than by our code, and IAM can only match on
+-- something IN the resource. A signalling channel is named
+-- `{deviceId}-{streamKey}` and carries no tenant text, so there is nothing in
+-- the ARN to match. Tags put the tenant on the resource; the vended session
+-- policy then carries a constant-size condition
+-- (`aws:ResourceTag/xorgate:workspaceId` equals the scope) instead of a list of
+-- channel ARNs that would grow with the fleet against a hard 2048-character
+-- quota. Same reason the telemetry half uses a topic pattern rather than a
+-- topic list.
+--
+-- Why the column rather than reading tags back from AWS: `ListTagsForResource`
+-- is a per-channel API call, and the vend path would make one per channel in
+-- scope on every request. The column is the local record of what we last wrote,
+-- so the steady-state cost of reconciliation is one indexed SELECT that returns
+-- no rows.
+--
+-- NULL means "tags unknown", and that is the correct state for:
+--   * every channel created before this phase (backfilled by the first vend
+--     that covers its workspace);
+--   * any channel whose device has moved workspace. Note that the reconciler
+--     does not depend on an invalidation hook: it compares this column against
+--     `devices.workspace_id` through a join, so a move made by ANY means —
+--     including direct SQL, which is the only way to move a device today, since
+--     `PUT /devices/{id}` is metadata-only — is detected and repaired on the
+--     next vend.
+--
+-- A channel whose tags are missing or stale FAILS CLOSED: a scoped credential
+-- simply cannot view it. That is why reconciliation is allowed to be lazy.
+--
+-- ⚠️ Hand-written rather than `npm run db:generate`, for the same reason as
+-- `010`, `011`, `012` and `013`: generate stops on the still-unanswered
+-- firmware_version -> agent_version rename prompt, which needs a TTY, and
+-- answering it would fold that unrelated pending change into this migration.
+-- The snapshot under drizzle/meta is therefore now behind the real schema in
+-- FIVE places (010's rename, 011's table, 012's columns, 013's table, this
+-- column). The honest fix is still to answer the rename prompt first and let
+-- generate re-baseline all of it at once, as its own revertible commit.
+--
+-- Idempotent (IF NOT EXISTS). Adding a nullable column with no default is a
+-- catalogue-only change in Postgres: no table rewrite, no row touched, and the
+-- ACCESS EXCLUSIVE lock is held for microseconds.
+--
+-- Apply on dev with the Data API (one statement per call):
+--   aws rds-data execute-statement --resource-arn <cluster> --secret-arn <secret> \
+--     --database xorgatedb_dev --sql '<statement>'
+-- Prod is out of scope for this whole plan (user, 2026-08-13).
+--
+-- WHAT IS INERT WITHOUT IT: the video half of every scoped credential, and it
+-- does NOT degrade gracefully. `services/live-credentials.ts` selects this
+-- column on every vend, so on a database without it `POST /auth/live-credentials`
+-- is a 500 rather than a partial success. Apply before deploying, which is the
+-- habit Phases 2 and 3 settled on.
+
+ALTER TABLE kvs_channels ADD COLUMN IF NOT EXISTS tagged_workspace_id uuid;

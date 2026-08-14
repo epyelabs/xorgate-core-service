@@ -1,4 +1,5 @@
 import { PublishCommand } from '@aws-sdk/client-iot-data-plane';
+import { deviceScope, ensureThingScopeAttributes, type DeviceScope } from './device-scope';
 import { iotDataClient } from './iot-data';
 import {
   CONFIG_NAMESPACES,
@@ -49,6 +50,22 @@ export interface DeviceConfigEnvelope {
    * it is environment-derived and lands in kvs.json, not settings.json.
    */
   uploadBucket?: string;
+  /**
+   * The device's tenant (platform-auth Phase 4). Not a config namespace — it is
+   * tenancy, not a setting, and there is nothing for an operator to change —
+   * so it rides the envelope exactly as `uploadBucket` does, for exactly the
+   * same reason: this is the one channel that reaches a device already in the
+   * field without re-provisioning it.
+   *
+   * An agent that has it publishes telemetry to
+   * `xorgate/orgs/{organizationId}/ws/{workspaceId}/devices/{deviceId}/telemetry`,
+   * which is the only topic shape a per-tenant IAM policy can be written
+   * against. An agent that does not (an older build, or a device whose
+   * workspace row has gone) keeps using the unscoped topic, which still works
+   * and is still ingested. Omitted rather than nulled when unresolvable, so an
+   * old agent and a new one see the same absence.
+   */
+  scope?: DeviceScope;
   ts: number;
 }
 
@@ -83,6 +100,7 @@ export function buildDeviceConfigMessage(
   doc: DeviceConfigDocument | null | undefined,
   rev: number,
   now: number = Date.now(),
+  scope?: DeviceScope | null,
 ): DeviceConfigMessage {
   const source = (doc ?? {}) as Record<string, unknown>;
   // Registry order is the wire order, and gnssAntBias is first in both — keep
@@ -108,6 +126,7 @@ export function buildDeviceConfigMessage(
     rev,
     ...(namespaces as PublishedConfigDocument),
     ...(uploadBucket ? { uploadBucket } : {}),
+    ...(scope ? { scope } : {}),
     ts: now,
   } as DeviceConfigMessage;
 }
@@ -126,7 +145,16 @@ export async function publishDeviceConfig(
   doc: DeviceConfigDocument | null | undefined,
   rev: number,
 ): Promise<void> {
-  const message = buildDeviceConfigMessage(doc, rev);
+  // Resolved here rather than passed in, deliberately. Every caller already has
+  // the device row and could supply it, and every future caller would have to
+  // remember to — and a caller that forgot would silently publish a message
+  // telling the device it has no tenant, which reverts it to the unscoped
+  // topic. One indexed read on an operation that happens when someone saves
+  // settings is the cheaper side of that trade.
+  const scope = await deviceScope(deviceId);
+  if (scope) await ensureThingScopeAttributes(deviceId, scope);
+
+  const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope);
   const client = await iotDataClient();
   await client.send(
     new PublishCommand({
