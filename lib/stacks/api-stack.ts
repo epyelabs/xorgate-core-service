@@ -136,28 +136,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
             );
           })());
 
-    const allowedOrigins: string[] = [
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://localhost:5175",
-      "https://xorgate.ai",
-      "http://dev.xorgate.io.s3-website-us-east-1.amazonaws.com",
-      "http://www.xorgate.io.s3-website-us-east-1.amazonaws.com",
-      "https://d3u971sluio616.cloudfront.net",
-      "https://dev.xorgate.io",
-      "https://www.xorgate.io",
-      // Docs site (frontend/xorgate-docs). Its API-reference playground calls
-      // this API straight from the browser, so the docs origins must be
-      // allowed. localhost:3000 is the Next dev server. Add the CloudFront
-      // distribution domains here too if the site is reached that way before
-      // DNS points at it.
-      "http://localhost:3000",
-      "http://docs.xorgate.io.s3-website-us-east-1.amazonaws.com",
-      "http://docs-dev.xorgate.io.s3-website-us-east-1.amazonaws.com",
-      "https://docs.xorgate.io",
-      "https://docs-dev.xorgate.io",
-    ];
-
     let lambdaSG: ec2.SecurityGroup | undefined;
     if (vpc) {
       lambdaSG = new ec2.SecurityGroup(this, "LambdaSG", {
@@ -1599,11 +1577,47 @@ export class XorgateCoreApiStack extends cdk.Stack {
       description: "GET /docs (Swagger UI) + GET /openapi.json",
     });
 
+    // CORS: the API answers every origin, deliberately.
+    //
+    // Phase 5 of plans/platform-auth-and-live-plane evaluated a per-org
+    // registered-origin allowlist (design note N3) and the user's call was not
+    // to build it. Two measured facts and one structural one decided it:
+    //
+    // 1. Per-response enforcement is IMPOSSIBLE while `corsPreflight` is set.
+    //    Measured on dev 2026-08-18: with CORS configured on an HTTP API,
+    //    API Gateway strips the integration's `Access-Control-*` headers and
+    //    substitutes its own, even for an origin its own list does not match.
+    //    So N3's "option 1" (wildcard preflight + enforcement in the response
+    //    helper) enforces nothing, and the obvious hybrid (static preflight
+    //    list + handler-computed header for everyone else) does not work
+    //    either. Enforcing per-org would mean dropping `corsPreflight`
+    //    entirely and answering OPTIONS from Lambda.
+    // 2. There is nothing for CORS to protect. CORS guards AMBIENT browser
+    //    credentials. This API has none: no cookie is read or written
+    //    anywhere, auth is the `Authorization` header alone
+    //    (src/middleware/auth.ts), and `allowCredentials` is unset (false),
+    //    which a wildcard requires. A hostile page cannot obtain a victim's
+    //    token, and anything that HAS the token can call this API from a
+    //    server, where CORS does not exist.
+    // 3. A preflight carries no credential, so an allowlist could never be
+    //    consulted per-org at preflight time anyway; and enforcing it on the
+    //    real request would turn every expired-token 401 into a "blocked by
+    //    CORS policy" console error instead of a readable `401`.
+    //
+    // The security boundary is auth, and Phases 2 to 4 are what make that
+    // defensible: every browser-holdable credential is now verified,
+    // short-lived and scoped. The consumer-facing benefit N3 actually wanted,
+    // namely that a third-party app's origin works without a xorgate deploy,
+    // is delivered in full by the wildcard.
+    //
+    // DO NOT set `allowCredentials: true` here. Wildcard + credentials is
+    // rejected by browsers, and it is the combination that would make the
+    // reasoning above false. test/cors-config.test.ts fails the build on it.
     this.api = new apigwv2.HttpApi(this, "XorgateCoreApi", {
       apiName: isProd ? "xorgate-core-api" : "xorgate-core-api-dev",
       description: "Xorgate core backend HTTP API",
       corsPreflight: {
-        allowOrigins: allowedOrigins,
+        allowOrigins: ["*"],
         allowMethods: [
           apigwv2.CorsHttpMethod.GET,
           apigwv2.CorsHttpMethod.POST,
@@ -1622,6 +1636,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
         maxAge: cdk.Duration.hours(24),
       },
     });
+
 
     const healthInt = new apigwv2int.HttpLambdaIntegration(
       "HealthInt",
