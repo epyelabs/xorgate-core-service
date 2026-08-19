@@ -13,6 +13,36 @@ Aurora cluster via the RDS Data API** (AWS console Query Editor, or
 resource (see `initiate_backend.md`). The Data API runs **one statement per call**,
 so split each file on its `--> statement-breakpoint` markers.
 
+## Building a database from zero (verified on prod, 2026-08-19)
+
+The numbered walk-through below explains WHY each manual file exists and is
+still the reference for that. This section is the recipe, and it is the one that
+has actually been run against an empty cluster:
+
+1. **`drizzle/0000_*.sql` through `drizzle/0026_next_sway.sql`, in order.**
+   Note `0026`'s header says it must not be run against dev, where its contents
+   were already applied by hand. A fresh cluster is exactly the case it is for,
+   and it SUBSUMES manual `010` to `014`.
+2. **`manual/` in filename order, skipping `008`.** Every file is idempotent or
+   guarded, so the ones `0026` already covered are no-ops. `008` converts an
+   ALREADY-POPULATED `telemetry_readings` and would be wrong here; `001`, which
+   runs instead, opens with `DROP TABLE IF EXISTS ... CASCADE` and is safe only
+   because the table is empty at this point.
+
+Applied that way to the production cluster on 2026-08-19: **194 statements, zero
+skipped, no failures.** Verified afterwards with `information_schema`: 27 base
+tables, `devices.agent_version` present and `firmware_version` gone,
+`telemetry_readings` partitioned with a DEFAULT partition, the seed device model
+present, and `session_tokens` + `iot_policy_attachments` present.
+
+**One defect this exposed, still unfixed:** `001` bootstraps partitions for
+`2026_06` and `2026_07` as hardcoded literals, so a cluster built after July 2026
+gets no partition for the current month. Nothing breaks, because `005`'s DEFAULT
+partition catches those rows and that is what it is for, but every row lands in
+DEFAULT until the partition-maintenance Lambda runs. `2026_08` and `2026_09` were
+created by hand on prod. The file should compute the current and next month
+rather than name two.
+
 ## Order
 
 Apply after the latest generated migration, in filename order:
