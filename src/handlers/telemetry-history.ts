@@ -1,3 +1,4 @@
+import { requestPath } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
@@ -578,9 +579,10 @@ export const handler = async (
     .limit(1);
   if (!device) return notFound(`Device "${id}" not found`);
 
-  if (event.rawPath.endsWith('/telemetry/latest')) return handleLatest(id);
-  if (event.rawPath.endsWith('/telemetry/recent')) return handleRecent(id, event);
-  if (event.rawPath.endsWith('/telemetry/readings')) {
+  const path = requestPath(event);
+  if (path.endsWith('/telemetry/latest')) return handleLatest(id);
+  if (path.endsWith('/telemetry/recent')) return handleRecent(id, event);
+  if (path.endsWith('/telemetry/readings')) {
     return handleReadings(id, event, device.ioCapabilities);
   }
   return handleHistory(id, event);

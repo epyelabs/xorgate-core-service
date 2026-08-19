@@ -1,3 +1,4 @@
+import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
@@ -37,7 +38,7 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
 export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
-  const routeKey = event.routeKey; // e.g. "POST /devices/{id}/reboot"
+  const routeKey = canonicalRouteKey(event); // e.g. "POST /devices/{id}/reboot"
   const deviceId = event.pathParameters?.id;
 
   const command = ROUTE_COMMANDS[routeKey];

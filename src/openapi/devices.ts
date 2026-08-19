@@ -258,7 +258,7 @@ export const devicesPaths = {
       operationId: 'deleteDevice',
       summary: 'Delete a device',
       description:
-        'Removes the row and everything cascading off it (identity, KVS channels, sessions, ' +
+        'Removes the row and everything cascading off it (identity, video channels, sessions, ' +
         'telemetry). The AWS IoT thing and certificate are NOT torn down by this endpoint.',
       tags: ['Devices'],
       responses: {

@@ -34,9 +34,9 @@ export const deviceModelsPaths = {
       summary: 'Add a device model (platform admin only)',
       description:
         '`ioCapabilities` is what makes a model useful: it declares the video/audio stream keys ' +
-        'that become KVS channels at provisioning time, and the telemetry metrics that become the ' +
+        'that become video channels at provisioning time, and the telemetry metrics that become the ' +
         'default history columns. It is NOT validated here, but it IS parsed at provisioning ' +
-        'time, and a document that fails that parse provisions zero KVS channels. Check it ' +
+        'time, and a document that fails that parse provisions zero video channels. Check it ' +
         'against the schema before you send it.',
       tags: ['Device Models'],
       requestBody: {
@@ -106,7 +106,7 @@ export const deviceModelsPaths = {
       summary: 'Update a device model (platform admin only)',
       description:
         'Partial update; an empty body is a 400. Changing `ioCapabilities` does not retro-provision ' +
-        'KVS channels on devices already created from this model.',
+        'video channels on devices already created from this model.',
       tags: ['Device Models'],
       requestBody: {
         required: true,

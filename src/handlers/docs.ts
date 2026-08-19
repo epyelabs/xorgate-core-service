@@ -1,3 +1,4 @@
+import { requestPath } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { buildOpenApiDocument } from '../openapi/index';
 
@@ -43,7 +44,9 @@ const CORS_HEADERS = {
 };
 
 export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
-  const reqPath = event.rawPath;
+  // Canonical form: `/v1/openapi.json` and `/openapi.json` are the same
+  // document, and the exact comparison below would miss the versioned one.
+  const reqPath = requestPath(event);
   const baseUrl = process.env.DOCS_BASE_URL ?? '/';
 
   if (reqPath === '/openapi.json') {

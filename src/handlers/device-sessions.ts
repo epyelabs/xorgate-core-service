@@ -1,3 +1,4 @@
+import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DeleteObjectsCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -55,7 +56,7 @@ export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
-  const routeKey = event.routeKey;
+  const routeKey = canonicalRouteKey(event);
   const deviceId = event.pathParameters?.id;
   const sessionId = event.pathParameters?.sessionId;
 

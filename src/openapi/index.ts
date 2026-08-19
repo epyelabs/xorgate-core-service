@@ -1,4 +1,5 @@
 import { openApiComponents } from './components';
+import { versionedPath } from './scope';
 import { metaPaths } from './meta';
 import { usersPaths } from './users';
 import { organizationsPaths } from './organizations';
@@ -111,7 +112,8 @@ const TAGS = [
     name: 'Live',
     'x-displayName': 'Live',
     description:
-      'Bootstrap for the live plane: KVS channel metadata and the IoT policy attachment a browser needs.',
+      'Bootstrap for the live plane: video channel metadata, and the access grant the ' +
+      'first-party dashboard needs.',
   },
   {
     name: 'Search',
@@ -124,6 +126,17 @@ const TAGS = [
 const DESCRIPTION = [
   'The REST API behind xorgate: organizations, workspaces, devices, device configuration,',
   'recorded media, and stored telemetry.',
+  '',
+  '**Versioning.** Every path in this document is served under `/v1`, and that prefix is part',
+  'of the path rather than of the host, so a base URL is a bare origin such as',
+  '`https://api-dev.xorgate.io` and the operation below appends `/v1/...` to it.',
+  '',
+  'Every one of these paths ALSO answers without the prefix, and two of them answer under an',
+  'older name as well (`GET /devices/{id}/kvs-channels` for `GET /devices/{id}/video-channels`,',
+  'and `POST /iot/attach-policy` for `POST /live/access`). Those unversioned and renamed-from',
+  'paths are DEPRECATED, exist only so the first-party dashboard did not have to move in the',
+  'same release, and are not operations in this document. Do not build on them: they are removed',
+  'once xorgate-web calls the `/v1` names. New integrations should use `/v1` exclusively.',
   '',
   '**Authentication.** Every endpoint except `/health` and this document requires',
   '`Authorization: Bearer <credential>`, and there are three kinds, told apart by their prefix in',
@@ -166,7 +179,7 @@ const DESCRIPTION = [
   '**Pagination.** Only `GET /devices`, `GET /devices/{id}/sessions` and',
   '`GET /devices/{id}/telemetry/readings` paginate; they accept `limit`/`offset`/`order`/`sort`',
   'and return a `page` block. Every other list endpoint returns its whole collection unbounded:',
-  'organizations, memberships, workspaces, device models, API keys, KVS channels, and a session',
+  'organizations, memberships, workspaces, device models, API keys, video channels, and a session',
   "segment index. `GET /devices/{id}/telemetry` is not a list endpoint either. It caps rows and",
   'reports `truncated`.',
   '',
@@ -183,18 +196,35 @@ const DESCRIPTION = [
   'still moving.',
 ].join('\n');
 
+/** Re-key a `paths` object under the version prefix, preserving order. */
+function withVersionPrefix(
+  paths: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(paths).map(([path, item]) => [versionedPath(path), item]),
+  );
+}
+
 /** Build the served document. `baseUrl` becomes the single `servers` entry. */
 export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
   return {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
-      // 0.5.0: scoped live credentials. A new endpoint, and the live plane
-      // stops being first-party-only — the same bar the previous three bumps
-      // were held to.
-      version: '0.5.0',
+      // 0.6.0: the `/v1` cut. Every path key below gained the prefix, two
+      // routes were renamed (N11), and `VideoChannel` replaced `KvsChannel`.
+      // Comfortably the same bar the previous four bumps were held to: this is
+      // the largest change to the described surface any of them made.
+      version: '0.6.0',
       description: DESCRIPTION,
     },
+    // The BARE origin. The version lives in the path keys below, not here, so
+    // that overriding `servers` for a dev stage or a proxy cannot silently drop
+    // `/v1` and land on the deprecated unversioned aliases. The docs site does
+    // exactly that override (scripts/generate-openapi.mjs rewrites `servers`
+    // from NEXT_PUBLIC_API_BASE_URL), which is what makes this load-bearing
+    // rather than stylistic. Decision N6a: the SDK owns the version segment the
+    // same way, appending it to a bare `baseUrl`.
     servers: [{ url: baseUrl }],
     // Any of the three credentials, on every operation that does not say
     // otherwise. Two kinds of exception, each overriding this in its own module:
@@ -205,7 +235,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     components: openApiComponents(),
     // Spread order is the reading order: it decides the order of the generated
     // reference sections, so keep it aligned with TAGS above.
-    paths: {
+    // Every path key gains `/v1`. Applied here, once, rather than written into
+    // each module: the modules stay readable in the canonical unversioned
+    // spelling that `scope.ts` and the route table also use, and retiring or
+    // bumping the prefix is a one-line change in one place.
+    paths: withVersionPrefix({
       ...usersPaths,
       ...organizationsPaths,
       ...membershipsPaths,
@@ -220,6 +254,6 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...livePaths,
       ...searchPaths,
       ...metaPaths,
-    },
+    }),
   };
 }

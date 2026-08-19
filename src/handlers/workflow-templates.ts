@@ -1,3 +1,4 @@
+import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
@@ -223,7 +224,7 @@ export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
-  const routeKey = event.routeKey;
+  const routeKey = canonicalRouteKey(event);
   const id = event.pathParameters?.id;
   const versionId = event.pathParameters?.versionId;
 

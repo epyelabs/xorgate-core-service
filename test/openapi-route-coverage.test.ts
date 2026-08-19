@@ -2,7 +2,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildOpenApiDocument } from '../src/openapi/index';
-import { INTERNAL_ROUTES, isOutOfScopePath } from '../src/openapi/scope';
+import {
+  ALIAS_EXEMPT_ROUTES,
+  API_VERSION_PREFIX,
+  INTERNAL_ROUTES,
+  RENAMED_ROUTE_ALIASES,
+  isOutOfScopePath,
+  isVersionedRoute,
+  unversionRoute,
+  versionedRoute,
+} from '../src/openapi/scope';
 
 /**
  * THE drift guard. The OpenAPI document is hand-written, so the only thing that
@@ -15,6 +24,13 @@ import { INTERNAL_ROUTES, isOutOfScopePath } from '../src/openapi/scope';
  * (Lambdas, buckets, IoT) inside a unit test. The parser is defended by a floor
  * on the number of routes it finds, so a refactor that changes the declaration
  * shape fails loudly here instead of quietly matching nothing.
+ *
+ * Since Phase 6 the table also carries the `/v1` cut. `addRoutes` is a LOCAL
+ * helper in the stack that declares each route twice, so this file has to model
+ * the same expansion the helper performs. The risk that creates — a rule modeled
+ * in two places — is closed by `declares no route outside the twinning helper`
+ * below, which is what stops a route from reaching the API without going
+ * through the helper at all.
  */
 
 const API_STACK = join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts');
@@ -22,17 +38,43 @@ const API_STACK = join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts');
 /** Trips if `addRoutes` is ever reshaped so the regex stops matching. */
 const MIN_EXPECTED_ROUTES = 40;
 
-const ADD_ROUTES_RE =
-  /addRoutes\(\{\s*path:\s*["'`]([^"'`]+)["'`],\s*methods:\s*\[([\s\S]*?)\]/g;
+/** One `addRoutes({...})` call, before the `/v1` expansion. */
+interface Declaration {
+  path: string;
+  methods: string[];
+  versioned: boolean;
+  alias: boolean;
+}
 
-function declaredRoutes(): string[] {
+const ADD_ROUTES_RE =
+  /addRoutes\(\{\s*path:\s*["'`]([^"'`]+)["'`],\s*methods:\s*\[([\s\S]*?)\],([\s\S]*?)\n\s*\}\);/g;
+
+function declarations(): Declaration[] {
   const source = readFileSync(API_STACK, 'utf8');
-  const routes: string[] = [];
+  const out: Declaration[] = [];
   for (const match of source.matchAll(ADD_ROUTES_RE)) {
-    const path = match[1];
-    const methods = [...match[2].matchAll(/HttpMethod\.([A-Z]+)/g)].map((m) => m[1]);
+    const [, path, methodsText, rest] = match;
+    const methods = [...methodsText.matchAll(/HttpMethod\.([A-Z]+)/g)].map((m) => m[1]);
     expect(methods.length, `no methods parsed for ${path}`).toBeGreaterThan(0);
-    for (const method of methods) routes.push(`${method} ${path}`);
+    out.push({
+      path,
+      methods,
+      versioned: !/\bversioned:\s*false\b/.test(rest),
+      alias: !/\balias:\s*false\b/.test(rest),
+    });
+  }
+  return out;
+}
+
+/** Every route key the API actually serves, after the helper's expansion. */
+function declaredRoutes(): string[] {
+  const routes: string[] = [];
+  for (const decl of declarations()) {
+    for (const method of decl.methods) {
+      const key = `${method} ${decl.path}`;
+      if (decl.versioned) routes.push(versionedRoute(key));
+      if (decl.alias) routes.push(key);
+    }
   }
   return routes;
 }
@@ -69,7 +111,8 @@ describe('OpenAPI route coverage', () => {
 
   it('documents every in-scope route', () => {
     const missing = routes
-      .filter((route) => !isOutOfScopePath(route.slice(route.indexOf(' ') + 1)))
+      .filter(isVersionedRoute)
+      .filter((route) => !isOutOfScopePath(unversionRoute(route).slice(route.indexOf(' ') + 1)))
       .filter((route) => !documented.has(route));
     expect(
       missing,
@@ -84,15 +127,16 @@ describe('OpenAPI route coverage', () => {
   });
 
   it('never documents the Workflows/AI surface', () => {
-    const leaked = [...documented.keys()].filter((route) =>
-      isOutOfScopePath(route.slice(route.indexOf(' ') + 1)),
-    );
+    const leaked = [...documented.keys()].filter((route) => {
+      const canonical = unversionRoute(route);
+      return isOutOfScopePath(canonical.slice(canonical.indexOf(' ') + 1));
+    });
     expect(leaked, 'out-of-scope routes leaked into the public document').toEqual([]);
   });
 
   it('flags the installer-only routes as internal', () => {
     for (const route of INTERNAL_ROUTES) {
-      const operation = documented.get(route);
+      const operation = documented.get(versionedRoute(route));
       expect(operation, `${route} is missing from the document`).toBeDefined();
       expect(operation?.['x-internal'], `${route} must carry x-internal: true`).toBe(true);
     }
@@ -101,8 +145,92 @@ describe('OpenAPI route coverage', () => {
   it('marks nothing else internal', () => {
     const flagged = [...documented.entries()]
       .filter(([, operation]) => operation['x-internal'])
-      .map(([route]) => route);
+      .map(([route]) => unversionRoute(route));
     expect(flagged.sort()).toEqual([...INTERNAL_ROUTES].sort());
+  });
+});
+
+/**
+ * The `/v1` cut and its alias period. These tests are the sunset checklist:
+ * retiring the aliases means deleting them, and until someone does, they stop
+ * the deprecated half from being dropped by accident or documented by mistake.
+ *
+ * The thing they exist to catch is asymmetric: a test that only proves `/v1/foo`
+ * works proves nothing about whether `foo` still answers, and `foo` is the half
+ * that keeps xorgate-web alive.
+ */
+describe('the /v1 alias period', () => {
+  const decls = declarations();
+  const routes = declaredRoutes();
+  const documented = documentedOperations();
+  const declared = new Set(routes);
+
+  it('declares no route outside the twinning helper', () => {
+    // Without this, a route added with `this.api.addRoutes` would exist under
+    // exactly one name and every other test here would still pass, because
+    // they all read the same text this rule protects.
+    const source = readFileSync(API_STACK, 'utf8');
+    const direct = [...source.matchAll(/this\.api\.addRoutes\(/g)].length;
+    expect(
+      direct,
+      'this.api.addRoutes may only be called by the addRoutes helper (twice: /v1 and the alias)',
+    ).toBe(2);
+  });
+
+  it('serves every documented route under /v1', () => {
+    const bare = [...documented.keys()].filter((route) => !isVersionedRoute(route));
+    expect(bare, 'the document must describe the /v1 names only').toEqual([]);
+  });
+
+  it('keeps an unversioned alias for every /v1 route', () => {
+    const missing = routes
+      .filter(isVersionedRoute)
+      .map(unversionRoute)
+      .filter((route) => !ALIAS_EXEMPT_ROUTES.includes(route))
+      .filter((route) => !declared.has(route));
+    expect(
+      missing,
+      'these /v1 routes lost their unversioned alias. If that is deliberate, the alias sunset ' +
+        'has arrived: read ALIAS_SUNSET in src/openapi/scope.ts and retire the whole set, or add ' +
+        'the route to ALIAS_EXEMPT_ROUTES if it postdates the cut.',
+    ).toEqual([]);
+  });
+
+  it('documents no alias as an operation', () => {
+    const documentedAliases = [...documented.keys()].filter((route) => !isVersionedRoute(route));
+    expect(documentedAliases, 'aliases are a deprecation note, not operations').toEqual([]);
+  });
+
+  it('serves both halves of every N11 rename, and only the new name under /v1', () => {
+    for (const [oldRoute, newRoute] of Object.entries(RENAMED_ROUTE_ALIASES)) {
+      expect(declared.has(oldRoute), `${oldRoute} must keep answering unversioned`).toBe(true);
+      expect(declared.has(newRoute), `${newRoute} must be served`).toBe(true);
+      expect(declared.has(versionedRoute(newRoute)), `${newRoute} must be served under /v1`).toBe(
+        true,
+      );
+      expect(
+        declared.has(versionedRoute(oldRoute)),
+        `${oldRoute} must NOT exist under /v1: the versioned surface carries new names only`,
+      ).toBe(false);
+      expect(documented.has(versionedRoute(newRoute)), `${newRoute} must be documented`).toBe(true);
+      expect(documented.has(oldRoute), `${oldRoute} must not be documented`).toBe(false);
+    }
+  });
+
+  it('leaves the Workflows surface unversioned', () => {
+    const versionedOutOfScope = decls
+      .filter((decl) => isOutOfScopePath(decl.path))
+      .filter((decl) => decl.versioned)
+      .map((decl) => decl.path);
+    expect(
+      versionedOutOfScope,
+      'the Workflows surface makes no /v1 promise; see OUT_OF_SCOPE_PATH_PREFIXES',
+    ).toEqual([]);
+  });
+
+  it('agrees with the prefix the handlers strip', async () => {
+    const { VERSION_PREFIX } = await import('../src/utils/route');
+    expect(VERSION_PREFIX).toBe(API_VERSION_PREFIX);
   });
 });
 
