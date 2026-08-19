@@ -228,6 +228,33 @@ describe('the /v1 alias period', () => {
     ).toEqual([]);
   });
 
+  it('keeps the renamed response field additive until sunset', () => {
+    // A field rename cannot ride a path alias: both spellings have to be on the
+    // wire, on BOTH routes, or xorgate-web (which reads `channelArn`) breaks.
+    // The document describes `channelRef` as required and `channelArn` as
+    // deprecated, and the handler has to actually send both.
+    const doc = buildOpenApiDocument('https://api.example.test') as {
+      components: { schemas: Record<string, { required?: string[]; properties?: Record<string, { deprecated?: boolean }> }> };
+    };
+    const schema = doc.components.schemas.VideoChannel;
+    expect(schema, 'VideoChannel schema is gone').toBeDefined();
+    expect(schema.required).toContain('channelRef');
+    expect(schema.required, 'the deprecated spelling must not be required').not.toContain('channelArn');
+    expect(
+      schema.properties?.channelArn?.deprecated,
+      'channelArn must stay documented AND flagged deprecated while it is still sent',
+    ).toBe(true);
+
+    const handler = readFileSync(
+      join(__dirname, '..', 'src', 'handlers', 'device-kvs-channels.ts'),
+      'utf8',
+    );
+    expect(
+      /channelRef:\s*row\.channelArn/.test(handler),
+      'device-kvs-channels must still map channelArn onto channelRef',
+    ).toBe(true);
+  });
+
   it('agrees with the prefix the handlers strip', async () => {
     const { VERSION_PREFIX } = await import('../src/utils/route');
     expect(VERSION_PREFIX).toBe(API_VERSION_PREFIX);
