@@ -8,6 +8,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2int from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as cwActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as sns from "aws-cdk-lib/aws-sns";
@@ -20,6 +21,42 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
 import * as path from "path";
+
+/**
+ * The public hostname each stage answers on, and the ACM certificate in front
+ * of it. Both are the USER'S to create (Q1 precedent in the docs plan): DNS for
+ * xorgate.io is on Cloudflare, not Route 53, so nothing here can request or
+ * validate a certificate, and the deploy credentials are denied ACM and
+ * Route 53 entirely. The flow is: user issues the certificate, hands over the
+ * ARN, this deploys the domain, and the user points a CNAME at the
+ * `ApiDomainTarget` output.
+ *
+ * Set an entry to `undefined` to deploy without a custom domain; the API is
+ * still reachable on its `execute-api` hostname either way, and `/v1` lives in
+ * the route table rather than in a domain mapping, so the version prefix does
+ * not depend on DNS existing.
+ *
+ * PROD IS NEVER DEPLOYED. `npm run deploy:prod` has never been run and there is
+ * no production environment; the entry below exists so `api.xorgate.io` is
+ * RESERVED (the certificate is issued and recorded) rather than pointed at the
+ * dev stage, which is the mistake that would later force a name consumers hold
+ * to move. Deploying it is a deliberate future act, not a side effect.
+ */
+const CUSTOM_DOMAINS: Record<
+  "dev" | "prod",
+  { hostname: string; certificateArn: string } | undefined
+> = {
+  dev: {
+    hostname: "api-dev.xorgate.io",
+    certificateArn:
+      "arn:aws:acm:us-east-1:111910761410:certificate/9891cf72-d40d-4565-bc5e-9419684748e1",
+  },
+  prod: {
+    hostname: "api.xorgate.io",
+    certificateArn:
+      "arn:aws:acm:us-east-1:111910761410:certificate/23c03f08-1395-4f09-8152-f4660db4d6fe",
+  },
+};
 
 export interface XorgateCoreApiStackProps extends cdk.StackProps {
   stage: "dev" | "prod";
@@ -1753,8 +1790,17 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
-    // Inject the API endpoint into the docs Lambda now that the api exists.
-    docsFn.addEnvironment("DOCS_BASE_URL", this.api.apiEndpoint);
+    // Inject the API base into the docs Lambda now that the api exists. The
+    // public hostname wins when there is one: `servers` in the served document
+    // is the URL a reader is meant to copy, and the `execute-api` name is an
+    // implementation detail. It is a BARE origin — the document's path keys
+    // carry `/v1` themselves (src/openapi/index.ts explains why).
+    docsFn.addEnvironment(
+      "DOCS_BASE_URL",
+      CUSTOM_DOMAINS[stage]
+        ? `https://${CUSTOM_DOMAINS[stage]!.hostname}`
+        : this.api.apiEndpoint,
+    );
 
     // Device-registration Lambdas need the public API base to build the install
     // URL and the claim URL baked into install.sh. Same chicken-and-egg as
@@ -1763,24 +1809,80 @@ export class XorgateCoreApiStack extends cdk.Stack {
     deviceRegistrationsFn.addEnvironment("API_BASE_URL", this.api.apiEndpoint);
     installScriptFn.addEnvironment("API_BASE_URL", this.api.apiEndpoint);
 
-    this.api.addRoutes({
+    // ---------------------------------------------------------------------
+    // The route table.
+    //
+    // Every in-scope route is declared TWICE by this helper: once under `/v1`
+    // (the public, documented name) and once at its bare path (the deprecated
+    // alias xorgate-web still calls). Phase 6 of
+    // plans/platform-auth-and-live-plane introduced the prefix; the sunset
+    // condition for the aliases is written down in `src/openapi/scope.ts`
+    // (ALIAS_SUNSET) and enforced by test/openapi-route-coverage.test.ts.
+    //
+    // `/v1` is a ROUTE, not a domain mapping. It could have been an
+    // `ApiMappingKey` on the custom domain instead, which would have cost ~5
+    // CloudFormation resources rather than ~116, but then the versioned surface
+    // would exist only where DNS points and could not be tested at all until a
+    // certificate did. Declaring it here keeps `/v1` working on the raw
+    // `execute-api` hostname and independent of the user's Cloudflare zone.
+    //
+    // Do NOT call `this.api.addRoutes` directly. The guard test fails the build
+    // if you do, because a route declared outside this helper silently skips
+    // the twinning and would exist under one name only.
+    const addRoutes = (props: {
+      path: string;
+      methods: apigwv2.HttpMethod[];
+      integration: apigwv2.HttpRouteIntegration;
+      /**
+       * `false` declares the bare path only, no `/v1` twin. Two reasons, both
+       * checked by the guard: the Workflows/AI surface is deliberately
+       * unversioned (see OUT_OF_SCOPE_PATH_PREFIXES), and a route that has been
+       * RENAMED keeps its old spelling as an alias but must not appear under
+       * `/v1`, where only the new name is served.
+       */
+      versioned?: boolean;
+      /**
+       * `false` declares the `/v1` route only, no bare alias. For routes added
+       * AFTER the cut: there is no legacy caller to alias for, and shipping a
+       * deprecated path on the same day as the route it deprecates is silly.
+       */
+      alias?: boolean;
+    }) => {
+      const { path: routePath, methods, integration } = props;
+      const versioned = props.versioned ?? true;
+      const alias = props.alias ?? true;
+      // The ALIAS is declared first, and the order matters for one non-obvious
+      // reason. CDK derives an Integration's logical id from the first route
+      // that binds it, and integrations are shared across every route pointing
+      // at the same Lambda. Declaring `/v1` first renamed 23 existing
+      // integrations, which turned a purely additive deploy into one that
+      // replaced live resources. This way `cdk diff` is additions only.
+      if (alias) {
+        this.api.addRoutes({ path: routePath, methods, integration });
+      }
+      if (versioned) {
+        this.api.addRoutes({ path: `/v1${routePath}`, methods, integration });
+      }
+    };
+
+    addRoutes({
       path: "/health",
       methods: [apigwv2.HttpMethod.GET],
       integration: healthInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/me",
       methods: [apigwv2.HttpMethod.GET],
       integration: meInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/organizations",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: organizationsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/organizations/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
@@ -1790,45 +1892,45 @@ export class XorgateCoreApiStack extends cdk.Stack {
       integration: organizationsInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/memberships",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: membershipsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/memberships/{id}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: membershipsInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/api-keys",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: apiKeysInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/api-keys/{id}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: apiKeysInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/auth/session-tokens",
       methods: [apigwv2.HttpMethod.POST],
       integration: authSessionTokensInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/auth/live-credentials",
       methods: [apigwv2.HttpMethod.POST],
       integration: authLiveCredentialsInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/workspaces",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: workspacesInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workspaces/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
@@ -1838,12 +1940,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       integration: workspacesInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-models",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: deviceModelsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-models/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
@@ -1853,18 +1955,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       integration: deviceModelsInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/search",
       methods: [apigwv2.HttpMethod.GET],
       integration: searchInt,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: devicesInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
@@ -1877,46 +1979,46 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // Phase 2): PATCH /config validates + publishes the retained document and
     // bumps config_rev; PATCH /ui-prefs is cloud-only and does neither. Both go
     // to the devices Lambda, which dispatches on event.routeKey.
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/config",
       methods: [apigwv2.HttpMethod.PATCH],
       integration: devicesInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/ui-prefs",
       methods: [apigwv2.HttpMethod.PATCH],
       integration: devicesInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceProvisioningInt,
     });
     // One-shot commands. Separate routes rather than one /commands endpoint so
     // each action is independently visible in the route table and in docs.
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/reboot",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/power-off",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/refresh-state",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/update",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
 
     // Fleet-wide, not per-device: what the newest published agent build is.
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-dist/latest",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceDistInt,
@@ -1924,104 +2026,139 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     // Device registration (onboarding). The {code}/claim route is reached
     // unauthenticated by install.sh — the handler skips auth for it.
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-registrations",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceRegistrationsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-registrations/{code}",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceRegistrationsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/device-registrations/{code}/claim",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceRegistrationsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/get/{code}",
       methods: [apigwv2.HttpMethod.GET],
       integration: installScriptInt,
     });
-    this.api.addRoutes({
+    // The N11 rename: `video-channels` is the public name and the only one
+    // served under `/v1`. `kvs-channels` keeps answering unversioned so
+    // xorgate-web did not have to move in this release. Both reach the same
+    // handler and return the same body, which carries `channelRef` (the new
+    // field name) alongside `channelArn` (the old one) so the field rename is
+    // additive too.
+    //
+    // The DEPRECATED name is declared first, for the same reason the helper
+    // declares aliases before their `/v1` twins: whichever route binds the
+    // integration first owns its logical id, so leading with the existing route
+    // keeps the deploy additive instead of replacing a live integration.
+    addRoutes({
       path: "/devices/{id}/kvs-channels",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceKvsChannelsInt,
+      // DEPRECATED NAME, alias only. The `/v1` surface serves the N11 rename
+      // instead; see RENAMED_ROUTE_ALIASES in src/openapi/scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
+      path: "/devices/{id}/video-channels",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceKvsChannelsInt,
+    });
+    addRoutes({
       path: "/devices/{id}/identity",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceIdentityInt,
     });
     // Device-recorded media sessions (offline recording plan, Phase 4;
     // DELETE added in Phase 6.3).
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/sessions",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceSessionsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/sessions/{sessionId}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: deviceSessionsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/sessions/{sessionId}/segments",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceSessionsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/sessions/{sessionId}/segments/{seq}/playback",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceSessionsInt,
     });
     // Replay manifest (Composite Replays plan, Phase 2): gap-aware timeline +
     // batch-presigned segment URLs, one response per replay (R3).
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/replay-manifest",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceSessionsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/telemetry",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/telemetry/latest",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/telemetry/recent",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/telemetry/readings",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
 
-    this.api.addRoutes({
+    // The other N11 rename. Grant and revoke are one path with two methods, but
+    // two Lambdas: the grant needs org membership and the revoke deliberately
+    // does not (Phase 1), so they stayed separate handlers when the revoke
+    // shipped early under the new name. Deprecated name first, same reason as
+    // above.
+    addRoutes({
       path: "/iot/attach-policy",
       methods: [apigwv2.HttpMethod.POST],
       integration: iotAttachPolicyInt,
+      // DEPRECATED NAME, alias only. The `/v1` surface serves the N11 rename
+      // instead; see RENAMED_ROUTE_ALIASES in src/openapi/scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
+      path: "/live/access",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: iotAttachPolicyInt,
+    });
+    addRoutes({
       path: "/live/access",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: liveAccessInt,
     });
 
     // Workflow templates (org-scoped) + versioning.
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}",
       methods: [
         apigwv2.HttpMethod.GET,
@@ -2029,126 +2166,219 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.DELETE,
       ],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/draft",
       methods: [apigwv2.HttpMethod.PUT],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/versions/{versionId}/publish",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/versions/{versionId}/restore",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/usage",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowTemplatesInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Simulator (M3): create a simulation run / presign an input upload.
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/simulations",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-templates/{id}/simulations/uploads",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Per-org connector credentials (M7).
-    this.api.addRoutes({
+    addRoutes({
       path: "/organization-credentials",
       methods: [apigwv2.HttpMethod.GET],
       integration: organizationCredentialsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/organization-credentials/{provider}",
       methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
       integration: organizationCredentialsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/organization-credentials/{provider}/validate",
       methods: [apigwv2.HttpMethod.POST],
       integration: organizationCredentialsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Served node catalog (static per deployment, ETag cached).
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-catalog",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowCatalogInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Model registry (model pickers in node config forms).
-    this.api.addRoutes({
+    addRoutes({
       path: "/model-registry",
       methods: [apigwv2.HttpMethod.GET],
       integration: modelRegistryInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Device workflow attachments.
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/workflows",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: deviceWorkflowsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/workflows/{attachmentId}",
       methods: [apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
       integration: deviceWorkflowsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/workflows/{attachmentId}/run",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceWorkflowsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
     // Workflow runs (read + rerun).
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-runs",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-runs/{id}",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-runs/{id}/rerun",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowRunsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
     // Presigned GET for v2 run artifacts (Data Capture downloads etc., M3).
-    this.api.addRoutes({
+    addRoutes({
       path: "/workflow-runs/{id}/artifact-url",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/devices/{id}/workflow-runs",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
+      // Unversioned: the Workflows/AI surface is out of scope for the public
+      // document and makes no `/v1` stability promise. See scope.ts.
+      versioned: false,
     });
 
-    this.api.addRoutes({
+    addRoutes({
       path: "/docs",
       methods: [apigwv2.HttpMethod.GET],
       integration: docsInt,
     });
-    this.api.addRoutes({
+    addRoutes({
       path: "/openapi.json",
       methods: [apigwv2.HttpMethod.GET],
       integration: docsInt,
     });
+
+    // Custom domain. A ROOT mapping (no `ApiMappingKey`), because `/v1` is in
+    // the route table above: the domain and the version are independent, so the
+    // hostname can arrive late, move, or be removed without touching a route.
+    const customDomain = CUSTOM_DOMAINS[stage];
+    if (customDomain) {
+      const domainName = new apigwv2.DomainName(this, "ApiDomain", {
+        domainName: customDomain.hostname,
+        certificate: acm.Certificate.fromCertificateArn(
+          this,
+          "ApiDomainCert",
+          customDomain.certificateArn,
+        ),
+        // HTTP APIs can only map to a regional domain on TLS 1.2.
+        securityPolicy: apigwv2.SecurityPolicy.TLS_1_2,
+      });
+
+      new apigwv2.ApiMapping(this, "ApiDomainMapping", {
+        api: this.api,
+        domainName,
+      });
+
+      // What the user points a Cloudflare CNAME at. DNS is not in this account,
+      // so the record is a manual step and this output is the handoff.
+      new cdk.CfnOutput(this, "ApiDomainTarget", {
+        value: domainName.regionalDomainName,
+        description: `CNAME target for ${customDomain.hostname}`,
+      });
+      new cdk.CfnOutput(this, "ApiPublicUrl", {
+        value: `https://${customDomain.hostname}/v1`,
+        description: "Public, versioned API base URL",
+      });
+    }
 
     new cdk.CfnOutput(this, "ApiUrl", {
       value: this.api.apiEndpoint,

@@ -419,13 +419,13 @@ export function openApiSchemas(): Record<string, unknown> {
         'What a device model can do (`device_models.io_capabilities`). Each declared leaf maps to ' +
         'one telemetry metric namespace and/or one media stream key, and every section is ' +
         'optional so partial-capability hardware is describable. `media.video[].key` is what ' +
-        'becomes a KVS signaling channel at provisioning time; `sensors.imu` field lists become ' +
+        'becomes a video channel at provisioning time; `sensors.imu` field lists become ' +
         'the `imu.<prefix>_<field>` metrics; `comm` and `system` field lists become the `gps`, ' +
         '`signal` and `system` metric namespaces.\n\n' +
         'IMPORTANT: this shape is NOT enforced when you write a device model. ' +
         '`POST`/`PUT /device-models` accept any JSON object here. It IS parsed at provisioning ' +
         'time, and a document that fails to parse yields NO video stream keys, so the device is ' +
-        'provisioned with zero KVS channels and live video silently never works. Validate against ' +
+        'provisioned with zero video channels and live video silently never works. Validate against ' +
         'this schema yourself before writing.',
     },
     DeviceModel: {
@@ -949,15 +949,31 @@ export function openApiSchemas(): Record<string, unknown> {
         },
       },
     },
-    KvsChannel: {
+    VideoChannel: {
       type: 'object',
-      required: ['streamKey', 'channelName', 'channelArn', 'region'],
-      description: 'A KVS WebRTC signaling channel for the browser viewer.',
+      required: ['streamKey', 'channelName', 'channelRef', 'region'],
+      description:
+        'One live video channel a viewer can join. Renamed from `KvsChannel` at the `/v1` cut ' +
+        '(design note N11): nothing a consumer touches should require knowing which cloud ' +
+        'xorgate runs on.',
       properties: {
         streamKey: { type: 'string', example: 'cam0' },
         channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
-        channelArn: { type: 'string' },
+        channelRef: {
+          type: 'string',
+          description:
+            'Opaque handle for the channel. Pass it back to the SDK; do not parse it. The value ' +
+            'happens to be an ARN today and that is not part of the contract.',
+        },
         region: { type: 'string', example: 'us-east-1' },
+        channelArn: {
+          type: 'string',
+          deprecated: true,
+          description:
+            'The former name of `channelRef`, carrying the identical value. Still sent so the ' +
+            'rename is additive and no caller broke; it is removed when the `/v1` aliases are ' +
+            'retired. Read `channelRef`.',
+        },
       },
     },
     TelemetryReading: {

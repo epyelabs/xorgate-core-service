@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, eq } from 'drizzle-orm';
 import { S3Client } from '@aws-sdk/client-s3';
@@ -68,7 +69,7 @@ export const handler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
-  const routeKey = event.routeKey;
+  const routeKey = canonicalRouteKey(event);
   const templateId = event.pathParameters?.id;
 
   let auth;

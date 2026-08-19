@@ -1,3 +1,4 @@
+import { requestPath } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import {
@@ -54,7 +55,7 @@ export const handler = async (
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
   const code = event.pathParameters?.code;
-  const isClaim = event.rawPath.endsWith('/claim');
+  const isClaim = requestPath(event).endsWith('/claim');
 
   if (method === 'POST' && code && isClaim) return claimRegistration(event, code);
   if (method === 'POST' && !code) return createRegistration(event);

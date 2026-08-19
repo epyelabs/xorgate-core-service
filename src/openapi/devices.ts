@@ -258,7 +258,7 @@ export const devicesPaths = {
       operationId: 'deleteDevice',
       summary: 'Delete a device',
       description:
-        'Removes the row and everything cascading off it (identity, KVS channels, sessions, ' +
+        'Removes the row and everything cascading off it (identity, video channels, sessions, ' +
         'telemetry). The AWS IoT thing and certificate are NOT torn down by this endpoint.',
       tags: ['Devices'],
       responses: {
@@ -355,8 +355,8 @@ export const devicesPaths = {
       operationId: 'provisionDevice',
       summary: 'Provision device identity (owner/admin only)',
       description:
-        'Mints an AWS IoT thing + X.509 certificate, attaches the device policy, and creates a KVS ' +
-        'signaling channel per declared video stream. Returns the certificate, private key, and ' +
+        'Mints an AWS IoT thing + X.509 certificate, attaches the device policy, and creates a ' +
+        'video channel per declared video stream. Returns the certificate, private key, and ' +
         'connection endpoints exactly once, so persist them on the device immediately. A second ' +
         'call for an already-provisioned device returns 409; certificate rotation is not supported ' +
         'yet.',
