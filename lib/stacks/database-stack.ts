@@ -59,7 +59,20 @@ export class XorgateCoreDatabaseStack extends cdk.Stack {
       enableDataApi: true,
       defaultDatabaseName: 'xorgatedb',
       storageEncrypted: true,
-      deletionProtection: true,
+      // OFF for the first production bring-up, deliberately, and this should be
+      // turned back ON the day prod holds data anyone would miss.
+      //
+      // What it actually protects right now is an EMPTY database. What it costs
+      // right now is the ability to tear prod down and redo it, which a first
+      // bring-up often needs: with protection on, deleting the cluster is a
+      // manual console step that has to be done before the stack will go.
+      //
+      // `removalPolicy: RETAIN` below is the guard that still matters and is
+      // unchanged: `cdk destroy` will NOT delete this cluster either way. So the
+      // posture is "CDK cannot remove it, a human deliberately can", which is
+      // the right shape for an empty environment and the wrong shape for a full
+      // one. The trigger to flip it: the first real organization in prod.
+      deletionProtection: false,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
