@@ -1810,59 +1810,26 @@ export class XorgateCoreApiStack extends cdk.Stack {
     installScriptFn.addEnvironment("API_BASE_URL", this.api.apiEndpoint);
 
     // ---------------------------------------------------------------------
-    // The route table.
+    // The route table. EVERY route is served under `/v1`, and only under `/v1`.
     //
-    // Every in-scope route is declared TWICE by this helper: once under `/v1`
-    // (the public, documented name) and once at its bare path (the deprecated
-    // alias xorgate-web still calls). Phase 6 of
-    // plans/platform-auth-and-live-plane introduced the prefix; the sunset
-    // condition for the aliases is written down in `src/openapi/scope.ts`
-    // (ALIAS_SUNSET) and enforced by test/openapi-route-coverage.test.ts.
-    //
-    // `/v1` is a ROUTE, not a domain mapping. It could have been an
-    // `ApiMappingKey` on the custom domain instead, which would have cost ~5
-    // CloudFormation resources rather than ~116, but then the versioned surface
-    // would exist only where DNS points and could not be tested at all until a
-    // certificate did. Declaring it here keeps `/v1` working on the raw
-    // `execute-api` hostname and independent of the user's Cloudflare zone.
+    // Between 2026-08-19 and 2026-08-19 each route was also declared at its bare
+    // unversioned path, as a deprecated alias, so that xorgate-web did not have
+    // to move in the same release as the version cut. Those aliases are gone:
+    // xorgate-web is the only consumer of this API and it now calls `/v1`.
     //
     // Do NOT call `this.api.addRoutes` directly. The guard test fails the build
-    // if you do, because a route declared outside this helper silently skips
-    // the twinning and would exist under one name only.
+    // if you do, because a route declared outside this helper skips the prefix
+    // and would be reachable at a name this API no longer serves.
     const addRoutes = (props: {
       path: string;
       methods: apigwv2.HttpMethod[];
       integration: apigwv2.HttpRouteIntegration;
-      /**
-       * `false` declares the bare path only, no `/v1` twin. Two reasons, both
-       * checked by the guard: the Workflows/AI surface is deliberately
-       * unversioned (see OUT_OF_SCOPE_PATH_PREFIXES), and a route that has been
-       * RENAMED keeps its old spelling as an alias but must not appear under
-       * `/v1`, where only the new name is served.
-       */
-      versioned?: boolean;
-      /**
-       * `false` declares the `/v1` route only, no bare alias. For routes added
-       * AFTER the cut: there is no legacy caller to alias for, and shipping a
-       * deprecated path on the same day as the route it deprecates is silly.
-       */
-      alias?: boolean;
     }) => {
-      const { path: routePath, methods, integration } = props;
-      const versioned = props.versioned ?? true;
-      const alias = props.alias ?? true;
-      // The ALIAS is declared first, and the order matters for one non-obvious
-      // reason. CDK derives an Integration's logical id from the first route
-      // that binds it, and integrations are shared across every route pointing
-      // at the same Lambda. Declaring `/v1` first renamed 23 existing
-      // integrations, which turned a purely additive deploy into one that
-      // replaced live resources. This way `cdk diff` is additions only.
-      if (alias) {
-        this.api.addRoutes({ path: routePath, methods, integration });
-      }
-      if (versioned) {
-        this.api.addRoutes({ path: `/v1${routePath}`, methods, integration });
-      }
+      this.api.addRoutes({
+        path: `/v1${props.path}`,
+        methods: props.methods,
+        integration: props.integration,
+      });
     };
 
     addRoutes({
@@ -2046,25 +2013,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: installScriptInt,
     });
-    // The N11 rename: `video-channels` is the public name and the only one
-    // served under `/v1`. `kvs-channels` keeps answering unversioned so
-    // xorgate-web did not have to move in this release. Both reach the same
-    // handler and return the same body, which carries `channelRef` (the new
-    // field name) alongside `channelArn` (the old one) so the field rename is
-    // additive too.
-    //
-    // The DEPRECATED name is declared first, for the same reason the helper
-    // declares aliases before their `/v1` twins: whichever route binds the
-    // integration first owns its logical id, so leading with the existing route
-    // keeps the deploy additive instead of replacing a live integration.
-    addRoutes({
-      path: "/devices/{id}/kvs-channels",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: deviceKvsChannelsInt,
-      // DEPRECATED NAME, alias only. The `/v1` surface serves the N11 rename
-      // instead; see RENAMED_ROUTE_ALIASES in src/openapi/scope.ts.
-      versioned: false,
-    });
+    // The N11 rename, now the only name: `kvs-channels` is gone.
     addRoutes({
       path: "/devices/{id}/video-channels",
       methods: [apigwv2.HttpMethod.GET],
@@ -2125,19 +2074,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       integration: telemetryHistoryInt,
     });
 
-    // The other N11 rename. Grant and revoke are one path with two methods, but
-    // two Lambdas: the grant needs org membership and the revoke deliberately
-    // does not (Phase 1), so they stayed separate handlers when the revoke
-    // shipped early under the new name. Deprecated name first, same reason as
-    // above.
-    addRoutes({
-      path: "/iot/attach-policy",
-      methods: [apigwv2.HttpMethod.POST],
-      integration: iotAttachPolicyInt,
-      // DEPRECATED NAME, alias only. The `/v1` surface serves the N11 rename
-      // instead; see RENAMED_ROUTE_ALIASES in src/openapi/scope.ts.
-      versioned: false,
-    });
+    // The other N11 rename, now the only name: `iot/attach-policy` is gone.
+    // Grant and revoke share a path but not a Lambda: the grant needs org
+    // membership and the revoke deliberately does not (Phase 1).
     addRoutes({
       path: "/live/access",
       methods: [apigwv2.HttpMethod.POST],
@@ -2154,9 +2093,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-templates",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}",
@@ -2166,41 +2102,26 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.DELETE,
       ],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}/draft",
       methods: [apigwv2.HttpMethod.PUT],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}/versions/{versionId}/publish",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}/versions/{versionId}/restore",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}/usage",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowTemplatesInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Simulator (M3): create a simulation run / presign an input upload.
@@ -2208,17 +2129,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-templates/{id}/simulations",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-templates/{id}/simulations/uploads",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Per-org connector credentials (M7).
@@ -2226,25 +2141,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/organization-credentials",
       methods: [apigwv2.HttpMethod.GET],
       integration: organizationCredentialsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/organization-credentials/{provider}",
       methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
       integration: organizationCredentialsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/organization-credentials/{provider}/validate",
       methods: [apigwv2.HttpMethod.POST],
       integration: organizationCredentialsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Served node catalog (static per deployment, ETag cached).
@@ -2252,9 +2158,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-catalog",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowCatalogInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Model registry (model pickers in node config forms).
@@ -2262,9 +2165,6 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/model-registry",
       methods: [apigwv2.HttpMethod.GET],
       integration: modelRegistryInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Device workflow attachments.
@@ -2272,25 +2172,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/workflows",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: deviceWorkflowsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/devices/{id}/workflows/{attachmentId}",
       methods: [apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
       integration: deviceWorkflowsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/devices/{id}/workflows/{attachmentId}/run",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceWorkflowsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     // Workflow runs (read + rerun).
@@ -2298,42 +2189,27 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/workflow-runs",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-runs/{id}",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/workflow-runs/{id}/rerun",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowRunsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     // Presigned GET for v2 run artifacts (Data Capture downloads etc., M3).
     addRoutes({
       path: "/workflow-runs/{id}/artifact-url",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
     addRoutes({
       path: "/devices/{id}/workflow-runs",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
-      // Unversioned: the Workflows/AI surface is out of scope for the public
-      // document and makes no `/v1` stability promise. See scope.ts.
-      versioned: false,
     });
 
     addRoutes({

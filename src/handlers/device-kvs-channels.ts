@@ -57,13 +57,14 @@ export const handler = async (
     },
   });
 
-  // `channelRef` is `channelArn` under the N11 name (Phase 6): a consumer gets an
-  // opaque handle rather than a field that names the cloud we happen to run on.
-  // Both are sent, on BOTH the `/v1` route and its alias, because a field rename
-  // cannot ride a path alias — an additive field is the only shape that leaves
-  // xorgate-web (which reads `channelArn`) working. `channelArn` goes away with
-  // the aliases; see ALIAS_SUNSET in src/openapi/scope.ts.
-  const channels = rows.map((row) => ({ ...row, channelRef: row.channelArn }));
+  // The column is `channel_arn`; the public field is `channelRef` (N11). The
+  // value is unchanged and is an ARN, which is why it is documented as opaque
+  // rather than as a URL or an id. `channelArn` was sent alongside it during
+  // the alias period and was removed with the unversioned paths.
+  const channels = rows.map(({ channelArn, ...rest }) => ({
+    ...rest,
+    channelRef: channelArn,
+  }));
 
   return ok({ channels });
 };

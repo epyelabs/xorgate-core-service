@@ -3,10 +3,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildOpenApiDocument } from '../src/openapi/index';
 import {
-  ALIAS_EXEMPT_ROUTES,
   API_VERSION_PREFIX,
   INTERNAL_ROUTES,
-  RENAMED_ROUTE_ALIASES,
   isOutOfScopePath,
   isVersionedRoute,
   unversionRoute,
@@ -26,11 +24,10 @@ import {
  * shape fails loudly here instead of quietly matching nothing.
  *
  * Since Phase 6 the table also carries the `/v1` cut. `addRoutes` is a LOCAL
- * helper in the stack that declares each route twice, so this file has to model
- * the same expansion the helper performs. The risk that creates — a rule modeled
- * in two places — is closed by `declares no route outside the twinning helper`
- * below, which is what stops a route from reaching the API without going
- * through the helper at all.
+ * helper in the stack that prefixes every path, so this file has to apply the
+ * same prefix when it compares. The risk that creates — a rule modeled in two
+ * places — is closed by `declares no route outside the prefixing helper` below,
+ * which is what stops a route from reaching the API unprefixed.
  */
 
 const API_STACK = join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts');
@@ -38,12 +35,12 @@ const API_STACK = join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts');
 /** Trips if `addRoutes` is ever reshaped so the regex stops matching. */
 const MIN_EXPECTED_ROUTES = 40;
 
-/** One `addRoutes({...})` call, before the `/v1` expansion. */
+/** One `addRoutes({...})` call, before the `/v1` prefix is applied. */
 interface Declaration {
   path: string;
   methods: string[];
-  versioned: boolean;
-  alias: boolean;
+  /** Everything after `methods`, so a resurrected opt-out can be spotted. */
+  options: string;
 }
 
 const ADD_ROUTES_RE =
@@ -56,24 +53,17 @@ function declarations(): Declaration[] {
     const [, path, methodsText, rest] = match;
     const methods = [...methodsText.matchAll(/HttpMethod\.([A-Z]+)/g)].map((m) => m[1]);
     expect(methods.length, `no methods parsed for ${path}`).toBeGreaterThan(0);
-    out.push({
-      path,
-      methods,
-      versioned: !/\bversioned:\s*false\b/.test(rest),
-      alias: !/\balias:\s*false\b/.test(rest),
-    });
+    out.push({ path, methods, options: rest });
   }
   return out;
 }
 
-/** Every route key the API actually serves, after the helper's expansion. */
+/** Every route key the API actually serves, after the helper applies `/v1`. */
 function declaredRoutes(): string[] {
   const routes: string[] = [];
   for (const decl of declarations()) {
     for (const method of decl.methods) {
-      const key = `${method} ${decl.path}`;
-      if (decl.versioned) routes.push(versionedRoute(key));
-      if (decl.alias) routes.push(key);
+      routes.push(versionedRoute(`${method} ${decl.path}`));
     }
   }
   return routes;
@@ -151,107 +141,59 @@ describe('OpenAPI route coverage', () => {
 });
 
 /**
- * The `/v1` cut and its alias period. These tests are the sunset checklist:
- * retiring the aliases means deleting them, and until someone does, they stop
- * the deprecated half from being dropped by accident or documented by mistake.
- *
- * The thing they exist to catch is asymmetric: a test that only proves `/v1/foo`
- * works proves nothing about whether `foo` still answers, and `foo` is the half
- * that keeps xorgate-web alive.
+ * The `/v1` cut. The alias period ran from 2026-08-19 to 2026-08-19 and is over:
+ * there is no unversioned surface, so the tests that policed the deprecated half
+ * were deleted with it. What survives is the pair of rules that keep `/v1` from
+ * quietly acquiring an exception.
  */
-describe('the /v1 alias period', () => {
-  const decls = declarations();
+describe('the /v1 surface', () => {
   const routes = declaredRoutes();
   const documented = documentedOperations();
-  const declared = new Set(routes);
 
-  it('declares no route outside the twinning helper', () => {
-    // Without this, a route added with `this.api.addRoutes` would exist under
-    // exactly one name and every other test here would still pass, because
-    // they all read the same text this rule protects.
+  it('declares no route outside the prefixing helper', () => {
+    // Without this, a route added with `this.api.addRoutes` would be served
+    // unprefixed and every other test here would still pass, because they all
+    // read the same text this rule protects.
     const source = readFileSync(API_STACK, 'utf8');
     const direct = [...source.matchAll(/this\.api\.addRoutes\(/g)].length;
-    expect(
-      direct,
-      'this.api.addRoutes may only be called by the addRoutes helper (twice: /v1 and the alias)',
-    ).toBe(2);
+    expect(direct, 'this.api.addRoutes may only be called by the addRoutes helper').toBe(1);
   });
 
-  it('serves every documented route under /v1', () => {
+  it('offers no way to opt a route out of the prefix', () => {
+    // `addRoutes` used to take `alias` and `versioned` flags. They are gone, and
+    // the helper would ignore them if reintroduced by copy-paste from an old
+    // commit, which is the quiet way a route would end up unprefixed or
+    // resurrected as an alias.
+    const offenders = declarations()
+      .filter((d) => /\b(alias|versioned)\s*:/.test(d.options))
+      .map((d) => d.path);
+    expect(offenders, 'addRoutes takes no alias/versioned option any more').toEqual([]);
+  });
+
+  it('serves nothing outside /v1', () => {
+    expect(routes.filter((route) => !isVersionedRoute(route))).toEqual([]);
     const bare = [...documented.keys()].filter((route) => !isVersionedRoute(route));
-    expect(bare, 'the document must describe the /v1 names only').toEqual([]);
+    expect(bare, 'the document must describe /v1 names only').toEqual([]);
   });
 
-  it('keeps an unversioned alias for every /v1 route', () => {
-    const missing = routes
-      .filter(isVersionedRoute)
-      .map(unversionRoute)
-      .filter((route) => !ALIAS_EXEMPT_ROUTES.includes(route))
-      .filter((route) => !declared.has(route));
-    expect(
-      missing,
-      'these /v1 routes lost their unversioned alias. If that is deliberate, the alias sunset ' +
-        'has arrived: read ALIAS_SUNSET in src/openapi/scope.ts and retire the whole set, or add ' +
-        'the route to ALIAS_EXEMPT_ROUTES if it postdates the cut.',
-    ).toEqual([]);
-  });
-
-  it('documents no alias as an operation', () => {
-    const documentedAliases = [...documented.keys()].filter((route) => !isVersionedRoute(route));
-    expect(documentedAliases, 'aliases are a deprecation note, not operations').toEqual([]);
-  });
-
-  it('serves both halves of every N11 rename, and only the new name under /v1', () => {
-    for (const [oldRoute, newRoute] of Object.entries(RENAMED_ROUTE_ALIASES)) {
-      expect(declared.has(oldRoute), `${oldRoute} must keep answering unversioned`).toBe(true);
-      expect(declared.has(newRoute), `${newRoute} must be served`).toBe(true);
-      expect(declared.has(versionedRoute(newRoute)), `${newRoute} must be served under /v1`).toBe(
-        true,
-      );
-      expect(
-        declared.has(versionedRoute(oldRoute)),
-        `${oldRoute} must NOT exist under /v1: the versioned surface carries new names only`,
-      ).toBe(false);
-      expect(documented.has(versionedRoute(newRoute)), `${newRoute} must be documented`).toBe(true);
-      expect(documented.has(oldRoute), `${oldRoute} must not be documented`).toBe(false);
-    }
-  });
-
-  it('leaves the Workflows surface unversioned', () => {
-    const versionedOutOfScope = decls
-      .filter((decl) => isOutOfScopePath(decl.path))
-      .filter((decl) => decl.versioned)
-      .map((decl) => decl.path);
-    expect(
-      versionedOutOfScope,
-      'the Workflows surface makes no /v1 promise; see OUT_OF_SCOPE_PATH_PREFIXES',
-    ).toEqual([]);
-  });
-
-  it('keeps the renamed response field additive until sunset', () => {
-    // A field rename cannot ride a path alias: both spellings have to be on the
-    // wire, on BOTH routes, or xorgate-web (which reads `channelArn`) breaks.
-    // The document describes `channelRef` as required and `channelArn` as
-    // deprecated, and the handler has to actually send both.
+  it('renames the field on the wire, and sends the old name nowhere', () => {
+    // `channelRef` is the public name for a column still called `channel_arn`.
+    // The handler has to do that rename; the document has to describe only the
+    // new name. `channelArn` was sent alongside it during the alias period.
     const doc = buildOpenApiDocument('https://api.example.test') as {
-      components: { schemas: Record<string, { required?: string[]; properties?: Record<string, { deprecated?: boolean }> }> };
+      components: { schemas: Record<string, { required?: string[]; properties?: Record<string, unknown> }> };
     };
     const schema = doc.components.schemas.VideoChannel;
-    expect(schema, 'VideoChannel schema is gone').toBeDefined();
     expect(schema.required).toContain('channelRef');
-    expect(schema.required, 'the deprecated spelling must not be required').not.toContain('channelArn');
-    expect(
-      schema.properties?.channelArn?.deprecated,
-      'channelArn must stay documented AND flagged deprecated while it is still sent',
-    ).toBe(true);
+    expect(Object.keys(schema.properties ?? {})).not.toContain('channelArn');
 
     const handler = readFileSync(
       join(__dirname, '..', 'src', 'handlers', 'device-kvs-channels.ts'),
       'utf8',
     );
     expect(
-      /channelRef:\s*row\.channelArn/.test(handler),
-      'device-kvs-channels must still map channelArn onto channelRef',
+      /channelRef:\s*channelArn/.test(handler),
+      'device-kvs-channels must still map the channel_arn column onto channelRef',
     ).toBe(true);
   });
 

@@ -953,9 +953,7 @@ export function openApiSchemas(): Record<string, unknown> {
       type: 'object',
       required: ['streamKey', 'channelName', 'channelRef', 'region'],
       description:
-        'One live video channel a viewer can join. Renamed from `KvsChannel` at the `/v1` cut ' +
-        '(design note N11): nothing a consumer touches should require knowing which cloud ' +
-        'xorgate runs on.',
+        'One live video channel a viewer can join.',
       properties: {
         streamKey: { type: 'string', example: 'cam0' },
         channelName: { type: 'string', description: '`${deviceId}-${streamKey}`' },
@@ -966,14 +964,6 @@ export function openApiSchemas(): Record<string, unknown> {
             'happens to be an ARN today and that is not part of the contract.',
         },
         region: { type: 'string', example: 'us-east-1' },
-        channelArn: {
-          type: 'string',
-          deprecated: true,
-          description:
-            'The former name of `channelRef`, carrying the identical value. Still sent so the ' +
-            'rename is additive and no caller broke; it is removed when the `/v1` aliases are ' +
-            'retired. Read `channelRef`.',
-        },
       },
     },
     TelemetryReading: {

@@ -129,14 +129,8 @@ const DESCRIPTION = [
   '',
   '**Versioning.** Every path in this document is served under `/v1`, and that prefix is part',
   'of the path rather than of the host, so a base URL is a bare origin such as',
-  '`https://api-dev.xorgate.io` and the operation below appends `/v1/...` to it.',
-  '',
-  'Every one of these paths ALSO answers without the prefix, and two of them answer under an',
-  'older name as well (`GET /devices/{id}/kvs-channels` for `GET /devices/{id}/video-channels`,',
-  'and `POST /iot/attach-policy` for `POST /live/access`). Those unversioned and renamed-from',
-  'paths are DEPRECATED, exist only so the first-party dashboard did not have to move in the',
-  'same release, and are not operations in this document. Do not build on them: they are removed',
-  'once xorgate-web calls the `/v1` names. New integrations should use `/v1` exclusively.',
+  '`https://api-dev.xorgate.io` and the operations below append `/v1/...` to it. There is no',
+  'unversioned surface: a request without the prefix is a 404.',
   '',
   '**Authentication.** Every endpoint except `/health` and this document requires',
   '`Authorization: Bearer <credential>`, and there are three kinds, told apart by their prefix in',
@@ -211,11 +205,12 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
-      // 0.6.0: the `/v1` cut. Every path key below gained the prefix, two
-      // routes were renamed (N11), and `VideoChannel` replaced `KvsChannel`.
-      // Comfortably the same bar the previous four bumps were held to: this is
-      // the largest change to the described surface any of them made.
-      version: '0.6.0',
+      // 0.7.0: the unversioned paths are gone. `/v1` is the whole surface, the
+      // two renamed-from paths no longer answer, and the deprecated
+      // `channelArn` field was removed from `VideoChannel`. The most breaking
+      // release this document has had, which is exactly why it happened before
+      // anyone outside xorgate consumed it.
+      version: '0.7.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so
