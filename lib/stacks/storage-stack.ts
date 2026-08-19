@@ -52,15 +52,31 @@ export class XorgateCoreStorageStack extends cdk.Stack {
       enforceSSL: true,
       cors: [
         {
-          allowedOrigins: [
-            'http://localhost:*',
-            'https://xorgate.ai',
-            'http://dev.xorgate.io.s3-website-us-east-1.amazonaws.com',
-            'http://www.xorgate.io.s3-website-us-east-1.amazonaws.com',
-            'https://d3u971sluio616.cloudfront.net',
-            'https://dev.xorgate.io',
-            'https://www.xorgate.io',
-          ],
+          // Every origin, for the same reason the API answers every origin.
+          // The long form is above the CORS block in `lib/stacks/api-stack.ts`;
+          // the part specific to this bucket:
+          //
+          // Nothing here is reachable without a signature. `BlockPublicAccess`
+          // is BLOCK_ALL and `enforceSSL` is on, so an unsigned request is
+          // refused whatever origin it claims. What a browser actually holds is
+          // a PRESIGNED url, which carries its own authority and its own expiry
+          // in the query string, and anything holding one can spend it from a
+          // server where CORS does not apply. So an origin list here refuses
+          // honest callers and stops no attacker.
+          //
+          // It was refusing honest callers. Three handlers hand a browser a
+          // presigned url on a consumer-reachable gate (`device-sessions.ts`
+          // for recorded video segments, `workflow-runs.ts` and
+          // `workflow-simulations.ts` for run artifacts, all
+          // `requireOrgContext` or `requireOrgWideContext`, so an API key or a
+          // session token reaches all three). Before this, a third-party
+          // application could fetch a url from the API and then be refused by
+          // this bucket when its browser tried to use it: a 200 followed by a
+          // CORS failure, which is the least debuggable pair in the platform.
+          //
+          // Same guard as the API: do not add a credentialed mode here. Phase 5
+          // of plans/platform-auth-and-live-plane, 2026-08-18.
+          allowedOrigins: ['*'],
           allowedMethods: [s3.HttpMethods.GET, s3.HttpMethods.PUT, s3.HttpMethods.POST],
           allowedHeaders: ['*'],
           maxAge: 3000,

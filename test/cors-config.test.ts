@@ -29,6 +29,7 @@ import { describe, expect, it } from 'vitest';
  */
 
 const API_STACK = join(__dirname, '../lib/stacks/api-stack.ts');
+const STORAGE_STACK = join(__dirname, '../lib/stacks/storage-stack.ts');
 const SRC_DIR = join(__dirname, '../src');
 
 function walk(dir: string): string[] {
@@ -79,5 +80,33 @@ describe('CORS configuration', () => {
   it('authenticates from the Authorization header, not an ambient credential', () => {
     const auth = readFileSync(join(SRC_DIR, 'middleware/auth.ts'), 'utf8');
     expect(auth).toMatch(/headers\['authorization'\]/);
+  });
+});
+
+/**
+ * The bucket has its own CORS list, and it was the second half of the same
+ * problem: three consumer-reachable handlers hand a browser a presigned url, so
+ * an origin list here turned a 200 from the API into a CORS failure at the
+ * bucket for any third-party application. Widened with the API, on the same
+ * reasoning, and guarded here so the two cannot drift apart silently.
+ */
+describe('S3 bucket CORS', () => {
+  const storage = readFileSync(STORAGE_STACK, 'utf8');
+
+  it('answers every origin, matching the API', () => {
+    expect(storage).toMatch(/allowedOrigins:\s*\['\*'\]/);
+  });
+
+  it('keeps BlockPublicAccess BLOCK_ALL, which is what makes that safe', () => {
+    // The wildcard is defensible only because an unsigned request is refused
+    // whatever origin it claims. If this ever relaxes, the origin list stops
+    // being the thing that does not matter.
+    expect(storage).toMatch(/blockPublicAccess:\s*s3\.BlockPublicAccess\.BLOCK_ALL/);
+    expect(storage).toMatch(/enforceSSL:\s*true/);
+  });
+
+  it('keeps the reasoning next to the decision', () => {
+    const i = storage.indexOf("allowedOrigins: ['*']");
+    expect(storage.slice(Math.max(0, i - 2000), i)).toMatch(/presigned/i);
   });
 });
