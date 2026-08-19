@@ -99,12 +99,20 @@ if (stage === 'prod') {
     stage,
     telemetryRetention,
     telemetryRetentionDays,
-    vpc: storageStack.vpc,
+    // NO `vpc` and NO `dbSecurityGroup`, deliberately, which puts the prod
+    // Lambdas on exactly the same footing as dev's: not VPC-attached, reaching
+    // Postgres over the RDS Data API (src/db/index.ts speaks nothing else).
+    // Passing `vpc` here is what would attach every DB-touching Lambda to a
+    // PRIVATE_WITH_EGRESS subnet, which is what would require a NAT gateway,
+    // and it would add the VPC cold-start penalty on top. The cluster still
+    // lives in the VPC's isolated subnets; only the Lambdas stay out.
+    //
+    // Reversing this is a one-line change plus a NAT gateway. It does not touch
+    // the database.
     bucket: storageStack.bucket,
     distBucket: storageStack.distBucket,
     dbCluster: databaseStack.cluster,
     dbSecret: databaseStack.dbSecret,
-    dbSecurityGroup: databaseStack.dbSecurityGroup,
     dbName: 'xorgatedb',
     userPoolId: authStack.userPool.userPoolId,
     userPoolClientId: authStack.userPoolClient.userPoolClientId,
