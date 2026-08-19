@@ -92,6 +92,10 @@ if (stage === 'prod') {
     env,
     stage,
     bucket: storageStack.bucket,
+    // Share the storage stack's VPC rather than building a second one for the
+    // same environment. Its public subnets are what Fargate needs, and the
+    // account is at the default 5-VPC-per-region limit.
+    vpc: storageStack.vpc,
   });
 
   new XorgateCoreApiStack(app, 'XorgateCoreApiStack', {

@@ -12,6 +12,17 @@ export interface XorgateCoreRecorderStackProps extends cdk.StackProps {
   // Core bucket; the engine runner reads device-recorded media segments from
   // media-sessions/v1/ and writes v2 run artifacts under workflows/v2/.
   bucket: s3.Bucket;
+  /**
+   * An existing VPC to run Fargate tasks in. Prod passes the storage stack's,
+   * which already has the public subnets these tasks need; dev passes nothing
+   * and gets a dedicated one, because dev's storage stack builds no VPC.
+   *
+   * This is not just tidiness. The account is at the default limit of 5 VPCs
+   * per region, and a first prod deploy failed here with "The maximum number of
+   * VPCs has been reached" (2026-08-19) while trying to make a second one for a
+   * single environment.
+   */
+  vpc?: ec2.IVpc;
 }
 
 /**
@@ -53,14 +64,19 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     const suffix = isProd ? '' : 'Dev';
     const removalPolicy = isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
 
-    // Public-only VPC, no NAT (tasks use a public IP to reach KVS/S3/TURN).
-    const vpc = new ec2.Vpc(this, 'RecorderVpc', {
-      maxAzs: 2,
-      natGateways: 0,
-      subnetConfiguration: [
-        { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
-      ],
-    });
+    // Reuse the caller's VPC when given one (prod), otherwise build a
+    // public-only VPC with no NAT (dev). Either way tasks get a public IP and
+    // reach S3/KVS/TURN directly, which is what keeps the NAT gateway off the
+    // bill in both stages.
+    const vpc =
+      props.vpc ??
+      new ec2.Vpc(this, 'RecorderVpc', {
+        maxAzs: 2,
+        natGateways: 0,
+        subnetConfiguration: [
+          { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
+        ],
+      });
 
     this.securityGroup = new ec2.SecurityGroup(this, 'RecorderSG', {
       vpc,
