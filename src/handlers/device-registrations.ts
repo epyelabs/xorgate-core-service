@@ -26,7 +26,12 @@ const REGISTRATION_TTL_MS = 15 * 60 * 1000;
 function apiBaseUrl(): string {
   const v = process.env.API_BASE_URL;
   if (!v) throw new Error('API_BASE_URL env var is not set');
-  return v.replace(/\/$/, '');
+  // API_BASE_URL is a bare origin; the version lives here, with every other
+  // route. The installer's two endpoints (`/v1/get/{code}` and
+  // `/v1/device-registrations/{code}/claim`) are as versioned as the rest of
+  // the API since the unversioned paths were deleted. Registration codes live
+  // 15 minutes, so no previously-issued URL outlived the change.
+  return `${v.replace(/\/$/, '')}/v1`;
 }
 
 interface RegistrationView {

@@ -31,12 +31,30 @@ export class XorgateCoreStorageStack extends cdk.Stack {
       retentionCtx === undefined || retentionCtx === null ? 90 : Number(retentionCtx);
 
     if (isProd) {
+      // NO NAT GATEWAY, and no PRIVATE_WITH_EGRESS subnets that would need one.
+      //
+      // This VPC exists for ONE reason: RDS requires a VPC, and a cluster's VPC
+      // can never be changed after creation, so it has to be right on day one.
+      // Aurora lives in the ISOLATED subnets, which by definition route nowhere
+      // and have never needed a NAT.
+      //
+      // Nothing else in prod needs private egress either. The API Lambdas are
+      // deliberately NOT attached to this VPC (see bin/app.ts): they reach
+      // Postgres over the RDS Data API, exactly as dev does, and every other
+      // dependency (S3, IoT, KVS, Secrets Manager, STS, ECS) is a public AWS
+      // endpoint. Fargate tasks run in the recorder stack's own public-only VPC
+      // with a public IP, which is the same trick this is.
+      //
+      // A NAT gateway is roughly $33/month plus data processing to buy egress
+      // nothing currently wants. Adding one later is PURELY ADDITIVE — a NAT
+      // gateway, a PRIVATE_WITH_EGRESS subnet group and a route table — and it
+      // does not touch the database, because isolated subnets do not route
+      // through it either way.
       this.vpc = new ec2.Vpc(this, 'XorgateVpc', {
         maxAzs: 2,
-        natGateways: 1,
+        natGateways: 0,
         subnetConfiguration: [
           { name: 'Public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
-          { name: 'Private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
           { name: 'Isolated', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 28 },
         ],
       });

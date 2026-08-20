@@ -6,11 +6,10 @@
  * do that, and take the authorization away again.
  *
  * Two N11 renames landed here at the `/v1` cut (Phase 6 of
- * plans/platform-auth-and-live-plane). `GET /devices/{id}/kvs-channels` is now
- * `GET /devices/{id}/video-channels`, and `POST /iot/attach-policy` is now
- * `POST /live/access`, joining the `DELETE /live/access` Phase 1 shipped. The
- * old paths still answer unversioned and are listed in `scope.ts`'s
- * `RENAMED_ROUTE_ALIASES`; they are deliberately not operations here.
+ * plans/platform-auth-and-live-plane): `kvs-channels` became `video-channels`,
+ * and `iot/attach-policy` became `POST /live/access`, joining the
+ * `DELETE /live/access` Phase 1 shipped. The old paths answered unversioned
+ * during a short alias period and were deleted with it.
  *
  * The video-channel operation is a CONSUMER path, so it drops AWS vocabulary
  * entirely. The two access operations are the first-party dashboard's own path
@@ -30,9 +29,7 @@ export const livePaths = {
         'Channel METADATA only, one entry per provisioned video stream, and no credentials: a ' +
         'viewer obtains its own scoped credentials from `POST /auth/live-credentials` and then ' +
         'joins these channels as a viewer. An empty array means the device is not provisioned ' +
-        'yet, which is a 200 rather than a 404. Video frames never traverse this API.\n\n' +
-        'Renamed from `GET /devices/{id}/kvs-channels`, which still answers unversioned during ' +
-        'the alias period and is not served under `/v1`.',
+        'yet, which is a 200 rather than a 404. Video frames never traverse this API.',
       tags: ['Live'],
       responses: {
         '200': {
@@ -65,8 +62,6 @@ export const livePaths = {
         'Cognito identity from the bearer token and authorizes that identity to connect to the ' +
         'realtime broker and subscribe to `xorgate/devices/{deviceId}/telemetry`. Idempotent, so ' +
         'calling it on every page load is fine.\n\n' +
-        'Renamed from `POST /iot/attach-policy`, which still answers unversioned during the alias ' +
-        'period and is not served under `/v1`.\n\n' +
         '**Third parties do not use this.** `POST /auth/live-credentials` is the third-party ' +
         'entry to the live plane: it needs no Cognito identity, works with any of the three ' +
         'credentials, and comes back scoped to the caller\'s organization or workspace. This ' +

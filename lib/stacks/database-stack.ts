@@ -34,8 +34,24 @@ export class XorgateCoreDatabaseStack extends cdk.Stack {
         version: rds.AuroraPostgresEngineVersion.VER_17_5,
       }),
       credentials,
-      serverlessV2MinCapacity: 0.5,
-      serverlessV2MaxCapacity: 8,
+      // Matches the shared sandbox cluster (epye-sandbox-db) exactly: min 0 ACU
+      // with a 30-minute auto-pause, max 4. A 0.5 ACU floor never pauses and
+      // bills around $44/month for an idle cluster; 0 bills nothing while
+      // nothing is connected, which is the right shape for an environment that
+      // does not exist yet and will start empty.
+      //
+      // Safe here specifically because BOTH stages reach Postgres over the RDS
+      // Data API (src/db/index.ts uses drizzle-orm/aws-data-api/pg), which
+      // resumes a paused cluster transparently. A direct connection pool would
+      // see errors on the first call after a pause instead. The cost is a cold
+      // resume of a few seconds on the first request after idle, on top of the
+      // Lambda cold start.
+      //
+      // Note it will only actually pause if nothing is connected. The dev
+      // cluster never does, because live telemetry ingest writes every 30-45 s.
+      serverlessV2MinCapacity: 0,
+      serverlessV2MaxCapacity: 4,
+      serverlessV2AutoPauseDuration: cdk.Duration.minutes(30),
       writer: rds.ClusterInstance.serverlessV2('writer'),
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
@@ -43,7 +59,20 @@ export class XorgateCoreDatabaseStack extends cdk.Stack {
       enableDataApi: true,
       defaultDatabaseName: 'xorgatedb',
       storageEncrypted: true,
-      deletionProtection: true,
+      // OFF for the first production bring-up, deliberately, and this should be
+      // turned back ON the day prod holds data anyone would miss.
+      //
+      // What it actually protects right now is an EMPTY database. What it costs
+      // right now is the ability to tear prod down and redo it, which a first
+      // bring-up often needs: with protection on, deleting the cluster is a
+      // manual console step that has to be done before the stack will go.
+      //
+      // `removalPolicy: RETAIN` below is the guard that still matters and is
+      // unchanged: `cdk destroy` will NOT delete this cluster either way. So the
+      // posture is "CDK cannot remove it, a human deliberately can", which is
+      // the right shape for an empty environment and the wrong shape for a full
+      // one. The trigger to flip it: the first real organization in prod.
+      deletionProtection: false,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
