@@ -41,19 +41,31 @@ if (stage !== 'dev' && stage !== 'prod') {
   );
 }
 
-// Cron jobs (OfflineSweeper) poll the shared sandbox Aurora via Data API and
-// block its auto-pause (~$1.45/day). Default OFF in dev; override with
-// --context scheduledJobs=on (or =off to force-disable).
+// Cron jobs poll Aurora via the Data API every minute (OfflineSweeper and
+// WorkflowScheduler both run at `rate(1 minute)`), which keeps the cluster
+// awake and stops it auto-pausing. On the shared sandbox that costs ~$1.45/day.
+//
+// DEFAULT OFF IN BOTH STAGES as of 2026-08-19. Dev has always been off for the
+// cost reason. Prod joined it because prod was created empty, on a cluster
+// deliberately configured with a 0-ACU floor and a 30-minute auto-pause: a
+// one-minute poller with no devices and no workflows to act on would have
+// billed a full always-on cluster to do nothing, which is exactly what the
+// 0-ACU floor was chosen to avoid.
+//
+// >>> TURN THIS ON FOR PROD BEFORE PROD CARRIES ANYTHING. <<<
+// With it off, devices are never marked offline and scheduled workflows never
+// fire. The trigger is the first real device or the first workflow schedule in
+// production, not a date:
+//
+//   npm run deploy:prod -- --context scheduledJobs=on
+//
+// (or flip the default below, which is better once prod is permanently live).
 const scheduledJobsCtx = app.node.tryGetContext('scheduledJobs') as
   | 'on'
   | 'off'
   | undefined;
 const disableScheduledJobs =
-  scheduledJobsCtx === 'on'
-    ? false
-    : scheduledJobsCtx === 'off'
-      ? true
-      : stage === 'dev';
+  scheduledJobsCtx === 'on' ? false : scheduledJobsCtx === 'off' ? true : true;
 
 // Telemetry retention (improve-recording-history-fetching plan, phase 4).
 // SHIPS DORMANT AND STAYS DORMANT until someone opts in on the command line:
@@ -101,6 +113,9 @@ if (stage === 'prod') {
   new XorgateCoreApiStack(app, 'XorgateCoreApiStack', {
     env,
     stage,
+    // Prod did not pass this at all until 2026-08-19, so the schedules were
+    // silently enabled there while dev disabled them. See the note above.
+    disableScheduledJobs,
     telemetryRetention,
     telemetryRetentionDays,
     // NO `vpc` and NO `dbSecurityGroup`, deliberately, which puts the prod
