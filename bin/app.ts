@@ -45,13 +45,13 @@ if (stage !== 'dev' && stage !== 'prod') {
 // refuses on a mismatch instead of quietly doing the wrong thing in the wrong
 // place.
 //
-// Both entries are 111910761410 today because prod still lives in the shared
-// account. Epye Labs is moving each product's production environment into its
-// own AWS account (plans/aws-organization-and-account-split); when xorgate prod
-// moves, change PROD here and nothing else.
+// Dev is the shared Epye Labs playground; prod has its own account, as of
+// 2026-08-21 (plans/aws-organization-and-account-split Phase 4). Each product's
+// production environment gets an account of its own under the one Organization,
+// which is what makes the bill attribute itself with no tagging discipline.
 const ACCOUNTS: Record<'dev' | 'prod', string> = {
   dev: '111910761410',
-  prod: '111910761410',
+  prod: '865609249890',
 };
 
 const env: cdk.Environment = {
