@@ -28,11 +28,6 @@ function recorderProps(rec: XorgateCoreRecorderStack) {
 
 const app = new cdk.App();
 
-const env: cdk.Environment = {
-  account: process.env.CDK_DEFAULT_ACCOUNT,
-  region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
-};
-
 const stage = app.node.tryGetContext('stage') as 'dev' | 'prod' | undefined;
 if (stage !== 'dev' && stage !== 'prod') {
   throw new Error(
@@ -40,6 +35,29 @@ if (stage !== 'dev' && stage !== 'prod') {
     "(use 'npm run deploy:dev' or 'npm run deploy:prod').",
   );
 }
+
+// The account is PINNED PER STAGE rather than taken from CDK_DEFAULT_ACCOUNT.
+//
+// It used to come from whichever credentials happened to be active, while the
+// stage came from a separate --context flag, and nothing tied the two together.
+// `npm run deploy:prod` with a dev profile would therefore deploy production
+// stacks into the development account AND SUCCEED. With the account pinned, CDK
+// refuses on a mismatch instead of quietly doing the wrong thing in the wrong
+// place.
+//
+// Both entries are 111910761410 today because prod still lives in the shared
+// account. Epye Labs is moving each product's production environment into its
+// own AWS account (plans/aws-organization-and-account-split); when xorgate prod
+// moves, change PROD here and nothing else.
+const ACCOUNTS: Record<'dev' | 'prod', string> = {
+  dev: '111910761410',
+  prod: '111910761410',
+};
+
+const env: cdk.Environment = {
+  account: ACCOUNTS[stage],
+  region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+};
 
 // Cron jobs poll Aurora via the Data API every minute (OfflineSweeper and
 // WorkflowScheduler both run at `rate(1 minute)`), which keeps the cluster
