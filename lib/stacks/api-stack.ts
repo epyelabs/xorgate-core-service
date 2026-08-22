@@ -51,10 +51,16 @@ const CUSTOM_DOMAINS: Record<
     certificateArn:
       "arn:aws:acm:us-east-1:111910761410:certificate/9891cf72-d40d-4565-bc5e-9419684748e1",
   },
+  // Prod lives in its own account (865609249890) as of 2026-08-21. ACM
+  // certificates cannot be moved between accounts, so this is a NEW certificate
+  // rather than the migrated one, and unlike its predecessor it covers
+  // api.xorgate.io ALONE. The old one was a multi-domain certificate whose CN
+  // was dev.xorgate.io, which meant one certificate spanned both stages; it
+  // stays in 111910761410 for the dev hostnames that still use it.
   prod: {
     hostname: "api.xorgate.io",
     certificateArn:
-      "arn:aws:acm:us-east-1:111910761410:certificate/23c03f08-1395-4f09-8152-f4660db4d6fe",
+      "arn:aws:acm:us-east-1:865609249890:certificate/6b724695-f3fe-4599-8830-598235bb9ffb",
   },
 };
 
