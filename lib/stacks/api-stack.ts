@@ -1680,6 +1680,29 @@ export class XorgateCoreApiStack extends cdk.Stack {
       },
     });
 
+    // Gateway throttling (sdk-packages-and-alocate-pilot Q7, extracted from
+    // the Phase 5 productization bundle and shipped early, USER 2026-08-21).
+    //
+    // The exposure this closes is not a malicious third party; it is a
+    // runaway loop in a CONSUMER'S dev environment, which as of Phase 3
+    // points at this production API and its pay-per-ACU database. Stage-wide
+    // token bucket, no per-key notion: per-key quotas remain Phase 5's, where
+    // they become the thing that lets tiers be sold.
+    //
+    // 50 rps steady / 100 burst is an order of magnitude above anything the
+    // first-party frontend or the pilot consumer legitimately does, and an
+    // order of magnitude below what a tight retry loop reaches. A throttled
+    // caller gets a bare 429 (no Retry-After on HTTP API throttles);
+    // @xorgate/sdk >= 0.1.1 treats 429 as retryable with backoff, which is
+    // why the SDK shipped 429-aware before this did.
+    //
+    // The L2 HttpApi does not expose default-stage route settings, so this is
+    // the documented CfnStage escape hatch.
+    const defaultStage = this.api.defaultStage!.node.defaultChild as apigwv2.CfnStage;
+    defaultStage.defaultRouteSettings = {
+      throttlingRateLimit: 50,
+      throttlingBurstLimit: 100,
+    };
 
     const healthInt = new apigwv2int.HttpLambdaIntegration(
       "HealthInt",
