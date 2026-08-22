@@ -59,20 +59,23 @@ export class XorgateCoreDatabaseStack extends cdk.Stack {
       enableDataApi: true,
       defaultDatabaseName: 'xorgatedb',
       storageEncrypted: true,
-      // OFF for the first production bring-up, deliberately, and this should be
-      // turned back ON the day prod holds data anyone would miss.
+      // ON as of 2026-08-22. It was OFF for the first production bring-up,
+      // deliberately, with the recorded trigger to flip it being "the first real
+      // organization in prod". The `Alocate` organization is that trigger: prod
+      // is now the environment an external consumer is pointed at, so the
+      // ability to tear it down and redo it is no longer worth more than the
+      // protection.
       //
-      // What it actually protects right now is an EMPTY database. What it costs
-      // right now is the ability to tear prod down and redo it, which a first
-      // bring-up often needs: with protection on, deleting the cluster is a
-      // manual console step that has to be done before the stack will go.
+      // This stack is created for the `prod` stage only (see bin/app.ts), so
+      // nothing about dev changes. Dev reaches the shared epye-sandbox cluster,
+      // which this file does not own.
       //
-      // `removalPolicy: RETAIN` below is the guard that still matters and is
-      // unchanged: `cdk destroy` will NOT delete this cluster either way. So the
-      // posture is "CDK cannot remove it, a human deliberately can", which is
-      // the right shape for an empty environment and the wrong shape for a full
-      // one. The trigger to flip it: the first real organization in prod.
-      deletionProtection: false,
+      // `removalPolicy: RETAIN` is unchanged and still means `cdk destroy` will
+      // not delete the cluster. The two guards stack rather than overlap:
+      // RETAIN stops CDK, and deletionProtection now also stops a direct
+      // `delete-db-cluster`, which previously only needed one console click.
+      // Deleting the cluster now requires deliberately turning this off first.
+      deletionProtection: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
