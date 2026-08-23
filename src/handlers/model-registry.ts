@@ -4,6 +4,7 @@ import { AuthError, authErrorResponse, requireOrgWideContext } from '../middlewa
 import { methodNotAllowed, ok } from '../utils/responses';
 import { MODEL_REGISTRY_PREFIX, type ModelManifest } from '../workflows/models/registry';
 import { listModelManifests } from '../workflows/models/store';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * GET /model-registry — the S3 model registry (architecture.md §6) as JSON:
@@ -22,7 +23,7 @@ const CACHE_TTL_MS = 60_000;
 
 let cache: { at: number; models: ModelManifest[] } | null = null;
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -41,3 +42,5 @@ export const handler = async (
   }
   return ok({ prefix: MODEL_REGISTRY_PREFIX, models: cache.models });
 };
+
+export const handler = apiHandler(restHandler);

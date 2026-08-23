@@ -4,13 +4,25 @@ export const organizationsPaths = {
       operationId: 'listOrganizations',
       summary: 'List organizations the caller is a member of',
       description:
-        'Unpaginated: the whole set comes back in one `organizations` array with no `page` block. ' +
-        'A user belongs to a handful of organizations at most.\n\n' +
+        'Paginated with the shared list dialect (a user belongs to a handful of organizations at ' +
+        'most, so the default page size of 100 is effectively "all of them").\n\n' +
         '**Cognito ID token only.** The result is defined by the caller\'s memberships, which an ' +
         'API key does not have; a key is refused with `401 USER_CREDENTIAL_REQUIRED`. A key ' +
         'already knows its one organization.',
       tags: ['Organizations'],
       security: [{ BearerAuth: [] }],
+      parameters: [
+        { $ref: '#/components/parameters/LimitQuery' },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        { $ref: '#/components/parameters/OrderQuery' },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['createdAt', 'name'], default: 'createdAt' },
+          description: 'Sort column. Anything else is a 400.',
+        },
+      ],
       responses: {
         '200': {
           description: 'List of organizations',
@@ -18,9 +30,10 @@ export const organizationsPaths = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['organizations'],
+                required: ['organizations', 'page'],
                 properties: {
                   organizations: { type: 'array', items: { $ref: '#/components/schemas/Organization' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
                 },
               },
             },

@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   AdminCreateUserCommand,
   AdminGetUserCommand,
@@ -23,6 +23,8 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { apiHandler } from '../utils/api-handler';
 
 const VALID_ROLES: MembershipRole[] = ['owner', 'admin', 'member', 'viewer'];
 
@@ -93,7 +95,7 @@ async function provisionInvitedUser(
   return { userId: sub, emailed };
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -101,7 +103,7 @@ export const handler = async (
 
   let auth;
   try {
-    const writeMethod = method === 'POST' || method === 'DELETE';
+    const writeMethod = method === 'POST' || method === 'PATCH' || method === 'DELETE';
     auth = await requireOrgWideContext(
       event,
       writeMethod ? ['owner', 'admin'] : undefined,
@@ -113,9 +115,30 @@ export const handler = async (
 
   switch (method) {
     case 'GET': {
+      // Standardized list dialect (utils/list-params). Default order stays
+      // ascending-by-join-date, the roster order the UI always showed.
+      const parsed = parseListParams(event, {
+        defaultOrder: 'asc',
+        sortable: ['createdAt', 'role'],
+        defaultSort: 'createdAt',
+      });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy } = parsed;
+
+      const where = eq(schema.memberships.organizationId, auth.organizationId);
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.memberships)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+
+      const sortCol =
+        sortBy === 'role' ? schema.memberships.role : schema.memberships.createdAt;
       const rows = await db.query.memberships.findMany({
-        where: eq(schema.memberships.organizationId, auth.organizationId),
-        orderBy: [asc(schema.memberships.createdAt)],
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
       });
       // Enrich each membership with its member's identity (name/email) so the
       // roster UI can render without a second round-trip. Memberships reference
@@ -138,7 +161,7 @@ export const handler = async (
         ...m,
         user: usersById.get(m.userId) ?? null,
       }));
-      return ok({ memberships });
+      return ok({ memberships, page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: { userId?: string; email?: string; role?: string };
@@ -189,6 +212,62 @@ export const handler = async (
         .values({ userId, organizationId: auth.organizationId, role })
         .returning();
       return created({ membership: m, invited });
+    }
+    case 'PATCH': {
+      // Change a member's role in place. Before this existed the only way to
+      // change a role was remove-and-reinvite (N6 6f).
+      if (!id) return badRequest('membership id required in path');
+
+      let body: { role?: string };
+      try {
+        body = JSON.parse(event.body ?? '{}');
+      } catch {
+        return badRequest('Invalid JSON body');
+      }
+      const role = body.role as MembershipRole | undefined;
+      if (!role || !VALID_ROLES.includes(role)) {
+        return badRequest(`role must be one of: ${VALID_ROLES.join(', ')}`);
+      }
+
+      const m = await db.query.memberships.findFirst({
+        where: and(
+          eq(schema.memberships.id, id),
+          eq(schema.memberships.organizationId, auth.organizationId),
+        ),
+      });
+      if (!m) return notFound(`Membership "${id}" not found`);
+
+      // The extra owner check, same precedent as DELETE /organizations/{id}:
+      // the middleware gate is owner|admin, and owner-level changes need owner.
+      // Without this an admin could promote themselves (or an accomplice) to
+      // owner, or demote an owner, both privilege escalations past the gate.
+      if ((m.role === 'owner' || role === 'owner') && auth.membershipRole !== 'owner') {
+        return forbidden('Only owners can grant or revoke the owner role');
+      }
+
+      // Demoting the last owner would lock the organization out of itself:
+      // every owner-gated operation (including this one) would become
+      // permanently unreachable. Same guard as DELETE.
+      if (m.role === 'owner' && role !== 'owner') {
+        const owners = await db.query.memberships.findMany({
+          where: and(
+            eq(schema.memberships.organizationId, auth.organizationId),
+            eq(schema.memberships.role, 'owner'),
+          ),
+        });
+        if (owners.length <= 1) {
+          return forbidden('Cannot demote the last owner of an organization');
+        }
+      }
+
+      if (role === m.role) return ok({ membership: m });
+
+      const [updated] = await db
+        .update(schema.memberships)
+        .set({ role })
+        .where(eq(schema.memberships.id, id))
+        .returning();
+      return ok({ membership: updated });
     }
     case 'DELETE': {
       if (!id) return badRequest('membership id required in path');
@@ -245,6 +324,8 @@ export const handler = async (
       return { statusCode: 204, body: '' };
     }
     default:
-      return methodNotAllowed(method, 'GET, POST, DELETE');
+      return methodNotAllowed(method, 'GET, POST, PATCH, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

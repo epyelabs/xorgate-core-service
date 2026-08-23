@@ -4,12 +4,13 @@ import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/a
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { methodNotAllowed, notFound, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 // GET /devices/{id}/identity — the device's IoT X.509 identity metadata (thing name,
 // certificate id, status, policy/role binding). Returns non-secret fields only: the
 // private key is never stored, and certificateArn/credentialEndpoint are intentionally
 // omitted. Reads Postgres only (no IoT call, no new IAM).
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -56,3 +57,5 @@ export const handler = async (
 
   return ok({ identity: identity ?? null });
 };
+
+export const handler = apiHandler(restHandler);

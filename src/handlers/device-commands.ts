@@ -9,6 +9,7 @@ import {
   publishDeviceCommand,
   type DeviceCommandName,
 } from '../services/device-command';
+import { apiHandler } from '../utils/api-handler';
 
 const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/reboot': 'reboot',
@@ -35,7 +36,7 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  * Ownership: the device must belong to a workspace in the caller's org (same
  * check as devices.ts / device-sessions.ts); cross-org reads surface as 404.
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const routeKey = canonicalRouteKey(event); // e.g. "POST /devices/{id}/reboot"
@@ -95,3 +96,5 @@ export const handler = async (
     );
   }
 };
+
+export const handler = apiHandler(restHandler);

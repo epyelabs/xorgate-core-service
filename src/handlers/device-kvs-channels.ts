@@ -4,6 +4,7 @@ import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/a
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { methodNotAllowed, notFound, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 // GET /v1/devices/{id}/video-channels — the device's live video channels
 // (name/ref/region) so a viewer can join them. The viewer mints its own scoped
@@ -13,7 +14,7 @@ import { methodNotAllowed, notFound, ok } from '../utils/responses';
 // Also serves the two unversioned aliases this route was renamed from:
 // /devices/{id}/video-channels and /devices/{id}/kvs-channels. The file keeps its
 // old name because it is internal; the ROUTE is what N11 renames.
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -68,3 +69,5 @@ export const handler = async (
 
   return ok({ channels });
 };
+
+export const handler = apiHandler(restHandler);

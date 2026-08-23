@@ -5,11 +5,24 @@ export const deviceModelsPaths = {
       summary: 'List the platform-wide device model catalog',
       description:
         'The catalog is PLATFORM-wide, not per organization, so this endpoint takes no tenancy ' +
-        'header and every authenticated caller sees the same rows. Unpaginated. Writes need the ' +
+        'header and every authenticated caller sees the same rows. Paginated with the shared list ' +
+        'dialect. Writes need the ' +
         'platform-admin role (`users.role = "admin"`), which is separate from any membership role. ' +
         'The envelope keys are `device_models` / `device_model` (snake_case, mirroring the table ' +
         'name) with camelCase contents; the SDKs present them as `deviceModels` / `deviceModel`.',
       tags: ['Device Models'],
+      parameters: [
+        { $ref: '#/components/parameters/LimitQuery' },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        { $ref: '#/components/parameters/OrderQuery' },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['createdAt', 'name'], default: 'createdAt' },
+          description: 'Sort column. Anything else is a 400.',
+        },
+      ],
       responses: {
         '200': {
           description: 'List of device models',
@@ -17,9 +30,10 @@ export const deviceModelsPaths = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['device_models'],
+                required: ['device_models', 'page'],
                 properties: {
                   device_models: { type: 'array', items: { $ref: '#/components/schemas/DeviceModel' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
                 },
               },
             },

@@ -1,4 +1,5 @@
 import type { APIGatewayProxyResultV2 } from 'aws-lambda';
+import { getRequestId } from './request-context';
 
 export function errorResponse(
   statusCode: number,
@@ -6,12 +7,17 @@ export function errorResponse(
   message: string,
   details?: Record<string, unknown>,
 ): APIGatewayProxyResultV2 {
+  // The gateway request id, when the invocation came through utils/api-handler.
+  // In the body (not only a header) so a consumer can quote it in a support
+  // ticket from whatever their HTTP client logged.
+  const requestId = getRequestId();
+  const error: Record<string, unknown> = { code, message };
+  if (details) error.details = details;
+  if (requestId) error.requestId = requestId;
   return {
     statusCode,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      error: details ? { code, message, details } : { code, message },
-    }),
+    body: JSON.stringify({ error }),
   };
 }
 

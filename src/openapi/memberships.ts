@@ -5,9 +5,27 @@ export const membershipsPaths = {
       operationId: 'listMemberships',
       summary: 'List members of the active organization',
       description:
-        'The roster. Unpaginated (one `memberships` array, no `page` block), and each row is ' +
-        'enriched with its member\'s `user` so a UI renders names and emails without a second ' +
-        'round-trip.',
+        'The roster, paginated with the shared list dialect (default order is ASCENDING by join ' +
+        'date, the one list endpoint whose default is not `desc`). Each row is enriched with its ' +
+        'member\'s `user` so a UI renders names and emails without a second round-trip.',
+      parameters: [
+        { $ref: '#/components/parameters/LimitQuery' },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        {
+          name: 'order',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['asc', 'desc'], default: 'asc' },
+          description: 'Sort direction. Default `asc` here (join order), unlike other lists.',
+        },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['createdAt', 'role'], default: 'createdAt' },
+          description: 'Sort column. Anything else is a 400.',
+        },
+      ],
       tags: ['Memberships'],
       responses: {
         '200': {
@@ -16,9 +34,10 @@ export const membershipsPaths = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['memberships'],
+                required: ['memberships', 'page'],
                 properties: {
                   memberships: { type: 'array', items: { $ref: '#/components/schemas/MembershipWithUser' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
                 },
               },
             },
@@ -85,6 +104,52 @@ export const membershipsPaths = {
       { $ref: '#/components/parameters/IdPath' },
       { $ref: '#/components/parameters/OrganizationIdHeader' },
     ],
+    patch: {
+      operationId: 'updateMembershipRole',
+      summary: "Change a member's role (owner/admin only)",
+      description:
+        'Changes the role in place; before this existed the only way to change a role was to ' +
+        'remove and re-invite the member. Two guards beyond the owner/admin gate: owner-level ' +
+        'changes (granting `owner`, or changing an existing owner\'s role) need the caller to be ' +
+        'an owner themselves, and demoting the LAST owner is refused with a 403 so an ' +
+        'organization can never lock itself out. Setting the role a member already has is a ' +
+        'no-op 200.',
+      tags: ['Memberships'],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['role'],
+              properties: {
+                role: { type: 'string', enum: ['owner', 'admin', 'member', 'viewer'] },
+              },
+            },
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description: 'The updated membership',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['membership'],
+                properties: {
+                  membership: { $ref: '#/components/schemas/Membership' },
+                },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+      },
+    },
     delete: {
       operationId: 'removeMembership',
       summary: 'Remove a member (owner/admin only)',

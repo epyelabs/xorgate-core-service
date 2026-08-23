@@ -5,12 +5,25 @@ export const apiKeysPaths = {
       operationId: 'listApiKeys',
       summary: 'List API keys for the active organization',
       description:
-        'Unpaginated, newest first, and includes revoked and expired keys. The envelope key is ' +
+        'Paginated with the shared list dialect, newest first by default, and includes revoked and ' +
+        'expired keys. The envelope key is ' +
         '`api_keys` (snake_case, mirroring the Postgres table name) while its contents are ' +
         'camelCase. That inconsistency is deliberate and stays on the wire; the SDKs present it ' +
         'as `apiKeys`. `keyPrefix` is null on keys minted before that column existed and cannot ' +
         'be recovered for them.',
       tags: ['API Keys'],
+      parameters: [
+        { $ref: '#/components/parameters/LimitQuery' },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        { $ref: '#/components/parameters/OrderQuery' },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['createdAt', 'name'], default: 'createdAt' },
+          description: 'Sort column. Anything else is a 400.',
+        },
+      ],
       responses: {
         '200': {
           description: 'API key metadata. The hashed key is never returned.',
@@ -18,9 +31,10 @@ export const apiKeysPaths = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['api_keys'],
+                required: ['api_keys', 'page'],
                 properties: {
                   api_keys: { type: 'array', items: { $ref: '#/components/schemas/ApiKey' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
                 },
               },
             },

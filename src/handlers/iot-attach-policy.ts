@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { AuthError, authErrorResponse, requireAnyMembership } from '../middleware/auth';
 import { grantLiveAccess, resolveIdentityId } from '../services/live-access';
 import { badRequest, methodNotAllowed, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * POST /iot/attach-policy
@@ -21,7 +22,7 @@ import { badRequest, methodNotAllowed, ok } from '../utils/responses';
  * The identity id is recorded against the caller so a later membership removal
  * can find it (see services/live-access.ts).
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -47,3 +48,5 @@ export const handler = async (
 
   return ok({ attached: true, identityId, policyName });
 };
+
+export const handler = apiHandler(restHandler);

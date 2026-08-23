@@ -1,6 +1,7 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import { apiHandler } from '../utils/api-handler';
 
-export const handler = async (
+const restHandler = async (
   _event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   return {
@@ -12,3 +13,5 @@ export const handler = async (
     }),
   };
 };
+
+export const handler = apiHandler(restHandler);

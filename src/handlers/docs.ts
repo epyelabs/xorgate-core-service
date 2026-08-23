@@ -1,6 +1,8 @@
 import { requestPath } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 import { buildOpenApiDocument } from '../openapi/index';
+import { notFound } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * Serves the OpenAPI document and a Swagger UI over it.
@@ -43,7 +45,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Authorization, Content-Type',
 };
 
-export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
+const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
   // Canonical form: `/v1/openapi.json` and `/openapi.json` are the same
   // document, and the exact comparison below would miss the versioned one.
   const reqPath = requestPath(event);
@@ -69,9 +71,7 @@ export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGateway
     };
   }
 
-  return {
-    statusCode: 404,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: { code: 'NOT_FOUND', message: 'Route not found' } }),
-  };
+  return notFound('Route not found');
 };
+
+export const handler = apiHandler(restHandler);

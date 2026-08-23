@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { desc, eq } from 'drizzle-orm';
+import { asc, desc, eq, sql } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
@@ -14,6 +14,8 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { apiHandler } from '../utils/api-handler';
 
 // device_models is a platform-wide catalog: any authenticated caller can read,
 // including an API-key caller (`requirePrincipal`, not `requireAuth`) — the
@@ -21,7 +23,7 @@ import {
 // device. Mutations require `users.role === 'admin'` (platform admin),
 // regardless of org membership, and an API-key principal is always platform
 // role `'user'`, so writes stay closed to keys with no extra check.
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -47,10 +49,28 @@ export const handler = async (
         if (!row) return notFound(`Device model "${id}" not found`);
         return ok({ device_model: row });
       }
-      const rows = await db.query.deviceModels.findMany({
-        orderBy: [desc(schema.deviceModels.createdAt)],
+      // Standardized list dialect (utils/list-params). Default order preserves
+      // the prior behaviour (newest first).
+      const parsed = parseListParams(event, {
+        sortable: ['createdAt', 'name'],
+        defaultSort: 'createdAt',
       });
-      return ok({ device_models: rows });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy } = parsed;
+
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.deviceModels);
+      const total = Number(totalRows[0]?.total ?? 0);
+
+      const sortCol =
+        sortBy === 'name' ? schema.deviceModels.name : schema.deviceModels.createdAt;
+      const rows = await db.query.deviceModels.findMany({
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
+      });
+      return ok({ device_models: rows, page: pageMeta(parsed, total) });
     }
     case 'POST': {
       const denial = requirePlatformAdmin();
@@ -129,3 +149,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

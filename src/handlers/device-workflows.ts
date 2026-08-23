@@ -21,6 +21,7 @@ import {
 } from '../services/workflow-capabilities';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import { desc } from 'drizzle-orm';
+import { apiHandler } from '../utils/api-handler';
 
 type AttachmentRow = typeof schema.workflowAttachments.$inferSelect;
 
@@ -56,7 +57,7 @@ function mapAttachment(
  * run-execution path in M3.) Ownership: the device must belong to a workspace in
  * the caller's org (same check as device-sessions.ts).
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -390,3 +391,5 @@ function safeJson(body: string | undefined): Record<string, unknown> {
     return {};
   }
 }
+
+export const handler = apiHandler(restHandler);

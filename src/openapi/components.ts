@@ -18,9 +18,10 @@ const listParameters = {
     required: false,
     schema: { type: 'integer', minimum: 1, default: 100 },
     description:
-      'Page size. Default 100, and values above the endpoint maximum (500 everywhere today) are ' +
-      'silently CLAMPED rather than rejected. Read `page.limit` back to see what was applied. ' +
-      'A non-integer or a value below 1 is a 400.',
+      'Page size. Default 100; the endpoint maximum is 500 everywhere the shared list dialect ' +
+      'applies. A value above the maximum, a non-integer, or a value below 1 is a 400. (Before ' +
+      'API productization the over-maximum case was silently clamped; it now rejects, so a ' +
+      'consumer cannot ship a page that quietly shows 500 of 4,000 rows.)',
   },
   OffsetQuery: {
     name: 'offset',
