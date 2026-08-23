@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * GET /device-dist/latest — what the newest published agent build IS
@@ -33,7 +34,7 @@ const KEY = 'latest.json';
 /** Bounded so a wrong/oversized object can't be streamed into memory wholesale. */
 const MAX_MANIFEST_BYTES = 8_192;
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   if (event.requestContext.http.method !== 'GET') {
@@ -107,3 +108,5 @@ export const handler = async (
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
 }
+
+export const handler = apiHandler(restHandler);

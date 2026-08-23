@@ -4,6 +4,7 @@ import { and, eq } from 'drizzle-orm';
 import { db } from '../db/index';
 import { memberships, users } from '../db/schema';
 import { classifyCredential, touchApiKey, verifyApiKey } from '../services/api-key-auth';
+import { errorResponse } from '../utils/responses';
 import { verifySessionToken } from '../services/session-token-auth';
 import type {
   AuthContext,
@@ -487,17 +488,9 @@ export async function requireAnyMembership(
 }
 
 export function unauthorizedResponse(message = 'Unauthorized'): APIGatewayProxyResultV2 {
-  return {
-    statusCode: 401,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: { code: 'UNAUTHORIZED', message } }),
-  };
+  return errorResponse(401, 'UNAUTHORIZED', message);
 }
 
 export function authErrorResponse(err: AuthError): APIGatewayProxyResultV2 {
-  return {
-    statusCode: err.statusCode,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ error: { code: err.code, message: err.message } }),
-  };
+  return errorResponse(err.statusCode, err.code, err.message);
 }

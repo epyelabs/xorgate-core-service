@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   assertOrgWideScope,
   AuthError,
@@ -15,6 +15,8 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * Workspaces are the one resource that is BOTH sides of the boundary, which is
@@ -29,7 +31,7 @@ import {
  *   the first place. A browser-held credential that could delete its own tenant
  *   is a liability with no matching use.
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -54,9 +56,6 @@ export const handler = async (
       // org-scoped caller this is every workspace in the organization, and for a
       // workspace-scoped token it is the single row it is bound to.
       const visibleIds = await resolveWorkspaceScope(auth);
-      if (visibleIds.length === 0) {
-        return id ? notFound(`Workspace "${id}" not found`) : ok({ workspaces: [] });
-      }
       if (id) {
         if (!visibleIds.includes(id)) return notFound(`Workspace "${id}" not found`);
         const row = await db.query.workspaces.findFirst({
@@ -68,14 +67,42 @@ export const handler = async (
         if (!row) return notFound(`Workspace "${id}" not found`);
         return ok({ workspace: row });
       }
-      const rows = await db.query.workspaces.findMany({
-        where: and(
-          eq(schema.workspaces.organizationId, auth.organizationId),
-          inArray(schema.workspaces.id, visibleIds),
-        ),
-        orderBy: [desc(schema.workspaces.updatedAt)],
+
+      // Standardized list dialect (utils/list-params). Default order preserves
+      // the prior behaviour (most-recently-updated first).
+      const parsed = parseListParams(event, {
+        sortable: ['updatedAt', 'createdAt', 'name'],
+        defaultSort: 'updatedAt',
       });
-      return ok({ workspaces: rows });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy } = parsed;
+      if (visibleIds.length === 0) {
+        return ok({ workspaces: [], page: pageMeta(parsed, 0) });
+      }
+
+      const where = and(
+        eq(schema.workspaces.organizationId, auth.organizationId),
+        inArray(schema.workspaces.id, visibleIds),
+      );
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.workspaces)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+
+      const sortCol =
+        sortBy === 'createdAt'
+          ? schema.workspaces.createdAt
+          : sortBy === 'name'
+            ? schema.workspaces.name
+            : schema.workspaces.updatedAt;
+      const rows = await db.query.workspaces.findMany({
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
+      });
+      return ok({ workspaces: rows, page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: { name?: string; slug?: string; description?: string };
@@ -145,3 +172,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

@@ -16,6 +16,7 @@ import {
 import { computeRequiredCapabilities } from '../services/workflow-capabilities';
 import { upgradeDefinitionSafe } from '../workflows/compat';
 import { validateDefinitionForPublish } from '../workflows/validate';
+import { apiHandler } from '../utils/api-handler';
 
 // Any executor that exposes the drizzle query-builder surface: the root db or a
 // transaction handle (both share .select/.insert/.update/.delete signatures).
@@ -220,7 +221,7 @@ async function loadTemplate(orgId: string, id: string): Promise<TemplateRow | un
  * version per template; publish archives the previous published row and sets both
  * template.publishedVersion and template.currentVersion.
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -616,3 +617,5 @@ function safeJson(body: string | undefined): unknown {
     return {};
   }
 }
+
+export const handler = apiHandler(restHandler);

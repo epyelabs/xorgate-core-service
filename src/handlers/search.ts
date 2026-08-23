@@ -8,6 +8,7 @@ import {
 import { db, schema } from '../db/index';
 import { isWorkspaceScoped, resolveWorkspaceScope } from '../services/workspace-scope';
 import { methodNotAllowed, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 // Global cross-resource search. `GET /search?q=<term>` returns a flat, normalized
 // list of results the caller's org can see. The result shape is intentionally
@@ -39,7 +40,7 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -156,3 +157,5 @@ export const handler = async (
 
   return ok({ results });
 };
+
+export const handler = apiHandler(restHandler);

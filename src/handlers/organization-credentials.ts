@@ -22,6 +22,7 @@ import {
   validateCredentialSchema,
   type CredentialProvider,
 } from '../workflows/org-credentials';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * Per-organization connector credentials (M7): BYO API keys for
@@ -133,7 +134,7 @@ async function putOrgKey(orgId: string, provider: CredentialProvider, apiKey: st
 
 class ConflictError extends Error {}
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -243,3 +244,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, PUT, DELETE, POST');
   }
 };
+
+export const handler = apiHandler(restHandler);

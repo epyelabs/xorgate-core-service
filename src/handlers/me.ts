@@ -3,8 +3,9 @@ import { eq, inArray } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireAuth } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { methodNotAllowed, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -43,3 +44,5 @@ export const handler = async (
     organizations: orgs,
   });
 };
+
+export const handler = apiHandler(restHandler);

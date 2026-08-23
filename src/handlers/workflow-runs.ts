@@ -13,6 +13,7 @@ import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { runPrefix } from '../workflows/engine/manifest';
 import { runTopicPrefix, simTopicPrefix } from '../workflows/engine/progress';
+import { apiHandler } from '../utils/api-handler';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -115,7 +116,7 @@ function deriveTriggeredBy(trigger: string, ctx: unknown): string {
  *   GET /devices/{id}/workflow-runs        per-device list
  * (POST /workflow-runs/{id}/rerun is added with the run-execution path in M3.)
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -393,3 +394,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST');
   }
 };
+
+export const handler = apiHandler(restHandler);

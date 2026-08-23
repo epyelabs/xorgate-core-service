@@ -17,6 +17,7 @@ import {
   pivotRows,
 } from '../services/telemetry-columns';
 import { tsParam } from '../utils/sql';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * Telemetry history (P4). Two org-scoped read routes on one handler:
@@ -538,7 +539,7 @@ async function handleReadings(
   });
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -587,3 +588,5 @@ export const handler = async (
   }
   return handleHistory(id, event);
 };
+
+export const handler = apiHandler(restHandler);

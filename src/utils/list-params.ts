@@ -90,7 +90,13 @@ export function parseListParams(
     if (!/^\d+$/.test(qs.limit)) return { error: badRequest('"limit" must be a positive integer') };
     limit = Number(qs.limit);
     if (limit < 1) return { error: badRequest('"limit" must be a positive integer') };
-    if (limit > maxLimit) limit = maxLimit;
+    // An out-of-range limit is a 400, matching the telemetry endpoints. This
+    // replaced a silent clamp (Phase 5 of sdk-packages-and-alocate-pilot): a
+    // clamp is how a consumer ships a page that shows 500 of 4,000 devices and
+    // never learns.
+    if (limit > maxLimit) {
+      return { error: badRequest(`"limit" must be between 1 and ${maxLimit}`) };
+    }
   }
 
   let offset = 0;

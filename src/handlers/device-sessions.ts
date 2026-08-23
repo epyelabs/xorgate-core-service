@@ -18,6 +18,7 @@ import {
   type RunFilters,
   type RunPageRow,
 } from '../services/session-runs';
+import { apiHandler } from '../utils/api-handler';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -52,7 +53,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * check as devices.ts). Response casing: drizzle camelCase rows, matching the
  * dialect every other device sub-resource uses.
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -527,3 +528,5 @@ function sessionManifestShape(
     gaps,
   };
 }
+
+export const handler = apiHandler(restHandler);

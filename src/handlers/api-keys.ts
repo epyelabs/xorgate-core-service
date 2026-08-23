@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
@@ -17,6 +17,8 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { apiHandler } from '../utils/api-handler';
 
 const VALID_SCOPES = ['edge', 'cloud', 'client'] as const;
 
@@ -44,7 +46,7 @@ function generatePlaintextKey(): string {
   return `${API_KEY_PREFIX}${randomBytes(24).toString('base64url')}`;
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -64,13 +66,33 @@ export const handler = async (
 
   switch (method) {
     case 'GET': {
+      // Standardized list dialect (utils/list-params). Default order preserves
+      // the prior behaviour (newest first).
+      const parsed = parseListParams(event, {
+        sortable: ['createdAt', 'name'],
+        defaultSort: 'createdAt',
+      });
+      if ('error' in parsed) return parsed.error;
+      const { limit, offset, order, sortBy } = parsed;
+
+      const where = eq(schema.apiKeys.organizationId, auth.organizationId);
+      const totalRows = await db
+        .select({ total: sql<number>`count(*)::int` })
+        .from(schema.apiKeys)
+        .where(where);
+      const total = Number(totalRows[0]?.total ?? 0);
+
+      const sortCol =
+        sortBy === 'name' ? schema.apiKeys.name : schema.apiKeys.createdAt;
       const rows = await db.query.apiKeys.findMany({
-        where: eq(schema.apiKeys.organizationId, auth.organizationId),
-        orderBy: [desc(schema.apiKeys.createdAt)],
+        where,
+        orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+        limit,
+        offset,
       });
       // Never return hashedKey to clients — strip it from list responses.
       const sanitized = rows.map(({ hashedKey: _h, ...rest }) => rest);
-      return ok({ api_keys: sanitized });
+      return ok({ api_keys: sanitized, page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: { name?: string; scope?: string; role?: string; expiresAt?: string | null };
@@ -152,3 +174,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

@@ -20,6 +20,7 @@ import { generateRegistrationCode } from '../utils/registration-code';
 import { provisionDevice, deleteThing } from '../services/iot-provisioning';
 import { publishDeviceConfig } from '../services/device-config';
 import { initialConfigDocument } from '../config-registry/index';
+import { apiHandler } from '../utils/api-handler';
 
 const REGISTRATION_TTL_MS = 15 * 60 * 1000;
 
@@ -55,7 +56,7 @@ function toView(row: DeviceRegistration): RegistrationView {
 // Router: POST /device-registrations, GET /device-registrations/{code},
 // POST /device-registrations/{code}/claim. All four routes hit this one Lambda;
 // the gateway has no authorizer, so the claim branch simply skips requireOrgContext.
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -342,3 +343,5 @@ async function revertClaim(registrationId: string): Promise<void> {
     .where(eq(schema.deviceRegistrations.id, registrationId))
     .catch(() => undefined);
 }
+
+export const handler = apiHandler(restHandler);

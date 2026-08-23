@@ -11,11 +11,12 @@ import {
   notFound,
 } from '../utils/responses';
 import { provisionDevice } from '../services/iot-provisioning';
+import { apiHandler } from '../utils/api-handler';
 
 // POST /devices/{id}/provision — mint an IoT thing + X.509 cert + KVS channels so the
 // device can obtain short-lived AWS creds via the IoT credential provider (no raw keys).
 // The private key is returned exactly once and never stored.
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -80,3 +81,5 @@ export const handler = async (
     kvs: { region: result.region, channels: result.channels },
   });
 };
+
+export const handler = apiHandler(restHandler);

@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { methodNotAllowed } from '../utils/responses';
 import { buildCatalogPayload } from '../workflows/catalog/serialize';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * GET /workflow-catalog — the served node catalog (architecture.md §3.1): the
@@ -17,7 +18,7 @@ const payload = buildCatalogPayload();
 const body = JSON.stringify(payload);
 const etag = `"${payload.catalogVersion}"`;
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -46,3 +47,5 @@ export const handler = async (
     body,
   };
 };
+
+export const handler = apiHandler(restHandler);

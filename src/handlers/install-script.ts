@@ -5,6 +5,7 @@ import {
   INSTALL_SCRIPT_PLACEHOLDERS,
   renderInstallScript,
 } from '../assets/install-script';
+import { apiHandler } from '../utils/api-handler';
 
 const SHELL_HEADERS = {
   'Content-Type': 'text/x-shellscript; charset=utf-8',
@@ -36,7 +37,7 @@ function shellError(statusCode: number, message: string): APIGatewayProxyResultV
 
 // GET /get/{code} (UNAUTHENTICATED). Served as text/x-shellscript so
 // `curl -s URL -o install.sh; sudo bash install.sh` behaves predictably.
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const code = event.pathParameters?.code;
@@ -89,3 +90,5 @@ export const handler = async (
 
   return { statusCode: 200, headers: SHELL_HEADERS, body };
 };
+
+export const handler = apiHandler(restHandler);

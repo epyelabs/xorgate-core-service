@@ -29,6 +29,7 @@ import {
   type DeviceConfigDocument,
 } from '../config-registry/index';
 import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
+import { apiHandler } from '../utils/api-handler';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
@@ -140,7 +141,7 @@ async function writeConfig(
   return ok({ device: deviceResponse(row) });
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -492,3 +493,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST, PUT, PATCH, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

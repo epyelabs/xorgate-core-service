@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { AuthError, authErrorResponse, requireAuth } from '../middleware/auth';
 import { resolveIdentityId, revokeLiveAccessForIdentity } from '../services/live-access';
 import { badRequest, methodNotAllowed, ok } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * DELETE /live/access
@@ -23,7 +24,7 @@ import { badRequest, methodNotAllowed, ok } from '../utils/responses';
  * just lost their last membership must still be able to clean up after
  * themselves, and revoking access can never be the privileged direction.
  */
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -50,3 +51,5 @@ export const handler = async (
 
   return ok({ detached: true, identityId, policyName });
 };
+
+export const handler = apiHandler(restHandler);

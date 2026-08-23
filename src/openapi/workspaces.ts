@@ -5,12 +5,24 @@ export const workspacesPaths = {
       operationId: 'listWorkspaces',
       summary: 'List workspaces in the active organization',
       description:
-        'Unpaginated. Workspaces are the unit devices belong to, so this is usually the second ' +
-        'call a client makes after `GET /me`.\n\n' +
+        'Paginated with the shared list dialect. Workspaces are the unit devices belong to, so ' +
+        'this is usually the second call a client makes after `GET /me`.\n\n' +
         'A workspace-scoped session token lists exactly one workspace: its own. Any other reads ' +
         'as `404` from `GET /workspaces/{id}`, indistinguishable from a workspace in another ' +
         'organization.',
       tags: ['Workspaces'],
+      parameters: [
+        { $ref: '#/components/parameters/LimitQuery' },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        { $ref: '#/components/parameters/OrderQuery' },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['updatedAt', 'createdAt', 'name'], default: 'updatedAt' },
+          description: 'Sort column. Anything else is a 400.',
+        },
+      ],
       responses: {
         '200': {
           description: 'List of workspaces',
@@ -18,9 +30,10 @@ export const workspacesPaths = {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['workspaces'],
+                required: ['workspaces', 'page'],
                 properties: {
                   workspaces: { type: 'array', items: { $ref: '#/components/schemas/Workspace' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
                 },
               },
             },

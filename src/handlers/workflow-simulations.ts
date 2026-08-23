@@ -27,6 +27,7 @@ import {
 } from '../workflows/simulations';
 import type { ResolvedVideoSession } from '../workflows/production';
 import { findOrgSessions, resolveVideoSessions } from '../services/media-session-input';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * Simulator API (M3, architecture §5): a simulation is a REAL run of the real
@@ -65,7 +66,7 @@ function bindingIssuesResponse(issues: SimulationBindingIssue[]): APIGatewayProx
   });
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -293,3 +294,5 @@ export const handler = async (
       return methodNotAllowed(method, 'POST');
   }
 };
+
+export const handler = apiHandler(restHandler);

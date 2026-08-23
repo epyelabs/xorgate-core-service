@@ -1895,7 +1895,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     addRoutes({
       path: "/memberships/{id}",
-      methods: [apigwv2.HttpMethod.DELETE],
+      methods: [apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
       integration: membershipsInt,
     });
 

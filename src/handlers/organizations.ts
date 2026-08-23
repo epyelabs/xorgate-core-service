@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { eq, inArray } from 'drizzle-orm';
+import { asc, desc, eq, inArray } from 'drizzle-orm';
 import {
   AuthError,
   authErrorResponse,
@@ -15,8 +15,10 @@ import {
   notFound,
   ok,
 } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { apiHandler } from '../utils/api-handler';
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -66,20 +68,35 @@ export const handler = async (
       throw err;
     }
 
+    // Standardized list dialect (utils/list-params). The membership rows ARE
+    // the total: no count query needed.
+    const parsed = parseListParams(event, {
+      sortable: ['createdAt', 'name'],
+      defaultSort: 'createdAt',
+    });
+    if ('error' in parsed) return parsed.error;
+    const { limit, offset, order, sortBy } = parsed;
+
     const userMemberships = await db.query.memberships.findMany({
       where: eq(schema.memberships.userId, auth.userId),
     });
+    if (userMemberships.length === 0) {
+      return ok({ organizations: [], page: pageMeta(parsed, 0) });
+    }
 
-    const orgs = userMemberships.length
-      ? await db.query.organizations.findMany({
-          where: inArray(
-            schema.organizations.id,
-            userMemberships.map((m) => m.organizationId),
-          ),
-        })
-      : [];
+    const sortCol =
+      sortBy === 'name' ? schema.organizations.name : schema.organizations.createdAt;
+    const orgs = await db.query.organizations.findMany({
+      where: inArray(
+        schema.organizations.id,
+        userMemberships.map((m) => m.organizationId),
+      ),
+      orderBy: [order === 'asc' ? asc(sortCol) : desc(sortCol)],
+      limit,
+      offset,
+    });
 
-    return ok({ organizations: orgs });
+    return ok({ organizations: orgs, page: pageMeta(parsed, userMemberships.length) });
   }
 
   // Everything else requires an active org context with appropriate role.
@@ -149,3 +166,5 @@ export const handler = async (
       return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
   }
 };
+
+export const handler = apiHandler(restHandler);

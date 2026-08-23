@@ -20,6 +20,7 @@ import {
   forbidden,
   methodNotAllowed,
 } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * `POST /auth/session-tokens` — exchange an API key for a short-lived token a
@@ -70,7 +71,7 @@ export function resetRealtimeEndpointCache(): void {
   cachedRealtimeEndpoint = undefined;
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -179,3 +180,5 @@ export const handler = async (
     live,
   });
 };
+
+export const handler = apiHandler(restHandler);

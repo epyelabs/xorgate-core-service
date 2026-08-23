@@ -13,6 +13,7 @@ import {
   errorResponse,
   methodNotAllowed,
 } from '../utils/responses';
+import { apiHandler } from '../utils/api-handler';
 
 /**
  * `POST /auth/live-credentials` — exchange a xorgate credential for AWS
@@ -66,7 +67,7 @@ export function resetRealtimeEndpointCache(): void {
   cachedRealtimeEndpoint = undefined;
 }
 
-export const handler = async (
+const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
@@ -157,3 +158,5 @@ export const handler = async (
     },
   });
 };
+
+export const handler = apiHandler(restHandler);
