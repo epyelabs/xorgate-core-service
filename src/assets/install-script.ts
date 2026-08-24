@@ -49,6 +49,28 @@ if [ "$(id -u)" -ne 0 ]; then
   fail "run with sudo"
 fi
 
+# 0a. Keep NetworkManager off the SIM7600's usb0 BEFORE anything touches the
+#     network (cm4-support plan, inventory #10). On a fresh device NM
+#     auto-creates a profile for usb0 and grabs the modem's internal DHCP
+#     lease; its metric-100 default route then black-holes the apt update,
+#     the claim, and the tarball download below (verified live on the CM4
+#     bring-up — the install died exactly here). The tarball ships the fully
+#     commented version of this conf and step 7 re-installs it; this early
+#     minimal copy exists only because the tarball cannot be downloaded
+#     through a black-holed route. Idempotent.
+if [ -d /etc/NetworkManager ]; then
+  install -d -m 0755 /etc/NetworkManager/conf.d
+  cat > /etc/NetworkManager/conf.d/99-sim7600-unmanaged.conf <<'NMEOF'
+# usb0 is owned exclusively by the xorgate sim7600-lte daemon (its own
+# dhclient + health checks); NetworkManager must not manage it. Installed
+# early by install.sh; replaced by the fully commented copy from the agent
+# tarball later in the same run.
+[keyfile]
+unmanaged-devices=interface-name:usb0
+NMEOF
+  systemctl reload NetworkManager 2>/dev/null || true
+fi
+
 # 0. Resolve the user the agent will RUN as (the installer itself must be root).
 #    Captured from \$SUDO_USER so the operator who ran \`sudo bash install.sh\`
 #    owns the cert/state and can inspect the agent without sudo. Falls back to
@@ -464,22 +486,24 @@ fi
 # Per-stream pipeline dir (operator drops <streamKey>.gst files here for cameras).
 install -d -m 0755 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR/pipelines"
 
-# Default per-stream pipelines for the current fleet hardware: CM5 carrier with
-# two IMX290 sensors on the cam0 (i2c@88000) and cam1 (i2c@70000) connectors,
-# H.264 via x264enc at 1280x720@15. Installed in BRIDGED form — the same three
-# files \`xorgate pipeline bridge <streamKey>\` writes — so video RECORDING works
-# out of the box: the agent's capture daemon owns the camera and feeds raw
-# frames over POSIX shm, and the KVS master's .gst consumes shmsrc. A direct
-# .gst here would leave the recorder permanently idle (it only ever owns
-# bridged cameras — rollout safety in device-agent recording/video-capture.ts).
-# With recording off the daemon runs bridge-only (raw passthrough, near-zero
-# CPU), so live streaming behaves the same either way. Per camera:
+# Per-stream pipelines (cm4-support plan, Phase 3).
+#
+# HARDWARE-BLOCK DEVICES (the claim resolved a schemaVersion-2 model —
+# hardware.json was written above): the installer writes NO pipelines. The
+# agent owns them now: on the first post-reboot start it enumerates cameras,
+# pairs them to the block's connector list, and renders the bridged trio from
+# its tested per-encoder templates (device-agent media/hardware-reconcile.ts).
+# Install-time rendering is impossible anyway — the overlays land in step 8b
+# and the cameras only exist after the reboot.
+#
+# LEGACY FALLBACK (no hardware block: a v1 model, or an old backend): keep
+# writing the historical CM5 trio VERBATIM, else a fresh legacy device would
+# boot with no pipelines and no agent machinery to render them. Per camera:
 #   camN.gst         shmsrc consumer the KVS master loads
 #   camN.camera      libcamera identity the capture daemon opens
 #   camN.gst.direct  direct pipeline \`xorgate pipeline direct camN\` restores
 # Written only if the .gst is absent so a later \`xorgate pipeline ...\`
-# customization is never clobbered. Hardware-specific by design (pairs with the
-# imx290 overlays in step 8b) — revisit for other sensors.
+# customization is never clobbered.
 # shm sockets live under XORGATE_HOME/shm (device-agent recording/config.ts);
 # XORGATE_HOME is the agent's systemd StateDirectory, /var/lib/xorgate.
 XORGATE_SHM_DIR=/var/lib/xorgate/shm
@@ -496,8 +520,13 @@ CAM
 libcamerasrc name=$key camera-name=$camera_name ! video/x-raw,format=I420,width=1280,height=720,framerate=15/1 ! x264enc bframes=0 speed-preset=ultrafast bitrate=1000 byte-stream=TRUE tune=zerolatency threads=2 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! appsink sync=TRUE emit-signals=TRUE name=appsink-video
 GST
 }
-write_bridged_pipeline cam0 /base/axi/pcie@1000120000/rp1/i2c@88000/imx290@1a
-write_bridged_pipeline cam1 /base/axi/pcie@1000120000/rp1/i2c@70000/imx290@1a
+if [ ! -f "$CONF_DIR/hardware.json" ]; then
+  log "no hardware block (legacy model); writing the historical CM5 pipeline defaults"
+  write_bridged_pipeline cam0 /base/axi/pcie@1000120000/rp1/i2c@88000/imx290@1a
+  write_bridged_pipeline cam1 /base/axi/pcie@1000120000/rp1/i2c@70000/imx290@1a
+else
+  log "hardware block present; the agent renders pipelines on first start after reboot"
+fi
 
 # Stage the runtime binary (tar preserves the +x bit, but be defensive) and warn
 # if the user-supplied KVS SDK .so libs aren't present yet.
@@ -511,11 +540,12 @@ else
   log "WARN: media runtime binary missing from build ($INSTALL_PREFIX/media); streaming disabled"
 fi
 
-# 8b. Camera device-tree overlays for the current fleet hardware (CM5 + dual
-#     IMX290 on the cam0/cam1 connectors). IMX290 has no camera EEPROM, so
-#     camera_auto_detect never finds it; the sensors only bind with explicit
-#     overlays. Idempotent + backed up + best-effort. Hardware-specific by design
-#     (pairs with the default pipelines above). Takes effect on the NEXT BOOT, so
+# 8b. Camera device-tree overlays. Sensors like the IMX290 have no camera
+#     EEPROM, so camera_auto_detect never finds them; they only bind with
+#     explicit overlays. The overlay LIST comes from the resolved model's
+#     hardware block (sensor + connector per camera — cm4-support plan); a
+#     device with no block falls back to the historical CM5 dual-IMX290 lines.
+#     Idempotent + backed up + best-effort. Takes effect on the NEXT BOOT, so
 #     a fresh device needs one reboot after install before streaming works.
 CONFIG_TXT=/boot/firmware/config.txt
 [ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
@@ -527,10 +557,21 @@ if [ -f "$CONFIG_TXT" ]; then
   else
     echo 'camera_auto_detect=0' >> "$CONFIG_TXT"
   fi
-  grep -qE '^dtoverlay=imx290,cam0' "$CONFIG_TXT" || { echo 'dtoverlay=imx290,cam0' >> "$CONFIG_TXT"; CAM_OVERLAY_ADDED=1; }
-  grep -qE '^dtoverlay=imx290,cam1' "$CONFIG_TXT" || { echo 'dtoverlay=imx290,cam1' >> "$CONFIG_TXT"; CAM_OVERLAY_ADDED=1; }
+  # One "<sensor>,<camN>" per declared camera: csi0 -> cam0, csi1 -> cam1.
+  # Legacy fallback when no hardware block was written.
+  OVERLAY_LINES=$(echo "$CLAIM_RESPONSE" | jq -r \
+    '.hardware.video // [] | .[] | "dtoverlay=\\(.sensor),\\(.connector | sub("^csi"; "cam"))"' 2>/dev/null)
+  if [ -z "$OVERLAY_LINES" ]; then
+    OVERLAY_LINES=$(printf 'dtoverlay=imx290,cam0\\ndtoverlay=imx290,cam1')
+  fi
+  while IFS= read -r overlay_line; do
+    [ -n "$overlay_line" ] || continue
+    grep -qF "$overlay_line" "$CONFIG_TXT" || { echo "$overlay_line" >> "$CONFIG_TXT"; CAM_OVERLAY_ADDED=1; }
+  done <<EOF
+$OVERLAY_LINES
+EOF
   if [ "$CAM_OVERLAY_ADDED" = "1" ]; then
-    log "camera overlays (dual IMX290) added to $CONFIG_TXT — REBOOT required before cameras stream"
+    log "camera overlays added to $CONFIG_TXT — REBOOT required before cameras stream"
   else
     log "camera overlays already present in $CONFIG_TXT"
   fi
