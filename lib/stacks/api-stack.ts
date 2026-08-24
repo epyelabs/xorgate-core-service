@@ -36,11 +36,12 @@ import * as path from "path";
  * the route table rather than in a domain mapping, so the version prefix does
  * not depend on DNS existing.
  *
- * PROD IS NEVER DEPLOYED. `npm run deploy:prod` has never been run and there is
- * no production environment; the entry below exists so `api.xorgate.io` is
- * RESERVED (the certificate is issued and recorded) rather than pointed at the
- * dev stage, which is the mistake that would later force a name consumers hold
- * to move. Deploying it is a deliberate future act, not a side effect.
+ * PROD IS LIVE since 2026-08-21, in its own AWS account (865609249890, part of
+ * the org/account split): `api.xorgate.io` answers from there, and
+ * `npm run deploy:prod` targets that account (the per-stage account pin in
+ * bin/app.ts refuses credentials for any other). Deploying prod therefore
+ * needs credentials that can assume into 865609249890, e.g.
+ * `AWS_PROFILE=xorgate-prod`; the default dev-account profile only covers dev.
  */
 const CUSTOM_DOMAINS: Record<
   "dev" | "prod",

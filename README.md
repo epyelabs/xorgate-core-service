@@ -191,9 +191,19 @@ generated `execute-api` endpoint.
 npm run typecheck            # tsc (cdk + lambda projects)
 npm run synth:dev            # cdk synth (bundles every Lambda via esbuild)
 npm run deploy:dev           # cdk deploy --context stage=dev --all
-npm run deploy:prod          # cdk deploy --context stage=prod --all
+npm run deploy:prod          # cdk deploy --context stage=prod --all (needs prod-account creds, see below)
 npm run db:generate          # generate a Drizzle migration after editing src/db/schema.ts
 ```
+
+**Prod is a different AWS account** (865609249890) since the 2026-08-21
+org/account split; dev stays in the shared 111910761410. `bin/app.ts` pins the
+account per stage, so `deploy:prod` with dev credentials fails fast rather than
+deploying to the wrong place — run it with credentials that reach the prod
+account, e.g. `AWS_PROFILE=xorgate-prod npm run deploy:prod`. The same applies
+to anything else prod-side: migrations over the RDS Data API, model-registry
+publishing to the core bucket, and `scripts/migrate-telemetry-partitions.mjs`
+(its defaults are the dev sandbox cluster; point `XORGATE_DB_CLUSTER_ARN` /
+`XORGATE_DB_SECRET_ARN` at the prod cluster explicitly).
 
 The Fargate paths (push a runner image, run/stop tasks) need ECR + ECS +
 `iam:PassRole` permissions the base deploy user does not have; grant them separately.
