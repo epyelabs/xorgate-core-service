@@ -179,14 +179,16 @@ MODE=real
 # KVS WebRTC media runtime (supervised by the agent's media collector; it reuses
 # the IoT cert above for KVS creds — channels/endpoints live in kvs.json). On for
 # every provisioned device; turn a camera off with
-# \`xorgate set recording.video.cameras.<streamKey> off\` or from the web UI.
+# 'xorgate set recording.video.cameras.<streamKey> off' or from the web UI.
+# (No backticks in this heredoc: its delimiter is unquoted, so a backtick
+# would command-substitute at install time and mangle the written file.)
 KVS_RUNTIME_BIN=$INSTALL_PREFIX/media/xorgate-kvs-webrtc
 KVS_RUNTIME_LIB_DIR=$INSTALL_PREFIX/media/lib
 KVS_MANIFEST=$CONF_DIR/kvs.json
 # Per-stream GStreamer pipelines: drop <streamKey>.gst here (e.g. cam0.gst), or
-# manage them with \`xorgate pipeline set <streamKey> <file>\`.
+# manage them with 'xorgate pipeline set <streamKey> <file>'.
 KVS_PIPELINE_DIR=$CONF_DIR/pipelines
-# Where \`xorgate update\` pulls new builds from.
+# Where 'xorgate update' pulls new builds from.
 DEVICE_DIST_BUCKET_URL=$DIST_BUCKET_URL
 DEVICE_DIST_VERSION=$DIST_VERSION
 EOF
