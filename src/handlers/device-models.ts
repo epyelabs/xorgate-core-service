@@ -16,6 +16,62 @@ import {
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { apiHandler } from '../utils/api-handler';
+import { ioCapabilitiesSchema } from '../schemas/capabilities';
+import { publishDeviceConfig } from '../services/device-config';
+
+/**
+ * Versioned `ioCapabilities` documents are validated on write (cm4-support
+ * plan): a v2 doc drives real device behavior (encoder templates, overlays,
+ * LED pins) through the hardware block, so a typo'd enum must fail HERE, not
+ * as a silently-degraded device. Unversioned/null docs stay accepted
+ * unvalidated — legacy rows (and the odd freeform sketch) predate the schema.
+ */
+function invalidCapabilities(caps: unknown): string | null {
+  if (caps === null || caps === undefined) return null;
+  if (typeof caps !== 'object' || Array.isArray(caps)) {
+    return 'ioCapabilities must be an object or null';
+  }
+  if (!('schemaVersion' in (caps as Record<string, unknown>))) return null;
+  const parsed = ioCapabilitiesSchema.safeParse(caps);
+  if (parsed.success) return null;
+  const issue = parsed.error.issues[0];
+  const path = issue?.path.length ? issue.path.join('.') : 'ioCapabilities';
+  return `ioCapabilities invalid at ${path}: ${issue?.message ?? 'invalid'}`;
+}
+
+/**
+ * A capability edit changes the hardware block every device on the model
+ * receives, and the retained config topic is how it reaches them: bump each
+ * device's config_rev and republish (the agent skips already-applied revs, so
+ * this is what makes it re-read). Best-effort per device — the model update
+ * has already committed, and the reported-rev self-heal republishes stragglers.
+ */
+async function republishModelDevices(modelId: string): Promise<void> {
+  const rows = await db
+    .update(schema.devices)
+    .set({
+      configRev: sql`${schema.devices.configRev} + 1`,
+      configUpdatedAt: new Date(),
+    })
+    .where(eq(schema.devices.deviceModelId, modelId))
+    .returning({
+      id: schema.devices.id,
+      config: schema.devices.config,
+      configRev: schema.devices.configRev,
+    });
+  for (const row of rows) {
+    try {
+      await publishDeviceConfig(row.id, row.config, row.configRev);
+    } catch (err) {
+      console.error('model-edit config republish failed', {
+        deviceId: row.id,
+        modelId,
+        rev: row.configRev,
+        err,
+      });
+    }
+  }
+}
 
 // device_models is a platform-wide catalog: any authenticated caller can read,
 // including an API-key caller (`requirePrincipal`, not `requireAuth`) — the
@@ -89,6 +145,8 @@ const restHandler = async (
       const name = body.name?.trim();
       const sku = body.sku?.trim();
       if (!name || !sku) return badRequest('name and sku are required');
+      const capsError = invalidCapabilities(body.ioCapabilities);
+      if (capsError) return badRequest(capsError);
 
       const [row] = await db
         .insert(schema.deviceModels)
@@ -120,6 +178,8 @@ const restHandler = async (
       if (body.name !== undefined) updates.name = body.name;
       if (body.sku !== undefined) updates.sku = body.sku;
       if (body.ioCapabilities !== undefined) {
+        const capsError = invalidCapabilities(body.ioCapabilities);
+        if (capsError) return badRequest(capsError);
         updates.ioCapabilities = body.ioCapabilities;
       }
       if (body.firmwareChannel !== undefined) updates.firmwareChannel = body.firmwareChannel;
@@ -132,6 +192,9 @@ const restHandler = async (
         .where(eq(schema.deviceModels.id, id))
         .returning();
       if (updated.length === 0) return notFound(`Device model "${id}" not found`);
+      // A capability edit must reach the model's devices (their hardware block
+      // rides the retained config message) — no re-provision, no ssh.
+      if (body.ioCapabilities !== undefined) await republishModelDevices(id);
       return ok({ device_model: updated[0] });
     }
     case 'DELETE': {

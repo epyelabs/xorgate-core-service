@@ -483,6 +483,13 @@ export function openApiSchemas(): Record<string, unknown> {
             'Machine-managed: telemetry ingest, the MQTT last-will and the offline sweeper own ' +
             'this. Writing it through `PUT /devices/{id}` is rejected 400.',
         },
+        needsModel: {
+          type: 'boolean',
+          description:
+            'Probe-at-claim could not pick a device model unambiguously; the device carries its ' +
+            'registration\'s fallback model until an operator confirms one via ' +
+            '`PUT /devices/{id}` `{deviceModelId}`, which clears this.',
+        },
         lastSeenAt: { type: 'string', format: 'date-time', nullable: true },
         config: {
           allOf: [{ $ref: '#/components/schemas/DeviceConfig' }],

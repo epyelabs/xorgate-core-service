@@ -128,17 +128,26 @@ fi
 #    re-run on the same machine maps to the same device (the backend rejects a
 #    duplicate serial in the workspace). machine-id is preferred; fall back to the
 #    DMI product UUID, then the hostname.
+#    The claim also carries a hardware probe (cm4-support plan, D3): the
+#    device-tree model string picks the right device model row server-side
+#    (CM4 vs CM5), and the camera count narrows further when cameras are
+#    already bound. On a FRESH install the count is 0 (the overlays land in
+#    step 8b and bind on the next boot) — the backend treats 0 as unknown.
 HOSTNAME_VAL=$(hostname || echo unknown)
 PLATFORM_VAL=$(uname -m || echo unknown)
 SERIAL_VAL=$(cat /etc/machine-id 2>/dev/null \\
   || cat /sys/class/dmi/id/product_uuid 2>/dev/null \\
   || echo "$HOSTNAME_VAL")
+DT_MODEL=$(tr -d '\\0' < /proc/device-tree/model 2>/dev/null || echo unknown)
+CAM_COUNT=$( { rpicam-hello --list-cameras 2>/dev/null || true; } | grep -cE '^[0-9]+ +:' || true)
+CAM_COUNT="\${CAM_COUNT:-0}"
 
-log "claiming registration code via $API_BASE"
+log "claiming registration code via $API_BASE (model: $DT_MODEL, cameras: $CAM_COUNT)"
 CLAIM_RESPONSE=$(curl -fsSL --retry 3 --retry-delay 2 \\
   -X POST -H 'Content-Type: application/json' \\
   -d "$(jq -n --arg s "$SERIAL_VAL" --arg h "$HOSTNAME_VAL" --arg p "$PLATFORM_VAL" \\
-        '{serial:$s, hostname:$h, platform:$p}')" \\
+        --arg d "$DT_MODEL" --argjson c "\${CAM_COUNT:-0}" \\
+        '{serial:$s, hostname:$h, platform:$p, dtModel:$d, cameras:$c}')" \\
   "$API_BASE/device-registrations/$REG_CODE/claim") \\
   || fail "claim failed (code may be expired, already used, or the device already registered)"
 
@@ -185,6 +194,10 @@ MODE=real
 KVS_RUNTIME_BIN=$INSTALL_PREFIX/media/xorgate-kvs-webrtc
 KVS_RUNTIME_LIB_DIR=$INSTALL_PREFIX/media/lib
 KVS_MANIFEST=$CONF_DIR/kvs.json
+# Device hardware block (cm4-support): written in step 8 when the claim
+# resolves a v2 device model; the agent falls back to legacy CM5 behavior
+# when the file is absent.
+HARDWARE_MANIFEST=$CONF_DIR/hardware.json
 # Per-stream GStreamer pipelines: drop <streamKey>.gst here (e.g. cam0.gst), or
 # manage them with 'xorgate pipeline set <streamKey> <file>'.
 KVS_PIPELINE_DIR=$CONF_DIR/pipelines
@@ -436,6 +449,17 @@ esac
 echo "$CLAIM_RESPONSE" \\
   | jq '{deviceId, region, credentialEndpoint, roleAlias, channels: (.channels // []), uploadBucket}' \\
   | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/kvs.json"
+
+# Hardware block (cm4-support plan): the device-facing projection of the
+# resolved device model — platform, encoder token, connector/sensor list,
+# LED/rails/IMU. Seeds the agent until the retained cloud-config message
+# (which also carries it) arrives. Absent for v1 models: the agent then keeps
+# its legacy CM5 behavior, matching what those devices run today.
+if echo "$CLAIM_RESPONSE" | jq -e '.hardware' >/dev/null 2>&1; then
+  echo "$CLAIM_RESPONSE" | jq '.hardware' \\
+    | install -m 0600 -o "$SVC_USER" -g "$SVC_GROUP" /dev/stdin "$CONF_DIR/hardware.json"
+  log "hardware block written ($CONF_DIR/hardware.json)"
+fi
 
 # Per-stream pipeline dir (operator drops <streamKey>.gst files here for cameras).
 install -d -m 0755 -o "$SVC_USER" -g "$SVC_GROUP" "$CONF_DIR/pipelines"

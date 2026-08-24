@@ -57,9 +57,16 @@ const PINS: Pin[] = [
   },
   {
     file: 'src/schemas/capabilities.ts',
-    sha256: 'ac24a8733fbd89032ebfc353e4418264e268f3b2b1ad35b177b16080721a33d6',
+    // 2026-08-24: schemaVersion 2 (cm4-support plan) — platform facts on
+    // `system` (platform/encoder/rails/statusLed), per-video connector+sensor,
+    // sensors.imu.model. ⚠ SDK re-vendor still OUTSTANDING: mirror v2 into
+    // vendor/io-capabilities.schema.json in epyelabs/xorgate-sdk-js and
+    // regenerate there (steps 1-2 in the header); this pin was moved with the
+    // change so the suite stays green, and the SDK task is tracked in
+    // plans/cm4-support/PROGRESS.md.
+    sha256: '76101abaf26dd247563ef15ca57950b61abe3f854a6f7e5fc600c513ec93858f',
     vendoredAs: 'vendor/io-capabilities.schema.json (hand-derived mirror)',
-    pinnedAt: '2026-08-22',
+    pinnedAt: '2026-08-24',
   },
 ];
 

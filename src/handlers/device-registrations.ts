@@ -19,6 +19,8 @@ import {
 import { generateRegistrationCode } from '../utils/registration-code';
 import { provisionDevice, deleteThing } from '../services/iot-provisioning';
 import { publishDeviceConfig } from '../services/device-config';
+import { resolveModel } from '../services/model-probe';
+import { deriveHardwareBlock } from '../schemas/capabilities';
 import { initialConfigDocument } from '../config-registry/index';
 import { apiHandler } from '../utils/api-handler';
 
@@ -101,9 +103,31 @@ async function createRegistration(
     return badRequest('workspaceId does not belong to the active organization');
   }
 
-  // Auto-pick the device model. Today there is exactly one seeded model; when
-  // multiple exist this takes the most recent. (Future: the agent reports a GPIO
-  // BOARD_ID that selects the model — deferred.)
+  // Optional explicit model pick (cm4-support D3 override): when the operator
+  // chooses a model in the Register dialog, the claim honors it and skips
+  // probe-at-claim mapping (`model_pinned`).
+  let body: { deviceModelId?: string } = {};
+  try {
+    body = JSON.parse(event.body ?? '{}');
+  } catch {
+    return badRequest('Invalid JSON body');
+  }
+  let pinnedModelId: string | null = null;
+  if (body.deviceModelId !== undefined) {
+    if (typeof body.deviceModelId !== 'string') {
+      return badRequest('deviceModelId must be a string');
+    }
+    const picked = await db.query.deviceModels.findFirst({
+      where: eq(schema.deviceModels.id, body.deviceModelId),
+    });
+    if (!picked) return badRequest(`Device model "${body.deviceModelId}" not found`);
+    pinnedModelId = picked.id;
+  }
+
+  // Auto-pick fallback model when the operator didn't choose one. This is only
+  // a FALLBACK now: probe-at-claim (see claimRegistration) maps the device's
+  // own hardware to a model row; when the probe is ambiguous the device keeps
+  // this model and is flagged `needs_model` for one-click resolution in the UI.
   const model = await db.query.deviceModels.findFirst({
     orderBy: [desc(schema.deviceModels.createdAt)],
   });
@@ -119,7 +143,19 @@ async function createRegistration(
     ),
     orderBy: [desc(schema.deviceRegistrations.createdAt)],
   });
-  if (existing) return ok(toView(existing));
+  if (existing) {
+    // Idempotent reuse — but an operator changing the model pick in the dialog
+    // must not be silently ignored on the reused row.
+    if (pinnedModelId && (existing.deviceModelId !== pinnedModelId || !existing.modelPinned)) {
+      const [repinned] = await db
+        .update(schema.deviceRegistrations)
+        .set({ deviceModelId: pinnedModelId, modelPinned: true })
+        .where(eq(schema.deviceRegistrations.id, existing.id))
+        .returning();
+      return ok(toView(repinned!));
+    }
+    return ok(toView(existing));
+  }
 
   const [row] = await db
     .insert(schema.deviceRegistrations)
@@ -127,7 +163,8 @@ async function createRegistration(
       code: generateRegistrationCode(),
       organizationId: auth.organizationId,
       workspaceId,
-      deviceModelId: model.id,
+      deviceModelId: pinnedModelId ?? model.id,
+      modelPinned: pinnedModelId !== null,
       // Exactly one of these is set. An API-key caller has no `users` row to
       // point at, so attribution moves to the key rather than being dropped.
       createdByUserId: auth.userId,
@@ -199,7 +236,15 @@ async function claimRegistration(
   event: APIGatewayProxyEventV2,
   code: string,
 ): Promise<APIGatewayProxyResultV2> {
-  let body: { serial?: string; hostname?: string; platform?: string };
+  let body: {
+    serial?: string;
+    hostname?: string;
+    platform?: string;
+    /** `/proc/device-tree/model` — the D3 probe. */
+    dtModel?: string;
+    /** Cameras libcamera saw at install time; 0/absent = unknown (fresh install has no overlays yet). */
+    cameras?: number;
+  };
   try {
     body = JSON.parse(event.body ?? '{}');
   } catch {
@@ -243,6 +288,35 @@ async function claimRegistration(
     );
   }
 
+  // Step 1b: resolve the device model from the probe (cm4-support D3). An
+  // operator-pinned registration wins outright; otherwise the probe narrows
+  // the catalog by platform (+ camera count when known), and an ambiguous or
+  // unrecognized probe keeps the registration's fallback model with
+  // `needs_model` set for one-click resolution in the console.
+  const regModel = await db.query.deviceModels.findFirst({
+    where: eq(schema.deviceModels.id, reg.deviceModelId),
+  });
+  let resolvedModel = regModel;
+  let needsModel = false;
+  if (regModel && !reg.modelPinned) {
+    const catalog = await db.query.deviceModels.findMany();
+    const res = resolveModel(catalog, regModel, {
+      dtModel: body.dtModel,
+      cameras: body.cameras,
+    });
+    resolvedModel = res.model;
+    needsModel = res.needsModel;
+    console.log('claim model resolution', {
+      code,
+      dtModel: body.dtModel ?? null,
+      cameras: body.cameras ?? null,
+      modelId: res.model.id,
+      sku: res.model.sku,
+      needsModel,
+      reason: res.reason,
+    });
+  }
+
   // Step 2: create the device row.
   let device;
   try {
@@ -250,7 +324,8 @@ async function claimRegistration(
       .insert(schema.devices)
       .values({
         workspaceId: reg.workspaceId,
-        deviceModelId: reg.deviceModelId,
+        deviceModelId: resolvedModel?.id ?? reg.deviceModelId,
+        needsModel,
         serial,
         name,
         // status omitted: column DEFAULT 'provisioned' fires.
@@ -266,14 +341,12 @@ async function claimRegistration(
     throw err;
   }
 
-  // Step 3: provision IoT (thing + cert + policy + KVS channels).
-  const model = await db.query.deviceModels.findFirst({
-    where: eq(schema.deviceModels.id, reg.deviceModelId),
-  });
-
+  // Step 3: provision IoT (thing + cert + policy + KVS channels). Channels are
+  // minted from the RESOLVED model's `media.video` — a 1-camera model mints
+  // one channel, so no phantom `cam1` on single-camera hardware.
   let result;
   try {
-    result = await provisionDevice(device!, model);
+    result = await provisionDevice(device!, resolvedModel);
   } catch (err) {
     // Roll back: delete the device row (cascades identity/channels), best-effort
     // delete the IoT thing, and revert the registration so the code can be retried.
@@ -333,6 +406,14 @@ async function claimRegistration(
     // uploader PUTs telemetry/v1/* + media-sessions/v1/* here with the same
     // IoT role-alias creds the KVS runtime uses.
     uploadBucket: process.env.BUCKET_NAME ?? null,
+    // The resolved model + its hardware block (cm4-support plan). The install
+    // script writes `hardware` to /etc/xorgate/hardware.json — the agent's
+    // seed until the retained config message (which also carries it) arrives.
+    // null for v1 models: the agent then keeps its legacy CM5 behavior.
+    modelId: resolvedModel?.id ?? reg.deviceModelId,
+    modelName: resolvedModel?.name ?? null,
+    needsModel,
+    hardware: deriveHardwareBlock(resolvedModel?.ioCapabilities),
   });
 }
 

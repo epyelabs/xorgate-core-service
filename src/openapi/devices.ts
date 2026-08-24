@@ -164,7 +164,11 @@ export const devicesPaths = {
       summary: 'Update device metadata',
       description:
         'Metadata only. `status` and `lastSeenAt` are machine-managed (telemetry ingest, the MQTT ' +
-        'last-will, and the offline sweeper own them) and are rejected 400. Device config moved to ' +
+        'last-will, and the offline sweeper own them) and are rejected 400. `deviceModelId` ' +
+        'reassigns the device model (resolving a `needsModel` device, or correcting a wrong ' +
+        'model): it clears `needsModel` and republishes the device config with a bumped rev so ' +
+        'the new model\'s hardware block reaches the device — it does NOT re-mint KVS channels. ' +
+        'Device config moved to ' +
         'PATCH /devices/{id}/config and PATCH /devices/{id}/ui-prefs; the old per-namespace body ' +
         'fields below are still accepted for the transition window, forwarded through the same ' +
         'validation into `config`/`uiPrefs`, and logged as deprecated.',
@@ -179,6 +183,13 @@ export const devicesPaths = {
               minProperties: 1,
               properties: {
                 name: { type: 'string', nullable: true },
+                deviceModelId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description:
+                    'Reassign the device model. Clears `needsModel` and delivers the new ' +
+                    'model\'s hardware block via a rev-bumped config republish.',
+                },
                 gnssAntBias: {
                   type: 'boolean',
                   deprecated: true,
