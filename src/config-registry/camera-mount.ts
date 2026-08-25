@@ -33,7 +33,11 @@ export type CameraRotationDeg = (typeof CAMERA_ROTATIONS)[number];
 const cameraMountEntrySchema = z
   .object({
     rotationDeg: z
-      .union([z.literal(0), z.literal(180)])
+      // The union's own message is "Invalid input", which tells an operator
+      // nothing about a closed two-value set that ends up in a boot config.
+      .union([z.literal(0), z.literal(180)], {
+        errorMap: () => ({ message: 'must be 0 or 180' }),
+      })
       .describe(
         'Rotation applied at the sensor, degrees. 180 = the camera is mounted upside down, so ' +
           'the sensor flips H+V and every consumer (live WebRTC, recorded MP4s, replays, ' +
