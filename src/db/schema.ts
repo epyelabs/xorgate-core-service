@@ -216,6 +216,11 @@ export const devices = pgTable(
     // operator. Named for what it is: the agent isn't firmware.
     agentVersion: text('agent_version'),
     status: text('status').default('provisioned').notNull(),
+    // Probe-at-claim couldn't pick a model unambiguously (cm4-support D3): the
+    // device carries its registration's fallback model until an operator
+    // confirms one (PUT /devices/{id} {deviceModelId}), which clears this.
+    // Separate from `status` — that column is machine-managed connectivity.
+    needsModel: boolean('needs_model').default(false).notNull(),
     // GNSS antenna bias: true powers an active GPS antenna's LNA via the modem's
     // VDD_AUX LDO (AT+CVAUXV/AT+CVAUXS). False (default) = passive antenna, bias
     // off — the hardware-safe state. Delivered to the device as a retained MQTT
@@ -366,6 +371,11 @@ export const deviceRegistrations = pgTable(
     deviceModelId: uuid('device_model_id')
       .references(() => deviceModels.id, { onDelete: 'restrict' })
       .notNull(),
+    // True when the operator explicitly picked the model in the Register
+    // dialog (cm4-support D3): the claim then honors the pick and skips
+    // probe-at-claim mapping. False = deviceModelId is the auto-picked
+    // default, which the probe may override.
+    modelPinned: boolean('model_pinned').default(false).notNull(),
     // Exactly one of the two creator columns is set. A Cognito-authenticated
     // caller sets the user; an API-key caller sets the key, because a key has no
     // `users` row to point at. Nullable since Phase 2 for that reason.

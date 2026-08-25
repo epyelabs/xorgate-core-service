@@ -22,10 +22,33 @@ export const deviceRegistrationsPaths = {
         '`X-Workspace-Id` is REQUIRED here (unlike on `GET /devices`, where it is a filter), ' +
         'because the code carries the workspace the future device will land in. Idempotent per ' +
         'workspace: while a pending, un-expired code exists it is returned again instead of ' +
-        'minting a new one, so reloading a dialog does not burn codes. The device model is picked ' +
-        'automatically (the most recently created one), and a deployment with no device models is ' +
-        'a 400. Note the success status is 200, not 201, even when a code is created.',
+        'minting a new one, so reloading a dialog does not burn codes. The device model defaults ' +
+        'to the most recently created one, and a deployment with no device models is a 400 — but ' +
+        'the default is only a FALLBACK: the claim maps the device\'s own hardware probe to a ' +
+        'model row (probe-at-claim), unless `deviceModelId` is passed here to pin the model ' +
+        'explicitly (the claim then skips the probe). Passing `deviceModelId` while a pending ' +
+        'code exists re-pins that code\'s model in place. Note the success status is 200, not ' +
+        '201, even when a code is created.',
       tags: ['Device Registrations'],
+      requestBody: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                deviceModelId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description:
+                    'Pin the device model explicitly instead of probe-at-claim mapping. ' +
+                    'Unknown ids are a 400.',
+                },
+              },
+            },
+          },
+        },
+      },
       responses: {
         '200': {
           description: 'A pending registration, freshly minted or the existing un-expired one.',
@@ -80,8 +103,13 @@ export const deviceRegistrationsPaths = {
       description:
         'INTERNAL. Called unauthenticated by the install script running on the device. It flips ' +
         'the code to `claimed`, creates the device row, provisions its AWS IoT identity, and ' +
-        'returns the certificate and PRIVATE KEY once. Not part of the public API surface: treat ' +
-        'the installer as the only client.',
+        'returns the certificate and PRIVATE KEY once. The body may carry a hardware probe ' +
+        '(`dtModel` = /proc/device-tree/model, `cameras` = libcamera count, 0 = unknown) that ' +
+        'picks the device model unless the registration pinned one; an ambiguous probe keeps ' +
+        'the registration\'s model and flags the device `needsModel`. The response embeds the ' +
+        'resolved model\'s device-facing `hardware` block (null for schemaVersion-1 models), ' +
+        'which the installer writes to /etc/xorgate/hardware.json. Not part of the public API ' +
+        'surface: treat the installer as the only client.',
       tags: ['Device Registrations'],
       security: [],
       'x-internal': true,

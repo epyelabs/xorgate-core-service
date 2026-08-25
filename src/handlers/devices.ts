@@ -373,6 +373,26 @@ const restHandler = async (
         }
         updates.name = body.name;
       }
+      // Model reassignment (cm4-support plan): resolves a `needs_model` device
+      // (D3) or corrects a wrong model (D7). Clears the flag and — below —
+      // republishes the device's config with a bumped rev so the new model's
+      // hardware block reaches the device and the agent re-renders pipelines.
+      // Deliberately does NOT re-mint KVS channels: channel provisioning
+      // happens at claim (matching the existing "changing ioCapabilities does
+      // not retro-provision" contract); orphan channels are deleted explicitly.
+      let touchesModel = false;
+      if (body.deviceModelId !== undefined) {
+        if (typeof body.deviceModelId !== 'string') {
+          return badRequest('deviceModelId must be a string');
+        }
+        const model = await db.query.deviceModels.findFirst({
+          where: eq(schema.deviceModels.id, body.deviceModelId),
+        });
+        if (!model) return badRequest(`Device model "${body.deviceModelId}" not found`);
+        updates.deviceModelId = model.id;
+        updates.needsModel = false;
+        touchesModel = true;
+      }
       // `firmwareVersion`/`agentVersion` are deliberately NOT settable: the
       // column is now mirrored from the device's config report (README §2.3), so
       // an operator write would be overwritten by the device's next report and
@@ -402,6 +422,7 @@ const restHandler = async (
       const unknownFields = Object.keys(body).filter(
         (k) =>
           k !== 'name' &&
+          k !== 'deviceModelId' &&
           !LEGACY_PUT_FIELDS.some((f) => f.field === k) &&
           !(LEGACY_UI_PREF_FIELDS as readonly string[]).includes(k),
       );
@@ -425,7 +446,7 @@ const restHandler = async (
 
       if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
 
-      if (!touchesConfig && !touchesPrefs) {
+      if (!touchesConfig && !touchesPrefs && !touchesModel) {
         updates.updatedAt = new Date();
         const updated = await db
           .update(schema.devices)
@@ -450,7 +471,7 @@ const restHandler = async (
         else nextPrefs[key] = value;
       }
 
-      if (!touchesConfig) {
+      if (!touchesConfig && !touchesModel) {
         updates.updatedAt = new Date();
         updates.uiPrefs = nextPrefs;
         Object.assign(updates, legacyUiPrefColumns(nextPrefs));
@@ -468,7 +489,12 @@ const restHandler = async (
         return ok({ device: deviceResponse(updated[0]) });
       }
 
-      const nextConfig = applyConfigPatch(device.config, configPatch) as DeviceConfigDocument;
+      // A model change with no config edit still goes through writeConfig: the
+      // config document is unchanged but the rev bump + republish are the
+      // delivery mechanism for the new model's hardware block.
+      const nextConfig = touchesConfig
+        ? (applyConfigPatch(device.config, configPatch) as DeviceConfigDocument)
+        : ((device.config ?? {}) as DeviceConfigDocument);
       return writeConfig(id, orgWorkspaceIds, nextConfig, {
         updates,
         ...(touchesPrefs ? { uiPrefs: nextPrefs } : {}),

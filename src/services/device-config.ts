@@ -1,4 +1,7 @@
 import { PublishCommand } from '@aws-sdk/client-iot-data-plane';
+import { eq } from 'drizzle-orm';
+import { db, schema } from '../db/index';
+import { deriveHardwareBlock, type DeviceHardwareBlock } from '../schemas/capabilities';
 import { deviceScope, ensureThingScopeAttributes, type DeviceScope } from './device-scope';
 import { iotDataClient } from './iot-data';
 import {
@@ -66,6 +69,18 @@ export interface DeviceConfigEnvelope {
    * old agent and a new one see the same absence.
    */
   scope?: DeviceScope;
+  /**
+   * The device's hardware block (cm4-support plan): the projection of its
+   * model's v2 `io_capabilities` the agent turns into mechanism — platform,
+   * encoder token, connector/sensor list, LED/rails/IMU. Not a config
+   * namespace — it is a fact about the hardware, not a setting, and it rides
+   * the envelope for the same reason `scope` does: the retained config topic
+   * is the one channel that reaches fielded devices without re-provisioning.
+   * A model edit in the console fans out a rev-bumped republish
+   * (handlers/device-models.ts), so the agent re-renders pipelines from it.
+   * Omitted for v1 models — the agent then keeps its legacy CM5 behavior.
+   */
+  hardware?: DeviceHardwareBlock;
   ts: number;
 }
 
@@ -101,6 +116,7 @@ export function buildDeviceConfigMessage(
   rev: number,
   now: number = Date.now(),
   scope?: DeviceScope | null,
+  hardware?: DeviceHardwareBlock | null,
 ): DeviceConfigMessage {
   const source = (doc ?? {}) as Record<string, unknown>;
   // Registry order is the wire order, and gnssAntBias is first in both — keep
@@ -127,8 +143,30 @@ export function buildDeviceConfigMessage(
     ...(namespaces as PublishedConfigDocument),
     ...(uploadBucket ? { uploadBucket } : {}),
     ...(scope ? { scope } : {}),
+    ...(hardware ? { hardware } : {}),
     ts: now,
   } as DeviceConfigMessage;
+}
+
+/**
+ * The device's hardware block, derived from its model row at publish time (so
+ * the message always reflects the CURRENT model — including after a model edit
+ * or a device-model reassignment). null when the device is gone or its model
+ * is v1/unparseable, in which case the block is omitted from the message.
+ */
+export async function deviceHardwareBlock(
+  deviceId: string,
+): Promise<DeviceHardwareBlock | null> {
+  const rows = await db
+    .select({ caps: schema.deviceModels.ioCapabilities })
+    .from(schema.devices)
+    .innerJoin(
+      schema.deviceModels,
+      eq(schema.devices.deviceModelId, schema.deviceModels.id),
+    )
+    .where(eq(schema.devices.id, deviceId))
+    .limit(1);
+  return deriveHardwareBlock(rows[0]?.caps);
 }
 
 /**
@@ -153,8 +191,9 @@ export async function publishDeviceConfig(
   // settings is the cheaper side of that trade.
   const scope = await deviceScope(deviceId);
   if (scope) await ensureThingScopeAttributes(deviceId, scope);
+  const hardware = await deviceHardwareBlock(deviceId);
 
-  const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope);
+  const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope, hardware);
   const client = await iotDataClient();
   await client.send(
     new PublishCommand({
