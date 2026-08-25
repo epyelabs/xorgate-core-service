@@ -24,6 +24,7 @@ import { recordingNamespace, type RecordingConfig } from './recording';
 import { lteRecoveryNamespace, type LteRecoveryConfig } from './lte-recovery';
 import { timeSyncNamespace, type TimeSyncConfig } from './time-sync';
 import { cellularNamespace, type CellularConfig } from './cellular';
+import { cameraMountNamespace, type CameraMountConfig } from './camera-mount';
 
 export * from './types';
 export * from './gnss-ant-bias';
@@ -32,6 +33,7 @@ export * from './recording';
 export * from './lte-recovery';
 export * from './time-sync';
 export * from './cellular';
+export * from './camera-mount';
 export * from './ui-prefs';
 
 /**
@@ -46,6 +48,7 @@ export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
   lteRecoveryNamespace,
   timeSyncNamespace,
   cellularNamespace,
+  cameraMountNamespace,
 ];
 
 export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
@@ -81,6 +84,7 @@ export interface DeviceConfigDocument {
   lteRecovery?: LteRecoveryConfig | null;
   timeSync?: TimeSyncConfig | null;
   cellular?: CellularConfig | null;
+  cameraMount?: CameraMountConfig | null;
 }
 
 /**

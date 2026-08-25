@@ -51,9 +51,13 @@ interface Pin {
 const PINS: Pin[] = [
   {
     file: 'src/config-registry/config-contract.json',
-    sha256: 'fa752d7f04ef71cb5c6c0438fd5920c838a96a36266249144f662f16d95dae71',
+    // 2026-08-25: added the `cameraMount` namespace (cam-sensor-level-rotate
+    // plan, Phase 1). ⚠ SDK re-vendor is that plan's Phase 3 (it ships with the
+    // SDK regen + publish); the pin is moved with the change, as the
+    // capabilities pin below was, so the suite stays green in the meantime.
+    sha256: '0b73cc21544dc78955965f6efb2cfb9c4ee7af4bba3f1f7e7038b99bdf54e5e7',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
-    pinnedAt: '2026-08-22',
+    pinnedAt: '2026-08-25',
   },
   {
     file: 'src/schemas/capabilities.ts',
