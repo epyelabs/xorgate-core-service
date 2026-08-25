@@ -12,7 +12,7 @@ import { legacyConfigColumns } from '../src/config-registry/legacy-columns';
 import { buildDeviceConfigMessage } from '../src/services/device-config';
 
 describe('config registry — namespaces', () => {
-  it('carries exactly the six wire namespaces, in wire order', () => {
+  it('carries exactly the seven wire namespaces, in wire order', () => {
     // Order is the published key order; the names are load-bearing (the modem
     // daemon greps them out of settings.json) and must never be renamed.
     expect(CONFIG_NAMESPACE_KEYS).toEqual([
@@ -22,6 +22,7 @@ describe('config registry — namespaces', () => {
       'lteRecovery',
       'timeSync',
       'cellular',
+      'cameraMount',
     ]);
   });
 
