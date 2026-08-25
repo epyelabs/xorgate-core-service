@@ -314,6 +314,30 @@ if [ -f "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" ]; then
   install -m 0644 -o root -g root "$INSTALL_PREFIX/system/xorgate-fake-hwclock.cron" /etc/cron.d/xorgate-fake-hwclock
 fi
 
+# 6a1. Camera mounting rotation (cam-sensor-level-rotate plan): the root helper
+#      that sets the \`rotation\` parameter on a camera's dtoverlay line, plus a
+#      sudoers grant for it. /boot/firmware is root-owned and the agent is not,
+#      so this helper is the whole privilege surface — it takes sensor/camN/deg
+#      arguments and re-validates all three, never a path or a body to write.
+#      The rotation is a device-tree parameter: it applies on the NEXT BOOT and
+#      the agent never reboots the device itself.
+if [ -f "$INSTALL_PREFIX/system/xorgate-camrotate" ]; then
+  install -m 0755 -o root -g root "$INSTALL_PREFIX/system/xorgate-camrotate" /usr/local/bin/xorgate-camrotate
+  SUDOERS_TMP="\$(mktemp)"
+  cat > "\$SUDOERS_TMP" <<EOF
+# Installed by xorgate. Allows the agent (running as $SVC_USER) to set the
+# camera overlay's rotation parameter in the boot config, and nothing else.
+# See device-agent src/hardware/boot-config.ts + system/xorgate-camrotate.
+$SVC_USER ALL=(root) NOPASSWD: /usr/local/bin/xorgate-camrotate
+EOF
+  if visudo -cf "\$SUDOERS_TMP" >/dev/null 2>&1; then
+    install -m 0440 -o root -g root "\$SUDOERS_TMP" /etc/sudoers.d/023_xorgate-camrotate
+  else
+    log "WARN: camrotate sudoers drop-in failed validation; camera rotation will not apply"
+  fi
+  rm -f "\$SUDOERS_TMP"
+fi
+
 # 6a2. Remote update rail (device_update_management plan, Phase 3): a oneshot
 #      unit that runs \`xorgate update\` as root, plus a sudoers grant letting the
 #      unprivileged agent START THAT ONE UNIT and nothing else. The agent cannot
