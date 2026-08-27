@@ -19,6 +19,7 @@
     "destroy:prod": "cdk destroy --context stage=prod --all",
     "typecheck": "tsc -p tsconfig.cdk.json --noEmit && tsc -p tsconfig.lambda.json --noEmit && tsc -p engine-runner/tsconfig.json --noEmit",
     "db:generate": "drizzle-kit generate",
+    "fetch:ffmpeg": "bash scripts/fetch-ffmpeg-layer.sh",
     "contract:generate": "ts-node -T --compilerOptions '{\"module\":\"commonjs\",\"target\":\"ES2022\",\"esModuleInterop\":true}' scripts/generate-config-contract.ts",
     "openapi:emit": "ts-node -T --compilerOptions '{\"module\":\"commonjs\",\"target\":\"ES2022\",\"esModuleInterop\":true}' scripts/emit-openapi.ts",
     "test": "vitest run"
