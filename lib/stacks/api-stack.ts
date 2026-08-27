@@ -20,6 +20,7 @@ import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
+import * as fs from "fs";
 import * as path from "path";
 
 /**
@@ -1193,6 +1194,84 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "MediaSegmentIngestFn async invoke failed past retries (video segment not indexed)",
     });
     mediaSegmentDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+
+    // --- Session poster frames (session-thumbnails) ---
+    // S3 Object Created for the FIRST segment of a session (suffix /00000.mp4;
+    // the handler's key parser is the prefix/shape gate, EventBridge can't
+    // combine prefix+suffix in one matcher) -> MediaThumbnailFn -> one
+    // downscaled JPEG next to the segments + media_sessions.thumbnail_key,
+    // which the sessions list presigns as `thumbnailUrl`. ffmpeg comes from a
+    // layer holding a pinned static arm64 build; the ~50 MB binary is NOT
+    // checked in — synth fails here until scripts/fetch-ffmpeg-layer.sh has
+    // downloaded and checksum-verified it (npm run fetch:ffmpeg).
+    const ffmpegBinary = path.join(
+      __dirname,
+      "../../lambda-layers/ffmpeg/bin/ffmpeg",
+    );
+    if (!fs.existsSync(ffmpegBinary)) {
+      throw new Error(
+        `MediaThumbnailFn ffmpeg layer binary is missing (${ffmpegBinary}). ` +
+          "Run `npm run fetch:ffmpeg` once, then synth/deploy again.",
+      );
+    }
+    const ffmpegLayer = new lambda.LayerVersion(this, "FfmpegLayer", {
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, "../../lambda-layers/ffmpeg"),
+      ),
+      compatibleArchitectures: [lambda.Architecture.ARM_64],
+      compatibleRuntimes: [lambda.Runtime.NODEJS_20_X],
+      description:
+        "Static ffmpeg (ffmpeg-static b6.0, linux-arm64) at /opt/bin/ffmpeg",
+    });
+    const mediaThumbnailFnDlq = new sqs.Queue(this, "MediaThumbnailFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const mediaThumbnailFn = new nodejs.NodejsFunction(this, "MediaThumbnailFn", {
+      ...standardFnProps(
+        path.join(entryBase, "media-thumbnail.ts"),
+        "S3 Object Created(media-sessions/v1/**/00000.mp4) -> session poster frame",
+      ),
+      // Downloads one whole segment (<= ~20 MB) to /tmp and decodes a single
+      // 1080p frame; memory also buys the CPU the decode runs on.
+      memorySize: 512,
+      timeout: cdk.Duration.seconds(60),
+      layers: [ffmpegLayer],
+      environment: { ...commonEnv, FFMPEG_PATH: "/opt/bin/ffmpeg" },
+      onFailure: new lambdaDestinations.SqsDestination(mediaThumbnailFnDlq),
+    });
+    const mediaThumbnailRuleDlq = new sqs.Queue(this, "MediaThumbnailRuleDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    new events.Rule(this, "MediaThumbnailRule", {
+      description: "First video segment uploaded -> extract session poster frame",
+      eventPattern: {
+        source: ["aws.s3"],
+        detailType: ["Object Created"],
+        detail: {
+          bucket: { name: [bucket.bucketName] },
+          object: { key: [{ suffix: "/00000.mp4" }] },
+        },
+      },
+      targets: [
+        new targets.LambdaFunction(mediaThumbnailFn, {
+          deadLetterQueue: mediaThumbnailRuleDlq,
+          retryAttempts: 2,
+        }),
+      ],
+    });
+    const mediaThumbnailDlqAlarm = new cloudwatch.Alarm(this, "MediaThumbnailDlqDepthAlarm", {
+      metric: mediaThumbnailFnDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "MediaThumbnailFn async invoke failed past retries (session poster frame not generated)",
+    });
+    mediaThumbnailDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
 
     // (RecordingCaptureFn + RecordingCaptureRule on xorgate/recordings/+/status
     // and its IoT invoke permission REMOVED in destroy-kvs-recorder Phase 5,

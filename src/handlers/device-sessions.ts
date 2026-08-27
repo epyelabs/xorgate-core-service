@@ -219,7 +219,10 @@ const restHandler = async (
 
       // Collect object keys BEFORE deleting rows: every segment's .mp4 plus
       // its .json sidecar (uploaded pairwise by the device; the sidecar is not
-      // row-tracked, its key is the .mp4 key with the extension swapped).
+      // row-tracked, its key is the .mp4 key with the extension swapped), and
+      // the poster frame when one was generated. (A thumbnail still being
+      // generated mid-delete can leave an orphan object — the lifecycle rule
+      // expires it, same as straggler segments.)
       const segments = await db.query.mediaSegments.findMany({
         where: eq(schema.mediaSegments.sessionId, session.id),
         columns: { s3Key: true },
@@ -228,6 +231,7 @@ const restHandler = async (
         s.s3Key,
         s.s3Key.replace(/\.mp4$/, '.json'),
       ]);
+      if (session.thumbnailKey) keys.push(session.thumbnailKey);
 
       // Best-effort S3 cleanup in batches of 1000 (DeleteObjects cap). Objects
       // already expired by the lifecycle rule just delete as no-ops. A failed
@@ -264,7 +268,9 @@ const restHandler = async (
  * Attach the per-session rollups (computed, not stored — so they can't drift
  * from the segment rows) that the list endpoint's consumers depend on. Shared
  * by both the session and the run branch so a run's members are byte-identical
- * in shape to an ungrouped listing.
+ * in shape to an ungrouped listing. Also presigns thumbnail_key into
+ * `thumbnailUrl` (list-only, like the rollups): local SigV4 crypto per row, no
+ * S3 round trips, so a page of sessions stays one DB query.
  */
 async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
   const ids = rows.map((r) => r.id);
@@ -281,17 +287,27 @@ async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
         .groupBy(schema.mediaSegments.sessionId)
     : [];
   const bySession = new Map(rollups.map((r) => [r.sessionId, r]));
-  return rows.map((r) => {
-    const agg = bySession.get(r.id);
-    return {
-      ...r,
-      segmentCount: Number(agg?.segmentCount ?? 0),
-      totalBytes: Number(agg?.totalBytes ?? 0),
-      // The Data API returns bigint aggregates as strings on some paths — keep
-      // coercing, the frontend schema expects numbers.
-      totalDurationMs: Number(agg?.totalDurationMs ?? 0),
-    };
-  });
+  return Promise.all(
+    rows.map(async (r) => {
+      const agg = bySession.get(r.id);
+      return {
+        ...r,
+        segmentCount: Number(agg?.segmentCount ?? 0),
+        totalBytes: Number(agg?.totalBytes ?? 0),
+        // The Data API returns bigint aggregates as strings on some paths — keep
+        // coercing, the frontend schema expects numbers.
+        totalDurationMs: Number(agg?.totalDurationMs ?? 0),
+        thumbnailUrl:
+          r.thumbnailKey && BUCKET
+            ? await getSignedUrl(
+                s3,
+                new GetObjectCommand({ Bucket: BUCKET, Key: r.thumbnailKey }),
+                { expiresIn: PLAYBACK_TTL_SECONDS },
+              )
+            : null,
+      };
+    }),
+  );
 }
 
 /**

@@ -718,9 +718,25 @@ export function openApiSchemas(): Record<string, unknown> {
           description: 'Server-side arrival time of the most recent segment (upload can lag recording).',
         },
         createdAt: { type: 'string', format: 'date-time' },
+        thumbnailKey: {
+          type: 'string',
+          nullable: true,
+          description:
+            'S3 key of the poster frame extracted from the first segment. NULL when none exists ' +
+            '(pre-feature session, first segment never uploaded, or extraction failed) — always ' +
+            'treat as optional. Not fetchable directly; use `thumbnailUrl`.',
+        },
         segmentCount: { type: 'integer', description: 'Rollup (list endpoint only).' },
         totalBytes: { type: 'integer', description: 'Rollup (list endpoint only).' },
         totalDurationMs: { type: 'integer', description: 'Rollup (list endpoint only).' },
+        thumbnailUrl: {
+          type: 'string',
+          format: 'uri',
+          nullable: true,
+          description:
+            'Presigned GET for the poster frame JPEG (list endpoint only, same TTL as segment ' +
+            'playback URLs). NULL when the session has no thumbnail.',
+        },
       },
     },
     RecordingRun: {

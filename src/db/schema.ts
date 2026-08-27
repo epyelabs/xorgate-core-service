@@ -528,6 +528,11 @@ export const mediaSessions = pgTable(
     // Device clock quality when the session started: ntp | rtc | unsynced (D6).
     timeSource: text('time_source'),
     bitrateKbps: integer('bitrate_kbps'),
+    // S3 key of the poster frame extracted from the session's first segment
+    // (media-thumbnail handler). Lives inside the session's own prefix so the
+    // segment lifecycle rule expires it too. NULL = no thumbnail (pre-feature
+    // session, or extraction failed past retries) — always optional.
+    thumbnailKey: text('thumbnail_key'),
     // Server-side arrival time of the most recent segment — the sweeper's
     // close-detection clock (upload can lag recording by hours; never use
     // device timestamps to decide "no longer arriving").
