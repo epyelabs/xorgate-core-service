@@ -43,7 +43,14 @@ type TriggerEvent = PreSignUpTriggerEvent | PostConfirmationTriggerEvent;
 export async function handler(event: TriggerEvent): Promise<TriggerEvent> {
   if (event.triggerSource === 'PreSignUp_ExternalProvider') {
     await linkFederatedToNative(event);
-  } else if (event.triggerSource === 'PostConfirmation_ConfirmSignUp') {
+  } else if (
+    event.triggerSource === 'PostConfirmation_ConfirmSignUp' &&
+    parseFederatedUsername(event.userName) === null
+  ) {
+    // Native signups only. A first-time federated sign-in also confirms
+    // through here (as `google_...`); absorbing then would find and delete
+    // the very user being created, and the sign-in fails with
+    // "User does not exist".
     await absorbFederatedUsers(event);
   }
   return event;
@@ -105,6 +112,7 @@ async function absorbFederatedUsers(event: PostConfirmationTriggerEvent): Promis
   const users = await listUsersByEmail(event.userPoolId, email);
   for (const user of users) {
     if (user.UserStatus !== 'EXTERNAL_PROVIDER' || !user.Username) continue;
+    if (user.Username === event.userName) continue; // never absorb ourselves
     const parsed = parseFederatedUsername(user.Username);
     if (!parsed) continue;
 
