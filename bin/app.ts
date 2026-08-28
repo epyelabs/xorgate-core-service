@@ -101,16 +101,25 @@ const telemetryRetentionDays =
   Number.isFinite(retentionDaysCtx) && retentionDaysCtx > 0 ? retentionDaysCtx : undefined;
 
 // Google Hosted-UI federation ("Continue with Google" in xorgate-web). When
-// googleClientId is unset the auth stack stays Cognito-only. The client secret
-// is read from Secrets Manager `xorgate/oauth-providers[-dev]` (JSON key
-// `googleClientSecret`) and must exist before the first federated deploy.
-//   npm run deploy:dev -- --context googleClientId=<id>.apps.googleusercontent.com
+// googleClientId resolves to nothing the auth stack stays Cognito-only. The
+// client secret is read from Secrets Manager `xorgate/oauth-providers[-dev]`
+// (JSON key `googleClientSecret`); both exist as of 2026-08-28.
+//   npm run deploy:dev -- [--context googleClientId=<id>|off]
 //   [--context webAppUrls=http://localhost:5173,https://dev.xorgate.io]
 //   [--context hostedUiDomainPrefix=xorgate-authdev]
 // The Google client itself must list
 // https://<prefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse as an
 // authorized redirect URI.
-const googleClientId = app.node.tryGetContext('googleClientId') as string | undefined;
+// Client IDs are public identifiers (the secret is the Secrets Manager entry).
+// Baked in per stage so a plain `deploy:dev` / `deploy:prod` keeps federation
+// on; `--context googleClientId=off` turns it off for one deploy.
+const GOOGLE_CLIENT_IDS: Record<typeof stage, string> = {
+  dev: '905531180123-etp9el5cm67kvsa2ugdma085ernfjj3n.apps.googleusercontent.com',
+  prod: '905531180123-f9ieep01amtiijakkkvml873ehcloi2s.apps.googleusercontent.com',
+};
+const googleClientIdCtx = app.node.tryGetContext('googleClientId') as string | undefined;
+const googleClientId =
+  googleClientIdCtx === 'off' ? undefined : (googleClientIdCtx ?? GOOGLE_CLIENT_IDS[stage]);
 const hostedUiDomainPrefix = app.node.tryGetContext('hostedUiDomainPrefix') as
   | string
   | undefined;
