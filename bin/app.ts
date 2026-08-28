@@ -100,6 +100,31 @@ const retentionDaysCtx = Number(app.node.tryGetContext('telemetryRetentionDays')
 const telemetryRetentionDays =
   Number.isFinite(retentionDaysCtx) && retentionDaysCtx > 0 ? retentionDaysCtx : undefined;
 
+// Google Hosted-UI federation ("Continue with Google" in xorgate-web). When
+// googleClientId is unset the auth stack stays Cognito-only. The client secret
+// is read from Secrets Manager `xorgate/oauth-providers[-dev]` (JSON key
+// `googleClientSecret`) and must exist before the first federated deploy.
+//   npm run deploy:dev -- --context googleClientId=<id>.apps.googleusercontent.com
+//   [--context webAppUrls=http://localhost:5173,https://dev.xorgate.io]
+//   [--context hostedUiDomainPrefix=xorgate-authdev]
+// The Google client itself must list
+// https://<prefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse as an
+// authorized redirect URI.
+const googleClientId = app.node.tryGetContext('googleClientId') as string | undefined;
+const hostedUiDomainPrefix = app.node.tryGetContext('hostedUiDomainPrefix') as
+  | string
+  | undefined;
+const webAppUrlsCtx = app.node.tryGetContext('webAppUrls') as string | undefined;
+const webAppUrls = webAppUrlsCtx
+  ? webAppUrlsCtx
+      .split(',')
+      .map((u) => u.trim().replace(/\/+$/, ''))
+      .filter(Boolean)
+  : stage === 'prod'
+    ? ['https://www.xorgate.io']
+    : ['http://localhost:5173', 'https://dev.xorgate.io'];
+const authProps = { googleClientId, hostedUiDomainPrefix, webAppUrls };
+
 if (stage === 'prod') {
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStack', { env, stage });
 
@@ -108,7 +133,11 @@ if (stage === 'prod') {
     vpc: storageStack.vpc!,
   });
 
-  const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStack', { env, stage });
+  const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStack', {
+    env,
+    stage,
+    ...authProps,
+  });
 
   const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStack', {
     env,
@@ -166,7 +195,11 @@ if (stage === 'prod') {
   // Dev: no dedicated DB cluster, no VPC. Imports the shared sandbox Aurora
   // cluster (epyelabs/epye-sandbox-stack) and reaches it via RDS Data API.
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStackDev', { env, stage });
-  const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStackDev', { env, stage });
+  const authStack = new XorgateCoreAuthStack(app, 'XorgateCoreAuthStackDev', {
+    env,
+    stage,
+    ...authProps,
+  });
 
   const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStackDev', {
     env,
