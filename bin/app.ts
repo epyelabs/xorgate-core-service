@@ -130,7 +130,7 @@ const webAppUrls = webAppUrlsCtx
       .map((u) => u.trim().replace(/\/+$/, ''))
       .filter(Boolean)
   : stage === 'prod'
-    ? ['https://www.xorgate.io']
+    ? ['https://console.xorgate.io']
     : ['http://localhost:5173', 'https://dev.xorgate.io'];
 const authProps = { googleClientId, hostedUiDomainPrefix, webAppUrls };
 
