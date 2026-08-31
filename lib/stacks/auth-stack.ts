@@ -28,6 +28,24 @@ export interface XorgateCoreAuthStackProps extends cdk.StackProps {
    * what xorgate-web derives from its page origin.
    */
   webAppUrls?: string[];
+  /**
+   * Public origin of xorgate-web for this stage (the links inside emails),
+   * e.g. `https://console.xorgate.io`.
+   */
+  appUrl: string;
+  /**
+   * Send the pool's emails (verification, invitation, password reset) from
+   * xorgate's own SES identity instead of Cognito's default sender. Only valid
+   * once the domain's DKIM records resolve AND the SES account is out of the
+   * sandbox — before that, every pool email would fail to send — so this is
+   * flipped per stage from bin/app.ts (`cognitoEmailViaSes`), not defaulted on.
+   */
+  sesEmail?: {
+    fromAddress: string;
+    fromName: string;
+    domain: string;
+    configurationSetName: string;
+  };
 }
 
 export class XorgateCoreAuthStack extends cdk.Stack {
@@ -46,8 +64,50 @@ export class XorgateCoreAuthStack extends cdk.Stack {
       standardAttributes: { email: { required: true, mutable: true } },
       passwordPolicy: { minLength: 8, requireSymbols: false, requireUppercase: false },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      // Subject and body come from the CustomMessage trigger below; only the
+      // SENDER is decided here, and only once the SES identity is verified and
+      // the account is out of the sandbox (see the prop's docs).
+      email: props.sesEmail
+        ? cognito.UserPoolEmail.withSES({
+            fromEmail: props.sesEmail.fromAddress,
+            fromName: props.sesEmail.fromName,
+            sesVerifiedDomain: props.sesEmail.domain,
+            sesRegion: this.region,
+            configurationSetName: props.sesEmail.configurationSetName,
+          })
+        : cognito.UserPoolEmail.withCognito(),
       removalPolicy: isProd ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
     });
+
+    const bundling: nodejs.BundlingOptions = {
+      minify: true,
+      sourceMap: true,
+      target: 'node20',
+      externalModules: ['@aws-sdk/*'],
+      forceDockerBundling: false,
+    };
+
+    // Every email the pool sends — verification code, invitation with the
+    // temporary password, password-reset code — is re-rendered in xorgate's
+    // own template by this trigger (src/email/templates.ts). Attached
+    // UNCONDITIONALLY, unlike the account-linking trigger below: the pool
+    // sends these mails whether or not federation is configured, and the
+    // branding is independent of which sender delivers them.
+    this.userPool.addTrigger(
+      cognito.UserPoolOperation.CUSTOM_MESSAGE,
+      new nodejs.NodejsFunction(this, 'CustomMessageTrigger', {
+        entry: path.join(__dirname, '../../src/handlers/cognito-custom-message.ts'),
+        handler: 'handler',
+        runtime: lambda.Runtime.NODEJS_20_X,
+        architecture: lambda.Architecture.ARM_64,
+        memorySize: 256,
+        timeout: cdk.Duration.seconds(5),
+        bundling,
+        environment: { APP_URL: props.appUrl, STAGE: props.stage },
+        description:
+          'Cognito CustomMessage: branded verification / invitation / reset emails',
+      }),
+    );
 
     // Hosted-UI federation (Google) is wired only when a Google client ID is
     // provided. Every federated login still yields a normal Cognito ID token
@@ -104,13 +164,7 @@ export class XorgateCoreAuthStack extends cdk.Stack {
         architecture: lambda.Architecture.ARM_64,
         memorySize: 256,
         timeout: cdk.Duration.seconds(10),
-        bundling: {
-          minify: true,
-          sourceMap: true,
-          target: 'node20',
-          externalModules: ['@aws-sdk/*'],
-          forceDockerBundling: false,
-        },
+        bundling,
       });
       // A standalone Policy (not the role's DefaultPolicy) breaks the circular
       // dependency pool -> trigger fn -> role/DefaultPolicy -> pool ARN: the
