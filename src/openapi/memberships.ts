@@ -53,9 +53,11 @@ export const membershipsPaths = {
       summary: 'Add a user to the active organization (owner/admin only)',
       description:
         'Adds a member by `userId` or `email`. If an `email` has no account yet, a Cognito account ' +
-        'is provisioned and the invitee is emailed a temporary password to set on first sign-in. ' +
-        '`invited` is true when a new account was created and emailed. Adding someone who is ' +
-        'already a member is a 400, not a no-op.',
+        'is provisioned and the invitee is emailed a temporary password to set on first sign-in; ' +
+        'the invitation names this organization and the caller. `invited` is true when a new ' +
+        'account was created and emailed. Someone who already has an account gets no credential, ' +
+        'so they are emailed a notice that they were added instead. Either email is best-effort ' +
+        'and never fails the request. Adding someone who is already a member is a 400, not a no-op.',
       tags: ['Memberships'],
       requestBody: {
         required: true,

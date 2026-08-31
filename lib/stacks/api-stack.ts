@@ -119,6 +119,16 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   engineTaskRoleArn: string;
   engineExecutionRoleArn: string;
   engineContainerName: string;
+  /** Public origin of xorgate-web for this stage, for links inside emails. */
+  appUrl: string;
+  /** The API's own SES sends (src/services/email.ts). */
+  email: {
+    /** `Name <address>` header form, e.g. `xorgate <no-reply@xorgate.io>`. */
+    from: string;
+    identityArn: string;
+    configurationSetName: string;
+    configurationSetArn: string;
+  };
 }
 
 export class XorgateCoreApiStack extends cdk.Stack {
@@ -155,6 +165,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       engineTaskRoleArn,
       engineExecutionRoleArn,
       engineContainerName,
+      appUrl,
+      email,
     } = props;
 
     const isProd = stage === "prod";
@@ -511,6 +523,18 @@ export class XorgateCoreApiStack extends cdk.Stack {
       }),
     );
 
+    // Outbound email sent by the API itself (src/services/email.ts), confined
+    // to the verified sending identity and its configuration set. Cognito's
+    // own mails do not go through this — the pool sends those under the
+    // identity policy granted in email-stack.ts.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "SesSendTransactionalEmail",
+        actions: ["ses:SendEmail"],
+        resources: [email.identityArn, email.configurationSetArn],
+      }),
+    );
+
     lambdaRole.addManagedPolicy(
       iam.ManagedPolicy.fromAwsManagedPolicyName(
         "service-role/AWSLambdaBasicExecutionRole",
@@ -527,6 +551,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     const commonEnv: Record<string, string> = {
       NODE_ENV: isProd ? "production" : "development",
+      STAGE: stage,
+      // Where links inside outbound email point, and the sender they go out
+      // as (src/services/email.ts).
+      APP_URL: appUrl,
+      EMAIL_FROM: email.from,
+      EMAIL_CONFIGURATION_SET: email.configurationSetName,
       DB_CLUSTER_ARN: clusterArn,
       DB_SECRET_ARN: dbSecret.secretArn,
       DB_NAME: dbName,

@@ -14,6 +14,8 @@ import {
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { revokeLiveAccessForUser } from '../services/live-access';
+import { brandContext, sendEmail } from '../services/email';
+import { addedToOrganizationEmail } from '../email/templates';
 import type { MembershipRole } from '../types/index';
 import {
   badRequest,
@@ -42,13 +44,16 @@ function subFromAttributes(attrs: AttributeType[] | undefined): string | undefin
 }
 
 // Provisions a Cognito account for an invited email that has no user yet, and
-// mirrors it into our users table. Cognito emails a temporary password; the
-// invitee sets a real one on first sign-in (the NEW_PASSWORD_REQUIRED challenge
+// mirrors it into our users table. Cognito emails a temporary password, in
+// xorgate's own template (the CustomMessage trigger, src/email/templates.ts,
+// which reads the organization and inviter out of ClientMetadata); the invitee
+// sets a real password on first sign-in (the NEW_PASSWORD_REQUIRED challenge
 // handled in the web app). Returns the new user's id (its Cognito sub) and
 // whether an invitation email was actually sent (false when the Cognito account
 // already existed but had no users row yet).
 async function provisionInvitedUser(
   email: string,
+  invite: { organizationName: string; inviterName?: string | null },
 ): Promise<{ userId: string; emailed: boolean }> {
   if (!USER_POOL_ID) {
     throw new Error('COGNITO_USER_POOL_ID is not configured');
@@ -68,6 +73,13 @@ async function provisionInvitedUser(
           { Name: 'email_verified', Value: 'true' },
         ],
         DesiredDeliveryMediums: ['EMAIL'],
+        // Surfaces in the CustomMessage trigger as `clientMetadata`, which is
+        // the only way the invitation email can name the organization and the
+        // person who sent it. Cognito never persists these.
+        ClientMetadata: {
+          organizationName: invite.organizationName,
+          ...(invite.inviterName ? { inviterName: invite.inviterName } : {}),
+        },
       }),
     );
     sub = subFromAttributes(res.User?.Attributes);
@@ -175,6 +187,16 @@ const restHandler = async (
         return badRequest(`role must be one of: ${VALID_ROLES.join(', ')}`);
       }
 
+      // Both emails this endpoint can send name the organization, and the
+      // invitation carries it into Cognito as ClientMetadata, so resolve it up
+      // front rather than once per branch.
+      const org = await db.query.organizations.findFirst({
+        where: eq(schema.organizations.id, auth.organizationId),
+      });
+      // Null for an API key, which has no human behind it; the templates then
+      // say "an administrator" rather than naming nobody.
+      const inviterName = auth.name ?? auth.email;
+
       let userId = body.userId;
       // True when we created a brand-new Cognito account and emailed an invite,
       // so the client can tell "added existing user" from "invited new user".
@@ -190,7 +212,10 @@ const restHandler = async (
         } else {
           // No account for this email yet — provision one (Cognito emails a
           // temporary password) instead of rejecting the invite.
-          const provisioned = await provisionInvitedUser(email);
+          const provisioned = await provisionInvitedUser(email, {
+            organizationName: org?.name ?? 'your organization',
+            inviterName,
+          });
           userId = provisioned.userId;
           invited = provisioned.emailed;
         }
@@ -211,6 +236,29 @@ const restHandler = async (
         .insert(schema.memberships)
         .values({ userId, organizationId: auth.organizationId, role })
         .returning();
+
+      // Cognito already mailed a brand-new account its temporary password. An
+      // account that already existed gets no credential, so it hears about the
+      // membership from us instead — otherwise being added is completely
+      // silent. Best-effort (services/email.ts swallows failures): the
+      // membership row is the fact, the email a courtesy.
+      if (!invited && org) {
+        const member = await db.query.users.findFirst({
+          where: eq(schema.users.id, userId),
+        });
+        if (member) {
+          await sendEmail(
+            member.email,
+            addedToOrganizationEmail(brandContext(), {
+              email: member.email,
+              name: member.name ?? null,
+              organizationName: org.name,
+              inviterName,
+            }),
+          );
+        }
+      }
+
       return created({ membership: m, invited });
     }
     case 'PATCH': {

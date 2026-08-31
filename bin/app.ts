@@ -6,6 +6,7 @@ import { XorgateCoreAuthStack } from '../lib/stacks/auth-stack';
 import { XorgateCoreIotStack } from '../lib/stacks/iot-stack';
 import { XorgateCoreApiStack } from '../lib/stacks/api-stack';
 import { XorgateCoreRecorderStack } from '../lib/stacks/recorder-stack';
+import { XorgateCoreEmailStack } from '../lib/stacks/email-stack';
 
 // Shared Fargate props for both stages: the cluster/network the api-stack
 // Lambdas launch engine-runner tasks into. The `recorder*` names are historic
@@ -132,7 +133,65 @@ const webAppUrls = webAppUrlsCtx
   : stage === 'prod'
     ? ['https://console.xorgate.io']
     : ['http://localhost:5173', 'https://dev.xorgate.io'];
-const authProps = { googleClientId, hostedUiDomainPrefix, webAppUrls };
+// The deployed console origin for this stage: where links inside emails point.
+const appUrl = stage === 'prod' ? 'https://console.xorgate.io' : 'https://dev.xorgate.io';
+
+// Outbound email (SES). Prod sends as xorgate.io; dev as dev.xorgate.io, so
+// the shared Epye sandbox account can never sign mail as production. The user
+// pool keeps Cognito's default sender until BOTH the domain's DNS records
+// resolve AND the SES account is out of the sandbox, then the stage's flag in
+// cdk.json (`cognitoEmailViaSes`) is flipped to true — or, for one deploy:
+//   npm run deploy:prod -- --context cognitoEmailViaSes=true
+// Flipping it early breaks every signup / invite / reset email, so the flag is
+// per stage and defaults off for a stage that has not been cut over.
+const EMAIL_DOMAINS: Record<typeof stage, string> = {
+  dev: 'dev.xorgate.io',
+  prod: 'xorgate.io',
+};
+const sesCtx = app.node.tryGetContext('cognitoEmailViaSes') as
+  | Record<string, boolean>
+  | string
+  | boolean
+  | undefined;
+const cognitoEmailViaSes =
+  typeof sesCtx === 'object' && sesCtx !== null
+    ? Boolean(sesCtx[stage])
+    : sesCtx === true || sesCtx === 'true';
+
+const suffix = stage === 'prod' ? '' : 'Dev';
+
+const emailStack = new XorgateCoreEmailStack(app, `XorgateCoreEmailStack${suffix}`, {
+  env,
+  stage,
+  domain: EMAIL_DOMAINS[stage],
+});
+
+const authProps = {
+  googleClientId,
+  hostedUiDomainPrefix,
+  webAppUrls,
+  appUrl,
+  sesEmail: cognitoEmailViaSes
+    ? {
+        fromAddress: emailStack.fromAddress,
+        fromName: emailStack.fromName,
+        domain: emailStack.domain,
+        configurationSetName: emailStack.configurationSet.configurationSetName,
+      }
+    : undefined,
+};
+
+const emailProps = {
+  appUrl,
+  email: {
+    from: `${emailStack.fromName} <${emailStack.fromAddress}>`,
+    identityArn: emailStack.identity.emailIdentityArn,
+    configurationSetName: emailStack.configurationSet.configurationSetName,
+    // The ConfigurationSet construct exposes no ARN attribute; SES
+    // configuration-set ARNs are deterministic from the name.
+    configurationSetArn: `arn:aws:ses:${env.region}:${env.account}:configuration-set/${emailStack.configurationSet.configurationSetName}`,
+  },
+};
 
 if (stage === 'prod') {
   const storageStack = new XorgateCoreStorageStack(app, 'XorgateCoreStorageStack', { env, stage });
@@ -147,6 +206,7 @@ if (stage === 'prod') {
     stage,
     ...authProps,
   });
+  if (cognitoEmailViaSes) authStack.addDependency(emailStack);
 
   const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStack', {
     env,
@@ -199,6 +259,7 @@ if (stage === 'prod') {
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
     liveVendRoleArn: iotStack.liveVendRoleArn,
     ...recorderProps(recorderStack),
+    ...emailProps,
   });
 } else {
   // Dev: no dedicated DB cluster, no VPC. Imports the shared sandbox Aurora
@@ -209,6 +270,7 @@ if (stage === 'prod') {
     stage,
     ...authProps,
   });
+  if (cognitoEmailViaSes) authStack.addDependency(emailStack);
 
   const iotStack = new XorgateCoreIotStack(app, 'XorgateCoreIotStackDev', {
     env,
@@ -245,6 +307,7 @@ if (stage === 'prod') {
     cognitoUserPoolProvider: iotStack.userPoolProviderName,
     liveVendRoleArn: iotStack.liveVendRoleArn,
     ...recorderProps(recorderStack),
+    ...emailProps,
   });
 }
 
