@@ -177,4 +177,88 @@ export const workspacesPaths = {
       },
     },
   },
+  '/workspaces/{id}/logo': {
+    parameters: [
+      { $ref: '#/components/parameters/IdPath' },
+      { $ref: '#/components/parameters/OrganizationIdHeader' },
+    ],
+    put: {
+      operationId: 'uploadWorkspaceLogo',
+      summary: 'Replace the workspace logo',
+      description:
+        'Identical in every respect to `PUT /organizations/{id}/logo` — base64 body, declared ' +
+        'type checked against the bytes, private object, presigned `logoUrl` on the response — ' +
+        'one level down. Organization-wide, like every workspace write: a workspace-scoped ' +
+        'session token gets `403 WORKSPACE_SCOPED`.',
+      tags: ['Workspaces'],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['contentType', 'data'],
+              properties: {
+                contentType: {
+                  type: 'string',
+                  enum: ['image/jpeg', 'image/png', 'image/webp'],
+                  description: 'Must match what the bytes actually are.',
+                },
+                data: {
+                  type: 'string',
+                  format: 'byte',
+                  description:
+                    'Base64 with no `data:` prefix. Decodes to at most 1.5 MB; larger is a 400.',
+                },
+              },
+            },
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description: 'Logo replaced',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['workspace'],
+                properties: { workspace: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+      },
+    },
+    delete: {
+      operationId: 'deleteWorkspaceLogo',
+      summary: 'Remove the workspace logo',
+      description:
+        'Clears the logo; clients fall back to the initials of the name. Idempotent — a ' +
+        'workspace with no logo answers 200 with `logoUrl: null`.',
+      tags: ['Workspaces'],
+      responses: {
+        '200': {
+          description: 'Logo removed',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['workspace'],
+                properties: { workspace: { $ref: '#/components/schemas/Workspace' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+      },
+    },
+  },
 };

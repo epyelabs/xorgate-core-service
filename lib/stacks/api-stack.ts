@@ -1975,6 +1975,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ],
       integration: organizationsInt,
     });
+    // Organization logo. Same storage as the profile picture above — base64 in
+    // the body, private object under `logos/organizations/` in the core bucket
+    // — so the shared lambdaRole's grantReadWrite already covers it.
+    addRoutes({
+      path: "/organizations/{id}/logo",
+      methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
+      integration: organizationsInt,
+    });
 
     addRoutes({
       path: "/memberships",
@@ -2021,6 +2029,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
         apigwv2.HttpMethod.PUT,
         apigwv2.HttpMethod.DELETE,
       ],
+      integration: workspacesInt,
+    });
+    // Workspace logo, under `logos/workspaces/` in the same bucket.
+    addRoutes({
+      path: "/workspaces/{id}/logo",
+      methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
       integration: workspacesInt,
     });
 

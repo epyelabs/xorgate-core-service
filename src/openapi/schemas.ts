@@ -134,6 +134,16 @@ export function openApiSchemas(): Record<string, unknown> {
         id: { type: 'string', format: 'uuid' },
         name: { type: 'string' },
         slug: { type: 'string' },
+        logoUrl: {
+          type: 'string',
+          format: 'uri',
+          nullable: true,
+          description:
+            'Presigned GET for the organization logo, valid one hour, or null when it has ' +
+            'none. Minted per response — the bucket is private, so the URL is the only way to ' +
+            'read the object and it cannot be cached past its expiry. Clients that draw a ' +
+            'placeholder fall back to the initials of `name`.',
+        },
         created_at: { type: 'string', format: 'date-time' },
         updated_at: { type: 'string', format: 'date-time' },
       },
@@ -425,6 +435,14 @@ export function openApiSchemas(): Record<string, unknown> {
         name: { type: 'string' },
         slug: { type: 'string' },
         description: { type: 'string', nullable: true },
+        logoUrl: {
+          type: 'string',
+          format: 'uri',
+          nullable: true,
+          description:
+            'Presigned GET for the workspace logo, valid one hour, or null when it has none. ' +
+            'Same contract as `Organization.logoUrl`.',
+        },
         createdAt: { type: 'string', format: 'date-time' },
         updatedAt: { type: 'string', format: 'date-time' },
       },

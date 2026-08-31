@@ -8,10 +8,10 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 /**
- * Uploaded pictures. Today that is profile pictures under `avatars/` in the
- * core bucket; the module is written for more than one prefix because a
- * logo or a workspace icon would land here rather than growing a second copy
- * of the same validation.
+ * Uploaded pictures: profile pictures under `avatars/` and organization and
+ * workspace logos under `logos/` in the core bucket. One module rather than
+ * one per feature, because all three share the same gate — the validation
+ * below is what stops a payload from being stored, and it should exist once.
  *
  * The bucket is private and stays private (`BLOCK_ALL`, `enforceSSL`), so a
  * browser never holds a credential for it: every read is a presigned GET
@@ -116,21 +116,24 @@ function requireBucket(): string {
 }
 
 /**
- * The key for one user's profile picture. A fresh uuid per upload rather than
- * a stable key, so a replaced picture cannot be served stale from a cache
- * still holding the previous presigned URL.
+ * The key for one stored picture. A fresh uuid per upload rather than a stable
+ * key, so a replaced picture cannot be served stale from a cache still holding
+ * the previous presigned URL.
+ *
+ * The prefix is chosen by the three helpers below rather than by the caller —
+ * a handler cannot reach into another feature's objects by getting the key
+ * wrong.
  */
-export function avatarKeyFor(userId: string, contentType: ImageContentType): string {
-  return `avatars/${userId}/${randomUUID()}.${EXTENSIONS[contentType]}`;
+function keyFor(prefix: string, ownerId: string, contentType: ImageContentType): string {
+  return `${prefix}/${ownerId}/${randomUUID()}.${EXTENSIONS[contentType]}`;
 }
 
-/** Write a profile picture and return the key the row should point at. */
-export async function putAvatar(
-  userId: string,
+/** Write a picture at `key` and return the key the row should point at. */
+async function put(
+  key: string,
   contentType: ImageContentType,
   bytes: Uint8Array,
 ): Promise<string> {
-  const key = avatarKeyFor(userId, contentType);
   await s3.send(
     new PutObjectCommand({
       Bucket: requireBucket(),
@@ -141,6 +144,33 @@ export async function putAvatar(
     }),
   );
   return key;
+}
+
+/** Profile picture for one user. */
+export function putAvatar(
+  userId: string,
+  contentType: ImageContentType,
+  bytes: Uint8Array,
+): Promise<string> {
+  return put(keyFor('avatars', userId, contentType), contentType, bytes);
+}
+
+/** Logo for one organization. */
+export function putOrganizationLogo(
+  organizationId: string,
+  contentType: ImageContentType,
+  bytes: Uint8Array,
+): Promise<string> {
+  return put(keyFor('logos/organizations', organizationId, contentType), contentType, bytes);
+}
+
+/** Logo for one workspace. */
+export function putWorkspaceLogo(
+  workspaceId: string,
+  contentType: ImageContentType,
+  bytes: Uint8Array,
+): Promise<string> {
+  return put(keyFor('logos/workspaces', workspaceId, contentType), contentType, bytes);
 }
 
 /**

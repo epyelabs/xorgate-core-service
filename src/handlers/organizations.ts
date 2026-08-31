@@ -7,6 +7,7 @@ import {
   requireOrgWideContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import type { Organization } from '../db/schema';
 import {
   badRequest,
   created,
@@ -17,6 +18,79 @@ import {
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { apiHandler } from '../utils/api-handler';
+import { routeKey } from '../utils/route';
+import { decodeImageUpload, deleteImage, putOrganizationLogo } from '../services/images';
+import { organizationView, organizationViews } from '../services/entity-views';
+
+/**
+ * Organizations, plus the `{id}/logo` pair.
+ *
+ * The logo is stored exactly the way a profile picture is (`PUT /me/avatar`):
+ * bytes arrive as base64, the declared type is checked against them, the object
+ * lands in the private core bucket and the row holds only its key. Responses
+ * carry a presigned GET, never the key. It is gated at owner/admin like every
+ * other organization edit.
+ */
+
+/** The shape both logo routes accept, mirroring `PUT /me/avatar`. */
+interface LogoBody {
+  contentType: string;
+  /** Base64, no `data:` prefix — the browser strips it before sending. */
+  data: string;
+}
+
+function parseLogoBody(event: APIGatewayProxyEventV2): LogoBody | null {
+  try {
+    const parsed = JSON.parse(event.body ?? '{}') as Partial<LogoBody>;
+    if (typeof parsed.contentType !== 'string' || typeof parsed.data !== 'string') {
+      return null;
+    }
+    if (parsed.data.length === 0) return null;
+    return { contentType: parsed.contentType, data: parsed.data };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PUT /organizations/{id}/logo — replace the logo. Same order of operations as
+ * the profile-picture route: validate the bytes, write the new object, point
+ * the row at it, and only then drop the old one, so a failed write never
+ * leaves the organization with no logo.
+ */
+async function putLogo(
+  event: APIGatewayProxyEventV2,
+  org: Organization,
+): Promise<APIGatewayProxyResultV2> {
+  const body = parseLogoBody(event);
+  if (!body) return badRequest('contentType and base64 data are required');
+  const upload = decodeImageUpload(body);
+  if (!upload.ok) return badRequest(upload.message);
+
+  const key = await putOrganizationLogo(org.id, upload.contentType, upload.bytes);
+  const [updated] = await db
+    .update(schema.organizations)
+    .set({ logoKey: key, updatedAt: new Date() })
+    .where(eq(schema.organizations.id, org.id))
+    .returning();
+  if (org.logoKey) await deleteImage(org.logoKey);
+
+  return ok({ organization: await organizationView(updated) });
+}
+
+/** DELETE /organizations/{id}/logo — back to initials. Idempotent. */
+async function deleteLogo(
+  org: Organization,
+): Promise<APIGatewayProxyResultV2> {
+  if (!org.logoKey) return ok({ organization: await organizationView(org) });
+  const [updated] = await db
+    .update(schema.organizations)
+    .set({ logoKey: null, updatedAt: new Date() })
+    .where(eq(schema.organizations.id, org.id))
+    .returning();
+  await deleteImage(org.logoKey);
+  return ok({ organization: await organizationView(updated) });
+}
 
 const restHandler = async (
   event: APIGatewayProxyEventV2,
@@ -55,7 +129,7 @@ const restHandler = async (
       .insert(schema.memberships)
       .values({ userId: auth.userId, organizationId: org.id, role: 'owner' });
 
-    return created({ organization: org });
+    return created({ organization: await organizationView(org) });
   }
 
   // GET /organizations without id = list orgs the caller is a member of.
@@ -96,7 +170,10 @@ const restHandler = async (
       offset,
     });
 
-    return ok({ organizations: orgs, page: pageMeta(parsed, userMemberships.length) });
+    return ok({
+      organizations: await organizationViews(orgs),
+      page: pageMeta(parsed, userMemberships.length),
+    });
   }
 
   // Everything else requires an active org context with appropriate role.
@@ -117,6 +194,19 @@ const restHandler = async (
     throw err;
   }
 
+  // The `{id}/logo` pair shares the gate above — a logo IS an organization
+  // edit — but not the `switch (method)` below, which reads a bare `PUT` as a
+  // name/slug update.
+  const route = routeKey(event);
+  if (route === 'PUT /organizations/{id}/logo' || route === 'DELETE /organizations/{id}/logo') {
+    if (id !== auth.organizationId) return forbidden('Cannot edit other organizations');
+    const org = await db.query.organizations.findFirst({
+      where: eq(schema.organizations.id, id!),
+    });
+    if (!org) return notFound(`Organization "${id}" not found`);
+    return method === 'PUT' ? putLogo(event, org) : deleteLogo(org);
+  }
+
   switch (method) {
     case 'GET': {
       if (id !== auth.organizationId) {
@@ -126,7 +216,7 @@ const restHandler = async (
         where: eq(schema.organizations.id, id),
       });
       if (!org) return notFound(`Organization "${id}" not found`);
-      return ok({ organization: org });
+      return ok({ organization: await organizationView(org) });
     }
     case 'PUT': {
       if (id !== auth.organizationId) return forbidden('Cannot edit other organizations');
@@ -148,7 +238,7 @@ const restHandler = async (
         .where(eq(schema.organizations.id, id!))
         .returning();
       if (!updated) return notFound(`Organization "${id}" not found`);
-      return ok({ organization: updated });
+      return ok({ organization: await organizationView(updated) });
     }
     case 'DELETE': {
       if (id !== auth.organizationId) return forbidden('Cannot delete other organizations');
