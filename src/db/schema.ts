@@ -36,6 +36,10 @@ export const organizations = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     name: text('name').notNull(),
     slug: text('slug').notNull(),
+    // S3 key of the logo in the core bucket, under `logos/organizations/`.
+    // Null means "no logo" — clients draw initials. Never handed to a client
+    // as-is: the bucket is private, so responses carry a presigned URL instead.
+    logoKey: text('logo_key'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -182,6 +186,8 @@ export const workspaces = pgTable(
     name: text('name').notNull(),
     slug: text('slug').notNull(),
     description: text('description'),
+    // Same contract as `organizations.logo_key`, under `logos/workspaces/`.
+    logoKey: text('logo_key'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

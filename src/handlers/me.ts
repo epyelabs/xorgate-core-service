@@ -7,6 +7,7 @@ import { db, schema } from '../db/index';
 import { routeKey } from '../utils/route';
 import { badRequest, methodNotAllowed, ok } from '../utils/responses';
 import { decodeImageUpload, deleteImage, imageUrl, putAvatar } from '../services/images';
+import { organizationViews } from '../services/entity-views';
 import { apiHandler } from '../utils/api-handler';
 
 /**
@@ -76,7 +77,10 @@ async function getMe(auth: UserAuthContext): Promise<APIGatewayProxyResultV2> {
   return ok({
     user: await view(auth),
     memberships: userMemberships,
-    organizations: orgs,
+    // Through the same view the organizations handler uses, so the sidebar can
+    // draw an organization's logo off this one bootstrap call rather than
+    // fetching each organization separately.
+    organizations: await organizationViews(orgs),
   });
 }
 

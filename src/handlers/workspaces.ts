@@ -7,7 +7,10 @@ import {
   requireOrgContext,
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
+import type { Workspace } from '../db/schema';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
+import { decodeImageUpload, deleteImage, putWorkspaceLogo } from '../services/images';
+import { workspaceView, workspaceViews } from '../services/entity-views';
 import {
   badRequest,
   created,
@@ -17,6 +20,64 @@ import {
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { apiHandler } from '../utils/api-handler';
+import { routeKey } from '../utils/route';
+
+/** The shape both logo routes accept, mirroring `PUT /me/avatar`. */
+interface LogoBody {
+  contentType: string;
+  /** Base64, no `data:` prefix — the browser strips it before sending. */
+  data: string;
+}
+
+function parseLogoBody(event: APIGatewayProxyEventV2): LogoBody | null {
+  try {
+    const parsed = JSON.parse(event.body ?? '{}') as Partial<LogoBody>;
+    if (typeof parsed.contentType !== 'string' || typeof parsed.data !== 'string') {
+      return null;
+    }
+    if (parsed.data.length === 0) return null;
+    return { contentType: parsed.contentType, data: parsed.data };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PUT /workspaces/{id}/logo — replace the logo. Validate the bytes, write the
+ * new object, point the row at it, and only then drop the old one, so a failed
+ * write never leaves the workspace with no logo.
+ */
+async function putLogo(
+  event: APIGatewayProxyEventV2,
+  workspace: Workspace,
+): Promise<APIGatewayProxyResultV2> {
+  const body = parseLogoBody(event);
+  if (!body) return badRequest('contentType and base64 data are required');
+  const upload = decodeImageUpload(body);
+  if (!upload.ok) return badRequest(upload.message);
+
+  const key = await putWorkspaceLogo(workspace.id, upload.contentType, upload.bytes);
+  const [updated] = await db
+    .update(schema.workspaces)
+    .set({ logoKey: key, updatedAt: new Date() })
+    .where(eq(schema.workspaces.id, workspace.id))
+    .returning();
+  if (workspace.logoKey) await deleteImage(workspace.logoKey);
+
+  return ok({ workspace: await workspaceView(updated) });
+}
+
+/** DELETE /workspaces/{id}/logo — back to initials. Idempotent. */
+async function deleteLogo(workspace: Workspace): Promise<APIGatewayProxyResultV2> {
+  if (!workspace.logoKey) return ok({ workspace: await workspaceView(workspace) });
+  const [updated] = await db
+    .update(schema.workspaces)
+    .set({ logoKey: null, updatedAt: new Date() })
+    .where(eq(schema.workspaces.id, workspace.id))
+    .returning();
+  await deleteImage(workspace.logoKey);
+  return ok({ workspace: await workspaceView(updated) });
+}
 
 /**
  * Workspaces are the one resource that is BOTH sides of the boundary, which is
@@ -30,6 +91,11 @@ import { apiHandler } from '../utils/api-handler';
  *   the consumer's BACKEND's job, done with the `xg_` key that mints tokens in
  *   the first place. A browser-held credential that could delete its own tenant
  *   is a liability with no matching use.
+ *
+ * The `{id}/logo` pair follows the WRITE rule, and is stored exactly the way a
+ * profile picture is (`PUT /me/avatar`): base64 in the body, the declared type
+ * checked against the bytes, the object private in the core bucket and only
+ * its key on the row. Responses carry a presigned GET, never the key.
  */
 const restHandler = async (
   event: APIGatewayProxyEventV2,
@@ -50,6 +116,22 @@ const restHandler = async (
     throw err;
   }
 
+  // The `{id}/logo` pair is a workspace WRITE, so it is already covered by the
+  // org-wide gate above; it just does not belong in the `switch (method)`
+  // below, which reads a bare `PUT` as a name/slug/description update.
+  const route = routeKey(event);
+  if (route === 'PUT /workspaces/{id}/logo' || route === 'DELETE /workspaces/{id}/logo') {
+    if (!id) return badRequest('workspace id required in path');
+    const workspace = await db.query.workspaces.findFirst({
+      where: and(
+        eq(schema.workspaces.id, id),
+        eq(schema.workspaces.organizationId, auth.organizationId),
+      ),
+    });
+    if (!workspace) return notFound(`Workspace "${id}" not found`);
+    return method === 'PUT' ? putLogo(event, workspace) : deleteLogo(workspace);
+  }
+
   switch (method) {
     case 'GET': {
       // The same intersection every device handler applies, one level up: for an
@@ -65,7 +147,7 @@ const restHandler = async (
           ),
         });
         if (!row) return notFound(`Workspace "${id}" not found`);
-        return ok({ workspace: row });
+        return ok({ workspace: await workspaceView(row) });
       }
 
       // Standardized list dialect (utils/list-params). Default order preserves
@@ -102,7 +184,7 @@ const restHandler = async (
         limit,
         offset,
       });
-      return ok({ workspaces: rows, page: pageMeta(parsed, total) });
+      return ok({ workspaces: await workspaceViews(rows), page: pageMeta(parsed, total) });
     }
     case 'POST': {
       let body: { name?: string; slug?: string; description?: string };
@@ -124,7 +206,7 @@ const restHandler = async (
           description: body.description ?? null,
         })
         .returning();
-      return created({ workspace: row });
+      return created({ workspace: await workspaceView(row) });
     }
     case 'PUT': {
       if (!id) return badRequest('workspace id required in path');
@@ -152,7 +234,7 @@ const restHandler = async (
         )
         .returning();
       if (updated.length === 0) return notFound(`Workspace "${id}" not found`);
-      return ok({ workspace: updated[0] });
+      return ok({ workspace: await workspaceView(updated[0]) });
     }
     case 'DELETE': {
       if (!id) return badRequest('workspace id required in path');

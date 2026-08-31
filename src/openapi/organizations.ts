@@ -178,4 +178,94 @@ export const organizationsPaths = {
       },
     },
   },
+  '/organizations/{id}/logo': {
+    parameters: [
+      { $ref: '#/components/parameters/IdPath' },
+      { $ref: '#/components/parameters/OrganizationIdHeader' },
+    ],
+    put: {
+      operationId: 'uploadOrganizationLogo',
+      summary: 'Replace the organization logo (owner/admin only)',
+      description:
+        'The image arrives as base64 in the body rather than through a presigned PUT: clients ' +
+        'fit it into a 512px square first, so the payload is tens of kilobytes and one round ' +
+        'trip writes both the object and the row that points at it.\n\n' +
+        'The declared `contentType` is checked against the bytes themselves — a payload whose ' +
+        'magic number disagrees with its label is refused, because the declared type is what ' +
+        'gets served back on the presigned GET. The stored object is private; the response ' +
+        'carries a fresh `logoUrl` for it, and the previous object is deleted only after the ' +
+        'row points at the new one.\n\n' +
+        'Organization-wide, like every organization write: `{id}` must be the active ' +
+        'organization, and a workspace-scoped session token gets `403 WORKSPACE_SCOPED`.',
+      tags: ['Organizations'],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['contentType', 'data'],
+              properties: {
+                contentType: {
+                  type: 'string',
+                  enum: ['image/jpeg', 'image/png', 'image/webp'],
+                  description: 'Must match what the bytes actually are.',
+                },
+                data: {
+                  type: 'string',
+                  format: 'byte',
+                  description:
+                    'Base64 with no `data:` prefix. Decodes to at most 1.5 MB; larger is a 400.',
+                },
+              },
+            },
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description: 'Logo replaced',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['organization'],
+                properties: { organization: { $ref: '#/components/schemas/Organization' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+      },
+    },
+    delete: {
+      operationId: 'deleteOrganizationLogo',
+      summary: 'Remove the organization logo (owner/admin only)',
+      description:
+        'Clears the logo; clients fall back to the initials of the name. Idempotent — an ' +
+        'organization with no logo answers 200 with `logoUrl: null`.',
+      tags: ['Organizations'],
+      responses: {
+        '200': {
+          description: 'Logo removed',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['organization'],
+                properties: { organization: { $ref: '#/components/schemas/Organization' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+      },
+    },
+  },
 };
