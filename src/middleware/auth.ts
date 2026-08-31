@@ -106,6 +106,7 @@ async function authenticateJwt(token: string): Promise<UserAuthContext> {
     userId: user.id,
     email: user.email,
     name: user.name ?? null,
+    avatarKey: user.avatarKey ?? null,
     tier: (user.tier ?? 'free') as UserTier,
     role: user.role as UserRole,
     principal: 'user',

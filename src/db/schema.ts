@@ -23,6 +23,10 @@ export const users = pgTable('users', {
   name: text('name'),
   tier: text('tier').default('free'),
   role: text('role').default('user').notNull(),
+  // S3 key of the profile picture in the core bucket, under `avatars/`. Null
+  // means "no picture" — clients draw initials. Never handed to a client as-is:
+  // the bucket is private, so `GET /me` answers with a presigned URL instead.
+  avatarKey: text('avatar_key'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 

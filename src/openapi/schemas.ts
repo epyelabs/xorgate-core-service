@@ -97,6 +97,16 @@ export function openApiSchemas(): Record<string, unknown> {
         id: { type: 'string', description: 'Cognito sub' },
         email: { type: 'string', format: 'email' },
         name: { type: 'string', nullable: true },
+        avatarUrl: {
+          type: 'string',
+          format: 'uri',
+          nullable: true,
+          description:
+            'Presigned GET for the profile picture, valid one hour, or null when the user has ' +
+            'none. Minted per response — the bucket is private, so the URL is the only way to ' +
+            'read the object and it cannot be cached past its expiry. Present on the `/me` ' +
+            'operations only; elsewhere a user block is the row and carries no picture.',
+        },
         tier: { type: 'string', enum: ['free', 'pro', 'team'] },
         role: {
           type: 'string',

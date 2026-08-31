@@ -645,7 +645,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "MeFn",
       standardFnProps(
         path.join(entryBase, "me.ts"),
-        "GET /me — current user + memberships",
+        "/me — current user + memberships, profile name and picture",
       ),
     );
 
@@ -1949,7 +1949,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     addRoutes({
       path: "/me",
-      methods: [apigwv2.HttpMethod.GET],
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH],
+      integration: meInt,
+    });
+    // Profile picture. Bytes land as base64 on the PUT and are stored in the
+    // core bucket under `avatars/` — the shared lambdaRole's grantReadWrite on
+    // that bucket already covers it, so there is no new grant here.
+    addRoutes({
+      path: "/me/avatar",
+      methods: [apigwv2.HttpMethod.PUT, apigwv2.HttpMethod.DELETE],
       integration: meInt,
     });
 

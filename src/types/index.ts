@@ -60,6 +60,12 @@ export interface AuthContext {
 export interface UserAuthContext extends AuthContext {
   userId: string;
   email: string;
+  /**
+   * `users.avatar_key`, the S3 key of the profile picture, or null for none.
+   * Carried here rather than re-read per request because `authenticateJwt`
+   * already has the row in hand; only `GET /me` and the avatar routes read it.
+   */
+  avatarKey: string | null;
   principal: 'user';
   apiKeyId: null;
   sessionTokenId: null;

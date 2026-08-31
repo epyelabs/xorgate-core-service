@@ -126,8 +126,9 @@ export function openApiComponents(): Record<string, unknown> {
         description:
           'A Cognito **ID** token (not an access token). Users are created just-in-time on first ' +
           'successful verification. This is what a signed-in browser session sends. A handful of ' +
-          'operations accept ONLY this, because they describe or act on a person: `GET /me`, both ' +
-          '`/organizations` collection operations, and the two live-access operations.',
+          'operations accept ONLY this, because they describe or act on a person: the four `/me` ' +
+          'operations, both `/organizations` collection operations, and the two live-access ' +
+          'operations.',
       },
       ApiKeyAuth: {
         type: 'http',
@@ -207,6 +208,20 @@ export function openApiComponents(): Record<string, unknown> {
         content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
       },
       NoContent: { description: 'Deleted. Empty body.' },
+      // The three profile writes all answer with the caller's updated user and
+      // nothing else, so a client can render the result without re-reading /me.
+      MeUser: {
+        description: "The caller's profile after the write.",
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['user'],
+              properties: { user: { $ref: '#/components/schemas/User' } },
+            },
+          },
+        },
+      },
       DeviceCommandAccepted: {
         description:
           'Command published to the device. Delivery to the broker only. The device may still ' +
