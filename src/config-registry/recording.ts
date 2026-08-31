@@ -94,7 +94,7 @@ export const recordingConfigSchema = z
           .max(RECORDING_RATE_HZ_MAX)
           .describe(
             'Target sample rate. Each sensor group is additionally capped by its native cadence ' +
-              '(IMU 20 Hz, GPS 1 Hz, system 1 Hz). Default 10.',
+              '(IMU 20 Hz, GPS 1 Hz, system 1 Hz). Default 1.',
           )
           .optional(),
       })
@@ -105,7 +105,7 @@ export const recordingConfigSchema = z
         enabled: z.boolean().describe('Record camera video locally (default false).').optional(),
         preset: z
           .enum(VIDEO_PRESET_NAMES)
-          .describe('Closed quality preset table (bounded CPU cost). Default 1080p15-2mbps.')
+          .describe('Closed quality preset table (bounded CPU cost). Default 720p15-1mbps.')
           .optional(),
         segmentSeconds: z
           .number()
@@ -380,10 +380,10 @@ export type RecordingConfig = z.infer<typeof recordingConfigSchema>;
  * match, and the web UI renders them instead of a blank control.
  */
 export const RECORDING_DEFAULTS = {
-  telemetry: { enabled: false, rateHz: 10 },
+  telemetry: { enabled: false, rateHz: 1 },
   video: {
     enabled: false,
-    preset: '1080p15-2mbps',
+    preset: '720p15-1mbps',
     segmentSeconds: 60,
     bootDefer: 'auto',
     bootDeferMaxSecs: 90,
