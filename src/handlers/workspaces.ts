@@ -10,6 +10,7 @@ import { db, schema } from '../db/index';
 import type { Workspace } from '../db/schema';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { decodeImageUpload, deleteImage, putWorkspaceLogo } from '../services/images';
+import { devicesInWorkspaces, teardownDevices } from '../services/device-teardown';
 import { workspaceView, workspaceViews } from '../services/entity-views';
 import {
   badRequest,
@@ -106,9 +107,12 @@ const restHandler = async (
   let auth;
   try {
     const writeMethod = method === 'POST' || method === 'PUT' || method === 'DELETE';
+    // Deleting a workspace deletes every device in it, with recordings and
+    // telemetry, so it is owner|admin like the other destructive operations;
+    // members keep create and edit.
     auth = await requireOrgContext(
       event,
-      writeMethod ? ['owner', 'admin', 'member'] : undefined,
+      method === 'DELETE' ? ['owner', 'admin'] : writeMethod ? ['owner', 'admin', 'member'] : undefined,
     );
     if (writeMethod) assertOrgWideScope(auth);
   } catch (err) {
@@ -238,6 +242,23 @@ const restHandler = async (
     }
     case 'DELETE': {
       if (!id) return badRequest('workspace id required in path');
+      const target = await db.query.workspaces.findFirst({
+        where: and(
+          eq(schema.workspaces.id, id),
+          eq(schema.workspaces.organizationId, auth.organizationId),
+        ),
+        columns: { id: true, logoKey: true },
+      });
+      if (!target) return notFound(`Workspace "${id}" not found`);
+      // Every device in it, AWS side included, before the rows cascade away.
+      const teardown = await teardownDevices(
+        await devicesInWorkspaces([id], auth.organizationId),
+        auth.userId ?? auth.apiKeyId ?? 'unknown',
+      );
+      if (teardown.errors.length) {
+        console.warn(`[workspaces] delete ${id}: ${teardown.errors.length} teardown error(s)`);
+      }
+      if (target.logoKey) await deleteImage(target.logoKey);
       const deleted = await db
         .delete(schema.workspaces)
         .where(

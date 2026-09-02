@@ -2,7 +2,7 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../db/index';
-import { memberships, users } from '../db/schema';
+import { deletedUsers, memberships, users } from '../db/schema';
 import { classifyCredential, touchApiKey, verifyApiKey } from '../services/api-key-auth';
 import { errorResponse } from '../utils/responses';
 import { verifySessionToken } from '../services/session-token-auth';
@@ -95,6 +95,14 @@ async function authenticateJwt(token: string): Promise<UserAuthContext> {
   let user = await db.query.users.findFirst({ where: eq(users.id, sub) });
 
   if (!user) {
+    // A closed account's token verifies until it expires. The tombstone
+    // (`DELETE /me`) is what stops it provisioning a fresh row here; checked
+    // only on a miss, so the hot path costs nothing extra.
+    const closed = await db.query.deletedUsers.findFirst({
+      where: eq(deletedUsers.id, sub),
+      columns: { id: true },
+    });
+    if (closed) throw new AuthError('This account has been deleted', 401, 'ACCOUNT_DELETED');
     const [newUser] = await db
       .insert(users)
       .values({ id: sub, email, name })

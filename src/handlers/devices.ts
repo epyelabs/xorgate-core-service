@@ -8,6 +8,7 @@ import {
 } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
+import { teardownDevices } from '../services/device-teardown';
 import {
   badRequest,
   created,
@@ -152,9 +153,12 @@ const restHandler = async (
   try {
     const writeMethod =
       method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+    // Deleting is the one write that takes recordings and telemetry with it,
+    // so it sits with the other destructive operations (session delete,
+    // workspace delete) at owner|admin; members keep every other write.
     auth = await requireOrgContext(
       event,
-      writeMethod ? ['owner', 'admin', 'member'] : undefined,
+      method === 'DELETE' ? ['owner', 'admin'] : writeMethod ? ['owner', 'admin', 'member'] : undefined,
     );
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
@@ -503,6 +507,20 @@ const restHandler = async (
     case 'DELETE': {
       if (!id) return badRequest('device id required in path');
       if (orgWorkspaceIds.length === 0) return notFound(`Device "${id}" not found`);
+      const target = await db.query.devices.findFirst({
+        where: and(eq(schema.devices.id, id), inArray(schema.devices.workspaceId, orgWorkspaceIds)),
+        columns: { id: true, workspaceId: true, serial: true },
+      });
+      if (!target) return notFound(`Device "${id}" not found`);
+      // AWS side and FK-less rows first: the identifiers live on rows that
+      // cascade away with the device. See services/device-teardown.ts.
+      const teardown = await teardownDevices(
+        [{ ...target, serial: target.serial ?? null, organizationId: auth.organizationId }],
+        auth.userId ?? auth.apiKeyId ?? 'unknown',
+      );
+      if (teardown.errors.length) {
+        console.warn(`[devices] delete ${id}: ${teardown.errors.length} teardown error(s)`);
+      }
       const deleted = await db
         .delete(schema.devices)
         .where(

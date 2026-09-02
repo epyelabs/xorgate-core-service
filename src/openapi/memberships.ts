@@ -154,10 +154,12 @@ export const membershipsPaths = {
     },
     delete: {
       operationId: 'removeMembership',
-      summary: 'Remove a member (owner/admin only)',
+      summary: 'Remove a member, or leave the organization',
       description:
-        'Removing the last remaining owner is refused with a 403, so an organization can never be ' +
-        'left ownerless.\n\n' +
+        'Owners and admins can remove any member. Any member can remove THEIR OWN membership ' +
+        '(leave); addressing someone else\'s with a lower role is a 403. Removing the last ' +
+        'remaining owner is refused with a 403 either way, so an organization can never be ' +
+        'left ownerless — hand ownership over first, or delete the organization.\n\n' +
         'Side effect: if this removal takes away the member\'s LAST organization membership, their ' +
         'live-plane access is revoked too (see `DELETE /live/access`), and any live subscription ' +
         'they hold dies on its next reconnect. Members who still belong to another organization ' +

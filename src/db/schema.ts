@@ -389,8 +389,10 @@ export const deviceRegistrations = pgTable(
     // Exactly one of the two creator columns is set. A Cognito-authenticated
     // caller sets the user; an API-key caller sets the key, because a key has no
     // `users` row to point at. Nullable since Phase 2 for that reason.
+    // `set null` (manual/020; was `cascade`): a registration is a record of
+    // how a device came to exist, and outlives the account that minted it.
     createdByUserId: text('created_by_user_id').references(() => users.id, {
-      onDelete: 'cascade',
+      onDelete: 'set null',
     }),
     createdByApiKeyId: uuid('created_by_api_key_id').references(() => apiKeys.id, {
       onDelete: 'set null',
@@ -840,3 +842,52 @@ export type WorkflowRunStep = InferSelectModel<typeof workflowRunSteps>;
 export type NewWorkflowRunStep = InferInsertModel<typeof workflowRunSteps>;
 export type WorkflowEvent = InferSelectModel<typeof workflowEvents>;
 export type NewWorkflowEvent = InferInsertModel<typeof workflowEvents>;
+
+// ---------------------------------------------------------------------------
+// Tombstones (manual/020). Deletes are real — no `deleted_at` on the live
+// tables, and the FK graph cascades — but three facts have to outlive the rows
+// they describe:
+//
+// - A deleted user's Cognito ID token verifies until it expires, and
+//   `authenticateJwt` provisions a `users` row on first sight of an unknown
+//   sub. Without this record a closed account would re-create itself on its
+//   next request. Subs are never reused, so the row is permanent, and it holds
+//   nothing personal: the opaque sub and when it was closed.
+// - A deleted organization is the audit trail a consumer (Alocate) needs to
+//   reconcile its own records against, and the place a support question about
+//   "where did our data go" lands.
+// - A deleted device may leave S3 objects behind when its prefixes were too
+//   large to drain inside one request; `s3Drained=false` marks those. The
+//   bucket lifecycle expires them regardless, so this is a bookkeeping flag,
+//   not a work queue.
+// ---------------------------------------------------------------------------
+
+export const deletedUsers = pgTable('deleted_users', {
+  /** The Cognito sub that used to be `users.id`. */
+  id: text('id').primaryKey(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const deletedOrganizations = pgTable('deleted_organizations', {
+  /** The former `organizations.id`. */
+  id: uuid('id').primaryKey(),
+  slug: text('slug').notNull(),
+  workspaceCount: integer('workspace_count').default(0).notNull(),
+  deviceCount: integer('device_count').default(0).notNull(),
+  /** The owner who asked. Not an FK: they may delete their own account next. */
+  deletedBy: text('deleted_by').notNull(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const deletedDevices = pgTable('deleted_devices', {
+  /** The former `devices.id`, which is also the IoT thing name and the KVS channel prefix. */
+  id: uuid('id').primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  organizationId: uuid('organization_id').notNull(),
+  serial: text('serial'),
+  /** False when the S3 prefixes still held objects after the request's budget; the lifecycle finishes. */
+  s3Drained: boolean('s3_drained').default(true).notNull(),
+  /** User id or API key id, whichever principal asked. */
+  deletedBy: text('deleted_by').notNull(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }).defaultNow().notNull(),
+});

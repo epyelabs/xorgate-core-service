@@ -115,7 +115,10 @@ const restHandler = async (
 
   let auth;
   try {
-    const writeMethod = method === 'POST' || method === 'PATCH' || method === 'DELETE';
+    // DELETE is gated inside the case instead: any member may remove THEIR
+    // OWN membership (leave the organization); removing someone else stays
+    // owner|admin.
+    const writeMethod = method === 'POST' || method === 'PATCH';
     auth = await requireOrgWideContext(
       event,
       writeMethod ? ['owner', 'admin'] : undefined,
@@ -327,6 +330,14 @@ const restHandler = async (
         ),
       });
       if (!m) return notFound(`Membership "${id}" not found`);
+
+      // Leaving is self-service; removing anyone else is administration. An
+      // API key has no membership to leave, so `userId` is null for it and
+      // only the admin path applies.
+      const isSelf = auth.userId !== null && m.userId === auth.userId;
+      if (!isSelf && auth.membershipRole !== 'owner' && auth.membershipRole !== 'admin') {
+        return forbidden('Only owners and admins can remove other members');
+      }
 
       if (m.role === 'owner') {
         const owners = await db.query.memberships.findMany({

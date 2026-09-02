@@ -314,6 +314,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
         actions: [
           "kinesisvideo:CreateSignalingChannel",
           "kinesisvideo:DescribeSignalingChannel",
+          // Device teardown (services/device-teardown.ts) removes a deleted
+          // device's channels rather than leaving them to bill forever.
+          "kinesisvideo:DeleteSignalingChannel",
         ],
         resources: [`arn:aws:kinesisvideo:${this.region}:${this.account}:channel/*`],
       }),
@@ -516,7 +519,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "CognitoAdminInviteUser",
-        actions: ["cognito-idp:AdminCreateUser", "cognito-idp:AdminGetUser"],
+        actions: [
+          "cognito-idp:AdminCreateUser",
+          "cognito-idp:AdminGetUser",
+          // DELETE /me (handlers/me.ts): resolve the pool username from the
+          // token's sub, then remove the account.
+          "cognito-idp:ListUsers",
+          "cognito-idp:AdminDeleteUser",
+        ],
         resources: [
           `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${userPoolId}`,
         ],
@@ -670,23 +680,34 @@ export class XorgateCoreApiStack extends cdk.Stack {
       standardFnProps(path.join(entryBase, "health.ts"), "GET /health", false),
     );
 
-    const meFn = new nodejs.NodejsFunction(
-      this,
-      "MeFn",
-      standardFnProps(
-        path.join(entryBase, "me.ts"),
-        "/me — current user + memberships, profile name and picture",
-      ),
-    );
+    // Destroy paths (DELETE /me, /organizations/{id}, /workspaces/{id},
+    // /devices/{id}) tear down IoT things, KVS channels and S3 prefixes before
+    // the row delete (services/device-teardown.ts). The S3 drain is budgeted
+    // per device, but an organization with several devices still needs more
+    // than the 10 s default; 28 s stays inside API Gateway's 29 s.
+    const destroyTimeout = cdk.Duration.seconds(28);
 
-    const organizationsFn = new nodejs.NodejsFunction(
-      this,
-      "OrganizationsFn",
-      standardFnProps(
-        path.join(entryBase, "organizations.ts"),
-        "CRUD /organizations",
+    const meFn = new nodejs.NodejsFunction(this, "MeFn", {
+      ...standardFnProps(
+        path.join(entryBase, "me.ts"),
+        "/me — current user + memberships, profile name and picture, account deletion",
       ),
-    );
+      // Bundles @aws-sdk/client-cognito-identity-provider for DELETE /me
+      // (ListUsers + AdminDeleteUser), same reason as the memberships fn.
+      bundling: bundlingWithSdk,
+      timeout: destroyTimeout,
+    });
+
+    const organizationsFn = new nodejs.NodejsFunction(this, "OrganizationsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "organizations.ts"),
+        "CRUD /organizations (DELETE tears down every device under it)",
+      ),
+      timeout: destroyTimeout,
+      // Bundles @aws-sdk/client-kinesis-video via services/device-teardown.ts,
+      // which isn't guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
 
     const membershipsFn = new nodejs.NodejsFunction(this, "MembershipsFn", {
       ...standardFnProps(
@@ -733,11 +754,16 @@ export class XorgateCoreApiStack extends cdk.Stack {
       bundling: bundlingWithSdk,
     });
 
-    const workspacesFn = new nodejs.NodejsFunction(
-      this,
-      "WorkspacesFn",
-      standardFnProps(path.join(entryBase, "workspaces.ts"), "CRUD /workspaces"),
-    );
+    const workspacesFn = new nodejs.NodejsFunction(this, "WorkspacesFn", {
+      ...standardFnProps(
+        path.join(entryBase, "workspaces.ts"),
+        "CRUD /workspaces (DELETE tears down every device in it)",
+      ),
+      timeout: destroyTimeout,
+      // Bundles @aws-sdk/client-kinesis-video via services/device-teardown.ts,
+      // which isn't guaranteed in the Lambda runtime SDK.
+      bundling: bundlingWithSdk,
+    });
 
     const deviceModelsFn = new nodejs.NodejsFunction(
       this,
@@ -750,6 +776,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     const devicesFn = new nodejs.NodejsFunction(this, "DevicesFn", {
       ...standardFnProps(path.join(entryBase, "devices.ts"), "CRUD /devices"),
+      timeout: destroyTimeout,
       // Bundles @aws-sdk/client-iot-data-plane (retained device-config publish),
       // which isn't guaranteed in the Lambda runtime SDK.
       bundling: bundlingWithSdk,
@@ -1979,7 +2006,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     addRoutes({
       path: "/me",
-      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH],
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
       integration: meInt,
     });
     // Profile picture. Bytes land as base64 on the PUT and are stored in the

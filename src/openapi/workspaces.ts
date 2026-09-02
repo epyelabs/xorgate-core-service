@@ -162,11 +162,12 @@ export const workspacesPaths = {
     },
     delete: {
       operationId: 'deleteWorkspace',
-      summary: 'Delete a workspace',
+      summary: 'Delete a workspace (owner/admin only)',
       description:
-        'Cascades to the devices in it, and to their sessions and telemetry, and to any session ' +
-        'token scoped to it. Organization-wide: a workspace-scoped session token gets ' +
-        '`403 WORKSPACE_SCOPED`.',
+        'Deletes every device in the workspace the way `DELETE /devices/{id}` does — IoT ' +
+        'identity, video channels, uploaded media and telemetry included — then the workspace, ' +
+        'its logo, and any session token scoped to it. There is no undo. Organization-wide: a ' +
+        'workspace-scoped session token gets `403 WORKSPACE_SCOPED`.',
       tags: ['Workspaces'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

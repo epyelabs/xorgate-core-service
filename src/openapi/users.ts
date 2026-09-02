@@ -1,8 +1,9 @@
 /**
  * `GET /me`: identity plus everything needed to pick an active organization.
- * `PATCH /me` and the `/me/avatar` pair: the caller's own profile.
+ * `PATCH /me` and the `/me/avatar` pair: the caller's own profile. `DELETE
+ * /me`: the account itself.
  *
- * All four are scoped to the caller by the bearer token alone — there is no id
+ * All five are scoped to the caller by the bearer token alone — there is no id
  * in any path, so none of them takes `X-Organization-Id` or consults a
  * membership role. Passwords are NOT here: the browser changes those against
  * Cognito directly and they never pass through this API.
@@ -48,6 +49,37 @@ export const usersPaths = {
         },
         '401': { $ref: '#/components/responses/Unauthorized' },
         '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+    delete: {
+      operationId: 'deleteMe',
+      summary: 'Delete the caller\'s own account',
+      description:
+        'Closes the account for good: the Cognito user (so the email can sign up again from ' +
+        'nothing), the profile row and picture, every organization membership, and the ' +
+        'browser live-plane policy. Organizations the caller merely belonged to are untouched; ' +
+        'device registrations they created keep a null creator.\n\n' +
+        'Refused with `409 OWNS_ORGANIZATIONS` while the caller is the ONLY owner of any ' +
+        'organization — the response lists them under `details.organizations`. Hand ownership ' +
+        'to another member first (`PATCH /memberships/{id}` with `role: "owner"`) or delete the ' +
+        'organization (`DELETE /organizations/{id}`). Several owners are allowed, so an owner ' +
+        'who is not the last one is not blocked.\n\n' +
+        'The ID token that made this call stays verifiable until it expires, but every later ' +
+        'request with it is refused with `401 ACCOUNT_DELETED` rather than re-creating the ' +
+        'profile. There is no undo.\n\n' +
+        '**Cognito ID token only.** An `xg_` API key is refused with `401 USER_CREDENTIAL_REQUIRED`: this operation acts on a person, and a key has no user behind it.',
+      tags: ['Users'],
+      security: [{ BearerAuth: [] }],
+      responses: {
+        '204': { $ref: '#/components/responses/NoContent' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            'The caller is the sole owner of at least one organization (`OWNS_ORGANIZATIONS`); ' +
+            '`details.organizations` lists `{id, name, slug}` for each.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
       },
     },
     patch: {
