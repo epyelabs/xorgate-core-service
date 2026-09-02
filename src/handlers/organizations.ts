@@ -20,6 +20,14 @@ import { pageMeta, parseListParams } from '../utils/list-params';
 import { apiHandler } from '../utils/api-handler';
 import { routeKey } from '../utils/route';
 import { decodeImageUpload, deleteImage, putOrganizationLogo } from '../services/images';
+import { devicesInWorkspaces, teardownDevices } from '../services/device-teardown';
+import { revokeLiveAccessForUser } from '../services/live-access';
+import { CREDENTIAL_PROVIDERS, orgSecretName } from '../workflows/org-credentials';
+import {
+  DeleteSecretCommand,
+  ResourceNotFoundException,
+  SecretsManagerClient,
+} from '@aws-sdk/client-secrets-manager';
 import { organizationView, organizationViews } from '../services/entity-views';
 
 /**
@@ -91,6 +99,8 @@ async function deleteLogo(
   await deleteImage(org.logoKey);
   return ok({ organization: await organizationView(updated) });
 }
+
+const secrets = new SecretsManagerClient({});
 
 const restHandler = async (
   event: APIGatewayProxyEventV2,
@@ -245,16 +255,108 @@ const restHandler = async (
       if (auth.membershipRole !== 'owner') {
         return forbidden('Only owners can delete an organization');
       }
-      const deleted = await db
-        .delete(schema.organizations)
-        .where(eq(schema.organizations.id, id!))
-        .returning({ id: schema.organizations.id });
-      if (deleted.length === 0) return notFound(`Organization "${id}" not found`);
-      return { statusCode: 204, body: '' };
+      return destroyOrganization(id, auth.userId ?? auth.apiKeyId ?? 'unknown');
     }
     default:
       return methodNotAllowed(method, 'GET, POST, PUT, DELETE');
   }
 };
+
+/**
+ * The whole organization. Order matters, and every step before the row delete
+ * needs identifiers that the cascade takes with it:
+ *
+ *  1. every device in every workspace — IoT thing, KVS channels, S3 prefixes,
+ *     FK-less telemetry rows (services/device-teardown.ts);
+ *  2. the organization's connector secrets in Secrets Manager, force-deleted
+ *     so the same names can be recreated (the pattern organization-credentials
+ *     already uses);
+ *  3. the organization and workspace logos;
+ *  4. the tombstone, in the same transaction as the row delete; the cascade
+ *     then removes workspaces, devices, API keys, session tokens, memberships,
+ *     workflow templates, registrations;
+ *  5. live-plane revocation for members whose ONLY membership this was — the
+ *     browser IoT policy hangs off the Cognito identity, not the membership,
+ *     so nothing else would ever detach it (same rule as DELETE /memberships).
+ *
+ * The AWS steps are best-effort and logged; the row delete is the fact.
+ */
+async function destroyOrganization(
+  organizationId: string,
+  deletedBy: string,
+): Promise<APIGatewayProxyResultV2> {
+  const org = await db.query.organizations.findFirst({
+    where: eq(schema.organizations.id, organizationId),
+  });
+  if (!org) return notFound(`Organization "${organizationId}" not found`);
+
+  const workspaces = await db.query.workspaces.findMany({
+    where: eq(schema.workspaces.organizationId, organizationId),
+    columns: { id: true, logoKey: true },
+  });
+  const members = await db.query.memberships.findMany({
+    where: eq(schema.memberships.organizationId, organizationId),
+    columns: { userId: true },
+  });
+
+  const devices = await devicesInWorkspaces(
+    workspaces.map((w) => w.id),
+    organizationId,
+  );
+  const teardown = await teardownDevices(devices, deletedBy);
+  if (teardown.errors.length) {
+    console.warn(
+      `[organizations] delete ${organizationId}: ${teardown.errors.length} device teardown error(s)`,
+    );
+  }
+
+  for (const provider of CREDENTIAL_PROVIDERS) {
+    try {
+      await secrets.send(
+        new DeleteSecretCommand({
+          SecretId: orgSecretName(organizationId, provider),
+          ForceDeleteWithoutRecovery: true,
+        }),
+      );
+    } catch (err) {
+      if (!(err instanceof ResourceNotFoundException)) {
+        console.warn(`[organizations] delete secret ${provider} failed`, err);
+      }
+    }
+  }
+
+  if (org.logoKey) await deleteImage(org.logoKey);
+  for (const w of workspaces) if (w.logoKey) await deleteImage(w.logoKey);
+
+  await db.transaction(async (tx) => {
+    // Sequential: the Data API driver cannot run concurrent statements in one transaction.
+    await tx
+      .insert(schema.deletedOrganizations)
+      .values({
+        id: organizationId,
+        slug: org.slug,
+        workspaceCount: workspaces.length,
+        deviceCount: devices.length,
+        deletedBy,
+      })
+      .onConflictDoNothing();
+    await tx.delete(schema.organizations).where(eq(schema.organizations.id, organizationId));
+  });
+
+  for (const { userId } of members) {
+    const remaining = await db.query.memberships.findFirst({
+      where: eq(schema.memberships.userId, userId),
+      columns: { id: true },
+    });
+    if (remaining) continue;
+    try {
+      await revokeLiveAccessForUser(userId);
+    } catch (err) {
+      console.error(`[organizations] live-access revoke failed for ${userId}`, err);
+    }
+  }
+
+  return { statusCode: 204, body: '' };
+}
 
 export const handler = apiHandler(restHandler);

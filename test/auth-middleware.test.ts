@@ -65,6 +65,7 @@ const store = {
   apiKeys: [] as FakeApiKey[],
   sessionTokens: [] as FakeSessionToken[],
   workspaces: [] as FakeWorkspace[],
+  deletedUsers: [] as { id: string }[],
 };
 /** Every `where` the middleware builds, in call order, for assertions below. */
 const lookups: string[] = [];
@@ -154,6 +155,7 @@ vi.mock('../src/db/index', async () => {
         memberships: table(() => store.memberships, 'memberships', ['userId', 'organizationId']),
         apiKeys: table(() => store.apiKeys, 'apiKeys', ['hashedKey']),
         workspaces: table(() => store.workspaces, 'workspaces', ['id', 'organizationId']),
+        deletedUsers: table(() => store.deletedUsers, 'deletedUsers', ['id']),
       },
       insert: () => ({
         values: (row: FakeUser) => ({
@@ -222,6 +224,7 @@ async function refusal(promise: Promise<unknown>, status: number, code: string) 
 }
 
 beforeEach(() => {
+  store.deletedUsers = [];
   store.users = [
     { id: 'sub-1', email: 'one@example.test', name: 'One', tier: 'free', role: 'user' },
   ];
@@ -329,6 +332,13 @@ describe('the Cognito path is unchanged', () => {
     const auth = await requireOrgContext(event('good-jwt'));
     expect(store.users).toHaveLength(1);
     expect(auth.userId).toBe('sub-1');
+  });
+
+  it('refuses a deleted account instead of re-creating its row (DELETE /me tombstone)', async () => {
+    store.users = [];
+    store.deletedUsers = [{ id: 'sub-1' }];
+    await refusal(requireOrgContext(event('good-jwt')), 401, 'ACCOUNT_DELETED');
+    expect(store.users).toHaveLength(0);
   });
 
   it('never touches api_keys for a JWT caller', async () => {

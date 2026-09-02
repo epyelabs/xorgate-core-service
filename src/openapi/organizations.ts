@@ -167,8 +167,12 @@ export const organizationsPaths = {
       operationId: 'deleteOrganization',
       summary: 'Delete the organization (owner only)',
       description:
-        'Cascades: workspaces, devices, API keys and memberships under this organization go with ' +
-        'it. There is no undo and no soft-delete.',
+        'Destroys the organization and everything under it: every workspace and every device ' +
+        '(each torn down the way `DELETE /devices/{id}` is — IoT identity, video channels, ' +
+        'uploaded media, telemetry), API keys and the session tokens minted from them, ' +
+        'memberships, workflow templates, connector credentials in Secrets Manager, and the ' +
+        'logos. Members whose only organization this was lose live-plane access. There is no ' +
+        'undo and no soft-delete; a minimal deletion record (id, slug, counts, who, when) is kept.',
       tags: ['Organizations'],
       responses: {
         '204': { $ref: '#/components/responses/NoContent' },

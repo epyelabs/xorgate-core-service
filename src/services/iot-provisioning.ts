@@ -170,12 +170,14 @@ export async function provisionDevice(
 }
 
 /**
- * Best-effort teardown for a half-provisioned device: detach the cert from the
+ * Best-effort teardown of a device's IoT identity: detach the cert from the
  * thing/policy, deactivate + delete the cert, and delete the thing. Used by the
- * claim handler to roll back when device-row linkage fails after provisioning.
- * Errors are swallowed — this runs on an already-failing path.
+ * claim handler to roll back when device-row linkage fails after provisioning,
+ * and by services/device-teardown.ts when a device is deleted. Errors are
+ * swallowed — the callers cannot do anything about them — but the return value
+ * says whether the thing itself is gone, so a teardown can log the truth.
  */
-export async function deleteThing(thingName: string): Promise<void> {
+export async function deleteThing(thingName: string): Promise<boolean> {
   try {
     const principals = await iotClient.send(
       new ListThingPrincipalsCommand({ thingName }),
@@ -207,8 +209,16 @@ export async function deleteThing(thingName: string): Promise<void> {
           .catch(() => undefined);
       }
     }
-    await iotClient.send(new DeleteThingCommand({ thingName })).catch(() => undefined);
+    return await iotClient
+      .send(new DeleteThingCommand({ thingName }))
+      .then(() => true)
+      .catch((err: unknown) => {
+        // Already gone counts as gone: a device row whose thing was never
+        // provisioned (or was removed by hand) must not read as a failure.
+        return (err as { name?: string } | null)?.name === 'ResourceNotFoundException';
+      });
   } catch {
     // swallow — best-effort cleanup on an already-failing path
+    return false;
   }
 }
