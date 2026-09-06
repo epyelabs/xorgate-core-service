@@ -17,7 +17,7 @@
     "//cognitoEmailViaSes": "Send the pool's emails from xorgate's own SES identity instead of Cognito's default sender. Flip a stage to true ONLY once its SES domain is verified AND its account is out of the SES sandbox; flipping early breaks every signup/invite/reset email.",
     "cognitoEmailViaSes": {
       "dev": true,
-      "prod": false
+      "prod": true
     },
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,
