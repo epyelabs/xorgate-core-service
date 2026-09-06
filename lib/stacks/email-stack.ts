@@ -44,8 +44,10 @@ export class XorgateCoreEmailStack extends cdk.Stack {
     const isProd = props.stage === 'prod';
     this.domain = props.domain;
     this.fromAddress = `no-reply@${props.domain}`;
-    // Lowercase, the way the console renders the wordmark.
-    this.fromName = isProd ? 'xorgate' : 'xorgate (dev)';
+    // Capitalized: this is the sender name a recipient sees in their inbox
+    // list, where the console's lowercase wordmark reads as a typo rather than
+    // as styling. Body copy stays lowercase, matching the product's own voice.
+    this.fromName = isProd ? 'Xorgate' : 'Xorgate (dev)';
 
     this.configurationSet = new ses.ConfigurationSet(this, 'TransactionalConfigurationSet', {
       configurationSetName: isProd ? 'xorgate-transactional' : 'xorgate-transactional-dev',

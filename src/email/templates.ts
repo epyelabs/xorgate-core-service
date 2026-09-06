@@ -9,9 +9,11 @@
  * `#ff3a00` (the `--brand` token, NOT `--primary`, which is neutral), a 10px
  * corner radius (`--radius: 0.625rem`), near-black text on a light shell, and
  * Figtree with a system fallback. Everything is table-based with inline
- * styles because that is still the only layout email clients agree on, and
- * the logo is a TYPOGRAPHIC wordmark: Gmail strips inline SVG and blocks
- * data-URI images, so the console's SVG mark cannot be used here.
+ * styles because that is still the only layout email clients agree on. The
+ * header mark is a HOSTED PNG (Gmail strips inline SVG and blocks data-URI
+ * images, so the console's SVG cannot be used directly), rendered from
+ * xorgate-web/public/xorgate-logo.svg; the wordmark beside it stays as text,
+ * so the brand still reads when a client blocks images.
  *
  * Cognito caps a custom email at 20,000 characters; the rendered layout is
  * comfortably under 6 KB, which leaves room for any body below.
@@ -33,6 +35,22 @@ const BRAND = {
 
 /** --radius: 0.625rem, in the px an email client will actually honour. */
 const RADIUS = '10px';
+
+/**
+ * The xorgate mark, a 264x96 transparent PNG rendered from
+ * xorgate-web/public/xorgate-logo.svg and served by the landing site
+ * (xorgate-landing/public/xorgate-mark.png, also uploaded straight to the
+ * www.xorgate.io bucket so it does not wait on a landing deploy). Displayed at
+ * a third of its pixel size so it stays sharp on retina.
+ *
+ * One absolute URL for every stage: a dev email may as well load the
+ * prod-hosted image, and a second copy would only be one more thing to keep in
+ * sync. If it ever 404s the header degrades to the "Xorgate" text beside it,
+ * which is why the wordmark is not baked into the image.
+ */
+const LOGO_URL = 'https://www.xorgate.io/xorgate-mark.png';
+const LOGO_WIDTH = 66;
+const LOGO_HEIGHT = 24;
 
 const FONT =
   "'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
@@ -136,8 +154,8 @@ function layout(o: LayoutOptions): string {
           <td style="padding:0 0 20px;">
             <table role="presentation" cellspacing="0" cellpadding="0" border="0">
               <tr>
-                <td style="width:26px;height:26px;background:${BRAND.accent};border-radius:7px;font-family:${FONT};font-size:16px;font-weight:700;line-height:26px;color:#ffffff;text-align:center;">&#215;</td>
-                <td style="padding-left:10px;font-family:${FONT};font-size:19px;font-weight:600;letter-spacing:-0.02em;color:${BRAND.ink};">xorgate</td>
+                <td style="width:${LOGO_WIDTH}px;"><img src="${LOGO_URL}" width="${LOGO_WIDTH}" height="${LOGO_HEIGHT}" alt="" style="display:block;border:0;" /></td>
+                <td style="padding-left:12px;font-family:${FONT};font-size:19px;font-weight:600;letter-spacing:-0.02em;color:${BRAND.ink};">Xorgate</td>
               </tr>
             </table>
           </td>
