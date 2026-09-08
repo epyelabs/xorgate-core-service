@@ -13,6 +13,7 @@ import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { runPrefix, runTopicPrefix, simTopicPrefix } from '@xorgate/workflow-engine';
 import { apiHandler } from '../utils/api-handler';
+import { artifactFileName } from '../workflows/host/result';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -391,9 +392,21 @@ const restHandler = async (
           ),
         );
       if (!row) return notFound(`Run "${id}" not found`);
-      const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: key }), {
-        expiresIn: ARTIFACT_URL_EXPIRES_SECONDS,
-      });
+      // ADDITIVE: `download=1` signs a Content-Disposition override so a browser
+      // saves the object under a name derived from the key instead of
+      // rendering it inline (the `download` attribute is ignored cross-origin).
+      const download = event.queryStringParameters?.download === '1';
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({
+          Bucket: BUCKET,
+          Key: key,
+          ...(download
+            ? { ResponseContentDisposition: `attachment; filename="${artifactFileName(id, key)}"` }
+            : {}),
+        }),
+        { expiresIn: ARTIFACT_URL_EXPIRES_SECONDS },
+      );
       return ok({ url, expiresInSeconds: ARTIFACT_URL_EXPIRES_SECONDS });
     }
 

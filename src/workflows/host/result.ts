@@ -44,3 +44,15 @@ export function videoKey(runId: string, nodeId: string): string {
 export function videosOf(result: EngineResult): Record<string, VideoArtifact> | undefined {
   return (result as PlatformEngineResult).artifacts.videos;
 }
+
+/**
+ * Download name for an artifact (`GET /workflow-runs/{id}/artifact-url?download=1`
+ * signs it into Content-Disposition): the path under the run prefix with the
+ * separators folded (outputs-cap-records.jsonl, video-viz.mp4, result.json), so
+ * files from one run never collide in a downloads folder.
+ */
+export function artifactFileName(runId: string, key: string): string {
+  const prefix = runPrefix(runId);
+  const rel = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+  return rel.split('/').filter(Boolean).join('-').replace(/[^A-Za-z0-9._-]/g, '_') || 'artifact';
+}
