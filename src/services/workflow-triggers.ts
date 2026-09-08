@@ -4,7 +4,7 @@ import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import { flattenTelemetryToRows, type TelemetryPayload } from '../schemas/telemetry';
 import type { AttachmentTrigger, WorkflowDefinition } from '../schemas/workflows';
-import { upgradeDefinition } from '../workflows/compat';
+import { upgradeDefinition } from '@xorgate/workflow-engine';
 import { engineTargetForDefinition } from '../workflows/simulations';
 
 /**

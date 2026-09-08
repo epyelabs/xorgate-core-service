@@ -8,7 +8,8 @@ import { AuthError, authErrorResponse, requireOrgWideContext } from '../middlewa
 import { db, schema } from '../db/index';
 import { badRequest, created, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
 import { dispatchV2Run, materializeHistoryInputs } from '../services/workflow-engine-v2';
-import { validateDefinitionForPublish } from '../workflows/validate';
+import { validateDefinitionForPublish } from '@xorgate/workflow-engine';
+import { platformCatalog } from '../workflows/catalog';
 import {
   buildSimulationManifest,
   createSimulationSchema,
@@ -125,7 +126,7 @@ const restHandler = async (
 
       // Strict publish validation on the draft (also upgrades v1 -> v2); the
       // simulator surfaces the exact issues publish would.
-      const { issues, definition } = validateDefinitionForPublish(parsed.data.definition);
+      const { issues, definition } = validateDefinitionForPublish(parsed.data.definition, platformCatalog);
       if (issues.length > 0) {
         return errorResponse(400, 'WORKFLOW_VALIDATION_FAILED', 'Workflow definition failed publish validation', {
           issues,

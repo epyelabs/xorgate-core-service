@@ -1,7 +1,6 @@
 import type { WorkflowDefinition } from '../schemas/workflows';
-import { getNodeType } from './catalog/index';
-import { runManifestSchema, runPrefix, type RunManifest } from './engine/manifest';
-import { runTopicPrefix } from './engine/progress';
+import { runManifestSchema, runPrefix, runTopicPrefix, type RunManifest } from '@xorgate/workflow-engine';
+import { getNodeType } from './catalog';
 
 /**
  * Pure half of the M6 production (triggered) dispatch: trigger-context

@@ -1,5 +1,3 @@
-import { z } from 'zod';
-
 /**
  * Model registry contracts (architecture.md §6). The registry is an S3 PREFIX
  * on the existing core bucket, not a separate bucket (one bucket to grant, the
@@ -21,49 +19,12 @@ import { z } from 'zod';
 
 export const MODEL_REGISTRY_PREFIX = 'models/';
 
-export const MODEL_FAMILIES = ['detection', 'depth', 'segmentation'] as const;
-
-export const modelManifestSchema = z.object({
-  manifestVersion: z.literal(1),
-  family: z.enum(MODEL_FAMILIES),
-  name: z.string().min(1), // e.g. "yolov8n"; node config references this
-  version: z.number().int().positive(),
-  label: z.string().min(1).optional(), // human name for pickers
-  backend: z.enum(['cpu-onnx', 'gpu-endpoint']),
-  input: z.object({
-    width: z.number().int().positive(),
-    height: z.number().int().positive(),
-    layout: z.literal('nchw').default('nchw'),
-    colorSpace: z.literal('rgb').default('rgb'),
-    normalize: z
-      .object({
-        // pixel -> pixel * scale (then (x - mean) / std per channel when set)
-        scale: z.number().positive().default(1 / 255),
-        mean: z.tuple([z.number(), z.number(), z.number()]).optional(),
-        std: z.tuple([z.number(), z.number(), z.number()]).optional(),
-      })
-      .default({}),
-    letterbox: z
-      .object({
-        enabled: z.boolean().default(true),
-        padValue: z.number().int().min(0).max(255).default(114),
-      })
-      .default({}),
-  }),
-  classNames: z.array(z.string().min(1)).default([]),
-  postprocess: z.object({
-    // yolov8: output (1, 4 + numClasses, N) = [cx,cy,w,h, class scores]
-    // yolov8-seg: detection head (1, 4 + numClasses + 32, N) + proto (1, 32, mh, mw)
-    // depth-anything: single map output (1, H, W) of relative inverse depth
-    // (M4 additions are ADDITIVE enum values: every pre-M4 manifest still parses)
-    kind: z.enum(['yolov8', 'rtdetr', 'yolov8-seg', 'depth-anything']),
-    nmsIouThreshold: z.number().min(0).max(1).default(0.45),
-    // yolov8-seg only: sigmoid cutoff when binarizing instance masks.
-    maskThreshold: z.number().min(0).max(1).default(0.5),
-  }),
-  quantization: z.enum(['fp32', 'fp16', 'int8']).optional(),
-});
-export type ModelManifest = z.infer<typeof modelManifestSchema>;
+// The manifest schema and its type come from the engine package (the engine
+// reads pre/post-processing from the manifest; the platform only stores and
+// lists them). `family` is an open string there with MODEL_FAMILIES as the
+// known values, exactly as the package's registry contract says.
+export { MODEL_FAMILIES, modelManifestSchema } from '@xorgate/workflow-engine';
+export type { ModelManifest } from '@xorgate/workflow-engine';
 
 export function modelVersionPrefix(family: string, name: string, version: number): string {
   return `${MODEL_REGISTRY_PREFIX}${family}/${name}/${version}/`;

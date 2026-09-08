@@ -14,8 +14,8 @@ import {
   workflowDefinitionSchema,
 } from '../schemas/workflows';
 import { computeRequiredCapabilities } from '../services/workflow-capabilities';
-import { upgradeDefinitionSafe } from '../workflows/compat';
-import { validateDefinitionForPublish } from '../workflows/validate';
+import { upgradeDefinitionSafe, validateDefinitionForPublish } from '@xorgate/workflow-engine';
+import { platformCatalog } from '../workflows/catalog';
 import { apiHandler } from '../utils/api-handler';
 
 // Any executor that exposes the drizzle query-builder surface: the root db or a
@@ -464,7 +464,7 @@ const restHandler = async (
           issues: [{ code: 'INVALID_SHAPE', message: 'Definition is not a valid node/edge graph' }],
         });
       }
-      const { issues } = validateDefinitionForPublish(shape.data);
+      const { issues } = validateDefinitionForPublish(shape.data, platformCatalog);
       if (issues.length > 0) {
         return errorResponse(400, 'WORKFLOW_VALIDATION_FAILED', 'Workflow definition failed publish validation', {
           issues,

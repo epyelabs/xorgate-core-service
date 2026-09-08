@@ -6,6 +6,7 @@ import type { Readable } from 'node:stream';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import {
   MODEL_REGISTRY_PREFIX,
+  modelManifestKey,
   modelManifestSchema,
   modelNamePrefix,
   modelOnnxKey,
@@ -94,6 +95,36 @@ export async function resolveLatestModel(
   if (manifest.name !== name || manifest.family !== family || manifest.version !== versions[0]) {
     throw new Error(
       `Model manifest at ${prefix}${versions[0]}/manifest.json disagrees with its path (${manifest.family}/${manifest.name}/${manifest.version})`,
+    );
+  }
+  return manifest;
+}
+
+/**
+ * Resolves a registry model: a pinned `version` reads that manifest directly
+ * (the package's `name@version` rule, split by `parseModelName` in the host),
+ * otherwise the newest version. Both validate the manifest against its path.
+ */
+export async function resolveModel(
+  s3: S3Client,
+  bucket: string,
+  family: string,
+  name: string,
+  version?: number,
+): Promise<ModelManifest> {
+  if (version === undefined) return resolveLatestModel(s3, bucket, family, name);
+  const key = modelManifestKey(family, name, version);
+  let manifest: ModelManifest;
+  try {
+    manifest = modelManifestSchema.parse(await getJson(s3, bucket, key));
+  } catch (err) {
+    throw new Error(
+      `Model "${name}@${version}" (family ${family}) is not in the registry at s3://${bucket}/${key}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (manifest.name !== name || manifest.family !== family || manifest.version !== version) {
+    throw new Error(
+      `Model manifest at ${key} disagrees with its path (${manifest.family}/${manifest.name}/${manifest.version})`,
     );
   }
   return manifest;

@@ -1,6 +1,6 @@
 import type { WorkflowDefinition } from '../schemas/workflows';
-import { capabilityTokensForNode, getNodeType } from '../workflows/catalog/index';
-import { upgradeDefinition } from '../workflows/compat';
+import { capabilityTokensForNode, upgradeDefinition } from '@xorgate/workflow-engine';
+import { getNodeType } from '../workflows/catalog';
 
 /**
  * Capability compatibility between a workflow definition and a device model.

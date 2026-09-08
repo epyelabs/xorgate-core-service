@@ -11,8 +11,7 @@ import { pageMeta, parseListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { fireWorkflowRun } from '../services/workflow-triggers';
 import type { WorkflowDefinition } from '../schemas/workflows';
-import { runPrefix } from '../workflows/engine/manifest';
-import { runTopicPrefix, simTopicPrefix } from '../workflows/engine/progress';
+import { runPrefix, runTopicPrefix, simTopicPrefix } from '@xorgate/workflow-engine';
 import { apiHandler } from '../utils/api-handler';
 
 const s3 = new S3Client({});

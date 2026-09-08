@@ -2,9 +2,8 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { workflowDefinitionSchema } from '../schemas/workflows';
-import { getNodeType } from './catalog/index';
-import { runManifestSchema, runPrefix, type RunManifest } from './engine/manifest';
-import { simTopicPrefix } from './engine/progress';
+import { runManifestSchema, runPrefix, simTopicPrefix, type RunManifest } from '@xorgate/workflow-engine';
+import { getNodeType } from './catalog';
 import { sessionBinding, sessionsWindow, type ResolvedVideoSession } from './production';
 
 /**
@@ -175,10 +174,17 @@ export function validateSimulationBindings(
   return issues;
 }
 
-/** Engine target for a v2 definition: Fargate iff any node is media-bound. */
+/**
+ * Engine target for a v2 definition: Fargate iff any node is media-bound OR
+ * is a code function node (group `function`). Function nodes need python3
+ * and the package's sandboxed runner on disk, which only the Fargate image
+ * provides (wf-engine-integration design §3.3, Q5). Everything else runs on
+ * the Lambda target.
+ */
 export function engineTargetForDefinition(definition: WorkflowDefinition): 'lambda' | 'fargate' {
   for (const node of definition.nodes) {
-    if (getNodeType(node.type)?.runtime.target === 'media') return 'fargate';
+    const def = getNodeType(node.type);
+    if (def?.runtime.target === 'media' || def?.group === 'function') return 'fargate';
   }
   return 'lambda';
 }

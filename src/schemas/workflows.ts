@@ -9,35 +9,14 @@ import { z } from 'zod';
  */
 
 // --- Graph definition (react-flow native) ------------------------------------
-export const workflowNodeSchema = z.object({
-  id: z.string(),
-  type: z.string(),
-  position: z.object({ x: z.number(), y: z.number() }),
-  data: z.object({
-    label: z.string(),
-    config: z.record(z.string(), z.unknown()).default({}),
-  }),
-});
+// The definition, node and edge schemas are the engine package's frozen
+// contract (`schemaVersion: 2`, v1 graphs upgraded by `upgradeDefinition`);
+// re-exported here so the platform's handlers and services keep one import
+// path (wf-engine-integration Q11). Everything below stays platform-only.
+import { workflowDefinitionSchema } from '@xorgate/workflow-engine';
 
-export const workflowEdgeSchema = z.object({
-  id: z.string(),
-  source: z.string(),
-  target: z.string(),
-  sourceHandle: z.string().nullish(),
-  targetHandle: z.string().nullish(),
-});
-
-export const workflowDefinitionSchema = z.object({
-  // Absent = v1 (PoC node types). v2 = catalog node types; see
-  // src/workflows/compat.ts (upgradeDefinition) and the catalog registry.
-  schemaVersion: z.number().int().positive().optional(),
-  nodes: z.array(workflowNodeSchema),
-  edges: z.array(workflowEdgeSchema),
-});
-
-export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
-export type WorkflowEdge = z.infer<typeof workflowEdgeSchema>;
-export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema>;
+export { workflowDefinitionSchema, workflowEdgeSchema, workflowNodeSchema } from '@xorgate/workflow-engine';
+export type { WorkflowDefinition, WorkflowEdge, WorkflowNode } from '@xorgate/workflow-engine';
 
 // --- Template create / update inputs -----------------------------------------
 export const createWorkflowTemplateSchema = z.object({

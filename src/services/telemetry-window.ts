@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { tsParam } from '../utils/sql';
-import type { TelemetrySample } from '../workflows/catalog/types';
+import type { TelemetrySample } from '@xorgate/workflow-engine';
 
 /**
  * The one sanctioned telemetry-history read for the v2 engine, shared by the

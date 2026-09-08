@@ -1,7 +1,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import mqtt from 'mqtt';
 import { z } from 'zod';
-import type { LiveIngestFrame } from '../catalog/types';
+import type { LiveIngestFrame } from '@xorgate/workflow-engine';
 
 /**
  * Webcam-over-MQTT ingest transport (M5, architecture §5). The browser samples

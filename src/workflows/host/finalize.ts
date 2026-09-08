@@ -1,4 +1,4 @@
-import { ENGINE_VERSION, type EngineResult } from './manifest';
+import { ENGINE_VERSION, type EngineResult } from '@xorgate/workflow-engine';
 
 /**
  * Pure row-mapping for the v2 finalize path (workflow-run-finalize.ts). Kept
