@@ -13,6 +13,13 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    // `moduleResolution: node` predates package `exports` maps; the engine's
+    // `./local` entry point needs this type-only alias (runtime resolves the
+    // exports map natively).
+    "baseUrl": ".",
+    "paths": {
+      "@xorgate/workflow-engine/local": ["node_modules/@xorgate/workflow-engine/dist/cjs/local/index.d.ts"]
+    },
     "composite": true
   },
   "include": ["src"],

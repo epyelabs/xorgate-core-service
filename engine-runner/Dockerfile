@@ -1,5 +1,5 @@
 # Xorgate v2 engine runner — a Fargate task (ARM64/Graviton) that runs a
-# workflow graph (the TS streaming engine, src/workflows/engine/) over S3-bound
+# workflow graph (@xorgate/workflow-engine over the platform cloud host) over S3-bound
 # media and writes result.json back to S3. Replaces the Python cv-runner at the
 # M6 cutover.
 #

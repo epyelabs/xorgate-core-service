@@ -1,37 +1,33 @@
-import { readTelemetryWindow } from '../services/telemetry-window';
-import { getNodeType } from '../workflows/catalog/index';
-import type { EngineSourceReader } from '../workflows/catalog/types';
-import { runGraph, type EngineRunOutcome } from '../workflows/engine/index';
-import { manifestKey, resultKey, type RunManifest } from '../workflows/engine/manifest';
 import {
-  captureFormats,
-  failureOutcome,
-  loadRunManifest,
-  manifestProgress,
-  s3FetchText,
-  secretsManagerReader,
-  writeRunArtifacts,
-} from '../workflows/engine/target';
-import { upgradeDefinition } from '../workflows/compat';
+  createEngine,
+  manifestKey,
+  resultKey,
+  upgradeDefinition,
+  type RunManifest,
+} from '@xorgate/workflow-engine';
+import { readTelemetryWindow } from '../services/telemetry-window';
+import { platformCatalog } from '../workflows/catalog';
+import { failureOutcome, loadRunManifest, writeRunArtifacts } from '../workflows/host/aws';
+import { cloudHost, preflightRefusal, writeRefusal } from '../workflows/host/cloud-host';
 
 /**
- * Lambda target of the v2 TS engine: telemetry-only batch graphs (architecture
- * §4.1). Direct-invoked with { runId } (or an explicit bucket/manifestKey);
- * reads workflows/v2/runs/<runId>/manifest.json, streams the graph in-process,
- * and writes events.jsonl / outputs/<nodeId>/records.jsonl / result.json back
- * under the same prefix (manifest-load and artifact-write halves shared with
- * the Fargate container main via workflows/engine/target.ts). result.json is
- * ALWAYS written, even on failure, so the finalize path is the single place
- * run status is resolved.
+ * Lambda target of the workflow engine: telemetry-only batch graphs
+ * (architecture §4.1). Direct-invoked with { runId } (or an explicit
+ * bucket/manifestKey); reads workflows/v2/runs/<runId>/manifest.json, runs the
+ * graph in-process through `@xorgate/workflow-engine` over the platform's
+ * cloud host (workflows/host/cloud-host.ts, the lambda flavour), and writes
+ * events.jsonl / outputs/<nodeId>/records.* / result.json back under the same
+ * prefix. result.json is ALWAYS written, even on failure, so the finalize path
+ * is the single place run status is resolved.
  *
- * The engine core is storage-free; this handler supplies the one sanctioned
- * seam: telemetry history reads from telemetry_readings via drizzle. Media
- * graphs (any node with runtime.target === "media") are refused here and
- * belong to the Fargate engine target (engine-runner/).
+ * The host supplies the one seam this target owns: telemetry history reads
+ * from telemetry_readings via drizzle. Media graphs (any node with
+ * runtime.target === "media") and graphs with a code function node are
+ * refused here pre-flight and belong to the Fargate target (engine-runner/).
  *
  * Routed to by BOTH dispatch paths since M6: the simulations handler (direct
  * invoke) and the SQS production dispatcher (every triggered telemetry-only
- * run; media runs go to the Fargate engine-runner instead).
+ * run; media and function runs go to the Fargate engine-runner instead).
  */
 
 const BUCKET = process.env.BUCKET_NAME;
@@ -44,15 +40,7 @@ export interface WorkflowEngineEvent {
   manifestKey?: string;
 }
 
-// `bucket` is the run's output bucket: CSV uploads default to it when the
-// binding names no bucket.
-const telemetrySources = (bucket: string): EngineSourceReader => ({
-  async fetchText({ bucket: refBucket, key }): Promise<string> {
-    return s3FetchText(refBucket ?? bucket, key);
-  },
-  // Shared with the M4 dispatcher-side materialization (services/telemetry-window.ts).
-  readTelemetryWindow,
-});
+const log = (m: string): void => console.log(`workflow-engine: ${m}`);
 
 export const handler = async (
   event: WorkflowEngineEvent,
@@ -77,65 +65,36 @@ export const handler = async (
     throw new Error(message);
   }
 
+  // The lambda flavour: drizzle telemetry reads, no media, no models, no
+  // live plane. The test-only local-input switch is never set here.
+  const host = cloudHost({ bucket, target: 'lambda', telemetry: readTelemetryWindow, log });
+  if (host.options.localInputs) throw new Error('workflow-engine: localInputs is a test-only host option');
+
   const definition = upgradeDefinition(manifest.definition);
-
-  // This target runs telemetry-only graphs; media graphs need the Fargate engine.
-  let refusal: { nodeId: string; error: string } | null = null;
-  for (const node of definition.nodes) {
-    const typeDef = getNodeType(node.type);
-    if (!typeDef) {
-      refusal = { nodeId: node.id, error: `Unknown node type "${node.type}"` };
-      break;
-    }
-    if (typeDef.runtime.target === 'media') {
-      refusal = {
-        nodeId: node.id,
-        error: `Node type "${node.type}" needs the media engine target; this run was misrouted to Lambda`,
-      };
-      break;
-    }
+  const refusal = preflightRefusal(definition, 'lambda');
+  if (refusal) {
+    const result = await writeRefusal(host, manifest, refusal);
+    log(`run refused: ${refusal.error} (${manifest.runId})`);
+    return { runId: manifest.runId, status: result.status, resultKey: resultKey(manifest.runId) };
   }
 
-  // Live progress (M3 simulations): present only when the manifest carries a
-  // progress block; production/batch manifests stay silent, exactly as in M2.
-  const progress = manifestProgress(manifest, (m) => console.log(`workflow-engine: ${m}`));
-  progress?.runStatus({ status: 'running' });
-
-  const outcome: EngineRunOutcome = refusal
-    ? failureOutcome(definition.nodes.length, refusal.nodeId, refusal.error)
-    : await runGraph(
-        {
-          runId: manifest.runId,
-          mode: manifest.mode,
-          deviceId: manifest.deviceId,
-          window: manifest.window
-            ? { fromMs: Date.parse(manifest.window.from), toMs: Date.parse(manifest.window.to) }
-            : null,
-          definition,
-          bindings: Object.fromEntries(manifest.inputs.map((i) => [i.nodeId, i.binding])),
-        },
-        {
-          sources: telemetrySources(bucket),
-          // M7: org credentials win over platform secrets when the manifest
-          // names the owning org.
-          secrets: secretsManagerReader(manifest.orgId ?? null),
-          ...(progress ? { progress } : {}),
-          deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
-        },
-      );
-
-  await writeRunArtifacts(bucket, manifest.runId, outcome, captureFormats(definition));
-  // Final status goes out AFTER artifacts are durable, so a subscriber that
-  // reacts to "succeeded" can immediately fetch records/frames.
-  if (progress) {
-    progress.runStatus({ status: outcome.status, error: outcome.error, failedNodeId: outcome.failedNodeId });
-    await progress.flush();
+  // The engine validates the manifest, binds the host, emits `running`, runs
+  // the graph, writes the artifact tree (result.json last) and emits the
+  // terminal status. Progress is flushed here, after the run resolves.
+  const engine = createEngine({ host, catalog: platformCatalog, log: (m, level) => log(`[${level}] ${m}`) });
+  let outcomeStatus: 'succeeded' | 'failed';
+  try {
+    const { outcome } = await engine.run({
+      manifest,
+      runId: manifest.runId,
+      deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
+    });
+    outcomeStatus = outcome.status;
+    log(
+      `run complete ${JSON.stringify({ runId: manifest.runId, status: outcome.status, events: outcome.metrics.events, messages: outcome.metrics.messages })}`,
+    );
+  } finally {
+    await host.takeProgress(manifest.runId)?.flush();
   }
-  console.log('workflow-engine: run complete', {
-    runId: manifest.runId,
-    status: outcome.status,
-    events: outcome.metrics.events,
-    messages: outcome.metrics.messages,
-  });
-  return { runId: manifest.runId, status: outcome.status, resultKey: resultKey(manifest.runId) };
+  return { runId: manifest.runId, status: outcomeStatus, resultKey: resultKey(manifest.runId) };
 };

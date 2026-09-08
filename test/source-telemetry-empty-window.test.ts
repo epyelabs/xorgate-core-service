@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { EngineRunCtx } from '../src/workflows/catalog/types';
-import { executor } from '../src/workflows/catalog/nodes/source-telemetry';
+import type { EngineRunCtx } from '@xorgate/workflow-engine';
+import { platformCatalog } from '../src/workflows/catalog';
+
+// The real executor, from the one catalog instance the platform runs (the engine package's).
+const executor = platformCatalog.getExecutor('source.telemetry')!;
 
 /**
  * disable_telemetry_recording DoD 8. With `recording.telemetry.enabled` now the

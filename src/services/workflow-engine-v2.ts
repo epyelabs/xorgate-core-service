@@ -7,7 +7,7 @@ import { db, schema } from '../db/index';
 import type { WorkflowRun } from '../db/schema';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import { readTelemetryWindow } from './telemetry-window';
-import { upgradeDefinition } from '../workflows/compat';
+import { inputRecordsKey, manifestKey, upgradeDefinition, type RunManifest } from '@xorgate/workflow-engine';
 import { engineTargetForDefinition, sessionQueueName } from '../workflows/simulations';
 import {
   buildProductionManifest,
@@ -23,7 +23,6 @@ import {
   findRecentDeviceSessions,
   resolveVideoSessions,
 } from './media-session-input';
-import { inputRecordsKey, manifestKey, type RunManifest } from '../workflows/engine/manifest';
 
 /**
  * v2 engine dispatch: write the v2 manifest to S3, then either async-invoke

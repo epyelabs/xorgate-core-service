@@ -34,7 +34,7 @@ export function thumbnailKeyFor(key: MediaSegmentObjectKey): string {
 /**
  * One frame, JPEG, capped width, taken `seekSeconds` into the segment (input
  * seek: lands on the nearest keyframe first, cheap). Same quiet/scale idiom as
- * the workflow media executors (workflows/engine/media.ts, video-decode-sample)
+ * the workflow media executors (the engine package's media module, video.decode_sample)
  * — argv for a direct spawn, no shell.
  */
 export function ffmpegThumbnailArgs(

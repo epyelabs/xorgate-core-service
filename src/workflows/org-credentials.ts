@@ -1,9 +1,5 @@
 import { z } from 'zod';
-import {
-  buildGoogleRoadsUrl,
-  buildHereRequest,
-  buildOverpassRequest,
-} from './catalog/nodes/connector-third-party';
+import { buildGoogleRoadsUrl, buildHereRequest, buildOverpassRequest } from '@xorgate/workflow-engine';
 
 /**
  * Pure half of the per-organization connector credentials (M7): secret naming,

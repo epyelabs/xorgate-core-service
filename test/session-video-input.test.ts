@@ -9,8 +9,8 @@ import {
   triggeredVideoSelection,
   type ResolvedVideoSession,
 } from '../src/workflows/production';
-import { executor as sourceVideo } from '../src/workflows/catalog/nodes/source-video';
-import type { EngineRunCtx, VideoPayload } from '../src/workflows/catalog/types';
+import type { EngineRunCtx, VideoPayload } from '@xorgate/workflow-engine';
+import { platformCatalog } from '../src/workflows/catalog';
 import type { WorkflowDefinition } from '../src/schemas/workflows';
 
 /**
@@ -49,6 +49,9 @@ function seg(
     meta: { anchor: seq === 0 ? 'fstat' : 'boundary' },
   };
 }
+
+// The real executor, from the one catalog instance the platform runs (the engine package's).
+const sourceVideo = platformCatalog.getExecutor('source.video')!;
 
 /** Runs the real source.video executor over a binding and collects its emits. */
 async function runSourceVideo(

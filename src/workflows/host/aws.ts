@@ -1,11 +1,10 @@
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import type { Readable } from 'node:stream';
 import { DescribeEndpointCommand, IoTClient } from '@aws-sdk/client-iot';
 import { IoTDataPlaneClient, PublishCommand } from '@aws-sdk/client-iot-data-plane';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
-import type { EngineArtifactSink, EngineSecretReader } from '../catalog/types';
-import { isSecretGoneError, orgSecretName, PROVIDER_BY_LOGICAL_SECRET } from '../org-credentials';
-import type { WorkflowDefinition } from '../../schemas/workflows';
-import type { EngineRunOutcome } from './index';
 import {
   buildEngineResult,
   eventsKey,
@@ -13,18 +12,24 @@ import {
   recordsKey,
   resultKey,
   runManifestSchema,
+  IotRunProgress,
+  type EngineArtifactSink,
   type EngineResult,
+  type EngineRunOutcome,
+  type EngineSecretReader,
+  type ProgressTransport,
   type RunManifest,
-} from './manifest';
-import { IotRunProgress } from './progress';
+} from '@xorgate/workflow-engine';
+import { isSecretGoneError, orgSecretName, PROVIDER_BY_LOGICAL_SECRET } from '../org-credentials';
 
 /**
- * The shared half of every DEPLOYED engine target (Lambda handler, Fargate
- * container main): manifest-in from S3, artifacts + result.json out to S3. The
- * engine core stays storage-free; this module is where a target's I/O lives so
- * the two targets cannot drift. Each target keeps only what is genuinely its
- * own: the Lambda's drizzle telemetry reader and media refusal, the
- * container's S3 video/model fetchers.
+ * The AWS half of the cloud host (wf-engine-integration design §3.2): manifest
+ * in from S3, artifacts and result.json out to S3, frames to S3, progress to
+ * IoT, secrets from Secrets Manager. Moved verbatim from the former
+ * the engine copy's `target.ts`; `cloud-host.ts` composes these into the
+ * `EngineHost` both deployed targets hand to `createEngine`. The engine
+ * package itself carries no AWS SDK (its smoke asserts it), so this file is
+ * the one place a cloud provider appears on the execution path.
  */
 
 const s3 = new S3Client({});
@@ -39,21 +44,12 @@ async function putJson(bucket: string, key: string, body: string, contentType: s
   await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
 }
 
-/** Each output.data_capture node's configured artifact format. */
-export function captureFormats(definition: WorkflowDefinition): Record<string, 'jsonl' | 'json'> {
-  const formats: Record<string, 'jsonl' | 'json'> = {};
-  for (const node of definition.nodes) {
-    if (node.type === 'output.data_capture') {
-      formats[node.id] = node.data.config?.format === 'json' ? 'json' : 'jsonl';
-    }
-  }
-  return formats;
-}
-
 /**
  * Writes events.jsonl, outputs/<nodeId>/records.*, and result.json for a
  * finished run. result.json goes LAST so the finalize rule fires only once
- * every other artifact is durable.
+ * every other artifact is durable. Exported for the targets' "no manifest
+ * could be read" path; every other write goes through the host's
+ * `writeArtifacts`, which is this function bound to the run.
  */
 export async function writeRunArtifacts(
   bucket: string,
@@ -121,7 +117,7 @@ export function s3ArtifactSink(bucket: string, runId: string): EngineArtifactSin
   };
 }
 
-/** Small text objects (telemetry CSV uploads) for the fetchText source seam. */
+/** Small text objects (telemetry CSV uploads, materialized inputs) for the fetchText source seam. */
 export async function s3FetchText(bucket: string, key: string): Promise<string> {
   const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   const body = await res.Body?.transformToString();
@@ -129,10 +125,22 @@ export async function s3FetchText(bucket: string, key: string): Promise<string> 
   return body;
 }
 
+/** Streams a video object to `localPath` (the fetchVideo source seam on the container target). */
+export async function s3FetchVideo(bucket: string, key: string, localPath: string): Promise<void> {
+  const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!res.Body) throw new Error(`Empty video object at s3://${bucket}/${key}`);
+  await pipeline(res.Body as Readable, createWriteStream(localPath));
+}
+
+/** The S3 client the host's model store shares (one client per process). */
+export function s3Client(): S3Client {
+  return s3;
+}
+
 // The default IoTDataPlaneClient endpoint is the legacy (non-ATS) data
 // endpoint; resolve the account's ATS endpoint once per process, same pattern
 // as services/device-config.ts. Both the Lambda role and the engine task role
-// carry iot:DescribeEndpoint + iot:Publish on wf/sim/*.
+// carry iot:DescribeEndpoint + iot:Publish on wf/sim/* and wf/run/*.
 let iotAtsEndpointPromise: Promise<string> | undefined;
 /** The account's iot:Data-ATS endpoint hostname, resolved once per process. */
 export async function iotAtsEndpoint(): Promise<string> {
@@ -164,23 +172,25 @@ async function iotDataClient(): Promise<IoTDataPlaneClient> {
   return iotDataClientPromise;
 }
 
+/** The IoT publish transport behind every deployed progress sink (QoS 0, ATS endpoint). */
+export const iotPublishTransport: ProgressTransport = async (topic, payload) => {
+  const client = await iotDataClient();
+  await client.send(new PublishCommand({ topic, qos: 0, payload: Buffer.from(payload) }));
+};
+
 /**
  * Builds the progress publisher for a manifest, or null when the manifest has
- * no progress block (every production/batch run today). Shared by the Lambda
- * handler and the container main so the transport cannot drift.
+ * no progress block. The transport is injectable so the smoke drives the
+ * class through an in-memory publisher; deployed code uses iotPublishTransport.
  */
-export function manifestProgress(manifest: RunManifest, log?: (m: string) => void): IotRunProgress | null {
+export function manifestProgress(
+  manifest: RunManifest,
+  log?: (m: string) => void,
+  transport: ProgressTransport = iotPublishTransport,
+): IotRunProgress | null {
   if (!manifest.progress) return null;
   const { topicPrefix } = manifest.progress;
-  return new IotRunProgress({
-    runId: manifest.runId,
-    topicPrefix,
-    publish: async (topic, payload) => {
-      const client = await iotDataClient();
-      await client.send(new PublishCommand({ topic, qos: 0, payload: Buffer.from(payload) }));
-    },
-    log,
-  });
+  return new IotRunProgress({ runId: manifest.runId, topicPrefix, publish: transport, log });
 }
 
 /**

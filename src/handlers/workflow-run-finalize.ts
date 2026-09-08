@@ -4,8 +4,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
 import { updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
-import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/engine/finalize';
-import { engineResultSchema } from '../workflows/engine/manifest';
+import { engineResultSchema } from '@xorgate/workflow-engine';
+import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/host/finalize';
 
 const s3 = new S3Client({});
 
@@ -51,7 +51,7 @@ const resultSchema = z.object({
  * pattern media-segment-ingest uses for uploaded segments.
  *
  * The two result shapes are versioned: `resultVersion: 2` routes to the v2
- * branch (engineResultSchema from workflows/engine/manifest.ts, stamps
+ * branch (engineResultSchema from @xorgate/workflow-engine, stamps
  * engine_version + artifacts); anything else is the unchanged v1 cv-runner
  * path.
  *
@@ -164,7 +164,7 @@ export const handler = async (
 // Same lifecycle as v1 (idempotency guard, best-effort steps/events, run row
 // last) with the v2-only stamps: engine_version = 2 and the result's artifacts
 // map (Data Capture keys) on the run row. Row mapping lives in
-// workflows/engine/finalize.ts so the smoke script can unit-test it.
+// workflows/host/finalize.ts so the smoke script can unit-test it.
 // Deploy note: needs migrations 0013 (engine_version) and 0014 (artifacts)
 // applied before any v2 producer is enabled.
 async function finalizeV2(raw: unknown, key: string): Promise<void> {
