@@ -2,6 +2,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { DeleteMessageCommand, ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import {
   createEngine,
   manifestKey,
@@ -11,8 +12,15 @@ import {
   type RunManifest,
 } from '@xorgate/workflow-engine';
 import { platformCatalog } from '../src/workflows/catalog';
-import { failureOutcome, loadRunManifest, writeRunArtifacts } from '../src/workflows/host/aws';
-import { cloudHost, preflightRefusal, writeRefusal, type CloudHost } from '../src/workflows/host/cloud-host';
+import { failureOutcome, iotAtsEndpoint, loadRunManifest, writeRunArtifacts } from '../src/workflows/host/aws';
+import {
+  cloudHost,
+  preflightRefusal,
+  writeRefusal,
+  type CloudHost,
+  type LiveIngestOpener,
+} from '../src/workflows/host/cloud-host';
+import { openIngestFrames } from '../src/workflows/host/live-ingest';
 import { runSessionLoop } from '../src/workflows/host/session';
 
 /**
@@ -56,8 +64,20 @@ function runIdFromManifestKey(key: string): string | null {
   return slash > 0 ? rest.slice(0, slash) : null;
 }
 
+// The live webcam-ingest seam (M5): MQTT over WSS with a SigV4-presigned URL
+// from the task role's credentials. Wired here, not in the host, so `mqtt`
+// stays out of every Lambda bundle (cloud-host.ts header).
+const liveIngest: LiveIngestOpener = (args) => {
+  const region = process.env.AWS_REGION ?? 'us-east-1';
+  const credentials = fromNodeProviderChain();
+  return (async function* liveFrames() {
+    const endpoint = await iotAtsEndpoint();
+    yield* openIngestFrames({ endpoint, region, credentials: () => credentials(), ...args });
+  })();
+};
+
 function buildHost(bucket: string, workDir: string): CloudHost {
-  const host = cloudHost({ bucket, target: 'fargate', workDir, liveIngest: true, log: (m) => log(m) });
+  const host = cloudHost({ bucket, target: 'fargate', workDir, liveIngest, log: (m) => log(m) });
   if (host.options.localInputs) throw new Error('localInputs is a test-only host option');
   return host;
 }
