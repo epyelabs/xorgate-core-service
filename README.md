@@ -110,60 +110,84 @@ User-defined processing pipelines that attach to a device, fire on a trigger, an
 produce reviewable runs + events. A **template** is an org-scoped graph of nodes
 (catalog type in `node.type`, knobs in `node.data.config`); an **attachment** binds
 a *published* template to one device with one or more triggers; a **run** is a
-single execution with a step trace and emitted events. Two execution engines sit
-behind one SQS queue: **telemetry-only** graphs run **inline** in the dispatcher
-Lambda; **video** graphs run on a **Fargate CV task** (Python + ONNX Runtime).
+single execution with a step trace and emitted events. Simulations run a draft
+from the editor over uploaded or recorded inputs through the same path.
 
-```mermaid
-flowchart TD
-  A[session_completed / segment_uploaded<br/>media-segment-ingest.ts] --> F
-  B[telemetry_condition<br/>telemetry-ingest.ts<br/>cached + debounced] --> F
-  C[schedule + watchdog<br/>workflow-scheduler.ts<br/>1-min rule, prod-only] --> F
-  D[manual run-now / rerun<br/>HTTP handlers] --> F
-  F[fireWorkflowRun<br/>insert workflow_runs status=running<br/>enqueue runId] --> Q[[WorkflowRunQueue + DLQ]]
-  Q --> DISP[workflow-dispatch.ts<br/>SQS, batchSize 1]
-  DISP -->|telemetry graph| INLINE[runWorkflowInline<br/>topo sort + executors]
-  DISP -->|video graph| MAN[write manifest.json to S3<br/>ECS RunTask]
-  MAN --> CV[cv-runner Fargate ARM64<br/>ffmpeg + YOLOv8n ONNX + IoU tracker]
-  CV -->|result.json to S3| RULE[S3 ObjectCreated<br/>EventBridge]
-  RULE --> FIN[workflow-run-finalize.ts]
-  INLINE --> DB[(workflow_runs / _steps / _events)]
-  FIN --> DB
-```
-
-**Schema** (migration `0009`, `db/schema.ts`): `workflow_templates`,
-`workflow_template_versions` (app-enforced one-draft + one-published invariant),
-`workflow_attachments`, `workflow_trigger_state` (debounce/cooldown + schedule
-cursor), `workflow_runs` (snapshot of the definition that ran),
-`workflow_run_steps`, `workflow_events`.
-
-**Handlers / services:**
+**One engine, consumed as a package.** The graph executor, the 28-node catalog,
+the definition/manifest/result schemas and the host seams are
+[`@xorgate/workflow-engine`](https://www.npmjs.com/package/@xorgate/workflow-engine)
+(pinned exactly in `package.json`, `0.3.0` today). This service is the engine's
+**platform shell**: it owns the REST API, the run rows, dispatch, the S3 artifact
+tree, the IoT progress plane and the AWS-backed host the engine runs on.
+Nothing engine-internal lives in this repo any more.
 
 | File | Role |
 |---|---|
-| `handlers/workflow-templates.ts` | template CRUD + versioning (save draft / publish / restore) in transactions |
-| `handlers/device-workflows.ts` | attach / list / enable / detach + Run-now; capability compat check |
-| `handlers/workflow-runs.ts` | run list / detail + rerun |
-| `handlers/workflow-dispatch.ts` | SQS consumer → inline runner or Fargate launch (idempotent under redelivery) |
-| `handlers/workflow-run-finalize.ts` | S3 `result.json` → persist steps/events + run status |
-| `handlers/workflow-scheduler.ts` | schedule triggers + stuck-run watchdog (1-min rule, `!disableScheduledJobs`) |
-| `services/workflow-triggers.ts` | `fireWorkflowRun` + telemetry / session / segment trigger evaluation |
-| `services/workflow-runner.ts` | inline executor registry (telemetry graphs) |
-| `services/workflow-fargate.ts` | manifest writer + ECS RunTask (video graphs) |
-| `services/workflow-capabilities.ts` | required-capabilities vs `device_models.ioCapabilities` |
+| `src/workflows/catalog.ts` | `platformCatalog` (the package's core catalog) and the served payload; `EXPECTED_CATALOG_VERSION` is the hash the smoke asserts |
+| `src/workflows/host/cloud-host.ts` | the `EngineHost` both targets hand to `createEngine`: S3 sources/artifacts, Secrets Manager secrets (org key over platform key), IoT progress, the live webcam-ingest seam; plus the pre-flight refusal |
+| `src/workflows/host/aws.ts` | the AWS SDK calls behind the host (manifest load, artifact writes with `result.json` last, frame sink, IoT publish transport, secret reader) |
+| `src/workflows/host/live-ingest.ts`, `session.ts`, `finalize.ts` | MQTT webcam ingest, the warm-session loop, the `result.json` to row mapping |
+| `src/workflows/simulations.ts`, `production.ts` | manifest building for simulations and triggered runs; `engineTargetForDefinition` routes |
+| `src/handlers/workflow-engine.ts` | **Lambda target**: telemetry-only graphs (512 MB, 5 min) |
+| `engine-runner/main.ts` + `Dockerfile` | **Fargate target**: media graphs and code function nodes (ffmpeg, ONNX Runtime, python3), single-run and warm-session modes |
 
-**CV runner image** — `cv-runner/` is a Python container (Fargate ARM64), built +
-pushed out-of-band (`recorder-stack.ts` — historic name, it is now the shared
-Fargate plane — holds the ECR repo `xorgate-cv-runner[-dev]` + task def). It needs
-`yolov8n.onnx` baked in; full build/push steps are in
-[`cv-runner/README.md`](cv-runner/README.md). Needs ECR/ECS/`iam:PassRole` grants
-beyond the base deploy user's (plus `ecr:BatchGetImage`).
+**Two targets, one call.** `engineTargetForDefinition` sends a graph to Fargate
+when any node is media-bound (`runtime.target: media`) or is a code function
+node (group `function`); everything else runs on Lambda. Both targets load the
+manifest from S3, run the pre-flight refusal (unknown types everywhere; media
+and function nodes on Lambda), then
+`createEngine({ host: cloudHost(...), catalog: platformCatalog }).run({ manifest })`.
+The engine emits the `running` and terminal status messages itself and writes
+the artifact tree through the host with `result.json` last, which is what the
+S3 `ObjectCreated` EventBridge rule and `workflow-run-finalize.ts` key on.
 
-**Notes:** new deps `@aws-sdk/client-sqs` + `cron-parser`; the run-firing Lambdas
-bundle the AWS SDK (`bundling: bundlingWithSdk`) since client-sqs isn't guaranteed
-in the runtime. The scheduler/watchdog rule is **off in dev by default** (Aurora
-auto-pause) — enable with `--context scheduledJobs=on`. Apply migration `0009`
-before deploying the new Lambdas.
+```mermaid
+flowchart TD
+  A[triggers: session / segment / telemetry / schedule / manual] --> F[fireWorkflowRun]
+  S[POST simulations] --> M
+  F --> Q[[WorkflowRunQueue]] --> DISP[workflow-dispatch.ts] --> M[manifest.json to S3<br/>dispatchV2Run]
+  M -->|telemetry graph| L[workflow-engine.ts Lambda<br/>cloudHost lambda flavour]
+  M -->|media or function graph| T[engine-runner Fargate ARM64<br/>cloudHost fargate flavour]
+  L --> E[@xorgate/workflow-engine createEngine]
+  T --> E
+  E -->|events, records, frames, result.json last| S3[(core bucket workflows/v2/runs/)]
+  E -->|status, steps, events, records, preview| IOT[IoT wf/sim and wf/run topics]
+  S3 --> FIN[workflow-run-finalize.ts] --> DB[(workflow_runs / _steps / _events)]
+```
+
+**Packaging.** The package locates its own `package.json` and `dist/runtime/`
+(the function-node runners) at run time, so it is never bundled: `api-stack.ts`
+lists it in `externalModules` and `nodeModules` of both bundling presets and
+installs it into every Lambda asset with `npm_config_omit=optional` (no ONNX
+Runtime in a Lambda). The Fargate image installs it through the ordinary
+`npm ci`, keeps the optional dependencies, and adds `python3`; build and push it
+from the service root, out of band:
+
+```bash
+docker build --platform linux/arm64 -f engine-runner/Dockerfile -t engine-runner .
+# tag + push to ECR xorgate-engine-runner[-dev]:latest (recorder-stack.ts holds the repo + task def)
+```
+
+**Bumping the engine.** `npm install --save-exact @xorgate/workflow-engine@<version>`,
+read its `CHANGELOG.md`, then `npm run typecheck && npm test && npm run smoke`.
+The smoke asserts the served catalog hash equals `EXPECTED_CATALOG_VERSION` in
+`src/workflows/catalog.ts`: if the release moved the core hash (a new core node
+or an additive def change, named in the changelog), update that constant in the
+same commit. Deploy dev, rebuild and push the dev image, run a simulation on each
+target, then prod. The catalog the editor fetches (`GET /workflow-catalog`, ETag
+= the hash) is the same instance both targets execute, so an engine bump is the
+only way a node appears or changes.
+
+**Schema** (migrations `0009` onward, `db/schema.ts`): `workflow_templates`,
+`workflow_template_versions` (app-enforced one-draft + one-published invariant),
+`workflow_attachments`, `workflow_trigger_state` (debounce/cooldown + schedule
+cursor), `workflow_runs` (snapshot of the definition that ran, `engine_version`,
+`artifacts`), `workflow_run_steps`, `workflow_events`.
+
+**Notes:** the run-firing and dispatching Lambdas bundle the AWS SDK
+(`bundling: bundlingWithSdk`) since client-sqs / client-ecs / client-lambda are
+not guaranteed in the runtime. The scheduler/watchdog rule is **off in dev by
+default** (Aurora auto-pause); enable with `--context scheduledJobs=on`.
 
 ## Routes (summary)
 

@@ -616,19 +616,31 @@ export class XorgateCoreApiStack extends cdk.Stack {
       ),
     };
 
-    // onnxruntime-node (native, media targets only) is required lazily inside
-    // the object-detection executor; it must be external in EVERY Lambda bundle
-    // (the catalog registry pulls the node module in) and is never reached at
-    // Lambda runtime (the Lambda engine refuses media graphs pre-flight).
+    // The workflow engine (@xorgate/workflow-engine) locates its own
+    // package.json and dist/runtime/ at run time, so it cannot be bundled into
+    // a single esbuild output: it is external in EVERY Lambda bundle (every
+    // workflow handler pulls the catalog in) and INSTALLED into each asset as
+    // real node_modules from the lockfile (`nodeModules`). zod and
+    // zod-to-json-schema ride along so the handler code and the package share
+    // one physical zod (the handlers compose package schemas into their own).
+    // The package's optional dependencies (onnxruntime-node ~283 MB unpacked,
+    // @anthropic-ai/sdk) are omitted at install time: they belong to the
+    // Fargate image only, the Lambda target refuses media graphs pre-flight,
+    // and the package requires them lazily so their absence is never touched.
+    // They stay external (with mqtt, live-ingest on the container only) so
+    // esbuild never tries to follow a lazy require into them.
+    const enginePackage = "@xorgate/workflow-engine";
+    const engineNodeModules = [enginePackage, "zod", "zod-to-json-schema"];
+    const engineExternals = [enginePackage, "onnxruntime-node", "@anthropic-ai/sdk", "mqtt"];
     const commonBundling: nodejs.BundlingOptions = {
       minify: true,
       sourceMap: true,
       target: "node20",
-      // @anthropic-ai/sdk mirrors onnxruntime-node: required lazily by the
-      // model.vlm executor (engine/anthropic.ts), which only ever runs on the
-      // media (Fargate) target; keeping it external keeps every Lambda bundle
-      // free of it.
-      externalModules: ["@aws-sdk/*", "onnxruntime-node", "@anthropic-ai/sdk", "mqtt"],
+      externalModules: ["@aws-sdk/*", ...engineExternals],
+      nodeModules: engineNodeModules,
+      // Applied to the asset's `npm ci` by the local bundler (and the Docker
+      // fallback): optional dependencies are not installed.
+      environment: { npm_config_omit: "optional" },
       forceDockerBundling: false,
     };
 
@@ -638,7 +650,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // SDK rather than externalize it.
     const bundlingWithSdk: nodejs.BundlingOptions = {
       ...commonBundling,
-      externalModules: ["onnxruntime-node", "@anthropic-ai/sdk", "mqtt"],
+      externalModules: engineExternals,
     };
 
     const vpcProps: Pick<

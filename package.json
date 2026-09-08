@@ -22,7 +22,8 @@
     "fetch:ffmpeg": "bash scripts/fetch-ffmpeg-layer.sh",
     "contract:generate": "ts-node -T --compilerOptions '{\"module\":\"commonjs\",\"target\":\"ES2022\",\"esModuleInterop\":true}' scripts/generate-config-contract.ts",
     "openapi:emit": "ts-node -T --compilerOptions '{\"module\":\"commonjs\",\"target\":\"ES2022\",\"esModuleInterop\":true}' scripts/emit-openapi.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "ts-node -T --compilerOptions '{\"module\":\"commonjs\",\"target\":\"ES2022\",\"esModuleInterop\":true}' scripts/platform-smoke.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cognito-identity": "^3.1063.0",
