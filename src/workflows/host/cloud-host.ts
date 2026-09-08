@@ -1,7 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { unlink } from 'node:fs/promises';
 import * as path from 'node:path';
-import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import {
   captureFormatsOf,
   runPrefix,
@@ -13,6 +12,7 @@ import {
   type EngineResult,
   type EngineSourceReader,
   type IotRunProgress,
+  type LiveIngestFrame,
   type MessageLevel,
   type ModelManifest,
   type ProgressTransport,
@@ -25,7 +25,6 @@ import { downloadModel, resolveModel } from '../models/store';
 import { getNodeType } from '../catalog';
 import {
   failureOutcome,
-  iotAtsEndpoint,
   iotPublishTransport,
   manifestProgress,
   s3ArtifactSink,
@@ -35,7 +34,6 @@ import {
   secretsManagerReader,
   writeRunArtifacts,
 } from './aws';
-import { openIngestFrames } from './live-ingest';
 
 /**
  * The platform's `EngineHost` (wf-engine-integration design §3.2): one factory,
@@ -48,6 +46,13 @@ import { openIngestFrames } from './live-ingest';
  * through drizzle and fetches no media or models; the Fargate flavour
  * downloads media and models to `workDir`, opens the live webcam-ingest seam,
  * and has no telemetry store (its task role is DB-free by design).
+ *
+ * The live seam is INJECTED (`liveIngest`), never imported here: live-ingest.ts
+ * pulls in `mqtt`, which is external in every Lambda bundle and installed
+ * only in the Fargate image. A static import from this module would land a
+ * top-level `require("mqtt")` in the Lambda handler's bundle and fail its
+ * cold start (found on the first dev deploy of M2). `npm run smoke` bundles
+ * the Lambda handler and asserts mqtt stays out.
  *
  * The engine emits `running` and the terminal status itself inside
  * `engine.run`; the host never does. The host keeps each run's progress sink
@@ -63,6 +68,15 @@ export type TelemetryReader = (query: {
 
 export type ModelCache = Map<string, Promise<{ manifest: ModelManifest; modelPath: string }>>;
 
+/** Opens the run's live webcam-ingest stream for one source node (the Fargate runner wires live-ingest.ts here). */
+export type LiveIngestOpener = (args: {
+  topicPrefix: string;
+  nodeId: string;
+  maxDurationMs: number;
+  idleTimeoutMs: number;
+  log: (message: string) => void;
+}) => AsyncIterable<LiveIngestFrame>;
+
 export interface CloudHostOptions {
   /** The run bucket (manifests, artifacts, uploads, the model registry). */
   bucket: string;
@@ -71,8 +85,8 @@ export interface CloudHostOptions {
   workDir?: string;
   /** Lambda: the drizzle-backed history reader. Absent on Fargate (the seam throws). */
   telemetry?: TelemetryReader;
-  /** Fargate: open the webcam-ingest seam (MQTT over WSS) for runs with a progress block. */
-  liveIngest?: boolean;
+  /** Fargate: the webcam-ingest opener (MQTT over WSS), used for runs with a progress block. */
+  liveIngest?: LiveIngestOpener;
   /** Fargate warm session: the per-(family, name@version) model cache that outlives one job. */
   modelCache?: ModelCache;
   /** Progress publish transport. Default: IoT Data ATS publish; the smoke injects memory. */
@@ -161,7 +175,7 @@ export function cloudHost(options: CloudHostOptions): CloudHost {
         return entry;
       },
       ...(options.liveIngest && manifest.progress?.topicPrefix
-        ? { openLiveFrames: liveFrames(manifest.progress.topicPrefix) }
+        ? { openLiveFrames: liveFrames(options.liveIngest, manifest.progress.topicPrefix) }
         : {}),
     };
   }
@@ -169,23 +183,15 @@ export function cloudHost(options: CloudHostOptions): CloudHost {
   // The live webcam-ingest seam for one run. The ingest topic derives from
   // the run's progress topic prefix, so live bindings only work on runs that
   // carry a progress block (all simulations do).
-  function liveFrames(topicPrefix: string): NonNullable<EngineSourceReader['openLiveFrames']> {
-    const region = process.env.AWS_REGION ?? 'us-east-1';
-    const credentials = fromNodeProviderChain();
+  function liveFrames(open: LiveIngestOpener, topicPrefix: string): NonNullable<EngineSourceReader['openLiveFrames']> {
     return (ref) =>
-      (async function* frames() {
-        const endpoint = await iotAtsEndpoint();
-        yield* openIngestFrames({
-          endpoint,
-          region,
-          credentials: () => credentials(),
-          topicPrefix,
-          nodeId: ref.nodeId,
-          maxDurationMs: ref.maxDurationMs,
-          idleTimeoutMs: ref.idleTimeoutMs,
-          log: (m) => log(m),
-        });
-      })();
+      open({
+        topicPrefix,
+        nodeId: ref.nodeId,
+        maxDurationMs: ref.maxDurationMs,
+        idleTimeoutMs: ref.idleTimeoutMs,
+        log: (m) => log(m),
+      });
   }
 
   return {

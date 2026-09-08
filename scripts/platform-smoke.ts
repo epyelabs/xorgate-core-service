@@ -34,6 +34,8 @@
  *  12. secrets resolution order: org key -> platform key -> clear failure
  *  13. org-credentials module: naming, schemas, provider probes (mocked HTTP)
  *  14. the installed package carries no AWS SDK
+ *  15. the Lambda engine handler's bundle (esbuild, the api-stack externals)
+ *      never requires mqtt: live-ingest is the Fargate runner's import only
  */
 import { strict as assert } from 'node:assert';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
@@ -335,7 +337,16 @@ async function testCloudHost(): Promise<void> {
   assert.strictEqual(lambdaHost.takeProgress('run-silent'), undefined);
 
   // Fargate flavour: media + models + live seam (only with a progress block); telemetry throws.
-  const fargateHost = cloudHost({ bucket: 'bkt', target: 'fargate', workDir: '/tmp/smoke-work', liveIngest: true, progressTransport: transport, log: () => {} });
+  const fargateHost = cloudHost({
+    bucket: 'bkt',
+    target: 'fargate',
+    workDir: '/tmp/smoke-work',
+    liveIngest: async function* stubIngest() {
+      // never called here; presence is what is asserted
+    },
+    progressTransport: transport,
+    log: () => {},
+  });
   const fargateBound = await fargateHost.bind({ runId: 'run-host-f', manifest, bindings, emitVideo: false });
   assert.strictEqual(typeof fargateBound.sources.fetchVideo, 'function');
   assert.strictEqual(typeof fargateBound.sources.releaseVideo, 'function');
@@ -738,6 +749,21 @@ function testPackageHasNoCloudSdk(): void {
   console.log(`check 14 ok: @xorgate/workflow-engine@${pkg.version} (exact pin) carries no AWS SDK`);
 }
 
+// --- 15. No mqtt in the Lambda engine bundle -----------------------------------------
+function testLambdaBundleHasNoMqtt(): void {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const esbuild = require('esbuild') as typeof import('esbuild');
+  const externals = ['@aws-sdk/*', '@xorgate/workflow-engine', 'onnxruntime-node', '@anthropic-ai/sdk', 'mqtt'];
+  for (const entry of ['src/handlers/workflow-engine.ts', 'src/handlers/workflow-catalog.ts', 'src/handlers/workflow-simulations.ts']) {
+    const out = esbuild.buildSync({ entryPoints: [path.join(__dirname, '..', entry)], bundle: true, platform: 'node', target: 'node20', write: false, external: externals, logLevel: 'silent' });
+    const text = out.outputFiles.map((f) => f.text).join('\n');
+    assert.ok(!/require\(["']mqtt["']\)/.test(text), `${entry} bundle requires mqtt (live-ingest leaked into a Lambda bundle)`);
+    assert.ok(/require\(["']@xorgate\/workflow-engine["']\)/.test(text), `${entry} bundle should require the engine package externally`);
+    assert.ok(!/require\(["']onnxruntime-node["']\)/.test(text) && !/require\(["']@anthropic-ai\/sdk["']\)/.test(text), `${entry} bundle must not require the package's optional deps directly`);
+  }
+  console.log('check 15 ok: Lambda handler bundles (engine, catalog, simulations) require the engine package externally and never mqtt');
+}
+
 async function main(): Promise<void> {
   testServedCatalog();
   testSchemaComposition();
@@ -753,6 +779,7 @@ async function main(): Promise<void> {
   await testSecretResolutionOrder();
   await testOrgCredentialsModule();
   testPackageHasNoCloudSdk();
+  testLambdaBundleHasNoMqtt();
   console.log(`\nplatform smoke: all checks passed; catalogVersion=${platformCatalogPayload.catalogVersion} nodes=${platformCatalogPayload.nodes.length}`);
 }
 
