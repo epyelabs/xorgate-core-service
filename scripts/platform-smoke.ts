@@ -19,7 +19,11 @@
  *      Lambda target path (createEngine + cloudHost over a mocked S3 client)
  *      writes events/records first and result.json LAST, the status stream
  *      carries exactly one `running` and one terminal message (emitted by the
- *      engine, not the host), and takeProgress hands the sink over once
+ *      engine, not the host), and takeProgress hands the sink over once;
+ *      the Fargate artifact path: a visualization frame reaches S3 AND the
+ *      local tee, writeArtifacts muxes + uploads video/<nodeId>.mp4 BEFORE
+ *      result.json (when an ffmpeg is reachable; skipped otherwise), records
+ *      it as artifacts.videos, and removes the local frames
  *   6. pre-flight + routing: function graphs route to Fargate; the Lambda
  *      pre-flight refuses media and function nodes; unknown types everywhere
  *   7. simulations module: request schema, binding validation, API -> executor
@@ -38,7 +42,8 @@
  *      never requires mqtt: live-ingest is the Fargate runner's import only
  */
 import { strict as assert } from 'node:assert';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { S3Client } from '@aws-sdk/client-s3';
@@ -46,6 +51,7 @@ import {
   buildEngineResult,
   createEngine,
   engineResultSchema,
+  frameKey,
   IotRunProgress,
   NODE_GROUPS,
   runGraph,
@@ -58,10 +64,12 @@ import {
   simTopicPrefix,
   upgradeDefinition,
   workflowDefinitionSchema,
+  type EngineRunOutcome,
   type EngineSourceReader,
   type RunManifest,
   type WorkflowDefinition,
 } from '@xorgate/workflow-engine';
+import { platformResultSchema } from '../src/workflows/host/result';
 import { EXPECTED_CATALOG_VERSION, platformCatalog, platformCatalogPayload } from '../src/workflows/catalog';
 import { cloudHost, preflightRefusal } from '../src/workflows/host/cloud-host';
 import { createSecretReader } from '../src/workflows/host/aws';
@@ -250,12 +258,7 @@ async function testProgressPlane(): Promise<void> {
   assert.strictEqual(eventMsgs[0].event.kind, 'idle_detect');
 
   // Preview: a 640x480 frame downscales to 480 wide, base64 under the cap.
-  // jpeg-js is the package's own dependency (not this service's), resolved
-  // through it on purpose.
-  const jpeg = require(require.resolve('jpeg-js', { paths: [path.dirname(require.resolve('@xorgate/workflow-engine/package.json'))] })) as {
-    encode(img: { data: Buffer; width: number; height: number }, quality: number): { data: Buffer };
-    decode(buf: Buffer, opts: { useTArray: boolean }): { width: number; height: number };
-  };
+  const jpeg = jpegJs();
   const wide = Buffer.alloc(640 * 480 * 4);
   for (let i = 0; i < wide.length; i += 4) {
     wide[i] = (i / 4) % 256;
@@ -270,6 +273,31 @@ async function testProgressPlane(): Promise<void> {
   assert.ok(previewMsgs[0].jpegBase64.length < 110_000, `preview base64 ${previewMsgs[0].jpegBase64.length}`);
   assert.strictEqual(jpeg.decode(Buffer.from(previewMsgs[0].jpegBase64, 'base64'), { useTArray: true }).width, 480);
   console.log(`check 4 ok: progress plane (IotRunProgress from the package; status/steps/events schemas, preview ${previewMsgs[0].width}x${previewMsgs[0].height})`);
+}
+
+// jpeg-js is the package's own dependency (not this service's), resolved
+// through it on purpose.
+function jpegJs(): {
+  encode(img: { data: Buffer; width: number; height: number }, quality: number): { data: Buffer };
+  decode(buf: Buffer, opts: { useTArray: boolean }): { width: number; height: number };
+} {
+  return require(require.resolve('jpeg-js', { paths: [path.dirname(require.resolve('@xorgate/workflow-engine/package.json'))] }));
+}
+
+// The mux needs an ffmpeg: FFMPEG_PATH, else the sibling engine checkout's
+// ffmpeg-static (the laptop layout), else PATH. Returns false when none is
+// reachable, in which case the mux assertions are skipped (never faked).
+function ffmpegAvailable(): boolean {
+  if (process.env.FFMPEG_PATH && existsSync(process.env.FFMPEG_PATH)) return true;
+  const sibling = path.resolve(__dirname, '../../../engines/xorgate-workflow-engine/node_modules/ffmpeg-static/ffmpeg');
+  if (existsSync(sibling)) {
+    process.env.FFMPEG_PATH = sibling;
+    return true;
+  }
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (dir && existsSync(path.join(dir, 'ffmpeg'))) return true;
+  }
+  return false;
 }
 
 // --- 5. Cloud host -------------------------------------------------------------------
@@ -382,7 +410,61 @@ async function testCloudHost(): Promise<void> {
   } finally {
     s3.restore();
   }
-  console.log(`check 5 ok: cloud host (bind per flavour; Lambda path through createEngine: ${s3.keys.length} S3 writes, result.json last, status running+succeeded once each)`);
+
+  // The Fargate artifact path (simulator-output-artifacts): frames tee to
+  // disk, the MP4 is muxed + uploaded before result.json, the tree is cleaned.
+  const workDir = mkdtempSync(path.join(tmpdir(), 'smoke-host-'));
+  const vizRunId = 'run-viz';
+  const vizHost = cloudHost({ bucket: 'bkt', target: 'fargate', workDir, progressTransport: transport, log: () => {} });
+  const vizBound = await vizHost.bind({ runId: vizRunId, manifest: { ...manifest, runId: vizRunId, progress: undefined }, bindings, emitVideo: false });
+  const s3v = mockS3();
+  const haveFfmpeg = ffmpegAvailable();
+  let vizDetail: string;
+  try {
+    const jpeg = jpegJs();
+    const rgba = Buffer.alloc(64 * 48 * 4, 255);
+    const frame = jpeg.encode({ data: rgba, width: 64, height: 48 }, 80).data;
+    for (let seq = 0; seq < 3; seq++) {
+      const key = await vizBound.artifacts!.putFrame('viz', seq, frame);
+      assert.strictEqual(key, frameKey(vizRunId, 'viz', seq), 'the S3 key stays the sink return value');
+      assert.ok(existsSync(path.join(workDir, vizRunId, 'frames', 'viz', `${seq}.jpg`)), `frame ${seq} teed to the local run dir`);
+    }
+    assert.deepStrictEqual(s3v.keys, [0, 1, 2].map((seq) => frameKey(vizRunId, 'viz', seq)), 'every frame reached S3');
+    const outcome: EngineRunOutcome = {
+      status: 'succeeded',
+      error: null,
+      failedNodeId: null,
+      steps: [{ seq: 0, nodeId: 'viz', label: 'Visualization', status: 'ok', output: '3 annotated frame(s)', durationMs: 1 }],
+      events: [],
+      captures: { cap: [{ ts: 1, tag: 'x', record: {} }] },
+      metrics: { nodes: 1, okSteps: 1, events: 0, messages: 0 },
+    };
+    const vizResult = await vizBound.writeArtifacts(outcome, { cap: 'jsonl' });
+    assert.strictEqual(s3v.keys.at(-1), `workflows/v2/runs/${vizRunId}/result.json`, 'result.json is still the last S3 write');
+    assert.ok(s3v.keys.includes(`workflows/v2/runs/${vizRunId}/outputs/cap/records.jsonl`));
+    assert.ok(!existsSync(path.join(workDir, vizRunId)), 'the local frames are removed after the mux');
+    const videoKeyIdx = s3v.keys.indexOf(`workflows/v2/runs/${vizRunId}/video/viz.mp4`);
+    const parsed = platformResultSchema.parse(JSON.parse(JSON.stringify(vizResult)));
+    engineResultSchema.parse(JSON.parse(JSON.stringify(vizResult))); // the frozen v2 contract still parses the file
+    if (haveFfmpeg) {
+      assert.ok(videoKeyIdx >= 0 && videoKeyIdx < s3v.keys.length - 1, `video/viz.mp4 uploaded before result.json: ${s3v.keys.join(', ')}`);
+      assert.deepStrictEqual(parsed.artifacts.videos, { viz: { key: `workflows/v2/runs/${vizRunId}/video/viz.mp4`, frames: 3, fps: 2 } });
+      vizDetail = 'video/viz.mp4 muxed (3 frames @ 2 fps) + uploaded before result.json, artifacts.videos recorded';
+    } else {
+      assert.strictEqual(videoKeyIdx, -1);
+      assert.strictEqual(parsed.artifacts.videos, undefined, 'no ffmpeg: no video recorded, the run still lands');
+      vizDetail = 'MUX SKIPPED (no ffmpeg reachable; set FFMPEG_PATH), tee + ordering + cleanup asserted';
+    }
+    // A failed outcome muxes nothing and still cleans up.
+    await vizBound.artifacts!.putFrame('viz', 9, frame);
+    const failed = await vizBound.writeArtifacts({ ...outcome, status: 'failed', error: 'boom', failedNodeId: 'viz', captures: {} }, {});
+    assert.strictEqual(failed.artifacts.videos, undefined);
+    assert.ok(!existsSync(path.join(workDir, vizRunId)));
+  } finally {
+    s3v.restore();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+  console.log(`check 5 ok: cloud host (bind per flavour; Lambda path through createEngine: ${s3.keys.length} S3 writes, result.json last, status running+succeeded once each; Fargate path: frames tee to disk + S3, ${vizDetail})`);
 }
 
 // --- 6. Pre-flight + routing ---------------------------------------------------------

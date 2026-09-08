@@ -229,7 +229,11 @@ const restHandler = async (
           workspaceName: row.workspaceName,
           triggeredBy: deriveTriggeredBy(run.trigger, run.triggerContext),
           definition: run.definition,
+          // ADDITIVE (simulator-output-artifacts): `seq` on steps, `payload` and
+          // `clipKey` on events, so the editor's Output panel can show the
+          // full trace order and event bodies without reading events.jsonl.
           steps: steps.map((s) => ({
+            seq: s.seq,
             nodeId: s.nodeId,
             label: s.label,
             status: s.status,
@@ -242,11 +246,14 @@ const restHandler = async (
             occurredAt: e.occurredAt.toISOString(),
             confidence: e.confidence ?? 0,
             clip: e.clip,
+            clipKey: e.clipS3Key ?? null,
             payloadSummary: e.payloadSummary,
+            payload: e.payload ?? null,
           })),
           metrics: run.metrics,
           // v2 engine runs only (null on PoC runs): which engine produced the
-          // result and where its Data Capture / events artifacts live in S3.
+          // result and where its Data Capture / events artifacts live in S3
+          // (plus `videos`, the muxed visualization MP4s, on Fargate runs).
           engineVersion: run.engineVersion ?? null,
           artifacts: run.artifacts ?? null,
           // ADDITIVE (M6): live-progress subscription hint. v2 runs (their
@@ -359,7 +366,8 @@ const restHandler = async (
 
     case 'GET /workflow-runs/{id}/artifact-url': {
       // Presigned GET for a v2 run artifact (Data Capture records, events.jsonl,
-      // visualization frames). The key must live under THIS run's v2 prefix, so
+      // visualization frames and MP4s, manifest.json, result.json, materialized
+      // inputs). The key must live under THIS run's v2 prefix, so
       // a caller can never presign outside runs their org can already read.
       const id = event.pathParameters?.id;
       if (!id) return badRequest('run id required');

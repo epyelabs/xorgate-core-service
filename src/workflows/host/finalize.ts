@@ -1,4 +1,5 @@
 import { ENGINE_VERSION, type EngineResult } from '@xorgate/workflow-engine';
+import type { PlatformArtifacts, PlatformEngineResult } from './result';
 
 /**
  * Pure row-mapping for the v2 finalize path (workflow-run-finalize.ts). Kept
@@ -66,10 +67,11 @@ export interface V2RunUpdate {
   error: string | null;
   failedNodeId: string | null;
   engineVersion: number;
-  artifacts: EngineResult['artifacts'];
+  /** The result's artifacts map verbatim, incl. the platform's additive `videos` when present. */
+  artifacts: PlatformArtifacts;
 }
 
-export function v2RunUpdate(result: EngineResult, startedAt: Date, now: Date): V2RunUpdate {
+export function v2RunUpdate(result: PlatformEngineResult, startedAt: Date, now: Date): V2RunUpdate {
   return {
     status: result.status,
     endedAt: now,

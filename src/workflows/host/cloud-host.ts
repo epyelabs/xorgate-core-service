@@ -1,11 +1,11 @@
-import { readFile } from 'node:fs/promises';
-import { unlink } from 'node:fs/promises';
+import { mkdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import {
   captureFormatsOf,
   runPrefix,
   teeArtifactSink,
   upgradeDefinition,
+  type EngineArtifactSink,
   type EngineBoundRun,
   type EngineHost,
   type EngineHostBindArgs,
@@ -20,9 +20,9 @@ import {
   type TelemetrySample,
   type WorkflowDefinition,
 } from '@xorgate/workflow-engine';
-import { parseModelName } from '@xorgate/workflow-engine/local';
+import { emitVisualizationVideos, parseModelName } from '@xorgate/workflow-engine/local';
 import { downloadModel, resolveModel } from '../models/store';
-import { getNodeType } from '../catalog';
+import { getNodeType, platformCatalog } from '../catalog';
 import {
   failureOutcome,
   iotPublishTransport,
@@ -31,9 +31,11 @@ import {
   s3Client,
   s3FetchText,
   s3FetchVideo,
+  s3PutFile,
   secretsManagerReader,
   writeRunArtifacts,
 } from './aws';
+import { videoKey, type VideoArtifact } from './result';
 
 /**
  * The platform's `EngineHost` (wf-engine-integration design §3.2): one factory,
@@ -58,6 +60,15 @@ import {
  * `engine.run`; the host never does. The host keeps each run's progress sink
  * so the target can `flush()` the publish tail once the run resolves
  * (`takeProgress`).
+ *
+ * Output video (simulator-output-artifacts): the Fargate flavour tees every
+ * visualization frame to `workDir/<runId>/frames/<nodeId>/<seq>.jpg` next to
+ * the S3 write, and its `writeArtifacts` muxes each node's frames into
+ * `video/<nodeId>.mp4` with the package's `emitVisualizationVideos` (ffmpeg,
+ * in the image), uploads the MP4 under the run prefix and records it
+ * ADDITIVELY as `artifacts.videos[nodeId]` in `result.json`, which stays the
+ * last write. The local copy is removed afterwards so a warm session never
+ * fills its disk. A mux failure is logged, never fails a run that succeeded.
  */
 
 export type TelemetryReader = (query: {
@@ -119,6 +130,58 @@ export function cloudHost(options: CloudHostOptions): CloudHost {
   let videoSeq = 0;
 
   const isLocalInput = (key: string): boolean => localInputs && path.isAbsolute(key);
+  const localRunDir = (runId: string): string => path.join(workDir ?? '', runId);
+
+  // Fargate: keep each visualization frame on disk beside the S3 write so the
+  // post-run mux has a local directory to read (`frames/<nodeId>/<seq>.jpg`,
+  // the package's local layout). The S3 key stays the sink's return value; a
+  // failed local write is logged and the frame simply misses the MP4.
+  function localFrameTee(inner: EngineArtifactSink, runDir: string): EngineArtifactSink {
+    return {
+      async putFrame(nodeId, frameSeq, jpegBuf) {
+        const key = await inner.putFrame(nodeId, frameSeq, jpegBuf);
+        const file = path.join(runDir, 'frames', nodeId, `${frameSeq}.jpg`);
+        try {
+          await mkdir(path.dirname(file), { recursive: true });
+          await writeFile(file, jpegBuf);
+        } catch (err) {
+          log(`frame tee failed for ${file}: ${err instanceof Error ? err.message : String(err)}`, 'error');
+        }
+        return key;
+      },
+    };
+  }
+
+  // Mux `<runDir>/frames/<nodeId>/` into `<runDir>/video/<nodeId>.mp4` per
+  // visualization node and upload each under the run prefix. Returns what was
+  // uploaded; best-effort by design (the frames are already durable in S3).
+  async function muxAndUploadVideos(runId: string, definition: WorkflowDefinition): Promise<Record<string, VideoArtifact>> {
+    const runDir = localRunDir(runId);
+    const videos: Record<string, VideoArtifact> = {};
+    try {
+      const emitted = await emitVisualizationVideos({
+        runDir,
+        definition,
+        catalog: platformCatalog,
+        log: (m) => log(m),
+      });
+      for (const video of emitted) {
+        const key = videoKey(runId, video.nodeId);
+        await s3PutFile(bucket, key, video.file, 'video/mp4');
+        videos[video.nodeId] = { key, frames: video.frames, fps: video.fps };
+        log(`uploaded ${key} (${video.frames} frames @ ${video.fps} fps)`);
+      }
+    } catch (err) {
+      log(`visualization video mux/upload failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+    return videos;
+  }
+
+  async function removeLocalRunDir(runId: string): Promise<void> {
+    await rm(localRunDir(runId), { recursive: true, force: true }).catch((err) => {
+      log(`could not remove ${localRunDir(runId)}: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    });
+  }
 
   function sources(manifest: RunManifest): EngineSourceReader {
     const base: EngineSourceReader = {
@@ -209,16 +272,26 @@ export function cloudHost(options: CloudHostOptions): CloudHost {
       // topic, downscaled, through the package's sink tee.
       const progress = manifestProgress(manifest, (m) => log(m), transport);
       if (progress) progressByRun.set(runId, progress);
-      const artifacts = s3ArtifactSink(bucket, runId);
+      const s3Sink = s3ArtifactSink(bucket, runId);
+      const sourceReader = sources(manifest); // throws first on a workDir-less fargate host
+      const artifacts = target === 'fargate' ? localFrameTee(s3Sink, localRunDir(runId)) : s3Sink;
       return {
         runDir: `s3://${bucket}/${runPrefix(runId)}`,
-        sources: sources(manifest),
+        sources: sourceReader,
         artifacts: progress ? teeArtifactSink(artifacts, progress) : artifacts,
         // M7: org credentials win over platform secrets when the manifest
         // names the owning org.
         secrets: secretsManagerReader(manifest.orgId ?? null),
         ...(progress ? { progress } : {}),
-        writeArtifacts: (outcome, formats) => writeRunArtifacts(bucket, runId, outcome, formats),
+        // Fargate: mux + upload the MP4s BEFORE result.json (the finalize rule
+        // fires on it), then drop the local frames whatever happened.
+        writeArtifacts: async (outcome, formats) => {
+          if (target !== 'fargate') return writeRunArtifacts(bucket, runId, outcome, formats);
+          const videos =
+            outcome.status === 'succeeded' ? await muxAndUploadVideos(runId, manifest.definition) : {};
+          await removeLocalRunDir(runId);
+          return writeRunArtifacts(bucket, runId, outcome, formats, { videos });
+        },
       };
     },
   };
