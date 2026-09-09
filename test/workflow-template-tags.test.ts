@@ -9,6 +9,8 @@ import {
   normalizeTags,
   parseTagFilter,
 } from '../src/utils/tags';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { textArrayParam } from '../src/utils/sql';
 import { buildOpenApiDocument } from '../src/openapi/index';
 import { IN_SCOPE_ROUTES, isOutOfScopeRoute, versionedRoute } from '../src/openapi/scope';
 import { createWorkflowTemplateSchema, updateWorkflowTemplateSchema } from '../src/schemas/workflows';
@@ -144,6 +146,18 @@ describe('the write schemas', () => {
   });
 });
 
+describe('the array bind', () => {
+  it('binds every value as a parameter rather than interpolating it into SQL text', () => {
+    // The filter is built from a query string. The driver has no array binding,
+    // so the array literal is written out; each element must still be a param.
+    const { sql: text, params } = new PgDialect().sqlToQuery(
+      textArrayParam(['geofence', 'zone-a']),
+    );
+    expect(text).toBe('ARRAY[$1, $2]::text[]');
+    expect(params).toEqual(['geofence', 'zone-a']);
+  });
+});
+
 describe('the handler', () => {
   const source = readFileSync(
     join(__dirname, '..', 'src', 'handlers', 'workflow-templates.ts'),
@@ -151,7 +165,7 @@ describe('the handler', () => {
   );
 
   it('filters with an ANY-of array overlap, which is what the GIN index serves', () => {
-    expect(source).toContain('arrayOverlaps(schema.workflowTemplates.tags');
+    expect(source).toContain('schema.workflowTemplates.tags} && ${textArrayParam(');
   });
 
   it('normalizes on both write paths', () => {

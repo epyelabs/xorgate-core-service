@@ -1,13 +1,13 @@
 import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, arrayOverlaps, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
 import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { normalizeTags, parseTagFilter } from '../utils/tags';
-import { uuidParam } from '../utils/sql';
+import { textArrayParam, uuidParam } from '../utils/sql';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
   createWorkflowTemplateSchema,
@@ -266,7 +266,7 @@ const restHandler = async (
         eq(schema.workflowTemplates.organizationId, orgId),
         status ? eq(schema.workflowTemplates.status, status) : undefined,
         tagFilter.tags.length > 0
-          ? arrayOverlaps(schema.workflowTemplates.tags, tagFilter.tags)
+          ? sql`${schema.workflowTemplates.tags} && ${textArrayParam(tagFilter.tags)}`
           : undefined,
       );
 
