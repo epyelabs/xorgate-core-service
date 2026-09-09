@@ -1,4 +1,5 @@
 import { createWriteStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
 import { DescribeEndpointCommand, IoTClient } from '@aws-sdk/client-iot';
@@ -14,13 +15,13 @@ import {
   runManifestSchema,
   IotRunProgress,
   type EngineArtifactSink,
-  type EngineResult,
   type EngineRunOutcome,
   type EngineSecretReader,
   type ProgressTransport,
   type RunManifest,
 } from '@xorgate/workflow-engine';
 import { isSecretGoneError, orgSecretName, PROVIDER_BY_LOGICAL_SECRET } from '../org-credentials';
+import type { PlatformEngineResult, VideoArtifact } from './result';
 
 /**
  * The AWS half of the cloud host (wf-engine-integration design §3.2): manifest
@@ -44,19 +45,28 @@ async function putJson(bucket: string, key: string, body: string, contentType: s
   await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
 }
 
+/** Platform-only additions to the result the package builds (host/result.ts). */
+export interface RunArtifactExtras {
+  /** Muxed visualization MP4s, already uploaded under the run prefix (Fargate host). */
+  videos?: Record<string, VideoArtifact>;
+}
+
 /**
  * Writes events.jsonl, outputs/<nodeId>/records.*, and result.json for a
  * finished run. result.json goes LAST so the finalize rule fires only once
- * every other artifact is durable. Exported for the targets' "no manifest
- * could be read" path; every other write goes through the host's
- * `writeArtifacts`, which is this function bound to the run.
+ * every other artifact is durable (callers upload anything else they add,
+ * such as the visualization MP4s in `extras.videos`, BEFORE calling this).
+ * Exported for the targets' "no manifest could be read" path; every other
+ * write goes through the host's `writeArtifacts`, which is this function
+ * bound to the run.
  */
 export async function writeRunArtifacts(
   bucket: string,
   runId: string,
   outcome: EngineRunOutcome,
   formats: Record<string, 'jsonl' | 'json'> = {},
-): Promise<EngineResult> {
+  extras: RunArtifactExtras = {},
+): Promise<PlatformEngineResult> {
   const puts: Array<Promise<void>> = [];
   if (outcome.events.length > 0) {
     puts.push(
@@ -82,9 +92,19 @@ export async function writeRunArtifacts(
     );
   }
   await Promise.all(puts);
-  const result = buildEngineResult(runId, outcome, formats);
+  const base = buildEngineResult(runId, outcome, formats);
+  const videos = extras.videos && Object.keys(extras.videos).length > 0 ? extras.videos : undefined;
+  const result: PlatformEngineResult = videos
+    ? { ...base, artifacts: { ...base.artifacts, videos } }
+    : base;
   await putJson(bucket, resultKey(runId), JSON.stringify(result), 'application/json');
   return result;
+}
+
+/** Uploads one local file (a muxed MP4) under the run prefix; the body is read whole (tens of MB at most). */
+export async function s3PutFile(bucket: string, key: string, localPath: string, contentType: string): Promise<void> {
+  const body = await readFile(localPath);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
 }
 
 /** An outcome for runs that failed before (or instead of) executing the graph. */

@@ -124,8 +124,9 @@ Nothing engine-internal lives in this repo any more.
 | File | Role |
 |---|---|
 | `src/workflows/catalog.ts` | `platformCatalog` (the package's core catalog) and the served payload; `EXPECTED_CATALOG_VERSION` is the hash the smoke asserts |
-| `src/workflows/host/cloud-host.ts` | the `EngineHost` both targets hand to `createEngine`: S3 sources/artifacts, Secrets Manager secrets (org key over platform key), IoT progress, the live webcam-ingest seam; plus the pre-flight refusal |
-| `src/workflows/host/aws.ts` | the AWS SDK calls behind the host (manifest load, artifact writes with `result.json` last, frame sink, IoT publish transport, secret reader) |
+| `src/workflows/host/cloud-host.ts` | the `EngineHost` both targets hand to `createEngine`: S3 sources/artifacts, Secrets Manager secrets (org key over platform key), IoT progress, the live webcam-ingest seam; plus the pre-flight refusal. The Fargate flavour also tees visualization frames to `workDir/<runId>/frames/` and muxes them into `video/<nodeId>.mp4` (ffmpeg) before `result.json` |
+| `src/workflows/host/aws.ts` | the AWS SDK calls behind the host (manifest load, artifact writes with `result.json` last, frame sink, MP4 upload, IoT publish transport, secret reader) |
+| `src/workflows/host/result.ts` | `platformResultSchema`: the package's `result.json` contract plus the additive `artifacts.videos` map (`{ key, frames, fps }` per visualization node); finalize parses with it so the videos reach the run row |
 | `src/workflows/host/live-ingest.ts`, `session.ts`, `finalize.ts` | MQTT webcam ingest, the warm-session loop, the `result.json` to row mapping |
 | `src/workflows/simulations.ts`, `production.ts` | manifest building for simulations and triggered runs; `engineTargetForDefinition` routes |
 | `src/handlers/workflow-engine.ts` | **Lambda target**: telemetry-only graphs (512 MB, 5 min) |
@@ -140,6 +141,17 @@ and function nodes on Lambda), then
 The engine emits the `running` and terminal status messages itself and writes
 the artifact tree through the host with `result.json` last, which is what the
 S3 `ObjectCreated` EventBridge rule and `workflow-run-finalize.ts` key on.
+
+**Run artifacts** under `workflows/v2/runs/<runId>/` (the package's layout,
+`docs/compatibility.md`): `manifest.json` (dispatcher), `events.jsonl`,
+`outputs/<nodeId>/records.<jsonl|json>` (Data Capture), `frames/<nodeId>/<seq>.jpg`
+(visualization), `inputs/<nodeId>/records.jsonl` (materialized telemetry,
+Fargate) and `result.json` last. The platform adds ONE key on Fargate runs:
+`video/<nodeId>.mp4`, the annotated frames muxed at the decode fps, recorded in
+`result.json` as `artifacts.videos[nodeId] = { key, frames, fps }` (additive; the
+package's `engineResultSchema` still parses the file). Every key is reachable
+from the browser through `GET /workflow-runs/{id}/artifact-url?key=`, which
+presigns anything under the run's own prefix.
 
 ```mermaid
 flowchart TD

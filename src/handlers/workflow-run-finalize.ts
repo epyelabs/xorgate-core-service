@@ -4,8 +4,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
 import { updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
-import { engineResultSchema } from '@xorgate/workflow-engine';
 import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/host/finalize';
+import { platformResultSchema } from '../workflows/host/result';
 
 const s3 = new S3Client({});
 
@@ -51,9 +51,9 @@ const resultSchema = z.object({
  * pattern media-segment-ingest uses for uploaded segments.
  *
  * The two result shapes are versioned: `resultVersion: 2` routes to the v2
- * branch (engineResultSchema from @xorgate/workflow-engine, stamps
- * engine_version + artifacts); anything else is the unchanged v1 cv-runner
- * path.
+ * branch (platformResultSchema = the package's engineResultSchema plus the
+ * additive `artifacts.videos`; stamps engine_version + artifacts); anything
+ * else is the unchanged v1 cv-runner path.
  *
  * Idempotent: skips if the run is no longer 'running' (a redelivered event or the
  * watchdog having already failed the run).
@@ -170,7 +170,7 @@ export const handler = async (
 async function finalizeV2(raw: unknown, key: string): Promise<void> {
   let result;
   try {
-    result = engineResultSchema.parse(raw);
+    result = platformResultSchema.parse(raw);
   } catch (err) {
     console.error('workflow-run-finalize: invalid v2 result.json', { key, err });
     return;
@@ -212,5 +212,6 @@ async function finalizeV2(raw: unknown, key: string): Promise<void> {
     status: result.status,
     events: result.events.length,
     outputs: Object.keys(result.artifacts.outputs).length,
+    videos: Object.keys(result.artifacts.videos ?? {}).length,
   });
 }
