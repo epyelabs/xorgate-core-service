@@ -190,8 +190,25 @@ target, then prod. The catalog the editor fetches (`GET /workflow-catalog`, ETag
 = the hash) is the same instance both targets execute, so an engine bump is the
 only way a node appears or changes.
 
-**Schema** (migrations `0009` onward, `db/schema.ts`): `workflow_templates`,
-`workflow_template_versions` (app-enforced one-draft + one-published invariant),
+**Tags.** `workflow_templates.tags` (`text[]`, GIN index, manual migration `021`)
+is how a PROGRAM finds a template it did not author. `src/utils/tags.ts` is the
+one source of the rules, applied to writes and to the filter alike: trimmed,
+lowercased, deduped, 1 to 32 characters matching `^[a-z0-9][a-z0-9._-]*$`, at
+most 20 per template, and anything else is a 400 rather than a silent drop.
+`POST`/`PUT /workflow-templates[/{id}]` take `tags` and REPLACE the whole set
+(`[]` clears it, absent leaves it alone). `GET /workflow-templates?tag=` filters
+ANY-of (`tags && ARRAY[...]`); repeating the parameter and comma-separating its
+values are the same request, because API Gateway comma-joins duplicates and a
+comma cannot occur inside a tag. `GET /workflow-templates/tags` returns the
+org's distinct tags with counts for a picker.
+
+Those three reads are the ONLY part of this surface in the public OpenAPI
+document (`src/openapi/scope.ts`, `IN_SCOPE_ROUTES`): `@xorgate/sdk` models them
+as `xg.workflowTemplates`, and a consumer holding an organization API key is
+expected to discover templates by tag. Authoring stays out and stays editor-side.
+
+**Schema** (migrations `0009` onward, `db/schema.ts`): `workflow_templates`
+(incl. `tags`), `workflow_template_versions` (app-enforced one-draft + one-published invariant),
 `workflow_attachments`, `workflow_trigger_state` (debounce/cooldown + schedule
 cursor), `workflow_runs` (snapshot of the definition that ran, `engine_version`,
 `artifacts`), `workflow_run_steps`, `workflow_events`.

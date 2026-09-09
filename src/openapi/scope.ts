@@ -89,11 +89,45 @@ export const OUT_OF_SCOPE_PATH_PREFIXES: readonly string[] = [
   '/devices/{id}/workflow-runs',
 ];
 
-/** True when a route belongs to a surface this document deliberately skips. */
+/**
+ * The exceptions carved out of the prefixes above, at ROUTE-key granularity.
+ *
+ * Workflow templates gained tags, and the consumer that needs them is a program
+ * holding an organization API key: it lists templates by tag and reads one back.
+ * `@xorgate/sdk` models exactly those three reads, and an SDK resource whose
+ * endpoints appear nowhere in the reference is not something a consumer can be
+ * asked to trust, so the reads are documented.
+ *
+ * The AUTHORING surface stays out on the original reasoning, which the reads do
+ * not share: creating, updating, deleting, saving a draft, publishing,
+ * restoring, simulating and the usage list are all still moving, and a template
+ * is authored in the editor rather than by a consumer. Note that `POST` and
+ * `GET` on `/workflow-templates` therefore land on opposite sides of this line,
+ * which is why the classification is per route key and not per path.
+ */
+export const IN_SCOPE_ROUTES: readonly RouteKey[] = [
+  'GET /workflow-templates',
+  'GET /workflow-templates/tags',
+  'GET /workflow-templates/{id}',
+];
+
+/**
+ * True when a PATH belongs to a surface this document deliberately skips.
+ *
+ * Path granularity cannot see the `IN_SCOPE_ROUTES` exceptions, so prefer
+ * `isOutOfScopeRoute` wherever a method is available.
+ */
 export function isOutOfScopePath(path: string): boolean {
   return OUT_OF_SCOPE_PATH_PREFIXES.some(
     (prefix) => path === prefix || path.startsWith(`${prefix}/`),
   );
+}
+
+/** True when a ROUTE belongs to a surface this document deliberately skips. */
+export function isOutOfScopeRoute(routeKey: RouteKey): boolean {
+  const canonical = unversionRoute(routeKey);
+  if (IN_SCOPE_ROUTES.includes(canonical)) return false;
+  return isOutOfScopePath(canonical.slice(canonical.indexOf(' ') + 1));
 }
 
 /** True when a route is documented but flagged `x-internal`. */

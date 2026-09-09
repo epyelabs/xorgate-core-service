@@ -2294,6 +2294,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: workflowTemplatesInt,
     });
+    // Literal, so it is selected ahead of `/workflow-templates/{id}`: the org's
+    // distinct tags with counts, for a picker.
+    addRoutes({
+      path: "/workflow-templates/tags",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowTemplatesInt,
+    });
     addRoutes({
       path: "/workflow-templates/{id}",
       methods: [

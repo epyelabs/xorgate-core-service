@@ -19,14 +19,20 @@ export { workflowDefinitionSchema, workflowEdgeSchema, workflowNodeSchema } from
 export type { WorkflowDefinition, WorkflowEdge, WorkflowNode } from '@xorgate/workflow-engine';
 
 // --- Template create / update inputs -----------------------------------------
+// `tags` is accepted as a bare string array here and normalized afterwards by
+// utils/tags.ts, so the rules (case, charset, dedupe, the per-template cap) live
+// in one module that the query filter reads too. Present replaces the whole set;
+// `[]` clears it; absent leaves it untouched.
 export const createWorkflowTemplateSchema = z.object({
   name: z.string().trim().min(1, 'Name is required').max(80, 'Name is too long'),
   description: z.string().max(280, 'Description is too long').optional(),
+  tags: z.array(z.string()).optional(),
 });
 
 export const updateWorkflowTemplateSchema = z.object({
   name: z.string().trim().min(1).max(80).optional(),
   description: z.string().max(280).nullable().optional(),
+  tags: z.array(z.string()).optional(),
 });
 
 export const saveDraftSchema = z.object({

@@ -5,7 +5,7 @@ import { buildOpenApiDocument } from '../src/openapi/index';
 import {
   API_VERSION_PREFIX,
   INTERNAL_ROUTES,
-  isOutOfScopePath,
+  isOutOfScopeRoute,
   isVersionedRoute,
   unversionRoute,
   versionedRoute,
@@ -102,7 +102,7 @@ describe('OpenAPI route coverage', () => {
   it('documents every in-scope route', () => {
     const missing = routes
       .filter(isVersionedRoute)
-      .filter((route) => !isOutOfScopePath(unversionRoute(route).slice(route.indexOf(' ') + 1)))
+      .filter((route) => !isOutOfScopeRoute(route))
       .filter((route) => !documented.has(route));
     expect(
       missing,
@@ -116,11 +116,8 @@ describe('OpenAPI route coverage', () => {
     expect(stale, 'documented routes with no entry in the CDK route table').toEqual([]);
   });
 
-  it('never documents the Workflows/AI surface', () => {
-    const leaked = [...documented.keys()].filter((route) => {
-      const canonical = unversionRoute(route);
-      return isOutOfScopePath(canonical.slice(canonical.indexOf(' ') + 1));
-    });
+  it('never documents the Workflows/AI surface beyond the classified exceptions', () => {
+    const leaked = [...documented.keys()].filter(isOutOfScopeRoute);
     expect(leaked, 'out-of-scope routes leaked into the public document').toEqual([]);
   });
 

@@ -14,6 +14,7 @@ import { mediaSessionsPaths } from './media-sessions';
 import { telemetryPaths } from './telemetry';
 import { livePaths } from './live';
 import { searchPaths } from './search';
+import { workflowTemplatesPaths } from './workflow-templates';
 
 /**
  * The OpenAPI document, assembled from one module per resource.
@@ -116,6 +117,13 @@ const TAGS = [
       'first-party dashboard needs.',
   },
   {
+    name: 'Workflow Templates',
+    'x-displayName': 'Workflow Templates',
+    description:
+      'The reusable processing graphs an organization has authored, and the tags a program ' +
+      'finds them by. Reading only: authoring happens in the editor.',
+  },
+  {
     name: 'Search',
     'x-displayName': 'Search',
     description: 'Cross-resource lookup within the active organization.',
@@ -170,11 +178,13 @@ const DESCRIPTION = [
   'empty body, device commands return `202`, and errors are uniformly',
   '`{"error": {"code", "message", "details?"}}`.',
   '',
-  '**Pagination.** Only `GET /devices`, `GET /devices/{id}/sessions` and',
-  '`GET /devices/{id}/telemetry/readings` paginate; they accept `limit`/`offset`/`order`/`sort`',
+  '**Pagination.** Only `GET /devices`, `GET /devices/{id}/sessions`,',
+  '`GET /devices/{id}/telemetry/readings` and `GET /workflow-templates` paginate; they accept',
+  '`limit`/`offset`/`order`/`sort`',
   'and return a `page` block. Every other list endpoint returns its whole collection unbounded:',
-  'organizations, memberships, workspaces, device models, API keys, video channels, and a session',
-  "segment index. `GET /devices/{id}/telemetry` is not a list endpoint either. It caps rows and",
+  'organizations, memberships, workspaces, device models, API keys, video channels, the',
+  'workflow-template tag vocabulary, and a session',
+  "segment index `GET /devices/{id}/telemetry` is not a list endpoint either. It caps rows and",
   'reports `truncated`.',
   '',
   '**The live plane.** Live telemetry and live video do not flow through this API: they are',
@@ -187,7 +197,9 @@ const DESCRIPTION = [
   'are not part of a third-party integration.',
   '',
   '**What is not here.** The Workflows and AI surface is deliberately undocumented while it is',
-  'still moving.',
+  'still moving. The three exceptions are the workflow-template READS below, which exist because',
+  'a program discovers templates by tag and acts on them; authoring a template, publishing it,',
+  'attaching it to a device and reading its runs are all still editor-side and undocumented.',
 ].join('\n');
 
 /** Re-key a `paths` object under the version prefix, preserving order. */
@@ -205,12 +217,16 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
+      // 0.8.0: workflow templates gained tags, and the three READ operations a
+      // program needs to find a template by one came into the document. Purely
+      // additive.
+      //
       // 0.7.0: the unversioned paths are gone. `/v1` is the whole surface, the
       // two renamed-from paths no longer answer, and the deprecated
       // `channelArn` field was removed from `VideoChannel`. The most breaking
       // release this document has had, which is exactly why it happened before
       // anyone outside xorgate consumed it.
-      version: '0.7.0',
+      version: '0.8.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so
@@ -247,6 +263,7 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...telemetryPaths,
       ...mediaSessionsPaths,
       ...livePaths,
+      ...workflowTemplatesPaths,
       ...searchPaths,
       ...metaPaths,
     }),
