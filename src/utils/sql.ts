@@ -23,3 +23,26 @@ export const tsParam = (iso: string): SQL => sql`${iso}::timestamptz`;
 
 /** Force a `jsonb` cast on an arbitrary value (serialized to JSON text first). */
 export const jsonbParam = (value: unknown): SQL => sql`${JSON.stringify(value)}::jsonb`;
+
+/**
+ * Force a `uuid` cast on an id param.
+ *
+ * Only needed in RAW `sql` where there is no column to take a typeHint from.
+ * `eq(table.organizationId, id)` is fine: drizzle reads the hint off the column.
+ * The same comparison written out by hand in a `sql` template is
+ * `operator does not exist: uuid = text`.
+ */
+export const uuidParam = (id: string): SQL => sql`${id}::uuid`;
+
+/**
+ * A `text[]` literal built from bound params: `ARRAY[$1, $2]::text[]`.
+ *
+ * The driver has no array binding, so handing drizzle's `arrayOverlaps` a JS
+ * array binds one `stringValue` and Postgres answers
+ * `operator does not exist: text[] && text`. Each element is still a bound
+ * parameter here, so nothing is interpolated into SQL text. Callers must not
+ * pass an empty list: `ARRAY[]::text[]` needs the cast inside the brackets and
+ * an empty filter has nothing to ask anyway.
+ */
+export const textArrayParam = (values: readonly string[]): SQL =>
+  sql`ARRAY[${sql.join(values.map((value) => sql`${value}`), sql`, `)}]::text[]`;

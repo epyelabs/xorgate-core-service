@@ -1084,5 +1084,156 @@ export function openApiSchemas(): Record<string, unknown> {
         ts: { type: 'string', format: 'date-time' },
       },
     },
+    Author: {
+      type: 'object',
+      required: ['id', 'name', 'email'],
+      description:
+        'The person a row is attributed to. When the account behind it was deleted the fields ' +
+        'degrade to `{"id": "", "name": "Unknown user", "email": ""}` rather than to null.',
+      properties: {
+        id: { type: 'string' },
+        name: { type: 'string' },
+        email: { type: 'string', format: 'email' },
+      },
+    },
+    WorkflowTemplateTag: {
+      type: 'string',
+      description:
+        'A free-form label, normalized on write: trimmed, lowercased and deduplicated, 1 to 32 ' +
+        'characters matching `^[a-z0-9][a-z0-9._-]*$`, at most 20 per template. A value that ' +
+        'cannot be normalized into that shape is a 400 rather than a silent drop.',
+      minLength: 1,
+      maxLength: 32,
+      pattern: '^[a-z0-9][a-z0-9._-]*$',
+      example: 'geofence',
+    },
+    WorkflowTemplate: {
+      type: 'object',
+      required: [
+        'id',
+        'name',
+        'slug',
+        'tags',
+        'status',
+        'currentVersion',
+        'usedBy',
+        'createdAt',
+        'updatedAt',
+      ],
+      description:
+        'The list-row view of an org-scoped workflow template. The graph itself is not here: it ' +
+        'lives on the template\'s versions, which only the detail response carries.',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        name: { type: 'string' },
+        slug: {
+          type: 'string',
+          description:
+            'Derived from the name at creation and unique within the organization. Stable: it ' +
+            'does not follow a rename.',
+        },
+        description: { type: 'string', nullable: true },
+        tags: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/WorkflowTemplateTag' },
+          description: 'Always present; an untagged template has an empty array.',
+        },
+        status: { type: 'string', enum: ['draft', 'published'] },
+        currentVersion: {
+          type: 'integer',
+          description: 'The highest version number, published or not.',
+        },
+        publishedVersion: {
+          type: 'integer',
+          nullable: true,
+          description: 'null until the template has been published once.',
+        },
+        usedBy: {
+          type: 'integer',
+          description: 'How many devices this template is attached to.',
+        },
+        requiredCapabilities: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Abstract input needs derived from the graph that would run (the published version, ' +
+            'else the current one): tokens such as `video`, `gps`, `metric:<key>`. A device ' +
+            'lacking one of them is refused on attach.',
+          example: ['gps'],
+        },
+        createdBy: { $ref: '#/components/schemas/Author' },
+        updatedBy: { $ref: '#/components/schemas/Author' },
+        createdAt: { type: 'string', format: 'date-time' },
+        updatedAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    WorkflowTemplateVersion: {
+      type: 'object',
+      required: ['id', 'version', 'status', 'definition', 'createdAt'],
+      description: 'One saved graph. At most one `draft` and one `published` row per template.',
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        version: { type: 'integer' },
+        status: { type: 'string', enum: ['draft', 'published', 'archived'] },
+        message: { type: 'string', nullable: true },
+        definition: {
+          type: 'object',
+          additionalProperties: true,
+          description:
+            'The graph, as `{ schemaVersion, nodes, edges }`. Its format is documented at ' +
+            'https://docs.xorgate.io/docs/workflows/definitions and is a frozen contract shared ' +
+            'with `@xorgate/workflow-engine`. Served upgraded to the current schema version, ' +
+            'whatever the stored row holds.',
+        },
+        storedSchemaVersion: {
+          type: 'integer',
+          description: 'The schema version of the STORED row, before the read-path upgrade.',
+        },
+        createdBy: { $ref: '#/components/schemas/Author' },
+        createdAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    WorkflowTemplateDeployment: {
+      type: 'object',
+      required: ['id', 'name', 'workspaceName', 'target', 'enabled'],
+      description: 'One device this template is attached to.',
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'The attachment id, not the device id.' },
+        name: { type: 'string', description: "The device's name, falling back to its serial." },
+        workspaceName: { type: 'string' },
+        target: { type: 'string', description: "The device's serial." },
+        pinnedVersion: { type: 'integer', nullable: true },
+        enabled: { type: 'boolean' },
+        lastRunAt: { type: 'string', format: 'date-time', nullable: true },
+      },
+    },
+    WorkflowTemplateDetail: {
+      allOf: [
+        { $ref: '#/components/schemas/WorkflowTemplate' },
+        {
+          type: 'object',
+          required: ['versions', 'usage'],
+          properties: {
+            versions: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/WorkflowTemplateVersion' },
+              description: 'Every version, oldest first.',
+            },
+            usage: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/WorkflowTemplateDeployment' },
+            },
+          },
+        },
+      ],
+    },
+    WorkflowTemplateTagCount: {
+      type: 'object',
+      required: ['tag', 'count'],
+      properties: {
+        tag: { $ref: '#/components/schemas/WorkflowTemplateTag' },
+        count: { type: 'integer', description: 'Templates in this organization carrying the tag.' },
+      },
+    },
   };
 }

@@ -610,6 +610,11 @@ export const workflowTemplates = pgTable(
     name: text('name').notNull(),
     slug: text('slug').notNull(),
     description: text('description'),
+    // Free-form labels, org-scoped and normalized on write (see utils/tags.ts):
+    // trimmed, lowercased, deduped, at most 20 of at most 32 chars each. A
+    // consumer holding an organization API key discovers templates by tag, which
+    // is what the GIN index below serves (`tags && ARRAY[...]`, ANY-of).
+    tags: text('tags').array().notNull().default(sql`'{}'::text[]`),
     status: text('status').default('draft').notNull(), // draft | published
     currentVersion: integer('current_version').default(1).notNull(),
     publishedVersion: integer('published_version'), // null until first publish
@@ -622,7 +627,10 @@ export const workflowTemplates = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
-  (t) => [uniqueIndex('workflow_templates_org_slug_idx').on(t.organizationId, t.slug)],
+  (t) => [
+    uniqueIndex('workflow_templates_org_slug_idx').on(t.organizationId, t.slug),
+    index('workflow_templates_tags_idx').using('gin', t.tags),
+  ],
 );
 
 // One version row per saved definition. App-enforced invariant (see

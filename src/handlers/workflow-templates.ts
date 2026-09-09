@@ -6,6 +6,8 @@ import { db, schema } from '../db/index';
 import type { DB } from '../db/index';
 import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
+import { normalizeTags, parseTagFilter } from '../utils/tags';
+import { textArrayParam, uuidParam } from '../utils/sql';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
   createWorkflowTemplateSchema,
@@ -90,6 +92,7 @@ function toSummary(
     name: t.name,
     slug: t.slug,
     description: t.description ?? null,
+    tags: t.tags ?? [],
     status: t.status,
     currentVersion: t.currentVersion,
     publishedVersion: t.publishedVersion ?? null,
@@ -209,6 +212,7 @@ async function loadTemplate(orgId: string, id: string): Promise<TemplateRow | un
 /**
  * CRUD + versioning for org-scoped workflow templates. Routes (all -> this Lambda):
  *   GET    /workflow-templates
+ *   GET    /workflow-templates/tags
  *   POST   /workflow-templates
  *   GET    /workflow-templates/{id}
  *   PUT    /workflow-templates/{id}
@@ -252,9 +256,18 @@ const restHandler = async (
       if ('error' in parsed) return parsed.error;
       const { limit, offset, order, sortBy, status } = parsed;
 
+      // `?tag=` narrows to templates carrying at least ONE of the values
+      // (ANY-of, `tags && ARRAY[...]`, served by the GIN index). Repeatable and
+      // comma-separated are the same request; see utils/tags.ts.
+      const tagFilter = parseTagFilter(event);
+      if ('error' in tagFilter) return tagFilter.error;
+
       const where = and(
         eq(schema.workflowTemplates.organizationId, orgId),
         status ? eq(schema.workflowTemplates.status, status) : undefined,
+        tagFilter.tags.length > 0
+          ? sql`${schema.workflowTemplates.tags} && ${textArrayParam(tagFilter.tags)}`
+          : undefined,
       );
 
       const totalRows = await db
@@ -319,10 +332,29 @@ const restHandler = async (
       });
     }
 
+    // The org's tag vocabulary, most used first. Its reason to exist is a
+    // picker: the web toolbar's tag filter and any consumer that wants to show
+    // what is taggable without paging the whole collection. Counts come from
+    // `unnest`, so a template contributes once per distinct tag it carries.
+    case 'GET /workflow-templates/tags': {
+      const res = await db.execute<{ tag: string; count: number }>(sql`
+        select tag, count(*)::int as count
+        from ${schema.workflowTemplates}, unnest(tags) as tag
+        where organization_id = ${uuidParam(orgId)}
+        group by tag
+        order by count desc, tag asc
+      `);
+      return ok({
+        tags: res.rows.map((r) => ({ tag: r.tag, count: Number(r.count) })),
+      });
+    }
+
     case 'POST /workflow-templates': {
       const parsed = createWorkflowTemplateSchema.safeParse(safeJson(event.body));
       if (!parsed.success) return badRequest(parsed.error.issues[0]?.message ?? 'Invalid body');
       const { name, description } = parsed.data;
+      const tags = normalizeTags(parsed.data.tags ?? []);
+      if ('error' in tags) return badRequest(tags.error);
 
       const detail = await db.transaction(async (tx) => {
         const slug = await freeSlug(tx, orgId, slugify(name));
@@ -333,6 +365,7 @@ const restHandler = async (
             name,
             slug,
             description: description?.trim() ? description.trim() : null,
+            tags: tags.tags,
             status: 'draft',
             currentVersion: 1,
             publishedVersion: null,
@@ -371,6 +404,12 @@ const restHandler = async (
       if (parsed.data.name !== undefined) updates.name = parsed.data.name;
       if (parsed.data.description !== undefined) {
         updates.description = parsed.data.description?.trim() ? parsed.data.description.trim() : null;
+      }
+      // A present `tags` REPLACES the set, so `[]` is how a caller clears it.
+      if (parsed.data.tags !== undefined) {
+        const tags = normalizeTags(parsed.data.tags);
+        if ('error' in tags) return badRequest(tags.error);
+        updates.tags = tags.tags;
       }
       const [updated] = await db
         .update(schema.workflowTemplates)
