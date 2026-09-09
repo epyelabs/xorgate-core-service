@@ -23,3 +23,13 @@ export const tsParam = (iso: string): SQL => sql`${iso}::timestamptz`;
 
 /** Force a `jsonb` cast on an arbitrary value (serialized to JSON text first). */
 export const jsonbParam = (value: unknown): SQL => sql`${JSON.stringify(value)}::jsonb`;
+
+/**
+ * Force a `uuid` cast on an id param.
+ *
+ * Only needed in RAW `sql` where there is no column to take a typeHint from.
+ * `eq(table.organizationId, id)` is fine: drizzle reads the hint off the column.
+ * The same comparison written out by hand in a `sql` template is
+ * `operator does not exist: uuid = text`.
+ */
+export const uuidParam = (id: string): SQL => sql`${id}::uuid`;

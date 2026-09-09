@@ -7,6 +7,7 @@ import type { DB } from '../db/index';
 import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { normalizeTags, parseTagFilter } from '../utils/tags';
+import { uuidParam } from '../utils/sql';
 import type { WorkflowDefinition } from '../schemas/workflows';
 import {
   createWorkflowTemplateSchema,
@@ -339,7 +340,7 @@ const restHandler = async (
       const res = await db.execute<{ tag: string; count: number }>(sql`
         select tag, count(*)::int as count
         from ${schema.workflowTemplates}, unnest(tags) as tag
-        where organization_id = ${orgId}
+        where organization_id = ${uuidParam(orgId)}
         group by tag
         order by count desc, tag asc
       `);
