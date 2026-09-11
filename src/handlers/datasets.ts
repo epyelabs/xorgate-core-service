@@ -7,6 +7,7 @@ import { AuthError, authErrorResponse, requireOrgWideContext } from '../middlewa
 import { db, schema } from '../db/index';
 import { badRequest, conflict, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
+import { tsParam } from '../utils/sql';
 import { apiHandler } from '../utils/api-handler';
 import type { MembershipRole } from '../types/index';
 import { applyClassEdits, classesFromNames, parseStoredClasses } from '../models/classes';
@@ -498,7 +499,7 @@ const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayPro
           and(
             eq(schema.datasetVersions.datasetId, dataset.id),
             inArray(schema.datasetVersions.status, ['ready', 'building']),
-            sql`${schema.datasetVersions.createdAt} >= ${item.createdAt}`,
+            sql`${schema.datasetVersions.createdAt} >= ${tsParam(item.createdAt.toISOString())}`,
           ),
         );
       if (Number(ref.n) > 0) {
