@@ -2537,6 +2537,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: datasetsInt,
     });
+    // Presigned GET for one object of a version, gated to the version prefix.
+    addRoutes({
+      path: "/datasets/{id}/versions/{version}/artifact-url",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: datasetsInt,
+    });
     // Models: the merged registry read and the org-model lifecycle.
     addRoutes({
       path: "/models",

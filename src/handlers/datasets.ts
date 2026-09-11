@@ -59,6 +59,7 @@ import { findOrgSessions } from '../services/media-session-input';
  *   GET        /datasets/{id}/imports/{importId}
  *   GET|POST   /datasets/{id}/versions                    POST = health-checked, then built async (SQS)
  *   GET        /datasets/{id}/versions/{version}
+ *   GET        /datasets/{id}/versions/{version}/artifact-url?key=   presigned GET gated to the version prefix
  *
  * Roles (Q5): every member reads; member and up write (annotate, upload,
  * import, version); admin and owner delete a dataset. Every route is
@@ -742,6 +743,26 @@ const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayPro
         }
       }
       return ok({ version: toVersion(row, files) });
+    }
+
+    case 'GET /datasets/{id}/versions/{version}/artifact-url': {
+      // Presigned GET for one object of a version (an image copy, or one of
+      // the three files): the key must lie under THIS version's prefix, so a
+      // caller can never presign outside a dataset their org can already
+      // read. What lets a laptop pull a version without bucket credentials
+      // (`xmf dataset validate` on the copy, `xwe`-style downloads in M4).
+      const raw = event.pathParameters?.version;
+      if (!raw || !/^\d+$/.test(raw)) return badRequest('version must be a positive integer');
+      const key = event.queryStringParameters?.key;
+      if (!key) return badRequest('key query parameter required');
+      const row = await db.query.datasetVersions.findFirst({
+        where: and(eq(schema.datasetVersions.datasetId, dataset.id), eq(schema.datasetVersions.version, Number(raw))),
+      });
+      if (!row) return notFound(`Version ${raw} not found`);
+      const prefix = datasetVersionPrefix(dataset.id, row.version);
+      if (!isKeyUnder(prefix, key)) return badRequest(`key must lie under ${prefix}`);
+      const url = await presignGet(BUCKET, key, { downloadName: key.slice(key.lastIndexOf('/') + 1) });
+      return ok({ url, expiresInSeconds: 15 * 60 });
     }
 
     default:
