@@ -40,6 +40,15 @@
  *  14. the installed package carries no AWS SDK
  *  15. the Lambda engine handler's bundle (esbuild, the api-stack externals)
  *      never requires mqtt: live-ingest is the Fargate runner's import only
+ *      (the Models handlers are held to the same rule)
+ *  16. xorgate-models pure module (src/models): the model-name rule agrees
+ *      with the engine's parseModelName; class edits keep ids and refuse a
+ *      used deletion; the split port reproduces the forge's own splits.json
+ *      on its 63-image fixture and honours keep-previous; health rules refuse
+ *      a class without val instances; the COCO writer emits 0-based
+ *      categories, xywh boxes and a header whose counts match; key gating
+ *      refuses climbs and foreign prefixes; header-byte dimensions for JPEG
+ *      and PNG; the host's root chain is org-first
  */
 import { strict as assert } from 'node:assert';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -107,6 +116,28 @@ import {
   validateSimulationBindings,
   type SimulationBinding,
 } from '../src/workflows/simulations';
+import { parseModelName } from '@xorgate/workflow-engine/local';
+import {
+  applyClassEdits,
+  assignSplits,
+  buildVersionFiles,
+  checkHealth,
+  classesFromNames,
+  computeStats,
+  datasetItemKey,
+  datasetVersionPrefix,
+  isKeyUnder,
+  MODEL_NAME_RE,
+  modelNameError,
+  orgModelPrefix,
+  parseItemKey,
+  prepareVersion,
+  readImageDimensions,
+  slugifyDatasetName,
+  splitCounts,
+  type DatasetClass,
+} from '../src/models';
+import { modelRootsFor } from '../src/workflows/models/registry';
 
 const failingSources: EngineSourceReader = {
   readTelemetryWindow: async () => {
@@ -836,14 +867,173 @@ function testLambdaBundleHasNoMqtt(): void {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const esbuild = require('esbuild') as typeof import('esbuild');
   const externals = ['@aws-sdk/*', '@xorgate/workflow-engine', 'onnxruntime-node', '@anthropic-ai/sdk', 'mqtt'];
-  for (const entry of ['src/handlers/workflow-engine.ts', 'src/handlers/workflow-catalog.ts', 'src/handlers/workflow-simulations.ts']) {
+  for (const entry of [
+    'src/handlers/workflow-engine.ts',
+    'src/handlers/workflow-catalog.ts',
+    'src/handlers/workflow-simulations.ts',
+    'src/handlers/datasets.ts',
+    'src/handlers/models.ts',
+    'src/handlers/model-job-dispatch.ts',
+    'src/handlers/workflow-templates.ts',
+  ]) {
     const out = esbuild.buildSync({ entryPoints: [path.join(__dirname, '..', entry)], bundle: true, platform: 'node', target: 'node20', write: false, external: externals, logLevel: 'silent' });
     const text = out.outputFiles.map((f) => f.text).join('\n');
     assert.ok(!/require\(["']mqtt["']\)/.test(text), `${entry} bundle requires mqtt (live-ingest leaked into a Lambda bundle)`);
-    assert.ok(/require\(["']@xorgate\/workflow-engine["']\)/.test(text), `${entry} bundle should require the engine package externally`);
+    // The Models handlers that never touch the engine (datasets, dispatch) are
+    // held to the mqtt/optional-deps rule only.
+    const usesEngine = !/datasets\.ts$|model-job-dispatch\.ts$/.test(entry);
+    if (usesEngine) assert.ok(/require\(["']@xorgate\/workflow-engine["']\)/.test(text), `${entry} bundle should require the engine package externally`);
     assert.ok(!/require\(["']onnxruntime-node["']\)/.test(text) && !/require\(["']@anthropic-ai\/sdk["']\)/.test(text), `${entry} bundle must not require the package's optional deps directly`);
   }
-  console.log('check 15 ok: Lambda handler bundles (engine, catalog, simulations) require the engine package externally and never mqtt');
+  console.log('check 15 ok: Lambda handler bundles (engine, catalog, simulations, datasets, models, model-job-dispatch, templates) require the engine package externally and never mqtt');
+}
+
+// --- 16. xorgate-models pure module -----------------------------------------------
+// The forge's fixture dataset (63 frames of drive.mp4 in five groups) and the
+// splits.json `xmf dataset split --seed 0 --train 0.8 --val 0.2` wrote for it
+// (fixtures/ds/splits.json at forge f630024): id|group|split, ids and groups
+// with their `drive_` / `drive:` prefixes stripped.
+const FORGE_FIXTURE_SPLITS = '0000|0|t;0006|0|t;0012|0|t;0018|0|t;0024|0|t;0030|0|t;0036|0|t;0042|0|t;0048|0|t;0054|0|t;0060|0|t;0066|0|t;0072|0|t;0078|1|t;0084|1|t;0090|1|t;0096|1|t;0102|1|t;0108|1|t;0114|1|t;0120|1|t;0126|1|t;0132|1|t;0138|1|t;0144|1|t;0150|1|t;0156|2|v;0162|2|v;0168|2|v;0174|2|v;0180|2|v;0186|2|v;0192|2|v;0198|2|v;0204|2|v;0210|2|v;0216|2|v;0222|2|v;0228|3|t;0234|3|t;0240|3|t;0246|3|t;0252|3|t;0258|3|t;0264|3|t;0270|3|t;0276|3|t;0282|3|t;0288|3|t;0294|3|t;0300|3|t;0306|4|t;0312|4|t;0318|4|t;0324|4|t;0330|4|t;0336|4|t;0342|4|t;0348|4|t;0354|4|t;0360|4|t;0366|4|t;0372|4|t';
+
+function testModelsModule(): void {
+  // Names: the literal regex and the engine's parser agree on every probe.
+  for (const name of ['yolov8n', 'fixture-vehicles', 'a.b_c-1', 'X']) {
+    assert.strictEqual(modelNameError(name), null, name);
+    assert.deepStrictEqual(parseModelName('detection', name), { family: 'detection', name });
+  }
+  for (const bad of ['', '-lead', '.dot', 'has space', 'slash/x', 'pin@2', 'a'.repeat(65)]) {
+    assert.ok(modelNameError(bad) !== null, `expected refusal for ${JSON.stringify(bad)}`);
+    if (bad !== '' && !bad.includes('@') && bad.length <= 64) assert.throws(() => parseModelName('detection', bad), bad);
+  }
+  assert.ok(!MODEL_NAME_RE.test('a b'));
+  assert.strictEqual(slugifyDatasetName('Yard cameras (west)!'), 'yard-cameras-west');
+  assert.strictEqual(slugifyDatasetName('***'), 'dataset');
+
+  // Classes: ids survive a rename and a reorder; a used deletion is refused;
+  // duplicate names are refused; a new entry gets a palette color.
+  const fresh = classesFromNames(['car', 'truck']);
+  assert.ok(fresh.ok);
+  const [car, truck] = fresh.classes;
+  assert.match(car.id, /^c_[0-9a-f]{8}$/);
+  const renamed = applyClassEdits(fresh.classes, [{ id: truck.id, name: 'lorry' }, { id: car.id, name: 'car', color: '#112233' }, { name: 'van' }]);
+  assert.ok(renamed.ok);
+  assert.deepStrictEqual(renamed.classes.map((c) => c.name), ['lorry', 'car', 'van']);
+  assert.strictEqual(renamed.classes[0].id, truck.id);
+  assert.strictEqual(renamed.classes[1].color, '#112233');
+  assert.strictEqual(renamed.added.length, 1);
+  const refused = applyClassEdits(fresh.classes, [{ id: car.id, name: 'car' }], new Map([[truck.id, 3]]));
+  assert.ok(!refused.ok && /used by 3 annotation/.test(refused.error));
+  const allowed = applyClassEdits(fresh.classes, [{ id: car.id, name: 'car' }], new Map());
+  assert.ok(allowed.ok && allowed.removed[0] === truck.id);
+  const dup = applyClassEdits(fresh.classes, [{ id: car.id, name: 'Car' }, { id: truck.id, name: 'car' }]);
+  assert.ok(!dup.ok && /Duplicate/.test(dup.error));
+
+  // Split: byte-for-byte the forge's assignment on its fixture.
+  const fixture = FORGE_FIXTURE_SPLITS.split(';').map((row) => {
+    const [id, group, split] = row.split('|');
+    return { id: `drive_${id}`, group: `drive:${group}`, split: split === 't' ? 'train' : split === 'v' ? 'val' : 'test' };
+  });
+  const images = fixture.map((f) => ({ id: f.id, group: f.group }));
+  const mine = assignSplits(images, { train: 0.8, val: 0.2, test: 0 }, 0);
+  const mismatches = fixture.filter((f) => mine[f.id] !== f.split);
+  assert.deepStrictEqual(mismatches, [], `split port disagrees with the forge on ${mismatches.length} image(s)`);
+  assert.deepStrictEqual(splitCounts(mine), { train: 51, val: 12, test: 0 });
+  assert.deepStrictEqual(assignSplits(images, { train: 0.8, val: 0.2, test: 0 }, 0), mine, 'deterministic');
+  const reseeded = assignSplits(images, { train: 0.8, val: 0.2, test: 0 }, 1); // the forge puts drive:3 in val under seed 1
+  assert.ok(fixture.some((f) => reseeded[f.id] !== mine[f.id]), 'a different seed moves at least one group');
+  // Groups never straddle: every image of a group lands in one split.
+  const byGroup = new Map<string, Set<string>>();
+  for (const img of images) byGroup.set(img.group, (byGroup.get(img.group) ?? new Set()).add(mine[img.id]));
+  assert.ok([...byGroup.values()].every((s) => s.size === 1), 'group straddles splits');
+  // keep-previous: kept ids stay put, the fractions apply to the rest.
+  const keep = Object.fromEntries(fixture.slice(0, 20).map((f) => [f.id, f.split === 'train' ? ('val' as const) : ('train' as const)]));
+  const kept = assignSplits(images, { train: 0.8, val: 0.2, test: 0 }, 0, keep);
+  assert.ok(Object.entries(keep).every(([id, s]) => kept[id] === s), 'kept ids moved');
+
+  // Health and stats: a class with no val instance is an error, few is a warning.
+  const classNames = ['car', 'truck'];
+  const boxes = fixture.filter((f) => f.split === 'train').map((f) => ({ imageId: f.id, classIndex: 1 }));
+  boxes.push(...fixture.filter((f) => f.split === 'val').slice(0, 3).map((f) => ({ imageId: f.id, classIndex: 0 })));
+  const stats = computeStats(images, boxes, mine, classNames);
+  assert.strictEqual(stats.perClass.car.val, 3);
+  assert.strictEqual(stats.perClass.truck.val, 0);
+  const health = checkHealth(stats, images, mine, classNames);
+  assert.ok(!health.ok);
+  assert.deepStrictEqual(health.errors.map((e) => e.code), ['CLASS_NO_VAL_INSTANCES']);
+  assert.match(health.errors[0].message, /class "truck" has no instance in the val split/);
+  assert.ok(health.warnings.some((w) => w.code === 'CLASS_FEW_VAL_INSTANCES' && w.className === 'car'));
+  const noVal = checkHealth(computeStats(images, boxes, Object.fromEntries(images.map((i) => [i.id, 'train' as const])), classNames), images, Object.fromEntries(images.map((i) => [i.id, 'train' as const])), classNames);
+  assert.ok(noVal.errors.some((e) => e.code === 'NO_VAL'));
+
+  // Version files: 0-based categories in class order, xywh boxes clamped to the
+  // image, header counts equal to the files, splits sorted.
+  const classes: DatasetClass[] = [
+    { id: 'c_aaaaaaaa', name: 'car', color: '#e6194b' },
+    { id: 'c_bbbbbbbb', name: 'truck', color: '#3cb44b' },
+  ];
+  const items = images.map((img) => ({ id: img.id, ext: 'jpg', width: 1280, height: 720, groupKey: img.group, source: { kind: 'upload' } }));
+  const annotations = [
+    ...fixture.map((f) => ({ itemId: f.id, classId: 'c_aaaaaaaa', x1: 10.004, y1: 20, x2: 110, y2: 80, source: 'human', confidence: null })),
+    ...fixture.filter((f) => f.split === 'val').map((f) => ({ itemId: f.id, classId: 'c_bbbbbbbb', x1: -5, y1: 0, x2: 1300, y2: 720, source: 'model', confidence: 0.9 })),
+    { itemId: fixture[0].id, classId: 'c_gone', x1: 0, y1: 0, x2: 1, y2: 1, source: 'human', confidence: null },
+  ];
+  const prepared = prepareVersion(classes, items, annotations, { split: { train: 0.8, val: 0.2, test: 0 }, seed: 0, keepPrevious: false, includeAiLabeled: false });
+  assert.ok(prepared.health.ok, JSON.stringify(prepared.health));
+  assert.strictEqual(prepared.droppedBoxes, 1);
+  assert.deepStrictEqual(prepared.classNames, ['car', 'truck']);
+  const files = buildVersionFiles(prepared, { datasetId: 'ds-1', datasetName: 'Fixture', version: 3, createdAt: '2026-09-11T00:00:00.000Z' });
+  assert.deepStrictEqual(files.coco.categories, [{ id: 0, name: 'car' }, { id: 1, name: 'truck' }]);
+  assert.strictEqual(files.coco.images.length, 63);
+  assert.strictEqual(files.coco.annotations.length, 63 + 12);
+  const first = files.coco.annotations[0];
+  assert.deepStrictEqual(first.bbox, [10, 20, 100, 60]);
+  assert.strictEqual(first.category_id, 0);
+  const clamped = files.coco.annotations.find((a) => a.category_id === 1)!;
+  assert.deepStrictEqual(clamped.bbox, [0, 0, 1280, 720]);
+  assert.strictEqual(clamped.source, 'model');
+  assert.strictEqual(files.header.images, 63);
+  assert.deepStrictEqual(files.header.splits, { train: 51, val: 12, test: 0 });
+  assert.strictEqual(files.header.classes.length, files.coco.categories.length);
+  assert.strictEqual(files.header.source.datasetId, 'ds-1');
+  assert.strictEqual(files.coco.images[0].file_name, `images/${images[0].id}.jpg`);
+  assert.deepStrictEqual(Object.keys(files.splits), Object.keys(files.splits).slice().sort());
+  assert.strictEqual(Object.keys(files.splits).length, 63);
+
+  // Keys and gating.
+  const prefix = datasetVersionPrefix('ds-1', 3);
+  assert.strictEqual(prefix, 'datasets/ds-1/versions/3/');
+  assert.ok(isKeyUnder(prefix, `${prefix}dataset.json`));
+  assert.ok(!isKeyUnder(prefix, `${prefix}../../ds-2/versions/1/dataset.json`));
+  assert.ok(!isKeyUnder(prefix, 'datasets/ds-2/versions/3/dataset.json'));
+  assert.ok(!isKeyUnder(prefix, prefix));
+  assert.ok(!isKeyUnder(prefix, `${prefix}a//b`));
+  const itemKey = datasetItemKey('ds-1', '9f9e0cf2-0000-4000-8000-0000000000aa', 'jpg');
+  assert.deepStrictEqual(parseItemKey('ds-1', itemKey), { itemId: '9f9e0cf2-0000-4000-8000-0000000000aa', ext: 'jpg' });
+  assert.strictEqual(parseItemKey('ds-2', itemKey), null);
+  assert.strictEqual(parseItemKey('ds-1', 'datasets/ds-1/items/not-a-uuid.jpg'), null);
+  assert.strictEqual(orgModelPrefix('org-1', 'detection', 'fixture-vehicles', 1), 'org-models/org-1/detection/fixture-vehicles/1/');
+  assert.deepStrictEqual(modelRootsFor('org-1'), ['org-models/org-1/', 'models/']);
+  assert.deepStrictEqual(modelRootsFor(null), ['models/']);
+
+  // Dimensions from header bytes: a JPEG with an APP0 segment then SOF0, and a PNG IHDR.
+  const jpeg = Buffer.from([
+    0xff, 0xd8, // SOI
+    0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, // APP0, length 4
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x02, 0xd0, 0x05, 0x00, 0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, // SOF0 720x1280
+    0xff, 0xda, 0x00, 0x02, // SOS
+  ]);
+  assert.deepStrictEqual(readImageDimensions(jpeg), { width: 1280, height: 720, format: 'jpeg' });
+  const png = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+  png.writeUInt32BE(13, 8);
+  png.write('IHDR', 12, 'ascii');
+  png.writeUInt32BE(640, 16);
+  png.writeUInt32BE(480, 20);
+  assert.deepStrictEqual(readImageDimensions(png), { width: 640, height: 480, format: 'png' });
+  assert.strictEqual(readImageDimensions(Buffer.from('<html>')), null);
+  assert.strictEqual(readImageDimensions(jpeg.subarray(0, 12)), null);
+
+  console.log('check 16 ok: models module (name rule = engine parser; class edits; split = forge splits.json 51/12/0 on 63 images; health; COCO/header/splits writers; key gating; JPEG/PNG dimensions; org-first roots)');
 }
 
 async function main(): Promise<void> {
@@ -862,6 +1052,7 @@ async function main(): Promise<void> {
   await testOrgCredentialsModule();
   testPackageHasNoCloudSdk();
   testLambdaBundleHasNoMqtt();
+  testModelsModule();
   console.log(`\nplatform smoke: all checks passed; catalogVersion=${platformCatalogPayload.catalogVersion} nodes=${platformCatalogPayload.nodes.length}`);
 }
 

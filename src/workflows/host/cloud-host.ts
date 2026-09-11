@@ -21,7 +21,8 @@ import {
   type WorkflowDefinition,
 } from '@xorgate/workflow-engine';
 import { emitVisualizationVideos, parseModelName } from '@xorgate/workflow-engine/local';
-import { downloadModel, resolveModel } from '../models/store';
+import { downloadModel, resolveModelIn } from '../models/store';
+import { modelRootsFor } from '../models/registry';
 import { getNodeType, platformCatalog } from '../catalog';
 import {
   failureOutcome,
@@ -218,19 +219,24 @@ export function cloudHost(options: CloudHostOptions): CloudHost {
         await unlink(localPath).catch(() => {});
       },
       // `name` may carry a version pin (`yolov8n@2`, the package's model-ref
-      // rule); the registry resolves it, else the newest version. Cached per
-      // (family, name@version) for the host's lifetime, so a warm session's
-      // second job skips the download.
+      // rule); the registry resolves it, else the newest version, walking the
+      // ROOT CHAIN `[org-models/<orgId>/, models/]` when the run manifest
+      // names its organization (xorgate-models design §4e; the local host's
+      // `--models-dir` order and the secret reader's org-first order). Cached
+      // per (org root, family, name@version) for the host's lifetime, so a
+      // warm session's second job skips the download and two organizations
+      // sharing a session never see each other's model.
       fetchModel({ family, name }) {
         const ref = parseModelName(family, name);
-        const cacheKey = `${ref.family}/${ref.name}@${ref.version ?? 'latest'}`;
+        const roots = modelRootsFor(manifest.orgId);
+        const cacheKey = `${roots[0]}${ref.family}/${ref.name}@${ref.version ?? 'latest'}`;
         let entry = modelCache.get(cacheKey);
         if (!entry) {
           entry = (async () => {
-            const manifest = await resolveModel(s3Client(), bucket, ref.family, ref.name, ref.version);
-            const modelPath = await downloadModel(s3Client(), bucket, manifest, workDir);
-            log(`fetched model ${ref.family}/${ref.name} v${manifest.version} -> ${modelPath}`);
-            return { manifest, modelPath };
+            const resolved = await resolveModelIn(s3Client(), bucket, ref.family, ref.name, ref.version, roots);
+            const modelPath = await downloadModel(s3Client(), bucket, resolved.manifest, workDir, resolved.root);
+            log(`fetched model ${ref.family}/${ref.name} v${resolved.manifest.version} from ${resolved.root} -> ${modelPath}`);
+            return { manifest: resolved.manifest, modelPath };
           })();
           entry.catch(() => modelCache.delete(cacheKey));
           modelCache.set(cacheKey, entry);

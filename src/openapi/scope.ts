@@ -87,6 +87,11 @@ export const OUT_OF_SCOPE_PATH_PREFIXES: readonly string[] = [
   '/organization-credentials',
   '/devices/{id}/workflows',
   '/devices/{id}/workflow-runs',
+  // xorgate-models (plans/xorgate-models): the datasets, training and
+  // registry surface is Phase 1 and moving; documented when it settles (M6).
+  '/datasets',
+  '/training-jobs',
+  '/models',
 ];
 
 /**

@@ -804,6 +804,191 @@ export const workflowEvents = pgTable(
   ],
 );
 
+// --- Models (xorgate-models plan, M2): datasets, items, annotations, imports,
+// versions, and the organization model registry. Design §4b. Status columns
+// are text (not pgEnum) for the same aws-data-api reason as every other table.
+// Keys under datasets/<datasetId>/ and org-models/<orgId>/ carry ids, not
+// tenancy; the organization comes from the row (datasets.organization_id, or
+// the dataset join for items, imports and versions).
+
+// A labeled image collection. `classes` is the ordered class list
+// [{ id, name, color }]: ids are stable so a rename never touches annotations;
+// the order is the future `classNames` order of every version built from it.
+export const datasets = pgTable(
+  'datasets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    name: text('name').notNull(),
+    slug: text('slug').notNull(),
+    description: text('description'),
+    task: text('task').default('object_detection').notNull(),
+    classes: jsonb('classes').default([]).notNull(),
+    itemCount: integer('item_count').default(0).notNull(),
+    labeledCount: integer('labeled_count').default(0).notNull(),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('datasets_org_slug_idx').on(t.organizationId, t.slug)],
+);
+
+// One image. `sha256` is unique per dataset (duplicates are reported at
+// register time, never stored twice); `groupKey` drives the group-based split
+// (a recording session minute); `status`: unlabeled | ai_labeled | labeled |
+// excluded. Hard delete only while no version references the item; otherwise
+// it flips to `excluded` and stays out of every later version.
+export const datasetItems = pgTable(
+  'dataset_items',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    datasetId: uuid('dataset_id')
+      .references(() => datasets.id, { onDelete: 'cascade' })
+      .notNull(),
+    s3Key: text('s3_key').notNull(),
+    width: integer('width').notNull(),
+    height: integer('height').notNull(),
+    bytes: integer('bytes').notNull(),
+    sha256: text('sha256').notNull(),
+    // { kind: upload | recording | run_capture, deviceId?, sessionId?, segmentSeq?, ts?, runId?, nodeId?, filename? }
+    source: jsonb('source').default({}).notNull(),
+    groupKey: text('group_key'),
+    status: text('status').default('unlabeled').notNull(),
+    labeledByUserId: text('labeled_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    labeledAt: timestamp('labeled_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('dataset_items_dataset_sha256_idx').on(t.datasetId, t.sha256),
+    index('dataset_items_dataset_status_idx').on(t.datasetId, t.status),
+  ],
+);
+
+// One box. The single internal representation is absolute xyxy in source
+// pixels; the COCO writer converts to xywh at version time. `source`: human |
+// model | import; `sourceRef` names the model ref or the import id.
+export const datasetAnnotations = pgTable(
+  'dataset_annotations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    itemId: uuid('item_id')
+      .references(() => datasetItems.id, { onDelete: 'cascade' })
+      .notNull(),
+    classId: text('class_id').notNull(),
+    x1: doublePrecision('x1').notNull(),
+    y1: doublePrecision('y1').notNull(),
+    x2: doublePrecision('x2').notNull(),
+    y2: doublePrecision('y2').notNull(),
+    source: text('source').default('human').notNull(),
+    sourceRef: text('source_ref'),
+    confidence: doublePrecision('confidence'),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index('dataset_annotations_item_idx').on(t.itemId)],
+);
+
+// A recording-frame import job (design §4f). `status`: queued | running |
+// succeeded | failed. `dispatchedAt` is the SQS dispatcher's atomic claim
+// (same shape as workflow_runs); `progress` carries the resume cursor when the
+// import chunks across invocations.
+export const datasetImports = pgTable(
+  'dataset_imports',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    datasetId: uuid('dataset_id')
+      .references(() => datasets.id, { onDelete: 'cascade' })
+      .notNull(),
+    kind: text('kind').default('recording').notNull(),
+    params: jsonb('params').default({}).notNull(),
+    status: text('status').default('queued').notNull(),
+    progress: jsonb('progress').default({}).notNull(),
+    itemsAdded: integer('items_added').default(0).notNull(),
+    error: text('error'),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index('dataset_imports_dataset_idx').on(t.datasetId)],
+);
+
+// A frozen, self-contained forge dataset v1 under datasets/<id>/versions/<n>/.
+// `status`: building | ready | failed; immutable once ready. `classNames` is
+// the frozen class order (COCO category id = index), `stats` per split and
+// class, `health` the warnings the health check produced.
+export const datasetVersions = pgTable(
+  'dataset_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    datasetId: uuid('dataset_id')
+      .references(() => datasets.id, { onDelete: 'cascade' })
+      .notNull(),
+    version: integer('version').notNull(),
+    message: text('message'),
+    splitConfig: jsonb('split_config').default({}).notNull(),
+    classNames: jsonb('class_names').default([]).notNull(),
+    stats: jsonb('stats'),
+    health: jsonb('health'),
+    s3Prefix: text('s3_prefix').notNull(),
+    status: text('status').default('building').notNull(),
+    error: text('error'),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
+    readyAt: timestamp('ready_at', { withTimezone: true }),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('dataset_versions_dataset_version_idx').on(t.datasetId, t.version)],
+);
+
+// The organization's model registry rows: one per published
+// org-models/<orgId>/<family>/<name>/<version>/. The source of truth for the
+// picker and lineage; platform (first-party) models stay S3-listed and are not
+// rows. `status`: ready | archived. `provenance`: { jobId, datasetVersionId,
+// recipe, base, metrics, trainedAt } (filled by M3's finalizer).
+export const orgModels = pgTable(
+  'org_models',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    family: text('family').notNull(),
+    name: text('name').notNull(),
+    version: integer('version').notNull(),
+    label: text('label'),
+    manifest: jsonb('manifest').notNull(),
+    s3Prefix: text('s3_prefix').notNull(),
+    status: text('status').default('ready').notNull(),
+    provenance: jsonb('provenance'),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('org_models_org_family_name_version_idx').on(t.organizationId, t.family, t.name, t.version),
+    index('org_models_org_family_idx').on(t.organizationId, t.family),
+  ],
+);
+
 export type User = InferSelectModel<typeof users>;
 export type NewUser = InferInsertModel<typeof users>;
 export type Organization = InferSelectModel<typeof organizations>;
@@ -850,6 +1035,18 @@ export type WorkflowRunStep = InferSelectModel<typeof workflowRunSteps>;
 export type NewWorkflowRunStep = InferInsertModel<typeof workflowRunSteps>;
 export type WorkflowEvent = InferSelectModel<typeof workflowEvents>;
 export type NewWorkflowEvent = InferInsertModel<typeof workflowEvents>;
+export type Dataset = InferSelectModel<typeof datasets>;
+export type NewDataset = InferInsertModel<typeof datasets>;
+export type DatasetItem = InferSelectModel<typeof datasetItems>;
+export type NewDatasetItem = InferInsertModel<typeof datasetItems>;
+export type DatasetAnnotation = InferSelectModel<typeof datasetAnnotations>;
+export type NewDatasetAnnotation = InferInsertModel<typeof datasetAnnotations>;
+export type DatasetImport = InferSelectModel<typeof datasetImports>;
+export type NewDatasetImport = InferInsertModel<typeof datasetImports>;
+export type DatasetVersion = InferSelectModel<typeof datasetVersions>;
+export type NewDatasetVersion = InferInsertModel<typeof datasetVersions>;
+export type OrgModel = InferSelectModel<typeof orgModels>;
+export type NewOrgModel = InferInsertModel<typeof orgModels>;
 
 // ---------------------------------------------------------------------------
 // Tombstones (manual/020). Deletes are real — no `deleted_at` on the live

@@ -1754,6 +1754,70 @@ export class XorgateCoreApiStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(workflowSchedulerFn)],
     });
 
+    // --- Models (xorgate-models plan, M2): datasets, items, annotations,
+    // imports, versions, and the organization model registry read. ---
+    // Datasets handler: DB + S3 (presigned POST for uploads, sha256 probe on
+    // register, presigned GETs on list) + SQS (imports and version builds are
+    // queued). Register streams up to 50 objects of up to 20 MiB per call, so
+    // it gets the 30 s API Gateway ceiling and memory for the hash.
+    const datasetsFn = new nodejs.NodejsFunction(this, "DatasetsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "datasets.ts"),
+        "CRUD /datasets(+items, annotations, imports, versions)",
+      ),
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 512,
+      bundling: bundlingWithSdk,
+    });
+    // Merged model read (platform manifests + org_models rows), archive and
+    // delete, presigned downloads. S3 read comes from the shared role's
+    // bucket grant.
+    const modelsFn = new nodejs.NodejsFunction(this, "ModelsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "models.ts"),
+        "GET /models (merged registry), PATCH|DELETE /models/{id}, download",
+      ),
+      timeout: cdk.Duration.seconds(20),
+      memorySize: 256,
+    });
+    // One queue for every Models job kind (import | version_build now; train |
+    // autolabel in M3), the WorkflowRunQueue shape: DLQ after 3 receives, a
+    // visibility timeout past the dispatcher's 15-minute budget.
+    const modelJobDlq = new sqs.Queue(this, "ModelJobDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const modelJobQueue = new sqs.Queue(this, "ModelJobQueue", {
+      visibilityTimeout: cdk.Duration.seconds(960),
+      retentionPeriod: cdk.Duration.days(4),
+      deadLetterQueue: { queue: modelJobDlq, maxReceiveCount: 3 },
+    });
+    modelJobQueue.grantSendMessages(lambdaRole);
+    // The dispatcher claims the owning row (dispatched_at) and runs the job:
+    // a version build copies images server-side and writes the three files;
+    // a recording import downloads segments, samples frames with the ffmpeg
+    // layer and chunks across invocations through the same queue. Full
+    // 15-minute budget, ephemeral storage for a 60 s segment plus its frames.
+    const modelJobDispatchFn = new nodejs.NodejsFunction(this, "ModelJobDispatchFn", {
+      ...standardFnProps(
+        path.join(entryBase, "model-job-dispatch.ts"),
+        "SQS -> claim + run Models jobs (import | version_build)",
+      ),
+      timeout: cdk.Duration.minutes(15),
+      memorySize: 1536,
+      ephemeralStorageSize: cdk.Size.mebibytes(2048),
+      layers: [ffmpegLayer],
+      environment: { ...commonEnv, FFMPEG_PATH: "/opt/bin/ffmpeg" },
+      bundling: bundlingWithSdk,
+    });
+    modelJobDispatchFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(modelJobQueue, {
+        batchSize: 1,
+        reportBatchItemFailures: true,
+      }),
+    );
+    modelJobDispatchFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
+    datasetsFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
+
     const docsFn = new nodejs.NodejsFunction(this, "DocsFn", {
       entry: path.join(entryBase, "docs.ts"),
       handler: "handler",
@@ -1966,6 +2030,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "OrganizationCredentialsInt",
       organizationCredentialsFn,
     );
+    const datasetsInt = new apigwv2int.HttpLambdaIntegration("DatasetsInt", datasetsFn);
+    const modelsInt = new apigwv2int.HttpLambdaIntegration("ModelsInt", modelsFn);
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
     // Inject the API base into the docs Lambda now that the api exists. The
@@ -2417,6 +2483,75 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/workflow-runs",
       methods: [apigwv2.HttpMethod.GET],
       integration: workflowRunsInt,
+    });
+
+    // Models: datasets (xorgate-models M2). Literal segments (`items/uploads`)
+    // are selected ahead of the `{itemId}` variable by the HTTP API.
+    addRoutes({
+      path: "/datasets",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/items",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/items/uploads",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/items/{itemId}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/items/{itemId}/annotations",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/imports",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/imports/{importId}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/versions",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    addRoutes({
+      path: "/datasets/{id}/versions/{version}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: datasetsInt,
+    });
+    // Models: the merged registry read and the org-model lifecycle.
+    addRoutes({
+      path: "/models",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: modelsInt,
+    });
+    addRoutes({
+      path: "/models/{id}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
+      integration: modelsInt,
+    });
+    addRoutes({
+      path: "/models/{id}/download",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: modelsInt,
     });
 
     addRoutes({

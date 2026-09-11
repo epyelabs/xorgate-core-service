@@ -17,8 +17,56 @@ import {
 } from '../schemas/workflows';
 import { computeRequiredCapabilities } from '../services/workflow-capabilities';
 import { upgradeDefinitionSafe, validateDefinitionForPublish } from '@xorgate/workflow-engine';
-import { platformCatalog } from '../workflows/catalog';
+import { getNodeType, platformCatalog } from '../workflows/catalog';
 import { apiHandler } from '../utils/api-handler';
+import { S3Client } from '@aws-sdk/client-s3';
+import { modelRootsFor } from '../workflows/models/registry';
+import { resolveModelIn } from '../workflows/models/store';
+import { parseModelName } from '@xorgate/workflow-engine/local';
+
+const s3 = new S3Client({});
+const BUCKET = process.env.BUCKET_NAME;
+
+export interface PublishWarning {
+  code: 'MODEL_NOT_FOUND';
+  nodeId: string;
+  message: string;
+}
+
+/**
+ * Publish-time WARNINGS (never failures; xorgate-models design §4e): a model
+ * node whose `model` config resolves in neither the organization's registry
+ * root nor the platform root would fail at run time with the same message,
+ * so the editor hears it now. Resolution is the engine host's own
+ * (`resolveModelIn` over `modelRootsFor(orgId)`); a listing error is reported
+ * as the warning text rather than blocking the publish.
+ */
+async function modelWarnings(definition: WorkflowDefinition, orgId: string): Promise<PublishWarning[]> {
+  if (!BUCKET) return [];
+  const warnings: PublishWarning[] = [];
+  const roots = modelRootsFor(orgId);
+  const seen = new Set<string>();
+  for (const node of definition.nodes) {
+    const typeDef = getNodeType(node.type);
+    const family = typeDef?.runtime.modelRef?.family;
+    const model = (node.data?.config as Record<string, unknown> | undefined)?.model;
+    if (!family || typeof model !== 'string' || model.trim() === '') continue;
+    const key = `${family}/${model.trim()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const ref = parseModelName(family, model);
+      await resolveModelIn(s3, BUCKET, ref.family, ref.name, ref.version, roots);
+    } catch (err) {
+      warnings.push({
+        code: 'MODEL_NOT_FOUND',
+        nodeId: node.id,
+        message: `Node "${node.id}": ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+  return warnings;
+}
 
 // Any executor that exposes the drizzle query-builder surface: the root db or a
 // transaction handle (both share .select/.insert/.update/.delete signatures).
@@ -549,7 +597,10 @@ const restHandler = async (
         return buildDetail(tx, freshTemplate);
       });
       if (!detail) return notFound(`Version "${versionId}" not found`);
-      return ok({ template: detail });
+      // ADDITIVE (xorgate-models M2): `warnings` names model refs that resolve
+      // in neither registry root. The publish itself is unaffected.
+      const warnings = await modelWarnings(shape.data, orgId);
+      return ok({ template: detail, warnings });
     }
 
     case 'POST /workflow-templates/{id}/versions/{versionId}/restore': {

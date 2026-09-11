@@ -149,6 +149,9 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
           bucket.arnForObjects('media-sessions/v1/*'),
           bucket.arnForObjects('workflows/v2/*'),
           bucket.arnForObjects('models/*'),
+          // Organization model registry roots (xorgate-models M2, design
+          // §4e): the host resolves org-models/<orgId>/ before models/.
+          bucket.arnForObjects('org-models/*'),
         ],
       }),
     );
@@ -157,7 +160,7 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         sid: 'EngineListModelRegistry',
         actions: ['s3:ListBucket'],
         resources: [bucket.bucketArn],
-        conditions: { StringLike: { 's3:prefix': 'models/*' } },
+        conditions: { StringLike: { 's3:prefix': ['models/*', 'org-models/*'] } },
       }),
     );
     engineTaskRole.addToPolicy(
