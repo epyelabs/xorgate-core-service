@@ -18,7 +18,7 @@ import { datasetS3, deletePrefix, presignGet } from '../services/dataset-store';
  *
  *   GET    /models?family=            platform manifests (S3-listed, 60 s cache) + org_models rows,
  *                                     each tagged { scope: platform | organization }
- *   GET    /models/{id}               an org model with lineage and usage; `platform:<family>/<name>` for a platform entry
+ *   GET    /models/{id}               an org model with lineage and usage; `platform:<family>:<name>` for a platform entry
  *   PATCH  /models/{id}               label, archive / unarchive (admin, owner)
  *   DELETE /models/{id}               409 while any published template version names it (admin, owner)
  *   GET    /models/{id}/download      presigned GETs for manifest.json and model.onnx (member and up, Q13)
@@ -49,12 +49,12 @@ async function platformManifests(): Promise<ModelManifest[]> {
 type OrgModelRow = typeof schema.orgModels.$inferSelect;
 
 function platformId(m: ModelManifest): string {
-  return `platform:${m.family}/${m.name}@${m.version}`;
+  return `platform:${m.family}:${m.name}@${m.version}`;
 }
 
-/** `platform:<family>/<name>[@<version>]` */
+/** `platform:<family>:<name>[@<version>]` (a colon, so the id survives a path segment). */
 function parsePlatformId(id: string): { family: string; name: string; version?: number } | null {
-  const m = /^platform:([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)(?:@(\d+))?$/.exec(id);
+  const m = /^platform:([A-Za-z0-9._-]+):([A-Za-z0-9._-]+)(?:@(\d+))?$/.exec(id);
   if (!m) return null;
   return { family: m[1], name: m[2], ...(m[3] ? { version: Number(m[3]) } : {}) };
 }
