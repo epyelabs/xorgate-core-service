@@ -957,6 +957,58 @@ export const datasetVersions = pgTable(
   (t) => [uniqueIndex('dataset_versions_dataset_version_idx').on(t.datasetId, t.version)],
 );
 
+// A training or assist job on SageMaker (xorgate-models M3, design §4b, §4d).
+// Mirrors `workflow_runs`: the row is the authority, `dispatchedAt` is the
+// dispatcher's atomic claim and `externalRef` is the SageMaker training-job
+// name. The organization sits directly on the row (a dataset version has no
+// workspace). `task`: train | autolabel. `status`: queued | dispatched |
+// running | succeeded | failed | cancelled.
+export const modelTrainingJobs = pgTable(
+  'model_training_jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    // Both nullable: a `train` job names a version, an `autolabel` job names
+    // only the dataset. The dataset is kept on every row so a job survives in
+    // the list view without a version join.
+    datasetId: uuid('dataset_id').references(() => datasets.id, { onDelete: 'set null' }),
+    datasetVersionId: uuid('dataset_version_id').references(() => datasetVersions.id, { onDelete: 'set null' }),
+    task: text('task').default('train').notNull(),
+    recipe: text('recipe').default('yolov8').notNull(),
+    // { kind: pretrained | weights, ref?, path? } for train; null for autolabel.
+    base: jsonb('base'),
+    // The forge job spec v1 exactly as it was written to training/<id>/job/job.json.
+    spec: jsonb('spec').default({}).notNull(),
+    mode: text('mode'),
+    target: text('target').default('cpu').notNull(),
+    // { instanceType, spot, volumeSizeGb, maxMinutes, maxRuntimeSeconds }
+    compute: jsonb('compute').default({}).notNull(),
+    status: text('status').default('queued').notNull(),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
+    externalRef: text('external_ref'),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    billableSeconds: integer('billable_seconds'),
+    // The last progress line seen plus the phase, so a list row can show it.
+    progress: jsonb('progress').default({}).notNull(),
+    metrics: jsonb('metrics'),
+    artifacts: jsonb('artifacts'),
+    error: text('error'),
+    outputModelId: uuid('output_model_id'),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index('model_training_jobs_org_status_idx').on(t.organizationId, t.status),
+    uniqueIndex('model_training_jobs_external_ref_idx').on(t.externalRef),
+  ],
+);
+
 // The organization's model registry rows: one per published
 // org-models/<orgId>/<family>/<name>/<version>/. The source of truth for the
 // picker and lineage; platform (first-party) models stay S3-listed and are not
@@ -1047,6 +1099,8 @@ export type DatasetVersion = InferSelectModel<typeof datasetVersions>;
 export type NewDatasetVersion = InferInsertModel<typeof datasetVersions>;
 export type OrgModel = InferSelectModel<typeof orgModels>;
 export type NewOrgModel = InferInsertModel<typeof orgModels>;
+export type ModelTrainingJob = InferSelectModel<typeof modelTrainingJobs>;
+export type NewModelTrainingJob = InferInsertModel<typeof modelTrainingJobs>;
 
 // ---------------------------------------------------------------------------
 // Tombstones (manual/020). Deletes are real — no `deleted_at` on the live

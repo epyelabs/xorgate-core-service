@@ -49,9 +49,18 @@
  *      categories, xywh boxes and a header whose counts match; key gating
  *      refuses climbs and foreign prefixes; header-byte dimensions for JPEG
  *      and PNG; the host's root chain is org-first
+ *  17. xorgate-models training module (M3): the forge job spec v1 builders
+ *      against the frozen examples; the CreateTrainingJob request (channels,
+ *      checkpoints, stopping condition, spot, isolation, tags) and the
+ *      instance allow-list refusal; the job-name round trip; the finalize
+ *      mapping over the real result.json examples incl. the identity and
+ *      sha256 refusal paths; the labels file -> annotation rows; the tar
+ *      reader against an archive tar(1) wrote
  */
 import { strict as assert } from 'node:assert';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { gunzipSync } from 'node:zlib';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
@@ -136,6 +145,29 @@ import {
   slugifyDatasetName,
   splitCounts,
   type DatasetClass,
+} from '../src/models';
+import {
+  buildAutolabelJobSpec,
+  buildCreateTrainingJobRequest,
+  buildTrainJobSpec,
+  checkManifestIdentity,
+  instanceTypeError,
+  jobArtifactsPrefix,
+  jobIdFromSagemakerName,
+  jobModelTarKey,
+  jobRowUpdateFromResult,
+  jobSpecKey,
+  labelsToAnnotationRows,
+  listTarEntries,
+  maxMinutesError,
+  maxRuntimeSeconds,
+  publishCandidate,
+  sagemakerJobName,
+  summarizeProgress,
+  tarEntryBytes,
+  isSafeTarPath,
+  forgeLabelsSchema,
+  forgeResultSchema,
 } from '../src/models';
 import { modelRootsFor } from '../src/workflows/models/registry';
 
@@ -874,6 +906,8 @@ function testLambdaBundleHasNoMqtt(): void {
     'src/handlers/datasets.ts',
     'src/handlers/models.ts',
     'src/handlers/model-job-dispatch.ts',
+    'src/handlers/training-jobs.ts',
+    'src/handlers/model-job-finalize.ts',
     'src/handlers/workflow-templates.ts',
   ]) {
     const out = esbuild.buildSync({ entryPoints: [path.join(__dirname, '..', entry)], bundle: true, platform: 'node', target: 'node20', write: false, external: externals, logLevel: 'silent' });
@@ -881,11 +915,13 @@ function testLambdaBundleHasNoMqtt(): void {
     assert.ok(!/require\(["']mqtt["']\)/.test(text), `${entry} bundle requires mqtt (live-ingest leaked into a Lambda bundle)`);
     // The Models handlers that never touch the engine (datasets, dispatch) are
     // held to the mqtt/optional-deps rule only.
-    const usesEngine = !/datasets\.ts$|model-job-dispatch\.ts$/.test(entry);
+    const usesEngine = !/datasets\.ts$|model-job-dispatch\.ts$|training-jobs\.ts$/.test(entry);
     if (usesEngine) assert.ok(/require\(["']@xorgate\/workflow-engine["']\)/.test(text), `${entry} bundle should require the engine package externally`);
     assert.ok(!/require\(["']onnxruntime-node["']\)/.test(text) && !/require\(["']@anthropic-ai\/sdk["']\)/.test(text), `${entry} bundle must not require the package's optional deps directly`);
   }
-  console.log('check 15 ok: Lambda handler bundles (engine, catalog, simulations, datasets, models, model-job-dispatch, templates) require the engine package externally and never mqtt');
+  console.log(
+    'check 15 ok: Lambda handler bundles (engine, catalog, simulations, datasets, models, model-job-dispatch, training-jobs, model-job-finalize, templates) require the engine package externally and never mqtt',
+  );
 }
 
 // --- 16. xorgate-models pure module -----------------------------------------------
@@ -1036,6 +1072,370 @@ function testModelsModule(): void {
   console.log('check 16 ok: models module (name rule = engine parser; class edits; split = forge splits.json 51/12/0 on 63 images; health; COCO/header/splits writers; key gating; JPEG/PNG dimensions; org-first roots)');
 }
 
+
+// --- 17. xorgate-models training module (M3) ---------------------------------------
+// The two result documents are the forge's own committed examples
+// (contracts/examples/result-train.json and result-autolabel.json at
+// xorgate-model-forge 4a500a9), trimmed to what this service reads; the labels
+// document is contracts/examples/autolabel-output.json with the platform's own
+// item ids in place of the example's.
+const FORGE_RESULT_TRAIN = {
+  resultVersion: 1,
+  jobId: 'tj_01J9X4M2K8',
+  task: 'train',
+  recipe: 'yolov8',
+  status: 'succeeded',
+  startedAt: '2026-09-12T14:10:02.000Z',
+  endedAt: '2026-09-12T14:41:37.000Z',
+  durationMs: 1895000,
+  dataset: { classes: ['forklift', 'pallet'], images: { train: 330, val: 82, test: 0 }, instances: { forklift: 512, pallet: 903 } },
+  base: { kind: 'pretrained', ref: 'yolov8n' },
+  hyperparameters: { epochs: 50, imgsz: 640, batch: 16, patience: 10, seed: 0 },
+  epochsCompleted: 37,
+  metrics: {
+    mAP50: 0.912,
+    mAP50_95: 0.664,
+    precision: 0.905,
+    recall: 0.881,
+    perClass: [
+      { name: 'forklift', mAP50: 0.951, precision: 0.93, recall: 0.92, instances: 96 },
+      { name: 'pallet', mAP50: 0.873, precision: 0.88, recall: 0.84, instances: 181 },
+    ],
+  },
+  model: { family: 'detection', name: 'yard-forklift', version: 2, dir: 'model/detection/yard-forklift/2' },
+  check: {
+    ok: true,
+    lines: [
+      'manifest   ok   detection/yard-forklift v2, yolov8, 2 classes, 640x640 nchw rgb',
+      'model      ok   model.onnx 11.6 MB, sha256 recorded in manifest.json',
+    ],
+  },
+  artifacts: {
+    trainLog: 'train.log',
+    weights: 'weights/best.pt',
+    eval: { metrics: 'eval/metrics.json', confusion: 'eval/confusion.json', samples: ['eval/samples/0.jpg'] },
+  },
+  provenance: { orgId: 'cb1e1710-3ee5-49ad-b3d3-32b2290f6e19', datasetVersionId: 'dv_01J9X0B2R4' },
+  error: null,
+};
+
+const FORGE_RESULT_AUTOLABEL = {
+  resultVersion: 1,
+  jobId: 'tj_01J9X5A1P0',
+  task: 'autolabel',
+  recipe: 'yolov8',
+  status: 'succeeded',
+  startedAt: '2026-09-10T16:01:35.089Z',
+  endedAt: '2026-09-10T16:01:36.318Z',
+  durationMs: 1229,
+  dataset: { classes: ['car', 'truck'], images: { train: 51, val: 12, test: 0 }, instances: {} },
+  artifacts: { labels: 'labels.json' },
+  labels: { file: 'labels.json', images: 63, boxes: 108, perClass: { car: 92, truck: 16 }, unmapped: { train: 1 } },
+  provenance: { orgId: 'cb1e1710-3ee5-49ad-b3d3-32b2290f6e19', datasetId: '6b1c1d8e-5f0a-4c1e-9a7d-2f3e4b5c6d7e' },
+  error: null,
+};
+
+const FORGE_PROGRESS_JSONL = [
+  '{"t":"status","at":"2026-09-12T14:10:02.000Z","status":"running","phase":"prepare"}',
+  '{"t":"log","at":"2026-09-12T14:10:05.120Z","line":"materialized yolo layout: 330 train, 82 val images, 2 classes"}',
+  '{"t":"status","at":"2026-09-12T14:10:06.000Z","status":"running","phase":"train"}',
+  '{"t":"epoch","at":"2026-09-12T14:10:48.300Z","epoch":1,"epochs":50,"loss":2.314,"mAP50":0.102}',
+  '{"t":"epoch","at":"2026-09-12T14:11:29.900Z","epoch":2,"epochs":50,"loss":1.871,"mAP50":0.318}',
+  '{"t":"epoch","at":"2026-09-12T14:12:10.0', // a partial line, as a live sync leaves one
+].join('\n');
+
+function testTrainingModule(): void {
+  const jobId = 'b4f3b974-e533-4653-a27e-40c3ee874ef9';
+  const orgId = '1d2b4514-7408-4234-af5f-83b9451575ea';
+
+  // Job names round-trip, and another stage's or another tool's name is refused.
+  assert.strictEqual(sagemakerJobName('dev', jobId), `xorgate-forge-dev-${jobId}`);
+  assert.strictEqual(jobIdFromSagemakerName('dev', `xorgate-forge-dev-${jobId}`), jobId);
+  assert.strictEqual(jobIdFromSagemakerName('prod', `xorgate-forge-dev-${jobId}`), null);
+  assert.strictEqual(jobIdFromSagemakerName('dev', 'pytorch-training-2026-09-12-20-00-00-000'), null);
+  assert.strictEqual(jobIdFromSagemakerName('dev', 'xorgate-forge-dev-not-a-uuid'), null);
+  assert.ok(sagemakerJobName('dev', jobId).length <= 63, 'SageMaker job names are at most 63 characters');
+
+  // Guardrails (Q6).
+  assert.strictEqual(instanceTypeError('cpu', 'ml.m5.xlarge'), null);
+  assert.match(instanceTypeError('cpu', 'ml.p5.48xlarge') ?? '', /not allowed for the cpu target/);
+  assert.match(instanceTypeError('gpu', 'ml.m5.xlarge') ?? '', /not allowed for the gpu target/);
+  assert.strictEqual(instanceTypeError('gpu', 'ml.g4dn.xlarge'), null);
+  assert.strictEqual(maxMinutesError(60), null);
+  assert.match(maxMinutesError(241) ?? '', /at most 240/);
+  assert.match(maxMinutesError(0) ?? '', /positive integer/);
+  // The startup allowance never exceeds the job's own budget, so maxMinutes 1
+  // asks SageMaker for a two-minute ceiling and not a twelve-minute one.
+  assert.strictEqual(maxRuntimeSeconds(1), 120);
+  assert.strictEqual(maxRuntimeSeconds(60), 60 * 60 + 600);
+  assert.strictEqual(maxRuntimeSeconds(240), 240 * 60 + 600);
+
+  // Job spec v1: the shape the forge's frozen schema describes.
+  const trainSpec = buildTrainJobSpec({
+    jobId,
+    recipe: 'yolov8',
+    output: { family: 'detection', name: 'fixture-vehicles', version: 2, label: 'Fixture vehicles v2' },
+    base: { kind: 'pretrained', ref: 'yolov8n' },
+    mode: 'fast',
+    hyperparameters: { epochs: 3, imgsz: 320 },
+    maxMinutes: 30,
+    provenance: { orgId, datasetId: 'ds-1', datasetVersion: 1, datasetVersionId: 'dv-1', requestedBy: 'u-1' },
+  });
+  assert.deepStrictEqual(trainSpec.output, { family: 'detection', name: 'fixture-vehicles', version: 2, label: 'Fixture vehicles v2' });
+  assert.deepStrictEqual(trainSpec.base, { kind: 'pretrained', ref: 'yolov8n', path: null });
+  assert.deepStrictEqual(trainSpec.hyperparameters, { epochs: 3, imgsz: 320 });
+  assert.deepStrictEqual(trainSpec.limits, { maxMinutes: 30 });
+  assert.strictEqual(trainSpec.specVersion, 1);
+  assert.strictEqual(trainSpec.task, 'train');
+  assert.deepStrictEqual(trainSpec.provenance, {
+    orgId,
+    datasetId: 'ds-1',
+    datasetVersion: 1,
+    datasetVersionId: 'dv-1',
+    requestedBy: 'u-1',
+  });
+  const autoSpec = buildAutolabelJobSpec({
+    jobId,
+    recipe: 'yolov8',
+    model: { family: 'detection', name: 'yolov8n@1' },
+    minConfidence: 0.4,
+    classMap: { truck: 'lorry' },
+    maxMinutes: 30,
+    provenance: { orgId, datasetId: 'ds-1' },
+  });
+  assert.strictEqual(autoSpec.task, 'autolabel');
+  assert.strictEqual(autoSpec.images, 'all');
+  assert.deepStrictEqual(autoSpec.classMap, { truck: 'lorry' });
+  // An empty classMap is omitted rather than written as {}: identity mapping.
+  assert.strictEqual(
+    'classMap' in buildAutolabelJobSpec({ jobId, recipe: 'yolov8', model: { family: 'detection', name: 'yolov8n' }, minConfidence: 0.4, classMap: {}, maxMinutes: 5, provenance: { orgId, datasetId: 'ds-1' } }),
+    false,
+  );
+
+  // CreateTrainingJob: channels, output, checkpoints, stopping condition, spot,
+  // isolation and tags, against the forge's own /opt/ml contract.
+  const request = buildCreateTrainingJobRequest({
+    stage: 'dev',
+    jobId,
+    orgId,
+    bucket: 'xorgate-core-dev',
+    imageUri: '111910761410.dkr.ecr.us-east-1.amazonaws.com/xorgate-model-forge-dev:0.1.0',
+    roleArn: 'arn:aws:iam::111910761410:role/XorgateForgeExecutionRoleDev',
+    target: 'cpu',
+    instanceType: 'ml.m5.xlarge',
+    spot: false,
+    maxMinutes: 30,
+    datasetPrefix: 'datasets/ds-1/versions/1/',
+  });
+  assert.strictEqual(request.TrainingJobName, `xorgate-forge-dev-${jobId}`);
+  assert.deepStrictEqual(request.AlgorithmSpecification.ContainerEntrypoint, ['xmf']);
+  assert.deepStrictEqual(request.AlgorithmSpecification.ContainerArguments, [
+    'run',
+    '/opt/ml/input/data/job/job.json',
+    '--host',
+    'sagemaker',
+  ]);
+  assert.deepStrictEqual(
+    request.InputDataConfig.map((c) => [c.ChannelName, c.DataSource.S3DataSource.S3Uri]),
+    [
+      ['dataset', 's3://xorgate-core-dev/datasets/ds-1/versions/1/'],
+      ['job', `s3://xorgate-core-dev/training/${jobId}/job/`],
+    ],
+  );
+  // The job spec's own prefix holds nothing else, or the channel would sweep
+  // in output/ and checkpoints/ as well.
+  assert.strictEqual(jobSpecKey(jobId), `training/${jobId}/job/job.json`);
+  assert.strictEqual(request.OutputDataConfig.S3OutputPath, `s3://xorgate-core-dev/training/${jobId}/output/`);
+  assert.deepStrictEqual(request.CheckpointConfig, {
+    S3Uri: `s3://xorgate-core-dev/training/${jobId}/checkpoints/`,
+    LocalPath: '/opt/ml/checkpoints',
+  });
+  assert.strictEqual(request.StoppingCondition.MaxRuntimeInSeconds, 30 * 60 + 600);
+  assert.strictEqual(request.StoppingCondition.MaxWaitTimeInSeconds, undefined);
+  assert.strictEqual(request.EnableManagedSpotTraining, false);
+  assert.strictEqual(request.EnableNetworkIsolation, true);
+  assert.strictEqual(request.ResourceConfig.InstanceCount, 1);
+  assert.deepStrictEqual(request.Tags.map((t) => t.Key).sort(), ['xorgate:jobId', 'xorgate:orgId', 'xorgate:stage']);
+  const spotRequest = buildCreateTrainingJobRequest({
+    stage: 'dev',
+    jobId,
+    orgId,
+    bucket: 'b',
+    imageUri: 'i',
+    roleArn: 'r',
+    target: 'gpu',
+    instanceType: 'ml.g4dn.xlarge',
+    spot: true,
+    maxMinutes: 60,
+    datasetPrefix: 'datasets/ds-1/versions/1/',
+    modelsRoot: `org-models/${orgId}/`,
+  });
+  assert.strictEqual(spotRequest.EnableManagedSpotTraining, true);
+  assert.strictEqual(spotRequest.StoppingCondition.MaxWaitTimeInSeconds, spotRequest.StoppingCondition.MaxRuntimeInSeconds);
+  assert.strictEqual(spotRequest.InputDataConfig[2].ChannelName, 'models');
+  assert.strictEqual(spotRequest.InputDataConfig[2].DataSource.S3DataSource.S3Uri, `s3://b/org-models/${orgId}/`);
+  // An instance outside the allow-list never becomes a request.
+  assert.throws(
+    () =>
+      buildCreateTrainingJobRequest({
+        stage: 'dev',
+        jobId,
+        orgId,
+        bucket: 'b',
+        imageUri: 'i',
+        roleArn: 'r',
+        target: 'gpu',
+        instanceType: 'ml.p4d.24xlarge',
+        spot: true,
+        maxMinutes: 60,
+        datasetPrefix: 'p/',
+      }),
+    /not allowed for the gpu target/,
+  );
+
+  // Where SageMaker leaves the output tarball.
+  assert.strictEqual(
+    jobModelTarKey(jobId, `xorgate-forge-dev-${jobId}`),
+    `training/${jobId}/output/xorgate-forge-dev-${jobId}/output/model.tar.gz`,
+  );
+
+  // Progress: the partial last line is counted, never thrown on.
+  const progress = summarizeProgress(FORGE_PROGRESS_JSONL);
+  assert.strictEqual(progress.skipped, 1);
+  assert.strictEqual(progress.phase, 'train');
+  assert.strictEqual(progress.epoch, 2);
+  assert.strictEqual(progress.epochs, 50);
+  assert.strictEqual(progress.lastEpochMap50, 0.318);
+  assert.match(progress.lastLine ?? '', /materialized yolo layout/);
+  assert.strictEqual(progress.lines.length, 5);
+
+  // Result v1 parses, and the publish gate agrees with the requested identity.
+  const trainResult = forgeResultSchema.parse(FORGE_RESULT_TRAIN);
+  const requested = { family: 'detection', name: 'yard-forklift', version: 2 };
+  const candidate = publishCandidate(trainResult, requested);
+  assert.ok(candidate.ok, 'the example result should publish');
+  assert.strictEqual(candidate.value.manifestPath, 'model/detection/yard-forklift/2/manifest.json');
+  assert.strictEqual(candidate.value.onnxPath, 'model/detection/yard-forklift/2/model.onnx');
+  const wrongName = publishCandidate(trainResult, { family: 'detection', name: 'other', version: 2 });
+  assert.ok(!wrongName.ok && /the job asked for detection\/other v2/.test(wrongName.error));
+  const failedCheck = publishCandidate({ ...trainResult, check: { ok: false, lines: ['model bad'] } }, requested);
+  assert.ok(!failedCheck.ok && /own model check did not pass/.test(failedCheck.error));
+  const noModel = publishCandidate({ ...trainResult, model: undefined }, requested);
+  assert.ok(!noModel.ok && /no model block/.test(noModel.error));
+
+  // Manifest identity and the sha256 of the bytes actually in the tar.
+  const sha = 'a'.repeat(64);
+  const manifest = { family: 'detection', name: 'yard-forklift', version: 2, files: { 'model.onnx': { sha256: sha, sizeBytes: 11 } } };
+  assert.ok(checkManifestIdentity(manifest, requested, sha, 11).ok);
+  const wrongSha = checkManifestIdentity(manifest, requested, 'b'.repeat(64), 11);
+  assert.ok(!wrongSha.ok && /does not match manifest.json/.test(wrongSha.error));
+  const wrongSize = checkManifestIdentity(manifest, requested, sha, 12);
+  assert.ok(!wrongSize.ok && /12 bytes, manifest.json says 11/.test(wrongSize.error));
+  const wrongIdentity = checkManifestIdentity({ ...manifest, version: 3 }, requested, sha, 11);
+  assert.ok(!wrongIdentity.ok && /manifest.json says detection\/yard-forklift v3/.test(wrongIdentity.error));
+  const noFiles = checkManifestIdentity({ family: 'detection', name: 'yard-forklift', version: 2 }, requested, sha, 11);
+  assert.ok(!noFiles.ok && /no files\["model.onnx"\].sha256/.test(noFiles.error));
+
+  // Result -> row columns, for both tasks and for a failure.
+  const endedAt = new Date('2026-09-12T14:41:37.000Z');
+  const trainUpdate = jobRowUpdateFromResult(trainResult, { endedAt, artifactPrefix: jobArtifactsPrefix(jobId) });
+  assert.strictEqual(trainUpdate.status, 'succeeded');
+  assert.strictEqual((trainUpdate.metrics as { mAP50: number }).mAP50, 0.912);
+  assert.strictEqual((trainUpdate.metrics as { epochsCompleted: number }).epochsCompleted, 37);
+  assert.strictEqual((trainUpdate.artifacts as { prefix: string }).prefix, `training/${jobId}/artifacts/`);
+  assert.strictEqual(trainUpdate.error, null);
+  const autoUpdate = jobRowUpdateFromResult(forgeResultSchema.parse(FORGE_RESULT_AUTOLABEL), {
+    endedAt,
+    artifactPrefix: jobArtifactsPrefix(jobId),
+  });
+  assert.strictEqual(autoUpdate.status, 'succeeded');
+  assert.strictEqual((autoUpdate.metrics as { labels: { boxes: number } }).labels.boxes, 108);
+  const failedUpdate = jobRowUpdateFromResult(
+    forgeResultSchema.parse({ ...FORGE_RESULT_TRAIN, status: 'failed', error: { phase: 'train', message: 'out of memory' } }),
+    { endedAt, artifactPrefix: jobArtifactsPrefix(jobId) },
+  );
+  assert.strictEqual(failedUpdate.status, 'failed');
+  assert.strictEqual(failedUpdate.error, 'train: out of memory');
+  assert.strictEqual((failedUpdate.progress as { phase: string }).phase, 'train');
+
+  // Labels file -> annotation rows. Boxes clamp into the image; an unknown
+  // class and an image the dataset no longer holds are counted, not fatal.
+  const itemA = '11111111-1111-4111-8111-111111111111';
+  const itemB = '22222222-2222-4222-8222-222222222222';
+  const gone = '33333333-3333-4333-8333-333333333333';
+  const labels = forgeLabelsSchema.parse({
+    labelsVersion: 1,
+    jobId,
+    model: { family: 'detection', name: 'yolov8n', version: 1 },
+    minConfidence: 0.4,
+    classMap: { truck: 'lorry' },
+    images: [
+      { id: itemA, boxes: [{ cls: 'car', modelCls: 'car', confidence: 0.71, xyxy: [-5, 10, 2000, 400] }] },
+      { id: itemA, boxes: [] },
+      { id: itemB, boxes: [{ cls: 'unicorn', modelCls: 'unicorn', confidence: 0.9, xyxy: [1, 1, 2, 2] }] },
+      { id: gone, boxes: [{ cls: 'car', modelCls: 'car', confidence: 0.5, xyxy: [1, 1, 2, 2] }] },
+    ],
+    summary: { images: 4, boxes: 3, perClass: { car: 2 }, unmapped: {} },
+  });
+  const mapped = labelsToAnnotationRows(labels, {
+    classIdByName: new Map([['car', 'c_car0000'], ['lorry', 'c_lorry000']]),
+    itemSizeById: new Map([
+      [itemA, { width: 1280, height: 720 }],
+      [itemB, { width: 1280, height: 720 }],
+    ]),
+    sourceRef: 'detection/yolov8n@1',
+  });
+  assert.strictEqual(mapped.boxes, 1);
+  assert.deepStrictEqual(mapped.labeledItemIds, [itemA]);
+  assert.deepStrictEqual(mapped.unknownClasses, ['unicorn']);
+  assert.deepStrictEqual(mapped.unknownImages, [gone]);
+  assert.deepStrictEqual(
+    { x1: mapped.rows[0].x1, y1: mapped.rows[0].y1, x2: mapped.rows[0].x2, y2: mapped.rows[0].y2 },
+    { x1: 0, y1: 10, x2: 1280, y2: 400 },
+  );
+  assert.strictEqual(mapped.rows[0].source, 'model');
+  assert.strictEqual(mapped.rows[0].sourceRef, 'detection/yolov8n@1');
+
+  // The tar reader, against an archive tar(1) wrote (what SageMaker ships).
+  const tarDir = mkdtempSync(path.join(tmpdir(), 'smoke-tar-'));
+  try {
+    const deep = path.join(tarDir, 'model', 'detection', 'fixture-vehicles', '1');
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(path.join(tarDir, 'result.json'), JSON.stringify(FORGE_RESULT_TRAIN));
+    writeFileSync(path.join(deep, 'model.onnx'), Buffer.from('onnx-bytes'));
+    writeFileSync(path.join(deep, 'manifest.json'), JSON.stringify(manifest));
+    const tgz = path.join(tarDir, 'model.tar.gz');
+    // COPYFILE_DISABLE: macOS bsdtar otherwise adds an AppleDouble `._x`
+    // entry next to every file, which is noise, not a reader problem.
+    const res = spawnSync('tar', ['-czf', tgz, '-C', tarDir, 'result.json', 'model'], {
+      encoding: 'utf8',
+      env: { ...process.env, COPYFILE_DISABLE: '1' },
+    });
+    assert.strictEqual(res.status, 0, `tar: ${res.stderr}`);
+    const buf = gunzipSync(readFileSync(tgz));
+    const entries = listTarEntries(buf).filter((e) => e.type === 'file');
+    const names = entries.map((e) => e.name).sort();
+    assert.deepStrictEqual(names, [
+      'model/detection/fixture-vehicles/1/manifest.json',
+      'model/detection/fixture-vehicles/1/model.onnx',
+      'result.json',
+    ]);
+    const onnx = entries.find((e) => e.name.endsWith('model.onnx'))!;
+    assert.strictEqual(tarEntryBytes(buf, onnx).toString('utf8'), 'onnx-bytes');
+    const resultEntry = entries.find((e) => e.name === 'result.json')!;
+    assert.strictEqual(forgeResultSchema.parse(JSON.parse(tarEntryBytes(buf, resultEntry).toString('utf8'))).jobId, 'tj_01J9X4M2K8');
+    assert.strictEqual(isSafeTarPath('model/detection/x/1/model.onnx'), true);
+    assert.strictEqual(isSafeTarPath('../escape'), false);
+    assert.strictEqual(isSafeTarPath('/abs'), false);
+  } finally {
+    rmSync(tarDir, { recursive: true, force: true });
+  }
+
+  console.log(
+    'check 17 ok: training module (job spec v1 builders; CreateTrainingJob channels/checkpoints/spot/isolation/tags + allow-list refusal; job-name round trip; progress tail with a partial line; publish gate + manifest identity and sha256 refusals; result -> row; labels -> annotation rows; tar reader over a real tar(1) archive)',
+  );
+}
+
 async function main(): Promise<void> {
   testServedCatalog();
   testSchemaComposition();
@@ -1053,6 +1453,7 @@ async function main(): Promise<void> {
   testPackageHasNoCloudSdk();
   testLambdaBundleHasNoMqtt();
   testModelsModule();
+  testTrainingModule();
   console.log(`\nplatform smoke: all checks passed; catalogVersion=${platformCatalogPayload.catalogVersion} nodes=${platformCatalogPayload.nodes.length}`);
 }
 

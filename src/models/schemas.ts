@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { CLASS_NAME_MAX, DATASET_NAME_MAX, MODEL_NAME_MAX } from './names';
 import { MAX_CLASSES } from './classes';
 import { IMAGE_CONTENT_TYPES, MAX_IMPORT_FRAMES } from './keys';
+import { DEFAULT_MAX_MINUTES, MAX_MAX_MINUTES, RECIPES, TRAINING_MODES, TRAINING_TARGETS } from './training';
 
 /**
  * Request bodies of the Models API (design §4c). Server-side contract; the
@@ -105,10 +106,60 @@ export const patchModelSchema = z.object({
   status: z.enum(['ready', 'archived']).optional(),
 });
 
-/** What `ModelJobQueue` carries. M3 adds `train | autolabel`. */
+// --- training and assist (M3, design §4c) ------------------------------------------
+
+const hyperparametersSchema = z.object({
+  epochs: z.number().int().min(1).max(1000).optional(),
+  imgsz: z.number().int().min(32).max(1920).optional(),
+  batch: z.union([z.literal('auto'), z.number().int().min(1).max(256)]).optional(),
+  patience: z.number().int().min(0).max(1000).optional(),
+  seed: z.number().int().min(0).max(2 ** 31 - 1).optional(),
+});
+
+export const createTrainingJobSchema = z.object({
+  datasetVersionId: z.string().uuid(),
+  recipe: z.enum(RECIPES).default('yolov8'),
+  /** Phase 1 trains from a recipe base only; `weights` (train-from-previous) is Phase 2. */
+  base: z
+    .object({ kind: z.literal('pretrained').default('pretrained'), ref: z.string().min(1).max(64) })
+    .default({ kind: 'pretrained', ref: 'yolov8n' }),
+  output: z.object({
+    name: z.string().min(1).max(MODEL_NAME_MAX),
+    label: z.string().trim().max(120).optional(),
+    /** Omitted: the next free version of that name in the organization. */
+    version: z.number().int().min(1).max(10_000).optional(),
+  }),
+  mode: z.enum(TRAINING_MODES).default('fast'),
+  hyperparameters: hyperparametersSchema.optional(),
+  target: z.enum(TRAINING_TARGETS).default('cpu'),
+  instanceType: z.string().min(1).max(40).optional(),
+  spot: z.boolean().optional(),
+  limits: z.object({ maxMinutes: z.number().int().min(1).max(MAX_MAX_MINUTES).default(DEFAULT_MAX_MINUTES) }).default({
+    maxMinutes: DEFAULT_MAX_MINUTES,
+  }),
+});
+
+export const createAssistSchema = z.object({
+  /** A registry name, resolved org-first then platform (`yolov8n`, `my-model@2`). */
+  model: z.string().min(1).max(MODEL_NAME_MAX + 8),
+  family: z.string().min(1).max(40).default('detection'),
+  minConfidence: z.number().min(0).max(1).default(0.4),
+  /** model class name -> dataset class name; unmapped model classes are counted, not written. */
+  classMap: z.record(z.string().min(1).max(CLASS_NAME_MAX), z.string().min(1).max(CLASS_NAME_MAX)).optional(),
+  /** Which items to label. `unlabeled` (default) never touches a human-labeled item. */
+  items: z.enum(['unlabeled', 'all']).default('unlabeled'),
+  maxItems: z.number().int().min(1).max(500).optional(),
+  target: z.enum(TRAINING_TARGETS).default('cpu'),
+  instanceType: z.string().min(1).max(40).optional(),
+  limits: z.object({ maxMinutes: z.number().int().min(1).max(MAX_MAX_MINUTES).default(30) }).default({ maxMinutes: 30 }),
+});
+
+/** What `ModelJobQueue` carries. */
 export const modelJobMessageSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('import'), importId: z.string().uuid(), cursor: z.number().int().min(0).optional() }),
   z.object({ kind: z.literal('version_build'), versionId: z.string().uuid() }),
+  z.object({ kind: z.literal('train'), jobId: z.string().uuid() }),
+  z.object({ kind: z.literal('autolabel'), jobId: z.string().uuid() }),
 ]);
 export type ModelJobMessage = z.infer<typeof modelJobMessageSchema>;
 

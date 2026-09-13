@@ -18,6 +18,7 @@ import * as iot from "aws-cdk-lib/aws-iot";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import { Construct } from "constructs";
 import * as fs from "fs";
@@ -1818,6 +1819,200 @@ export class XorgateCoreApiStack extends cdk.Stack {
     modelJobDispatchFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
     datasetsFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
 
+    // --- Models M3: training and assist jobs on SageMaker ---------------------
+    // The forge image lives in a repo of this account, retagged out of band
+    // from ghcr.io/epyelabs/xmf (the same discipline as engine-runner). The
+    // name and the URI are literals so the execution role's ECR grant and the
+    // dispatcher's env var never create a construct dependency.
+    const forgeRepoName = isProd
+      ? "xorgate-model-forge"
+      : "xorgate-model-forge-dev";
+    const forgeImageTag = this.node.tryGetContext("forgeImageTag") ?? "0.1.0";
+    const forgeImageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${forgeRepoName}:${forgeImageTag}`;
+    new ecr.Repository(this, "ForgeRepo", {
+      repositoryName: forgeRepoName,
+      // The image is pushed by hand and rolled back by retagging; keep both
+      // tags around, and expire nothing automatically.
+      imageScanOnPush: false,
+      emptyOnDelete: false,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // The role SageMaker assumes to run a forge container. It reaches exactly
+    // three prefixes of the core bucket and nothing else: no database, no
+    // secrets, no IoT. Design §4d.
+    const forgeExecutionRoleName = isProd
+      ? "XorgateForgeExecutionRole"
+      : "XorgateForgeExecutionRoleDev";
+    const forgeExecutionRoleArn = `arn:aws:iam::${this.account}:role/${forgeExecutionRoleName}`;
+    const forgeExecutionRole = new iam.Role(this, "ForgeExecutionRole", {
+      roleName: forgeExecutionRoleName,
+      assumedBy: new iam.ServicePrincipal("sagemaker.amazonaws.com"),
+      description:
+        "Execution role for xorgate-model-forge SageMaker training jobs (datasets read, training write)",
+    });
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ForgeEcrPull",
+        actions: [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+        ],
+        resources: [
+          `arn:aws:ecr:${this.region}:${this.account}:repository/${forgeRepoName}`,
+        ],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        // GetAuthorizationToken has no resource-level scoping.
+        sid: "ForgeEcrAuth",
+        actions: ["ecr:GetAuthorizationToken"],
+        resources: ["*"],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ForgeLogs",
+        actions: [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams",
+        ],
+        resources: [
+          `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/sagemaker/TrainingJobs*`,
+        ],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        // Training metrics; the action has no resource-level scoping.
+        sid: "ForgeMetrics",
+        actions: ["cloudwatch:PutMetricData"],
+        resources: ["*"],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ForgeReadInputs",
+        actions: ["s3:GetObject"],
+        resources: [
+          `arn:aws:s3:::${bucket.bucketName}/datasets/*`,
+          `arn:aws:s3:::${bucket.bucketName}/training/*`,
+          `arn:aws:s3:::${bucket.bucketName}/org-models/*`,
+          `arn:aws:s3:::${bucket.bucketName}/models/*`,
+        ],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        // Only the job's own tree: the output tarball and the synced
+        // checkpoints directory (progress.jsonl).
+        sid: "ForgeWriteOutputs",
+        actions: ["s3:PutObject"],
+        resources: [`arn:aws:s3:::${bucket.bucketName}/training/*`],
+      }),
+    );
+    forgeExecutionRole.addToPolicy(
+      new iam.PolicyStatement({
+        // S3Prefix channels list before they download.
+        sid: "ForgeListInputs",
+        actions: ["s3:ListBucket"],
+        resources: [`arn:aws:s3:::${bucket.bucketName}`],
+        conditions: {
+          StringLike: {
+            "s3:prefix": [
+              "datasets/*",
+              "training/*",
+              "org-models/*",
+              "models/*",
+            ],
+          },
+        },
+      }),
+    );
+
+    // The shared Lambda role starts, stops and describes forge jobs, and may
+    // pass the forge execution role to SageMaker and to nothing else. Literal
+    // ARNs (shared-role rule).
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ForgeTrainingJobs",
+        actions: [
+          "sagemaker:CreateTrainingJob",
+          "sagemaker:StopTrainingJob",
+          "sagemaker:DescribeTrainingJob",
+          "sagemaker:AddTags",
+        ],
+        resources: [
+          `arn:aws:sagemaker:${this.region}:${this.account}:training-job/xorgate-forge-${stage}-*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ForgePassRole",
+        actions: ["iam:PassRole"],
+        resources: [forgeExecutionRoleArn],
+        conditions: {
+          StringEquals: { "iam:PassedToService": "sagemaker.amazonaws.com" },
+        },
+      }),
+    );
+
+    // Training-jobs API: start, list, detail (progress tail + artifact index),
+    // cancel, presigned artifact reads. Bundles the AWS SDK (SageMaker stop).
+    const trainingJobsFn = new nodejs.NodejsFunction(this, "TrainingJobsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "training-jobs.ts"),
+        "CRUD /training-jobs (+progress, cancel, artifact-url)",
+      ),
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 512,
+      bundling: bundlingWithSdk,
+    });
+
+    // SageMaker state changes -> the row. A terminal event downloads
+    // model.tar.gz, mirrors it into training/<jobId>/artifacts/ and publishes
+    // the model, so it needs room for the archive in memory and on disk.
+    const modelJobFinalizeFn = new nodejs.NodejsFunction(this, "ModelJobFinalizeFn", {
+      ...standardFnProps(
+        path.join(entryBase, "model-job-finalize.ts"),
+        "SageMaker state change -> finalize a training/assist job",
+      ),
+      timeout: cdk.Duration.minutes(10),
+      memorySize: 3008,
+      ephemeralStorageSize: cdk.Size.mebibytes(2048),
+      bundling: bundlingWithSdk,
+    });
+    new events.Rule(this, "ForgeTrainingJobStateRule", {
+      description:
+        "SageMaker training job state change (xorgate-forge jobs) -> finalize the row",
+      eventPattern: {
+        source: ["aws.sagemaker"],
+        detailType: ["SageMaker Training Job State Change"],
+        detail: {
+          TrainingJobName: [{ prefix: `xorgate-forge-${stage}-` }],
+        },
+      },
+      targets: [new targets.LambdaFunction(modelJobFinalizeFn)],
+    });
+
+    // The dispatcher writes the job spec and calls CreateTrainingJob; the
+    // training-jobs handler stops one. Both need the image and the role.
+    for (const fn of [modelJobDispatchFn, trainingJobsFn, datasetsFn]) {
+      fn.addEnvironment("FORGE_IMAGE_URI", forgeImageUri);
+      fn.addEnvironment("FORGE_EXECUTION_ROLE_ARN", forgeExecutionRoleArn);
+    }
+    trainingJobsFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
+
+    new cdk.CfnOutput(this, "ForgeRepositoryUri", {
+      value: `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${forgeRepoName}`,
+      description: "ECR repository the forge image is retagged into (out of band)",
+    });
+
     const docsFn = new nodejs.NodejsFunction(this, "DocsFn", {
       entry: path.join(entryBase, "docs.ts"),
       handler: "handler",
@@ -2032,6 +2227,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     const datasetsInt = new apigwv2int.HttpLambdaIntegration("DatasetsInt", datasetsFn);
     const modelsInt = new apigwv2int.HttpLambdaIntegration("ModelsInt", modelsFn);
+    const trainingJobsInt = new apigwv2int.HttpLambdaIntegration(
+      "TrainingJobsInt",
+      trainingJobsFn,
+    );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
 
     // Inject the API base into the docs Lambda now that the api exists. The
@@ -2542,6 +2741,33 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/datasets/{id}/versions/{version}/artifact-url",
       methods: [apigwv2.HttpMethod.GET],
       integration: datasetsInt,
+    });
+    // Models: assist (an autolabel job on the dataset's own items).
+    addRoutes({
+      path: "/datasets/{id}/assist",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: datasetsInt,
+    });
+    // Models: training and assist jobs (M3).
+    addRoutes({
+      path: "/training-jobs",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: trainingJobsInt,
+    });
+    addRoutes({
+      path: "/training-jobs/{id}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: trainingJobsInt,
+    });
+    addRoutes({
+      path: "/training-jobs/{id}/cancel",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: trainingJobsInt,
+    });
+    addRoutes({
+      path: "/training-jobs/{id}/artifact-url",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: trainingJobsInt,
     });
     // Models: the merged registry read and the org-model lifecycle.
     addRoutes({

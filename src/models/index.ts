@@ -15,3 +15,6 @@ export * from './keys';
 export * from './image-dimensions';
 export * from './schemas';
 export * from './version';
+export * from './training';
+export * from './forge-result';
+export * from './tar';

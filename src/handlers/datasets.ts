@@ -24,6 +24,7 @@ import {
   VERSION_FILES,
 } from '../models/keys';
 import {
+  createAssistSchema,
   createDatasetSchema,
   createImportSchema,
   createUploadsSchema,
@@ -45,6 +46,9 @@ import { prepareVersionFromDb } from '../services/dataset-version-build';
 import { refreshItemCount } from '../services/dataset-import';
 import { enqueueModelJob } from '../services/model-jobs';
 import { findOrgSessions } from '../services/media-session-input';
+import { buildAutolabelJobSpec, RECIPE_LICENSES } from '../models/training';
+import { activeJobsForOrg, chooseCompute, concurrencyMessage, resolveAssistModel, toJobResponse } from '../services/training-jobs';
+import { closeJob } from '../services/training-finalize';
 
 /**
  * Datasets API (xorgate-models design §4c; all routes -> this Lambda):
@@ -57,6 +61,7 @@ import { findOrgSessions } from '../services/media-session-input';
  *   GET|PUT    /datasets/{id}/items/{itemId}/annotations  PUT = replace-all + item status, If-Match on the item's etag
  *   GET|POST   /datasets/{id}/imports                     recording-frame import jobs (SQS)
  *   GET        /datasets/{id}/imports/{importId}
+ *   POST       /datasets/{id}/assist                      an `autolabel` job on SageMaker (admin, owner)
  *   GET|POST   /datasets/{id}/versions                    POST = health-checked, then built async (SQS)
  *   GET        /datasets/{id}/versions/{version}
  *   GET        /datasets/{id}/versions/{version}/artifact-url?key=   presigned GET gated to the version prefix
@@ -73,6 +78,8 @@ const BUCKET = process.env.BUCKET_NAME;
 const UPLOAD_EXPIRES_SECONDS = 15 * 60;
 const WRITE_ROLES: MembershipRole[] = ['owner', 'admin', 'member'];
 const DELETE_ROLES: MembershipRole[] = ['owner', 'admin'];
+/** Assist jobs cost money, so they take the training gate, not the annotate gate (Q5). */
+const ASSIST_ROLES: MembershipRole[] = ['owner', 'admin'];
 
 type DatasetRow = typeof schema.datasets.$inferSelect;
 type ItemRow = typeof schema.datasetItems.$inferSelect;
@@ -661,6 +668,92 @@ const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayPro
       });
       if (!row) return notFound(`Import "${importId}" not found`);
       return ok({ import: toImport(row) });
+    }
+
+    case 'POST /datasets/{id}/assist': {
+      // An assist run costs money like a training run, so it takes the same
+      // role gate and the same one-job-per-organization guardrail (Q5, Q6).
+      if (!ASSIST_ROLES.includes(auth.membershipRole)) {
+        return errorResponse(403, 'FORBIDDEN', 'Only an admin or owner can start an assist job');
+      }
+      const parsed = createAssistSchema.safeParse(safeJson(event.body));
+      if (!parsed.success) return badRequest(parsed.error.issues[0]?.message ?? 'Invalid body');
+      const body = parsed.data;
+      if (classes.length === 0) return badRequest('The dataset has no classes');
+      const active = await activeJobsForOrg(orgId);
+      if (active.length > 0) {
+        return errorResponse(409, 'TRAINING_JOB_IN_FLIGHT', concurrencyMessage(active), { jobs: active.map((j) => j.id) });
+      }
+      const compute = chooseCompute({
+        target: body.target,
+        instanceType: body.instanceType,
+        spot: false, // an assist run is minutes; a spot interruption would cost more than it saves
+        maxMinutes: body.limits.maxMinutes,
+      });
+      if ('error' in compute) return badRequest(compute.error);
+      const model = await resolveAssistModel(BUCKET, orgId, body.family, body.model);
+      if ('error' in model) return errorResponse(400, 'MODEL_NOT_FOUND', model.error, { model: body.model });
+      // The classMap names DATASET classes on the right; a name the dataset
+      // does not carry would be refused by the forge minutes later instead.
+      const classNames = new Set(classes.map((c) => c.name));
+      const unknown = Object.values(body.classMap ?? {}).filter((n) => !classNames.has(n));
+      if (unknown.length > 0) {
+        return badRequest(`classMap names class(es) this dataset does not have: ${unknown.join(', ')} (classes: ${[...classNames].join(', ')})`);
+      }
+      const eligibleStatuses = body.items === 'all' ? ['unlabeled', 'ai_labeled', 'labeled'] : ['unlabeled', 'ai_labeled'];
+      const [{ eligible }] = await db
+        .select({ eligible: sql<number>`count(*)::int` })
+        .from(schema.datasetItems)
+        .where(and(eq(schema.datasetItems.datasetId, dataset.id), inArray(schema.datasetItems.status, eligibleStatuses)));
+      if (Number(eligible) === 0) return conflict('No item matches the assist filter');
+
+      const jobId = randomUUID();
+      const spec = {
+        ...buildAutolabelJobSpec({
+          jobId,
+          recipe: 'yolov8',
+          model: { family: body.family, name: `${model.name}@${model.version}` },
+          minConfidence: body.minConfidence,
+          classMap: body.classMap,
+          maxMinutes: compute.maxMinutes,
+          provenance: { orgId, datasetId: dataset.id, requestedBy: auth.userId ?? null },
+        }),
+        // Platform-only block the forge ignores: what the dispatcher needs to
+        // build the scratch dataset the `dataset` channel points at.
+        platform: { items: body.items, maxItems: body.maxItems ?? 500 },
+      };
+      const [row] = await db
+        .insert(schema.modelTrainingJobs)
+        .values({
+          id: jobId,
+          organizationId: orgId,
+          datasetId: dataset.id,
+          task: 'autolabel',
+          recipe: 'yolov8',
+          spec,
+          target: compute.target,
+          compute,
+          status: 'queued',
+          progress: { phase: 'queued' },
+          // The registry root the model resolved in becomes the `models` channel.
+          artifacts: { modelsRoot: model.root },
+          createdByUserId: auth.userId,
+        })
+        .returning();
+      try {
+        await enqueueModelJob({ kind: 'autolabel', jobId: row.id });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await closeJob(row.id, 'failed', { error: `enqueue failed: ${message}` });
+        return errorResponse(502, 'ASSIST_DISPATCH_FAILED', 'Failed to queue the assist job', { jobId: row.id, message });
+      }
+      return created({
+        job: toJobResponse(row, {
+          recipeLicense: RECIPE_LICENSES.yolov8,
+          model: { family: body.family, name: model.name, version: model.version, root: model.root, classNames: model.classNames },
+          eligibleItems: Number(eligible),
+        }),
+      });
     }
 
     case 'GET /datasets/{id}/versions': {

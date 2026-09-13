@@ -2,14 +2,16 @@ import type { Context, SQSBatchResponse, SQSEvent } from 'aws-lambda';
 import { modelJobMessageSchema } from '../models/schemas';
 import { runRecordingImport } from '../services/dataset-import';
 import { buildDatasetVersion } from '../services/dataset-version-build';
+import { dispatchTrainingJob } from '../services/training-dispatch';
 
 /**
  * `ModelJobQueue` consumer (xorgate-models design §4d). SQS event source,
  * batchSize 1, reportBatchItemFailures. The message names the row that owns
  * the job (`{ kind: 'import', importId, cursor? }` or
  * `{ kind: 'version_build', versionId }`); the job re-reads the row and claims
- * it atomically (`dispatched_at IS NULL`), so a redelivery is a no-op. M3 adds
- * `train | autolabel` here.
+ * it atomically (`dispatched_at IS NULL`), so a redelivery is a no-op.
+ * `train` and `autolabel` write the job spec to S3 and call
+ * `CreateTrainingJob`; the EventBridge finalizer closes those rows.
  *
  * The import needs the ffmpeg layer (FFMPEG_PATH) and the function's full
  * 15-minute budget; it chunks across invocations through the queue when a
@@ -45,6 +47,10 @@ export const handler = async (event: SQSEvent, context: Context): Promise<SQSBat
           break;
         case 'version_build':
           await buildDatasetVersion(bucket, message.versionId, log);
+          break;
+        case 'train':
+        case 'autolabel':
+          await dispatchTrainingJob(bucket, message.jobId, log);
           break;
       }
     } catch (err) {
