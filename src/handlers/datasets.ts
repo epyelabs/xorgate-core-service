@@ -358,8 +358,11 @@ const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayPro
         parsed.status ? eq(schema.datasetItems.status, parsed.status) : undefined,
         sourceKind ? sql`${schema.datasetItems.source}->>'kind' = ${sourceKind}` : undefined,
         groupKey ? eq(schema.datasetItems.groupKey, groupKey) : undefined,
+        // `${schema.datasetItems}.id`, not `${schema.datasetItems.id}`: drizzle
+        // renders a single-table query's columns unqualified, so the latter
+        // became `a.item_id = "id"`, the annotation's own id (M4 finding).
         classFilter
-          ? sql`exists (select 1 from dataset_annotations a where a.item_id = ${schema.datasetItems.id} and a.class_id = ${classFilter})`
+          ? sql`exists (select 1 from dataset_annotations a where a.item_id = ${schema.datasetItems}.id and a.class_id = ${classFilter})`
           : undefined,
       ];
       const where = and(...conditions);
@@ -367,7 +370,7 @@ const restHandler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayPro
       const rows = await db
         .select({
           item: schema.datasetItems,
-          annotationCount: sql<number>`(select count(*)::int from dataset_annotations a where a.item_id = ${schema.datasetItems.id})`,
+          annotationCount: sql<number>`(select count(*)::int from dataset_annotations a where a.item_id = ${schema.datasetItems}.id)`,
         })
         .from(schema.datasetItems)
         .where(where)
