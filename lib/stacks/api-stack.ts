@@ -2083,7 +2083,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
           "X-Request-ID",
           "X-Organization-Id",
           "X-Workspace-Id",
+          // The annotator's optimistic-concurrency token on
+          // PUT /datasets/{id}/items/{itemId}/annotations (xorgate-models
+          // M4). Without it the browser's preflight fails and the PUT never
+          // leaves the page; curl (the M2 E2E) sends no preflight.
+          "If-Match",
         ],
+        exposeHeaders: ["ETag"],
         maxAge: cdk.Duration.hours(24),
       },
     });

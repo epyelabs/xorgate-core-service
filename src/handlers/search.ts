@@ -21,7 +21,7 @@ import { apiHandler } from '../utils/api-handler';
 // templates) filter by organizationId; workspace-owned tables (devices, runs)
 // filter by workspaceId IN <the org's workspaces>.
 
-type SearchResultType = 'device' | 'workflow-template' | 'workflow-instance';
+type SearchResultType = 'device' | 'workflow-template' | 'workflow-instance' | 'dataset' | 'model';
 
 interface SearchResult {
   type: SearchResultType;
@@ -61,7 +61,7 @@ const restHandler = async (
   const orgWorkspaceIds = await resolveWorkspaceScope(auth);
   const hasWorkspaces = orgWorkspaceIds.length > 0;
 
-  const [devices, templates, runs] = await Promise.all([
+  const [devices, templates, runs, datasets, orgModels] = await Promise.all([
     // Devices (workspace-owned): match name or serial.
     hasWorkspaces
       ? db.query.devices.findMany({
@@ -132,6 +132,37 @@ const restHandler = async (
           .orderBy(desc(schema.workflowRuns.startedAt))
           .limit(PER_TYPE_LIMIT)
       : Promise.resolve([]),
+
+    // Datasets and organization models (xorgate-models M4): org-scoped like
+    // templates, and suppressed for a workspace-scoped token for the same
+    // reason. Platform models are not rows and are not searched here; the
+    // registry page lists them.
+    isWorkspaceScoped(auth)
+      ? Promise.resolve([])
+      : db.query.datasets.findMany({
+          where: and(
+            eq(schema.datasets.organizationId, auth.organizationId),
+            or(
+              ilike(schema.datasets.name, pat),
+              ilike(schema.datasets.slug, pat),
+              ilike(schema.datasets.description, pat),
+            ),
+          ),
+          columns: { id: true, name: true, slug: true, itemCount: true },
+          orderBy: [desc(schema.datasets.updatedAt)],
+          limit: PER_TYPE_LIMIT,
+        }),
+    isWorkspaceScoped(auth)
+      ? Promise.resolve([])
+      : db.query.orgModels.findMany({
+          where: and(
+            eq(schema.orgModels.organizationId, auth.organizationId),
+            or(ilike(schema.orgModels.name, pat), ilike(schema.orgModels.label, pat)),
+          ),
+          columns: { id: true, family: true, name: true, version: true, label: true, status: true },
+          orderBy: [desc(schema.orgModels.updatedAt)],
+          limit: PER_TYPE_LIMIT,
+        }),
   ]);
 
   const results: SearchResult[] = [
@@ -152,6 +183,18 @@ const restHandler = async (
       id: r.id,
       title: r.templateName,
       subtitle: r.deviceName ?? r.serial,
+    })),
+    ...datasets.map((d): SearchResult => ({
+      type: 'dataset',
+      id: d.id,
+      title: d.name,
+      subtitle: `${d.slug} · ${d.itemCount} item${d.itemCount === 1 ? '' : 's'}`,
+    })),
+    ...orgModels.map((m): SearchResult => ({
+      type: 'model',
+      id: m.id,
+      title: m.label ?? m.name,
+      subtitle: `${m.family}/${m.name}@${m.version}${m.status === 'archived' ? ' (archived)' : ''}`,
     })),
   ];
 
