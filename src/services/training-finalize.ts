@@ -3,7 +3,7 @@ import { gunzipSync } from 'node:zlib';
 import type { Readable } from 'node:stream';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, notInArray, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { orgModelPrefix } from '../models/keys';
 import { modelManifestSchema } from '../workflows/models/registry';
@@ -16,7 +16,7 @@ import {
   publishCandidate,
   type ForgeResult,
 } from '../models/forge-result';
-import { jobArtifactsPrefix, jobModelTarKey, type TrainingStatus } from '../models/training';
+import { jobArtifactsPrefix, jobModelTarKey, TERMINAL_TRAINING_STATUSES, type TrainingStatus } from '../models/training';
 import { isSafeTarPath, listTarEntries, tarEntryBytes, type TarEntry } from '../models/tar';
 import { datasetS3, mapBounded } from './dataset-store';
 import { classIdByName, isTerminal } from './training-jobs';
@@ -303,8 +303,36 @@ export async function closeJob(
 }
 
 /**
- * The whole terminal path for one job, idempotent on the row's status: a
- * redelivered state change for an already-closed job does nothing.
+ * Atomic claim on the row: exactly one finalizer invocation proceeds per job.
+ * SageMaker emits more than one state-change event at completion (the M4
+ * browser pass saw two invocations 150 ms apart, both reading the row as
+ * `running`, both applying the assist labels: every pre-label written twice).
+ * The status check alone is a read-then-act; this is one conditional UPDATE,
+ * so the loser sees zero rows and stops.
+ */
+export async function claimFinalize(jobId: string): Promise<boolean> {
+  const claimedAt = new Date().toISOString();
+  const rows = await db
+    .update(schema.modelTrainingJobs)
+    .set({
+      progress: sql`coalesce(${schema.modelTrainingJobs.progress}, '{}'::jsonb) || jsonb_build_object('finalizeClaimedAt', ${claimedAt}::text)`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(schema.modelTrainingJobs.id, jobId),
+        notInArray(schema.modelTrainingJobs.status, [...TERMINAL_TRAINING_STATUSES]),
+        sql`(${schema.modelTrainingJobs.progress}->>'finalizeClaimedAt') is null`,
+      ),
+    )
+    .returning({ id: schema.modelTrainingJobs.id });
+  return rows.length > 0;
+}
+
+/**
+ * The whole terminal path for one job, idempotent on the row's status and
+ * serialized by `claimFinalize`: a redelivered or duplicated state change for
+ * a job another invocation is closing (or has closed) does nothing.
  */
 export async function finalizeTrainingJob(
   bucket: string,
@@ -314,6 +342,10 @@ export async function finalizeTrainingJob(
 ): Promise<void> {
   if (isTerminal(job.status)) {
     log(`job ${job.id} is already ${job.status}, skipping`);
+    return;
+  }
+  if (!(await claimFinalize(job.id))) {
+    log(`job ${job.id} is being finalized by another invocation, skipping`);
     return;
   }
   const externalRef = job.externalRef;
