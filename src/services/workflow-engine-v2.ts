@@ -170,10 +170,15 @@ export interface DispatchV2Options {
  * then ensure a session task is polling it. Send-before-check ordering closes
  * most of the exit race: a task that is still RUNNING when we look will drain
  * the message we just sent; a task that exited between our send and its final
- * poll leaves the message for the replacement task we then launch. The one
- * residual window (task exits AFTER we saw it RUNNING, message unread until
- * the 15-minute queue retention drops it) strands the run for the watchdog —
- * accepted, same backstop as a lost cold task.
+ * poll leaves the message for the replacement task we then launch. The last
+ * window (task exits AFTER we saw it RUNNING, message unread) is closed by the
+ * session task itself (M6, src/workflows/host/session.ts): on idle-out it
+ * takes one final short receive and then DELETES its queue, so a SendMessage
+ * that lands after that throws (QueueDoesNotExist), and a CreateQueue on the
+ * same name throws for 60 s (QueueDeletedRecently); both surface here as a
+ * warm-path error and the caller takes the cold RunTask path. What remains is
+ * the few milliseconds between that final receive and the delete, backstopped
+ * by the 45-minute watchdog like a lost cold task.
  */
 async function dispatchToWarmSession(runId: string, sessionKey: string): Promise<string> {
   if (!SESSION_QUEUE_PREFIX) throw new Error('warm sessions are not configured (WF_SESSION_QUEUE_PREFIX unset)');
@@ -286,6 +291,9 @@ export async function dispatchV2Run(runId: string, opts: DispatchV2Options): Pro
     } catch (err) {
       console.error('workflow-engine-v2: warm session dispatch failed; falling back to cold RunTask', {
         runId,
+        // QueueDoesNotExist / QueueDeletedRecently here = a session task retired
+        // its queue on idle-out (the M6 exit race closure), not a fault.
+        name: err instanceof Error ? err.name : undefined,
         err: err instanceof Error ? err.message : String(err),
       });
     }

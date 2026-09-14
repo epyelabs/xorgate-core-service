@@ -3,7 +3,7 @@ import type { TrainingStatus } from './training';
 
 /**
  * The forge's READ-side contracts, mirrored as zod (xorgate-model-forge
- * `4a500a9`, `contracts/result.schema.json`, `progress.schema.json`,
+ * `4a500a9` plus the 0.2.0 `metrics.confidence`, `contracts/result.schema.json`, `progress.schema.json`,
  * `labels.schema.json`): what the finalizer parses out of `model.tar.gz` and
  * what `GET /training-jobs/{id}` tails. Pure: no AWS, no DB.
  *
@@ -32,6 +32,13 @@ export const forgeMetricsSchema = z
     precision: z.number(),
     recall: z.number(),
     perClass: z.array(forgePerClassMetricSchema).default([]),
+    /**
+     * The operating confidence (forge 0.2.0, additive): the F1-maximizing
+     * threshold on the validation split, at which precision and recall are
+     * reported. A detection node running the model should use it as its
+     * minimum confidence. Absent from 0.1.0 results.
+     */
+    confidence: z.number().min(0).max(1).nullish(),
   })
   .passthrough();
 
@@ -292,6 +299,7 @@ export function jobRowUpdateFromResult(
           mAP50_95: result.metrics.mAP50_95,
           precision: result.metrics.precision,
           recall: result.metrics.recall,
+          confidence: result.metrics.confidence ?? null,
           perClass: result.metrics.perClass,
           epochsCompleted: result.epochsCompleted ?? null,
           hyperparameters: result.hyperparameters ?? null,

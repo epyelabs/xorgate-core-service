@@ -168,7 +168,15 @@ export async function publishTrainedModel(
     recipe: job.recipe,
     base: job.base ?? null,
     metrics: result.metrics
-      ? { mAP50: result.metrics.mAP50, mAP50_95: result.metrics.mAP50_95, precision: result.metrics.precision, recall: result.metrics.recall }
+      ? {
+          mAP50: result.metrics.mAP50,
+          mAP50_95: result.metrics.mAP50_95,
+          precision: result.metrics.precision,
+          recall: result.metrics.recall,
+          // The operating confidence (forge 0.2.0): what the picker prefills the
+          // detection node's minConfidence with. Null for a 0.1.0 result.
+          confidence: result.metrics.confidence ?? null,
+        }
       : null,
     trainedAt: result.endedAt,
     epochsCompleted: result.epochsCompleted ?? null,

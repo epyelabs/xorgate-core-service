@@ -200,11 +200,13 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
     );
     // M5 warm simulator sessions: a session task long-polls (and drains) its
     // per-editing-session queue. Name-pattern grant, matching the api-stack's
-    // create/send grant on the shared Lambda role.
+    // create/send grant on the shared Lambda role. DeleteQueue (M6): the task
+    // retires its queue on idle-out so a late dispatch fails over to the cold
+    // path instead of enqueueing to a task that is exiting.
     engineTaskRole.addToPolicy(
       new iam.PolicyStatement({
         sid: 'EngineSessionQueuePoll',
-        actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes'],
+        actions: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:DeleteQueue'],
         resources: [
           `arn:aws:sqs:${this.region}:${this.account}:xorgate-wfsim-${stage}-*`,
         ],

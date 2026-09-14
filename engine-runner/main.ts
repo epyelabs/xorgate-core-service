@@ -1,7 +1,7 @@
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { DeleteMessageCommand, ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { DeleteMessageCommand, DeleteQueueCommand, ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import {
   createEngine,
@@ -38,7 +38,10 @@ import { runSessionLoop } from '../src/workflows/host/session';
  * each exactly like a single run (manifest key derives from the runId), and
  * exits 0 after the idle timeout. The host (and its per-model cache) persists
  * across jobs, so a rerun skips the model download AND the container cold
- * start.
+ * start. On idle-out the task takes one last short receive and then DELETES
+ * its queue before exiting (M6): a dispatcher that still saw this task as
+ * RUNNING fails its SendMessage (or its CreateQueue, refused for 60 s after a
+ * delete) and falls back to a cold task instead of stranding the run.
  *
  * Runs the SAME engine as the Lambda handler: `@xorgate/workflow-engine`
  * over the platform's cloud host (src/workflows/host/cloud-host.ts), fargate
@@ -51,6 +54,7 @@ import { runSessionLoop } from '../src/workflows/host/session';
 const DEFAULT_MAX_RUNTIME_SECONDS = 1800; // the production media cap
 const DEFAULT_SESSION_IDLE_SECONDS = 600; // architecture §5: ~10 min idle-out
 const SESSION_POLL_WAIT_SECONDS = 20;
+const SESSION_FINAL_WAIT_SECONDS = 1; // the last short receive before the queue is retired
 
 function log(msg: string): void {
   console.log(`[engine-runner] ${msg}`);
@@ -171,33 +175,43 @@ async function sessionMain(queueUrl: string, bucket: string): Promise<number> {
   const host = buildHost(bucket, workDir); // model cache persists across jobs
   log(`warm session start queue=${queueUrl} idle=${idleSeconds}s`);
 
+  const receive = async (waitSeconds: number) => {
+    const res = await sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 1,
+        WaitTimeSeconds: waitSeconds,
+      }),
+    );
+    const msg = res.Messages?.[0];
+    if (!msg?.Body) return null;
+    // Delete on receipt: a run whose execution crashes is covered by the
+    // watchdog (it always is), and redelivering it to a later session task
+    // would re-run a run the watchdog already failed.
+    if (msg.ReceiptHandle) {
+      await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: msg.ReceiptHandle }));
+    }
+    try {
+      const body = JSON.parse(msg.Body) as { runId?: string };
+      if (typeof body.runId === 'string' && body.runId.length > 0) return { runId: body.runId };
+    } catch {
+      // fall through
+    }
+    log(`ignoring malformed session message: ${msg.Body.slice(0, 200)}`);
+    return null;
+  };
+
   const outcome = await runSessionLoop({
     idleTimeoutMs: idleSeconds * 1000,
     log,
-    receive: async () => {
-      const res = await sqs.send(
-        new ReceiveMessageCommand({
-          QueueUrl: queueUrl,
-          MaxNumberOfMessages: 1,
-          WaitTimeSeconds: SESSION_POLL_WAIT_SECONDS,
-        }),
-      );
-      const msg = res.Messages?.[0];
-      if (!msg?.Body) return null;
-      // Delete on receipt: a run whose execution crashes is covered by the
-      // watchdog (it always is), and redelivering it to a later session task
-      // would re-run a run the watchdog already failed.
-      if (msg.ReceiptHandle) {
-        await sqs.send(new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: msg.ReceiptHandle }));
-      }
-      try {
-        const body = JSON.parse(msg.Body) as { runId?: string };
-        if (typeof body.runId === 'string' && body.runId.length > 0) return { runId: body.runId };
-      } catch {
-        // fall through
-      }
-      log(`ignoring malformed session message: ${msg.Body.slice(0, 200)}`);
-      return null;
+    receive: () => receive(SESSION_POLL_WAIT_SECONDS),
+    receiveFinal: () => receive(SESSION_FINAL_WAIT_SECONDS),
+    retireQueue: async () => {
+      // The queue is per editing session and named deterministically; the
+      // dispatcher recreates it (CreateQueue is idempotent) for the next warm
+      // task once SQS allows the name again (60 s after a delete).
+      await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+      log(`deleted session queue ${queueUrl}`);
     },
     runJob: async (job) => {
       const ok = await executeRun({
@@ -209,7 +223,7 @@ async function sessionMain(queueUrl: string, bucket: string): Promise<number> {
       if (!ok) throw new Error('result.json upload failed');
     },
   });
-  log(`warm session end: ${outcome.jobsRun} job(s), ${outcome.jobFailures} failure(s)`);
+  log(`warm session end: ${outcome.jobsRun} job(s), ${outcome.jobFailures} failure(s), queue ${outcome.queueRetired ? 'retired' : 'left in place'}`);
   return 0;
 }
 

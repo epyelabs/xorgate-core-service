@@ -666,7 +666,62 @@ async function testSessionLoop(): Promise<void> {
   assert.strictEqual(outcome.jobsRun, 3);
   assert.strictEqual(outcome.jobFailures, 1);
   assert.strictEqual(outcome.endedReason, 'idle');
-  console.log('check 8 ok: warm session loop (serial jobs, failure tolerance, idle-out)');
+  assert.strictEqual(outcome.queueRetired, false, 'no retire seam, nothing retired');
+
+  // M6 (the warm-session exit race): on idle-out the loop takes one final
+  // short receive, serves what it finds, and only then retires the queue, so a
+  // dispatcher that enqueues after this point fails its SendMessage and takes
+  // the cold path instead of stranding the run.
+  const trace: string[] = [];
+  const late: Array<{ runId: string } | null> = [{ runId: 'late-1' }, null];
+  let clock2 = 0;
+  const outcome2 = await runSessionLoop({
+    idleTimeoutMs: 100,
+    log: () => {},
+    now: () => clock2,
+    receive: async () => {
+      clock2 += 60;
+      trace.push('receive');
+      return null;
+    },
+    receiveFinal: async () => {
+      trace.push('final');
+      return late.shift() ?? null;
+    },
+    retireQueue: async () => {
+      trace.push('retire');
+    },
+    runJob: async (job) => {
+      trace.push(`run ${job.runId}`);
+    },
+  });
+  // Two empty long polls reach the timeout; the final receive finds late-1 and
+  // serves it (activity resets the idle clock); two more empty polls, an empty
+  // final receive, then retire, then exit.
+  assert.deepStrictEqual(trace, ['receive', 'receive', 'final', 'run late-1', 'receive', 'receive', 'final', 'retire']);
+  assert.strictEqual(outcome2.jobsRun, 1);
+  assert.strictEqual(outcome2.queueRetired, true);
+
+  // A retire failure (the queue already gone, a denied DeleteQueue) is logged
+  // and never keeps the task alive.
+  const logged: string[] = [];
+  let clock3 = 0;
+  const outcome3 = await runSessionLoop({
+    idleTimeoutMs: 100,
+    log: (m) => logged.push(m),
+    now: () => clock3,
+    receive: async () => {
+      clock3 += 100;
+      return null;
+    },
+    retireQueue: async () => {
+      throw new Error('AWS.SimpleQueueService.NonExistentQueue');
+    },
+    runJob: async () => {},
+  });
+  assert.strictEqual(outcome3.queueRetired, false);
+  assert.ok(logged.some((m) => /retire.*NonExistentQueue/.test(m)), logged.join(' | '));
+  console.log('check 8 ok: warm session loop (serial jobs, failure tolerance, idle-out, final receive then queue retire)');
 }
 
 // --- 9. Production dispatch module ---------------------------------------------------
@@ -1097,6 +1152,7 @@ const FORGE_RESULT_TRAIN = {
     mAP50_95: 0.664,
     precision: 0.905,
     recall: 0.881,
+    confidence: 0.35,
     perClass: [
       { name: 'forklift', mAP50: 0.951, precision: 0.93, recall: 0.92, instances: 96 },
       { name: 'pallet', mAP50: 0.873, precision: 0.88, recall: 0.84, instances: 181 },
@@ -1342,6 +1398,12 @@ function testTrainingModule(): void {
   assert.strictEqual(trainUpdate.status, 'succeeded');
   assert.strictEqual((trainUpdate.metrics as { mAP50: number }).mAP50, 0.912);
   assert.strictEqual((trainUpdate.metrics as { epochsCompleted: number }).epochsCompleted, 37);
+  assert.strictEqual((trainUpdate.metrics as { confidence: number }).confidence, 0.35, 'the operating confidence rides into the row');
+  const legacyUpdate = jobRowUpdateFromResult(
+    forgeResultSchema.parse({ ...FORGE_RESULT_TRAIN, metrics: { ...FORGE_RESULT_TRAIN.metrics, confidence: undefined } }),
+    { endedAt, artifactPrefix: jobArtifactsPrefix(jobId) },
+  );
+  assert.strictEqual((legacyUpdate.metrics as { confidence: number | null }).confidence, null, 'a 0.1.0 result (no confidence) still maps');
   assert.strictEqual((trainUpdate.artifacts as { prefix: string }).prefix, `training/${jobId}/artifacts/`);
   assert.strictEqual(trainUpdate.error, null);
   const autoUpdate = jobRowUpdateFromResult(forgeResultSchema.parse(FORGE_RESULT_AUTOLABEL), {

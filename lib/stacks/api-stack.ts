@@ -1827,7 +1827,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const forgeRepoName = isProd
       ? "xorgate-model-forge"
       : "xorgate-model-forge-dev";
-    const forgeImageTag = this.node.tryGetContext("forgeImageTag") ?? "0.1.0";
+    // The forge release the platform runs (xorgate-model-forge CHANGELOG):
+    // 0.2.0 reports the operating confidence in result v1. The tag must exist
+    // in the stage's forge ECR repo before a deploy, or every job fails at
+    // the image pull.
+    const forgeImageTag = this.node.tryGetContext("forgeImageTag") ?? "0.2.0";
     const forgeImageUri = `${this.account}.dkr.ecr.${this.region}.amazonaws.com/${forgeRepoName}:${forgeImageTag}`;
     new ecr.Repository(this, "ForgeRepo", {
       repositoryName: forgeRepoName,
