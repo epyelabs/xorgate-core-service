@@ -12,16 +12,30 @@ import { isTerminal } from '../services/training-jobs';
  * filtered to `xorgate-forge-<stage>-*`, so no other tool's training jobs and
  * no other stage's reach this function.
  *
- *   InProgress                -> the row flips to `running` (once)
+ *   InProgress                -> the row's `progress.phase` follows the
+ *                                SecondaryStatus (EventBridge delivers every
+ *                                transition, about fifteen events per job);
+ *                                the row flips to `running` once the container
+ *                                side starts (Downloading, Training, ...), not
+ *                                while SageMaker is still looking for an
+ *                                instance (Starting, Pending, ...). The M5 pass
+ *                                watched a spot job read "running, started
+ *                                10:47" for 31 minutes with no instance at all.
  *   Completed | Failed        -> extract model.tar.gz, read result.json,
  *                                publish or record the failure, close the row
- *   Stopped                   -> close the row `cancelled`
+ *   Stopped                   -> `cancelled` when this platform asked for the
+ *                                stop (POST /cancel), `failed` with the
+ *                                SecondaryStatus otherwise (MaxWaitTimeExceeded
+ *                                on a spot job that never got capacity)
  *
  * Idempotent on the row's status: a redelivered terminal event for a closed
  * job does nothing. `DescribeTrainingJob` is called on every terminal event
  * because `BillableTimeInSeconds` is the number the cost story rests on and
  * the event does not always carry it.
  */
+
+/** SecondaryStatus values before any container exists (nothing is billed yet). */
+const PRE_INSTANCE_STATUSES = new Set(['Starting', 'Pending', 'LaunchingMLInstances', 'PreparingTrainingStack', 'DownloadingTrainingImage']);
 
 const sagemaker = new SageMakerClient({});
 
@@ -67,18 +81,23 @@ export const handler = async (
   }
 
   if (status === 'InProgress') {
-    if (job.status === 'dispatched' || job.status === 'queued') {
-      await db
-        .update(schema.modelTrainingJobs)
-        .set({
-          status: 'running',
-          startedAt: asDate(event.detail.TrainingStartTime) ?? job.startedAt ?? new Date(),
-          progress: { phase: (event.detail.SecondaryStatus ?? 'Starting').toLowerCase() },
-          updatedAt: new Date(),
-        })
-        .where(eq(schema.modelTrainingJobs.id, job.id));
-      log(`job ${job.id} running (${event.detail.SecondaryStatus ?? 'Starting'})`);
-    }
+    if (isTerminal(job.status)) return;
+    const secondary = event.detail.SecondaryStatus ?? 'Starting';
+    const phase = secondary.toLowerCase();
+    const progress = { ...((job.progress ?? {}) as Record<string, unknown>) };
+    const containerSide = !PRE_INSTANCE_STATUSES.has(secondary);
+    const flip = containerSide && (job.status === 'dispatched' || job.status === 'queued');
+    if (!flip && progress.phase === phase) return;
+    progress.phase = phase;
+    await db
+      .update(schema.modelTrainingJobs)
+      .set({
+        ...(flip ? { status: 'running', startedAt: asDate(event.detail.TrainingStartTime) ?? job.startedAt ?? new Date() } : {}),
+        progress,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.modelTrainingJobs.id, job.id));
+    log(`job ${job.id} ${flip ? 'running' : job.status} (${secondary})`);
     return;
   }
 
@@ -102,6 +121,8 @@ export const handler = async (
   const terminal: TerminalEvent = {
     status,
     failureReason: described?.FailureReason ?? event.detail.FailureReason ?? null,
+    secondaryStatus: described?.SecondaryStatus ?? event.detail.SecondaryStatus ?? null,
+    statusMessage: described?.StatusMessage ?? null,
     billableSeconds: described?.BillableTimeInSeconds ?? event.detail.BillableTimeInSeconds ?? null,
     startedAt: described?.TrainingStartTime ?? asDate(event.detail.TrainingStartTime),
     endedAt: described?.TrainingEndTime ?? asDate(event.detail.TrainingEndTime) ?? new Date(),
@@ -111,8 +132,11 @@ export const handler = async (
 
 async function describe(name: string) {
   const res = await sagemaker.send(new DescribeTrainingJobCommand({ TrainingJobName: name }));
+  const transitions = res.SecondaryStatusTransitions ?? [];
   return {
     FailureReason: res.FailureReason ?? null,
+    SecondaryStatus: res.SecondaryStatus ?? null,
+    StatusMessage: transitions.length > 0 ? (transitions[transitions.length - 1].StatusMessage ?? null) : null,
     BillableTimeInSeconds: res.BillableTimeInSeconds ?? null,
     TrainingStartTime: res.TrainingStartTime ?? null,
     TrainingEndTime: res.TrainingEndTime ?? null,

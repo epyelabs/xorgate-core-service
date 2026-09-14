@@ -42,6 +42,10 @@ const MAX_TAR_BYTES = 1024 * 1024 * 1024;
 export interface TerminalEvent {
   status: 'Completed' | 'Failed' | 'Stopped';
   failureReason?: string | null;
+  /** SageMaker's SecondaryStatus at the terminal event (MaxWaitTimeExceeded, Stopped, ...). */
+  secondaryStatus?: string | null;
+  /** The last SecondaryStatusTransitions message, SageMaker's own words for why. */
+  statusMessage?: string | null;
   billableSeconds?: number | null;
   startedAt?: Date | null;
   endedAt?: Date | null;
@@ -334,6 +338,31 @@ export async function claimFinalize(jobId: string): Promise<boolean> {
  * serialized by `claimFinalize`: a redelivered or duplicated state change for
  * a job another invocation is closing (or has closed) does nothing.
  */
+/**
+ * A `Stopped` training job is `cancelled` only when this platform asked for
+ * the stop (`POST /training-jobs/{id}/cancel` records `stopRequestedAt` before
+ * calling StopTrainingJob). SageMaker also stops jobs on its own: a managed
+ * spot job that never found capacity ends `Stopped / MaxWaitTimeExceeded`,
+ * which the M5 pass saw closed as "cancelled: Stopped" after 31 minutes though
+ * nobody cancelled it. Those close `failed`, with SageMaker's own reason.
+ */
+export function stoppedOutcome(
+  progress: unknown,
+  event: Pick<TerminalEvent, 'failureReason' | 'secondaryStatus' | 'statusMessage'>,
+): { status: 'cancelled' | 'failed'; error: string } {
+  const requested = typeof (progress as { stopRequestedAt?: unknown } | null)?.stopRequestedAt === 'string';
+  if (requested) return { status: 'cancelled', error: 'Cancelled' };
+  const secondary = event.secondaryStatus ?? 'Stopped';
+  if (secondary === 'MaxWaitTimeExceeded') {
+    return {
+      status: 'failed',
+      error: 'No spot instance became available within the wait time (SageMaker MaxWaitTimeExceeded). Retry later, or use the CPU target.',
+    };
+  }
+  const why = event.statusMessage ?? event.failureReason;
+  return { status: 'failed', error: `SageMaker stopped the job before it finished (${secondary}${why ? `: ${why}` : ''})` };
+}
+
 export async function finalizeTrainingJob(
   bucket: string,
   job: typeof schema.modelTrainingJobs.$inferSelect,
@@ -370,13 +399,14 @@ export async function finalizeTrainingJob(
   }
 
   if (event.status === 'Stopped') {
-    await closeJob(job.id, 'cancelled', {
+    const outcome = stoppedOutcome(job.progress, event);
+    await closeJob(job.id, outcome.status, {
       ...common,
-      error: event.failureReason ?? 'Stopped',
-      progress: { phase: 'cancelled' },
+      error: outcome.error,
+      progress: { ...((job.progress ?? {}) as Record<string, unknown>), phase: outcome.status },
       artifacts: out ? { prefix: jobArtifactsPrefix(job.id), files: out.entries.length } : null,
     });
-    log(`job ${job.id} cancelled`);
+    log(`job ${job.id} ${outcome.status}: ${outcome.error}`);
     return;
   }
 
