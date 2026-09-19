@@ -137,6 +137,18 @@ describe('ensureThingScopeAttributes: no-op when already correct', () => {
     expect(await ensureThingScopeAttributes(DEVICE, SCOPE)).toBe('written');
   });
 
+  it('skips the read when the caller already knows (precheck: false)', async () => {
+    // The transfer path: the attributes are being moved on purpose, so the read
+    // has no answer to give and would only sit inside the window between the
+    // config publish and this write.
+    thingWith({ [ORG_ATTRIBUTE]: 'org-1', [WORKSPACE_ATTRIBUTE]: 'ws-new' });
+    expect(
+      await ensureThingScopeAttributes(DEVICE, SCOPE, { precheck: false }),
+    ).toBe('written');
+    expect(iotSend).toHaveBeenCalledTimes(1);
+    expect(iotSend.mock.calls[0][0]).toBeInstanceOf(UpdateThingCommand);
+  });
+
   it('stays best-effort: a failed write is reported, never thrown', async () => {
     iotSend.mockImplementation(async (cmd: unknown) => {
       if (cmd instanceof DescribeThingCommand) return { attributes: {} };

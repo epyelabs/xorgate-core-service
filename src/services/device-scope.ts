@@ -84,6 +84,14 @@ export type ScopeAttributeResult = 'unchanged' | 'written' | 'failed';
  * a path that runs when someone saves settings, and it is the cheaper side of
  * that trade by a wide margin.
  *
+ * `precheck: false` skips the read. It is for the one caller that already knows
+ * the answer — a TRANSFER, where the attributes are being moved on purpose — and
+ * it exists so the read does not sit inside the window between the config
+ * publish and this write, which README §2.2 says must not straddle a slow call.
+ * The read is ~40 ms against a window measured in seconds, so this is tidiness
+ * rather than a fix; every other caller should leave the precheck on, because for
+ * them skipping it is exactly the unconditional `UpdateThing` this replaced.
+ *
  * Best-effort by design — a failure here means the device is refused when it
  * tries the scoped topic and keeps using the legacy one, which is exactly the
  * state it was already in, so turning it into a 5xx on a config save would be
@@ -104,9 +112,12 @@ export type ScopeAttributeResult = 'unchanged' | 'written' | 'failed';
 export async function ensureThingScopeAttributes(
   deviceId: string,
   scope: DeviceScope,
+  opts: { precheck?: boolean } = {},
 ): Promise<ScopeAttributeResult> {
   try {
-    if (await thingScopeMatches(deviceId, scope)) return 'unchanged';
+    if (opts.precheck !== false && (await thingScopeMatches(deviceId, scope))) {
+      return 'unchanged';
+    }
     await iot.send(
       new UpdateThingCommand({
         thingName: deviceId,
