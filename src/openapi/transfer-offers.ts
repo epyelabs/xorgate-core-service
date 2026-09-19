@@ -29,15 +29,15 @@ export const transferOffersPaths = {
       operationId: 'createTransferOffer',
       summary: 'Offer a device to another organization',
       description:
-        'Mints a code that another organization can redeem to take ownership of this device.\\n\\n' +
+        'Mints a code that another organization can redeem to take ownership of this device.\n\n' +
         'Use this when you do NOT share a membership with the destination — a genuine handover ' +
         'to a customer. If you personally hold `owner` or `admin` in both organizations, ' +
-        '`POST /devices/{id}/transfer` with an `organizationId` does the same move in one call.\\n\\n' +
+        '`POST /devices/{id}/transfer` with an `organizationId` does the same move in one call.\n\n' +
         '**The code is a bearer token.** Anyone holding it can read the offer\'s preview and ' +
-        'accept or decline it. Send it over a channel you trust. It expires after 7 days.\\n\\n' +
+        'accept or decline it. Send it over a channel you trust. It expires after 7 days.\n\n' +
         '**Idempotent.** A device has at most one open offer. Calling this again while one is ' +
         'pending returns the existing offer with **200** instead of minting a second claimable ' +
-        'code; a genuinely new offer returns **201**.\\n\\n' +
+        'code; a genuinely new offer returns **201**.\n\n' +
         '`willDetachWorkflowAttachments` names the workflow templates this device is attached ' +
         'to. If the offer is accepted by a different organization they are all detached, ' +
         'because they belong to yours and the new owner cannot see them. It is returned HERE, ' +
@@ -116,12 +116,12 @@ export const transferOffersPaths = {
       summary: 'Transfer offers this organization sent or accepted',
       description:
         'Offers your organization CREATED, plus offers it has already ACCEPTED, newest first. ' +
-        '`direction` tells them apart.\\n\\n' +
+        '`direction` tells them apart.\n\n' +
         '**There is no inbox of incoming pending offers, by design.** An offer names no ' +
         'destination — that is exactly what lets it be handed to an organization whose id the ' +
         'sender does not know — so a pending offer is discoverable only by its code. If someone ' +
         'has offered you a device, you will have been sent a code; read it with ' +
-        '`GET /transfer-offers/{code}`.\\n\\n' +
+        '`GET /transfer-offers/{code}`.\n\n' +
         'Declines are visible here: an offer the destination refused reads `declined` with ' +
         '`resolvedAt` set, rather than quietly expiring.',
       parameters: [
@@ -170,10 +170,10 @@ export const transferOffersPaths = {
       summary: 'Read an offer you were sent a code for',
       description:
         'What the code buys, and nothing else: the device\'s name and model, the offering ' +
-        'organization\'s name, and the offer\'s own status and expiry.\\n\\n' +
+        'organization\'s name, and the offer\'s own status and expiry.\n\n' +
         '**Deliberately absent**: the device id, its serial, its workspace, its configuration ' +
         'and its telemetry. Whoever holds the code is not yet entitled to the device, so the ' +
-        'code must not double as a read primitive against someone else\'s fleet.\\n\\n' +
+        'code must not double as a read primitive against someone else\'s fleet.\n\n' +
         'Any role may read this. Accepting or declining needs `owner` or `admin`.',
       tags: ['TransferOffers'],
       responses: {
@@ -223,10 +223,10 @@ export const transferOffersPaths = {
       summary: 'Take ownership of an offered device',
       description:
         'Moves the device into one of YOUR workspaces and runs the full transfer, including the ' +
-        'cross-organization sweep. Requires `owner` or `admin` in the accepting organization.\\n\\n' +
+        'cross-organization sweep. Requires `owner` or `admin` in the accepting organization.\n\n' +
         'Everything in `POST /devices/{id}/transfer` applies from here on: all historical ' +
         'telemetry and all recorded footage come with the device, the device does not have to be ' +
-        'online, and `transfer.adoption` says whether it has confirmed the change yet.\\n\\n' +
+        'online, and `transfer.adoption` says whether it has confirmed the change yet.\n\n' +
         'Accepting is race-safe: the offer is claimed with a conditional write before the ' +
         'transfer runs, so only one of two simultaneous accepts wins. If the transfer itself ' +
         'fails the offer is put back to `pending` and the code can be retried.',
