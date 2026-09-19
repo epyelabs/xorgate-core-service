@@ -43,7 +43,7 @@ export const transferOffersPaths = {
         'because they belong to yours and the new owner cannot see them. It is returned HERE, ' +
         'at creation, because you are not present when the offer is accepted — this is the last ' +
         'point at which you can reconsider.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       requestBody: {
         required: false,
         content: {
@@ -82,7 +82,7 @@ export const transferOffersPaths = {
       description:
         'Open and resolved offers, newest first. A pending offer past its expiry is flipped to ' +
         '`expired` as it is read, so the status you see is always current.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       responses: {
         '200': {
           description: 'The device\'s offers.',
@@ -136,7 +136,7 @@ export const transferOffersPaths = {
           description: 'Filter by status. Anything else is a 400.',
         },
       ],
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       responses: {
         '200': {
           description: 'Up to 200 offers, newest first.',
@@ -175,7 +175,7 @@ export const transferOffersPaths = {
         'and its telemetry. Whoever holds the code is not yet entitled to the device, so the ' +
         'code must not double as a read primitive against someone else\'s fleet.\n\n' +
         'Any role may read this. Accepting or declining needs `owner` or `admin`.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       responses: {
         '200': {
           description: 'The offer preview.',
@@ -201,7 +201,7 @@ export const transferOffersPaths = {
       description:
         'Only the organization that created the offer can cancel it, and only while it is still ' +
         'pending. An offer belonging to another organization reads as **404**, not 403.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       responses: {
         '204': { description: 'Cancelled. The code no longer works.' },
         '401': { $ref: '#/components/responses/Unauthorized' },
@@ -230,7 +230,7 @@ export const transferOffersPaths = {
         'Accepting is race-safe: the offer is claimed with a conditional write before the ' +
         'transfer runs, so only one of two simultaneous accepts wins. If the transfer itself ' +
         'fails the offer is put back to `pending` and the code can be retried.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       requestBody: {
         required: true,
         content: {
@@ -308,7 +308,7 @@ export const transferOffersPaths = {
         'Marks the offer `declined` and closes it. The sender sees the decline in ' +
         '`GET /transfer-offers`, so a refusal is an answer rather than an offer that quietly ' +
         'expires. Requires `owner` or `admin`.',
-      tags: ['TransferOffers'],
+      tags: ['Transfer Offers'],
       responses: {
         '200': {
           description: 'Declined.',

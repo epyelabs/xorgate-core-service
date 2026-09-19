@@ -95,8 +95,8 @@ const TAGS = [
       'Device records, their configuration document, their IoT identity, and the one-shot commands you can send them.',
   },
   {
-    name: 'TransferOffers',
-    'x-displayName': 'Transfer offers',
+    name: 'Transfer Offers',
+    'x-displayName': 'Transfer Offers',
     description:
       'Handing a device to an organization you have no membership in. The source mints a code, ' +
       'the destination redeems it. A move between workspaces of the SAME organization needs none ' +
