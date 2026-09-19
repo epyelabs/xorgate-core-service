@@ -627,3 +627,61 @@ describe('listing', () => {
     expect(parse(accepted).offers).toHaveLength(0);
   });
 });
+
+describe('create: the check-then-act race', () => {
+  it('turns a lost insert race into the same idempotent 200 the winner got', async () => {
+    // Two simultaneous creates both read "no pending offer" and both insert. The
+    // partial unique index refuses the loser — verified against real Postgres on
+    // dev, where the second insert raises
+    // `duplicate key value violates unique constraint
+    //  "device_transfer_offers_pending_device_idx"`. The loser must answer like
+    // the winner rather than 500.
+    const winner = {
+      id: 'offer-winner',
+      code: 'code-winner',
+      status: 'pending',
+      deviceId: DEVICE,
+      fromOrganizationId: ORG_SOURCE,
+      fromWorkspaceId: WS_SOURCE,
+      acceptedByOrganizationId: null,
+      acceptedWorkspaceId: null,
+      resolvedAt: null,
+      transferId: null,
+      expiresAt: new Date(Date.now() + 1000),
+      createdAt: new Date(),
+    };
+    let firstRead = true;
+    const original = (await import('../src/db/index')).db as any;
+    const originalInsert = original.insert;
+    const originalFindFirst = original.query.deviceTransferOffers.findFirst;
+    // The pre-insert read sees nothing; the insert loses; the post-catch read
+    // sees the winner that landed in between.
+    original.query.deviceTransferOffers.findFirst = async (args: any) => {
+      if (firstRead) {
+        firstRead = false;
+        return undefined;
+      }
+      return winner;
+    };
+    original.insert = () => ({
+      values: () => ({
+        returning: async () => {
+          throw new Error(
+            'duplicate key value violates unique constraint "device_transfer_offers_pending_device_idx"',
+          );
+        },
+      }),
+    });
+    try {
+      asSource();
+      const res = await handler(
+        ev('POST /v1/devices/{id}/transfer-offers', { pathParameters: { id: DEVICE } }),
+      );
+      expect(status(res)).toBe(200);
+      expect(parse(res).offer.code).toBe('code-winner');
+    } finally {
+      original.insert = originalInsert;
+      original.query.deviceTransferOffers.findFirst = originalFindFirst;
+    }
+  });
+});

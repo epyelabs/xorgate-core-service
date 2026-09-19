@@ -465,20 +465,43 @@ async function createOffer(
     }
   }
 
-  const [row] = await db
-    .insert(schema.deviceTransferOffers)
-    .values({
-      code: generateRegistrationCode(),
-      deviceId,
-      fromOrganizationId: auth.organizationId,
-      fromWorkspaceId: device.workspaceId,
-      // Exactly one of these, mirroring `device_registrations`: an API-key
-      // caller has no `users` row to attribute to.
-      createdByUserId: auth.userId,
-      createdByApiKeyId: auth.apiKeyId,
-      expiresAt: new Date(Date.now() + OFFER_TTL_MS),
-    })
-    .returning();
+  let row;
+  try {
+    [row] = await db
+      .insert(schema.deviceTransferOffers)
+      .values({
+        code: generateRegistrationCode(),
+        deviceId,
+        fromOrganizationId: auth.organizationId,
+        fromWorkspaceId: device.workspaceId,
+        // Exactly one of these, mirroring `device_registrations`: an API-key
+        // caller has no `users` row to attribute to.
+        createdByUserId: auth.userId,
+        createdByApiKeyId: auth.apiKeyId,
+        expiresAt: new Date(Date.now() + OFFER_TTL_MS),
+      })
+      .returning();
+  } catch (err) {
+    // The read above is a check-then-act, so two simultaneous creates can both
+    // find no pending offer and both try to insert. `device_transfer_offers_pending_device_idx`
+    // is a partial unique index on (device_id) WHERE status='pending', so the
+    // loser is refused by the database — which is the point of having the index
+    // rather than trusting the read. Turn that into the same idempotent answer
+    // the winner got, not a 500. (Verified against real Postgres on dev: the
+    // second insert raises `duplicate key value violates unique constraint
+    // "device_transfer_offers_pending_device_idx"`.)
+    const winner = await db.query.deviceTransferOffers.findFirst({
+      where: and(
+        eq(schema.deviceTransferOffers.deviceId, deviceId),
+        eq(schema.deviceTransferOffers.status, 'pending'),
+      ),
+    });
+    if (!winner) throw err;
+    return ok({
+      offer: offerView(winner, { deviceName: device.name, direction: 'outgoing' }),
+      willDetachWorkflowAttachments: await detachNames(deviceId, auth.organizationId),
+    });
+  }
 
   return created({
     offer: offerView(row!, { deviceName: device.name, direction: 'outgoing' }),
