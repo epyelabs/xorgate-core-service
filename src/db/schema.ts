@@ -1150,3 +1150,138 @@ export const deletedDevices = pgTable('deleted_devices', {
   deletedBy: text('deleted_by').notNull(),
   deletedAt: timestamp('deleted_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// --- Device transfer (plans/transfer-device-ownership) ---
+
+// The audit trail for a tenancy change, and the state machine that makes one
+// survivable. A transfer writes three facts that must agree — `devices.workspace_id`,
+// the IoT thing's `xgOrgId`/`xgWorkspaceId` attributes, and the `scope` block in the
+// retained config message — and the row exists because those three writes cannot be
+// one transaction. It records which of them landed, so an interrupted transfer is a
+// visible state rather than a device nobody can explain (README §2.5).
+//
+// Three jobs, in the order they matter:
+//   1. the mid-transfer guard — a `pending` row blocks a second transfer of the
+//      same device, and a stale one is swept and REPAIRED rather than just cleared
+//      (`reconcileStaleTransfers`, services/device-transfer.ts);
+//   2. the audit trail — who moved what, when, and out of/into which tenancy;
+//   3. what the sweep did — the workflow attachments a cross-org move detached are
+//      recorded here because the templates they pointed at belong to an
+//      organization that can no longer see this device.
+//
+// Tenancy ids carry NO foreign keys, deliberately, exactly as `deleted_devices`
+// does: a transfer record has to outlive the deletion of either workspace, or the
+// history of where a device has been disappears the first time someone tidies up.
+// `device_id` is `set null` for the same reason it is on `device_registrations` —
+// the record of the move outlives the device.
+export const deviceTransfers = pgTable(
+  'device_transfers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    deviceId: uuid('device_id').references(() => devices.id, { onDelete: 'set null' }),
+    fromWorkspaceId: uuid('from_workspace_id').notNull(),
+    toWorkspaceId: uuid('to_workspace_id').notNull(),
+    fromOrganizationId: uuid('from_organization_id').notNull(),
+    toOrganizationId: uuid('to_organization_id').notNull(),
+    // Exactly one, mirroring `device_registrations`: an API-key caller has no
+    // `users` row to point at, so attribution moves to the key.
+    actorUserId: text('actor_user_id').references(() => users.id, { onDelete: 'set null' }),
+    actorApiKeyId: uuid('actor_api_key_id').references(() => apiKeys.id, {
+      onDelete: 'set null',
+    }),
+    // The offer this transfer came from, when it was a cross-org handshake.
+    // NULL for a same-org move and for the both-membership fast path.
+    offerId: uuid('offer_id'),
+    // pending | completed | failed. `pending` is only ever in flight for the
+    // couple of seconds the sequence takes; anything older is an interrupted
+    // transfer (text, not pgEnum — the aws-data-api enum-cast issue, same as
+    // devices.status).
+    status: text('status').default('pending').notNull(),
+    // Which step of the ordered sequence this row reached: db | publish |
+    // attributes | swept. On a `completed` row it is the last step that landed;
+    // on a `failed` row it names the step that failed.
+    stage: text('stage').default('db').notNull(),
+    // 'unchanged' | 'written' | 'failed' from `ensureThingScopeAttributes`.
+    // 'failed' is the one degraded-success state: the device was told its new
+    // topic but the broker was never told to allow it, so it falls back to the
+    // legacy telemetry plane until a config save re-asserts the attributes.
+    scopeAttributes: text('scope_attributes'),
+    // Template names detached by the cross-org sweep, for the audit trail and
+    // for the confirmation the operator already saw in the preview.
+    detachedWorkflowAttachments: jsonb('detached_workflow_attachments')
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+    warnings: jsonb('warnings').$type<string[]>().default([]).notNull(),
+    error: text('error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('device_transfers_device_idx').on(t.deviceId, t.createdAt),
+    // The mid-transfer guard scans this.
+    index('device_transfers_pending_idx')
+      .on(t.deviceId)
+      .where(sql`${t.status} = 'pending'`),
+  ],
+);
+
+// A cross-organization handover, offered by the source and accepted by the
+// destination (README §2.4, Q1). It exists because `auth.organizationId` resolves
+// to exactly ONE organization, so no single request can be authorized in both
+// tenancies — the destination has to act for itself.
+//
+// Modelled directly on `device_registrations`: a `generateRegistrationCode()`
+// code, a `pending | accepted | declined | cancelled | expired` status, an
+// `expires_at` enforced on read AND on accept, and the same
+// exactly-one-of-user-or-key attribution. The code is a bearer token for one
+// thing only — reading the offer's allowlisted preview and acting on it — so the
+// preview deliberately exposes device name, model and source organization and
+// nothing else.
+export const deviceTransferOffers = pgTable(
+  'device_transfer_offers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    code: text('code').notNull(),
+    // CASCADE, unlike `device_transfers.device_id`: an offer is a live claim on a
+    // device, and a deleted device must not leave a claimable code behind.
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    fromOrganizationId: uuid('from_organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    fromWorkspaceId: uuid('from_workspace_id')
+      .references(() => workspaces.id, { onDelete: 'cascade' })
+      .notNull(),
+    status: text('status').default('pending').notNull(),
+    createdByUserId: text('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdByApiKeyId: uuid('created_by_api_key_id').references(() => apiKeys.id, {
+      onDelete: 'set null',
+    }),
+    // Set on accept. No FK: the destination organization is a different tenant
+    // and the offer is history once it resolves.
+    acceptedByOrganizationId: uuid('accepted_by_organization_id'),
+    acceptedWorkspaceId: uuid('accepted_workspace_id'),
+    // Whoever resolved it — accepted, declined or cancelled.
+    resolvedByUserId: text('resolved_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    // The transfer this offer produced, when it was accepted.
+    transferId: uuid('transfer_id'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('device_transfer_offers_code_idx').on(t.code),
+    // One live offer per device: a second create returns the existing one rather
+    // than minting a duplicate, the same idempotency `device_registrations` uses.
+    uniqueIndex('device_transfer_offers_pending_device_idx')
+      .on(t.deviceId)
+      .where(sql`${t.status} = 'pending'`),
+    index('device_transfer_offers_from_org_status_idx').on(t.fromOrganizationId, t.status),
+  ],
+);
