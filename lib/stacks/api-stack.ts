@@ -2465,6 +2465,37 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceTransferInt,
     });
+    // Cross-organization handover. The device-scoped route mints a code; the
+    // `/transfer-offers/{code}` routes are reached by an organization that has
+    // no relationship to the device at all, so the CODE is the authorization.
+    // One path parameter name across all of them (`{code}`, never `{id}`): two
+    // routes on the same path template that differ only in the parameter's name
+    // is a conflict API Gateway has no good answer for.
+    addRoutes({
+      path: "/devices/{id}/transfer-offers",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: deviceTransferInt,
+    });
+    addRoutes({
+      path: "/transfer-offers",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceTransferInt,
+    });
+    addRoutes({
+      path: "/transfer-offers/{code}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.DELETE],
+      integration: deviceTransferInt,
+    });
+    addRoutes({
+      path: "/transfer-offers/{code}/accept",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceTransferInt,
+    });
+    addRoutes({
+      path: "/transfer-offers/{code}/decline",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceTransferInt,
+    });
 
     addRoutes({
       path: "/devices/{id}/provision",

@@ -1403,5 +1403,115 @@ export function openApiSchemas(): Record<string, unknown> {
         warnings: { type: 'array', items: { type: 'string' } },
       },
     },
+
+    TransferOffer: {
+      type: 'object',
+      description: 'An offer as its SENDER (or, once accepted, its recipient) sees it.',
+      required: ['id', 'code', 'status', 'direction', 'deviceId', 'from', 'expiresAt', 'createdAt'],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        code: {
+          type: 'string',
+          description: 'The redemption code. A secret — anyone holding it can accept or decline.',
+        },
+        status: {
+          type: 'string',
+          enum: ['pending', 'accepted', 'declined', 'cancelled', 'expired'],
+        },
+        direction: {
+          type: 'string',
+          enum: ['outgoing', 'incoming'],
+          description:
+            '`outgoing` when your organization created the offer, `incoming` when it accepted one.',
+        },
+        deviceId: { type: 'string', format: 'uuid' },
+        deviceName: { type: 'string', nullable: true },
+        from: {
+          type: 'object',
+          required: ['organizationId', 'workspaceId'],
+          properties: {
+            organizationId: { type: 'string', format: 'uuid' },
+            workspaceId: {
+              type: 'string',
+              format: 'uuid',
+              description: 'Where the device sat when the offer was created.',
+            },
+          },
+        },
+        acceptedBy: {
+          type: 'object',
+          nullable: true,
+          description: 'Null until accepted.',
+          properties: {
+            organizationId: { type: 'string', format: 'uuid' },
+            workspaceId: { type: 'string', format: 'uuid', nullable: true },
+          },
+        },
+        transferId: {
+          type: 'string',
+          format: 'uuid',
+          nullable: true,
+          description: 'The transfer the acceptance produced.',
+        },
+        expiresAt: { type: 'string', format: 'date-time' },
+        resolvedAt: { type: 'string', format: 'date-time', nullable: true },
+        createdAt: { type: 'string', format: 'date-time' },
+      },
+    },
+    TransferOfferPreview: {
+      type: 'object',
+      description:
+        'An offer as its RECIPIENT sees it, holding nothing but the code. The fields here are ' +
+        'the whole allowlist: enough to decide whether to accept, and no more. The device id, ' +
+        'serial, workspace, configuration and telemetry are all deliberately absent — whoever ' +
+        'holds the code is not yet entitled to the device.',
+      required: ['code', 'status', 'expiresAt', 'createdAt', 'from'],
+      properties: {
+        code: { type: 'string' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'accepted', 'declined', 'cancelled', 'expired'],
+        },
+        expiresAt: { type: 'string', format: 'date-time' },
+        createdAt: { type: 'string', format: 'date-time' },
+        device: {
+          type: 'object',
+          nullable: true,
+          required: ['name', 'model'],
+          properties: {
+            name: { type: 'string', nullable: true },
+            model: {
+              type: 'object',
+              required: ['id', 'name', 'sku'],
+              properties: {
+                id: { type: 'string', format: 'uuid' },
+                name: { type: 'string' },
+                sku: { type: 'string' },
+              },
+            },
+          },
+        },
+        from: {
+          type: 'object',
+          required: ['organizationName'],
+          properties: { organizationName: { type: 'string' } },
+        },
+      },
+    },
+    TransferOfferCreated: {
+      type: 'object',
+      required: ['offer', 'willDetachWorkflowAttachments'],
+      properties: {
+        offer: { $ref: '#/components/schemas/TransferOffer' },
+        willDetachWorkflowAttachments: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Workflow template names this device is attached to. If a DIFFERENT organization ' +
+            'accepts the offer they are all detached, because the templates belong to yours. ' +
+            'Shown at creation because the sender is not present at acceptance.',
+        },
+      },
+    },
   };
 }

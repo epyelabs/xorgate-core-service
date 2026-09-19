@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, or, sql } from 'drizzle-orm';
 import { routeKey as canonicalRouteKey } from '../utils/route';
 import {
   AuthError,
@@ -11,14 +11,19 @@ import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { deviceResponse } from '../services/device-view';
 import {
+  attachmentsAtRiskOnOrgChange,
   previewTransfer,
+  reconcileStaleTransfers,
   transferDevice,
   TransferError,
   type TransferPreview,
   type TransferSummary,
 } from '../services/device-transfer';
+import { generateRegistrationCode } from '../utils/registration-code';
 import {
   badRequest,
+  conflict,
+  created,
   errorResponse,
   methodNotAllowed,
   notFound,
@@ -197,13 +202,18 @@ function transferErrorResponse(err: TransferError): APIGatewayProxyResultV2 {
   return errorResponse(err.statusCode, err.code, err.message);
 }
 
-const restHandler = async (
+/**
+ * The device-scoped half of this handler: every route under `/devices/{id}/...`
+ * requires `owner|admin` in the organization that owns the device TODAY.
+ *
+ * The ownership check runs before anything else, so a probe for a device in
+ * another tenant reads exactly like a probe for a device that does not exist.
+ */
+async function deviceRoutes(
   event: APIGatewayProxyEventV2,
-): Promise<APIGatewayProxyResultV2> => {
-  const method = event.requestContext.http.method;
-  const routeKey = canonicalRouteKey(event);
-  const deviceId = event.pathParameters?.id;
-
+  routeKey: string,
+  deviceId: string,
+): Promise<APIGatewayProxyResultV2> {
   let auth: OrgAuthContext;
   try {
     auth = await requireOrgWideContext(event, ['owner', 'admin']);
@@ -212,13 +222,15 @@ const restHandler = async (
     throw err;
   }
 
-  if (!deviceId) return badRequest('device id required in path');
-
-  // The device must be one the caller's organization owns TODAY. Checked before
-  // anything else so a probe for a device in another tenant reads exactly like a
-  // probe for a device that does not exist.
   if (!(await callerOwnsDevice(auth, deviceId))) {
     return notFound(`Device "${deviceId}" not found`);
+  }
+
+  if (routeKey === 'POST /devices/{id}/transfer-offers') {
+    return createOffer(event, auth, deviceId);
+  }
+  if (routeKey === 'GET /devices/{id}/transfer-offers') {
+    return listDeviceOffers(auth, deviceId);
   }
 
   if (routeKey === 'GET /devices/{id}/transfer/preview') {
@@ -291,7 +303,501 @@ const restHandler = async (
     return ok({ device: deviceResponse(device), transfer: transferResponse(summary) });
   }
 
-  return methodNotAllowed(method, 'GET, POST');
+  return methodNotAllowed(event.requestContext.http.method, 'GET, POST');
+}
+
+// ---------------------------------------------------------------------------
+// Transfer offers (Phase 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handing a device to an organization you have no membership in.
+ *
+ * `auth.organizationId` resolves to exactly ONE organization, from a membership
+ * row or the `X-Organization-Id` header, so one request cannot be authorized in
+ * two tenancies. The destination therefore has to act for itself, and the shape
+ * that lets it is the one `device_registrations` already uses for onboarding: a
+ * long random code, a `pending` row with an expiry, and a route the other side
+ * reaches holding nothing but the code.
+ *
+ * The code is a bearer token for exactly two things — reading the offer's
+ * allowlisted preview, and resolving it. `offerPreview` below is that allowlist,
+ * and it is deliberately thin: device name, device model, source organization
+ * name. No serial, no device id, no telemetry, no configuration. Whoever holds
+ * the code is by definition not yet entitled to the device.
+ *
+ * **There is no incoming inbox, and that is a property of the data model, not an
+ * omission.** An offer names no destination — that is what makes it usable for a
+ * handover to an organization whose id the source does not know — so a pending
+ * offer is discoverable only by its code. `GET /transfer-offers` lists what the
+ * caller's organization SENT, plus what it has already accepted. The destination
+ * flow is: receive a code out of band, preview it, accept or decline.
+ */
+
+/** Seven days. A handover is slower than an install, which is why this is not the 15 minutes `device_registrations` uses. */
+const OFFER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+type OfferRow = typeof schema.deviceTransferOffers.$inferSelect;
+
+/** The full view, for the organization that created the offer or accepted it. */
+function offerView(
+  row: OfferRow,
+  extra: { deviceName?: string | null; direction: 'outgoing' | 'incoming' },
+): Record<string, unknown> {
+  return {
+    id: row.id,
+    code: row.code,
+    status: row.status,
+    direction: extra.direction,
+    deviceId: row.deviceId,
+    deviceName: extra.deviceName ?? null,
+    from: {
+      organizationId: row.fromOrganizationId,
+      workspaceId: row.fromWorkspaceId,
+    },
+    acceptedBy: row.acceptedByOrganizationId
+      ? {
+          organizationId: row.acceptedByOrganizationId,
+          workspaceId: row.acceptedWorkspaceId,
+        }
+      : null,
+    transferId: row.transferId,
+    expiresAt: row.expiresAt.toISOString(),
+    resolvedAt: row.resolvedAt ? row.resolvedAt.toISOString() : null,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/**
+ * The allowlist the CODE buys: enough to decide, and nothing more.
+ *
+ * Explicitly absent and explicitly tested for: `deviceId`, `serial`,
+ * `workspaceId`, any telemetry, any configuration. A code that leaked would
+ * otherwise be a read primitive against another tenant's fleet.
+ */
+function offerPreview(
+  row: OfferRow,
+  device: { name: string | null; modelId: string; modelName: string; modelSku: string } | null,
+  fromOrganizationName: string,
+): Record<string, unknown> {
+  return {
+    code: row.code,
+    status: row.status,
+    expiresAt: row.expiresAt.toISOString(),
+    createdAt: row.createdAt.toISOString(),
+    device: device
+      ? {
+          name: device.name,
+          model: { id: device.modelId, name: device.modelName, sku: device.modelSku },
+        }
+      : null,
+    from: { organizationName: fromOrganizationName },
+  };
+}
+
+function expired(row: OfferRow): boolean {
+  return row.status === 'pending' && row.expiresAt.getTime() < Date.now();
+}
+
+/**
+ * Flip a stale `pending` row to `expired` on read, so no sweeper job is needed —
+ * the same lazy expiry `device-registrations.ts` uses, and for the same reason:
+ * the only thing that ever asks about an offer is someone reading it.
+ */
+async function lazyExpire(row: OfferRow): Promise<OfferRow> {
+  if (!expired(row)) return row;
+  const [flipped] = await db
+    .update(schema.deviceTransferOffers)
+    .set({ status: 'expired', resolvedAt: new Date() })
+    .where(
+      and(
+        eq(schema.deviceTransferOffers.id, row.id),
+        eq(schema.deviceTransferOffers.status, 'pending'),
+      ),
+    )
+    .returning();
+  return flipped ?? { ...row, status: 'expired' };
+}
+
+/** POST /devices/{id}/transfer-offers — the source mints a code. */
+async function createOffer(
+  event: APIGatewayProxyEventV2,
+  auth: OrgAuthContext,
+  deviceId: string,
+): Promise<APIGatewayProxyResultV2> {
+  if (event.body && event.body !== '{}' && event.body !== '') {
+    let body: unknown;
+    try {
+      body = JSON.parse(event.body);
+    } catch {
+      return badRequest('Invalid JSON body');
+    }
+    const keys = Object.keys((body ?? {}) as Record<string, unknown>);
+    if (keys.length > 0) return badRequest(`unknown field(s): ${keys.join(', ')}`);
+  }
+
+  const device = await db.query.devices.findFirst({
+    where: eq(schema.devices.id, deviceId),
+    columns: { id: true, workspaceId: true, name: true },
+  });
+  if (!device) return notFound(`Device "${deviceId}" not found`);
+
+  // A device already mid-transfer must not also be offered: accepting the offer
+  // would be a second concurrent tenancy change.
+  await reconcileStaleTransfers(deviceId);
+
+  const existing = await db.query.deviceTransferOffers.findFirst({
+    where: and(
+      eq(schema.deviceTransferOffers.deviceId, deviceId),
+      eq(schema.deviceTransferOffers.status, 'pending'),
+    ),
+  });
+  if (existing) {
+    const current = await lazyExpire(existing);
+    if (current.status === 'pending') {
+      // Idempotent reuse, exactly as `POST /device-registrations` does it:
+      // reopening the dialog must not burn a second claimable code for the same
+      // device. 200 rather than 201 so a client can tell reuse from a mint.
+      return ok({
+        offer: offerView(current, { deviceName: device.name, direction: 'outgoing' }),
+        willDetachWorkflowAttachments: await detachNames(deviceId, auth.organizationId),
+      });
+    }
+  }
+
+  const [row] = await db
+    .insert(schema.deviceTransferOffers)
+    .values({
+      code: generateRegistrationCode(),
+      deviceId,
+      fromOrganizationId: auth.organizationId,
+      fromWorkspaceId: device.workspaceId,
+      // Exactly one of these, mirroring `device_registrations`: an API-key
+      // caller has no `users` row to attribute to.
+      createdByUserId: auth.userId,
+      createdByApiKeyId: auth.apiKeyId,
+      expiresAt: new Date(Date.now() + OFFER_TTL_MS),
+    })
+    .returning();
+
+  return created({
+    offer: offerView(row!, { deviceName: device.name, direction: 'outgoing' }),
+    // README §4.5: the SOURCE loses these, and the source is not present when
+    // the offer is accepted. Naming them here is the only moment at which it can
+    // still reconsider. They detach only if the destination turns out to be a
+    // different organization, which is the usual case for an offer.
+    willDetachWorkflowAttachments: await detachNames(deviceId, auth.organizationId),
+  });
+}
+
+async function detachNames(deviceId: string, organizationId: string): Promise<string[]> {
+  const rows = await attachmentsAtRiskOnOrgChange(deviceId, organizationId);
+  return rows.map((r) => r.templateName);
+}
+
+/** GET /devices/{id}/transfer-offers — every offer ever made for this device. */
+async function listDeviceOffers(
+  auth: OrgAuthContext,
+  deviceId: string,
+): Promise<APIGatewayProxyResultV2> {
+  const rows = await db.query.deviceTransferOffers.findMany({
+    where: eq(schema.deviceTransferOffers.deviceId, deviceId),
+    orderBy: [desc(schema.deviceTransferOffers.createdAt)],
+  });
+  const offers = await Promise.all(rows.map((r) => lazyExpire(r)));
+  return ok({
+    offers: offers.map((r) =>
+      offerView(r, {
+        direction: r.fromOrganizationId === auth.organizationId ? 'outgoing' : 'incoming',
+      }),
+    ),
+  });
+}
+
+/** The offer for a code, with lazy expiry applied. */
+async function offerByCode(code: string): Promise<OfferRow | null> {
+  const row = await db.query.deviceTransferOffers.findFirst({
+    where: eq(schema.deviceTransferOffers.code, code),
+  });
+  if (!row) return null;
+  return lazyExpire(row);
+}
+
+const OFFER_STATUSES = ['pending', 'accepted', 'declined', 'cancelled', 'expired'];
+
+/** GET /transfer-offers — what this organization sent, plus what it accepted. */
+async function listOffers(
+  event: APIGatewayProxyEventV2,
+  auth: OrgAuthContext,
+): Promise<APIGatewayProxyResultV2> {
+  const status = event.queryStringParameters?.status;
+  if (status && !OFFER_STATUSES.includes(status)) {
+    return badRequest(`status must be one of: ${OFFER_STATUSES.join(', ')}`);
+  }
+  const rows = await db.query.deviceTransferOffers.findMany({
+    where: or(
+      eq(schema.deviceTransferOffers.fromOrganizationId, auth.organizationId),
+      eq(schema.deviceTransferOffers.acceptedByOrganizationId, auth.organizationId),
+    ),
+    orderBy: [desc(schema.deviceTransferOffers.createdAt)],
+    limit: 200,
+  });
+  const offers = (await Promise.all(rows.map((r) => lazyExpire(r))))
+    .filter((r) => !status || r.status === status)
+    .map((r) =>
+      offerView(r, {
+        direction: r.fromOrganizationId === auth.organizationId ? 'outgoing' : 'incoming',
+      }),
+    );
+  return ok({ offers });
+}
+
+/** GET /transfer-offers/{code} — the destination's preview. */
+async function getOffer(code: string): Promise<APIGatewayProxyResultV2> {
+  const row = await offerByCode(code);
+  if (!row) return notFound('Transfer offer not found');
+  const rows = await db
+    .select({
+      name: schema.devices.name,
+      modelId: schema.deviceModels.id,
+      modelName: schema.deviceModels.name,
+      modelSku: schema.deviceModels.sku,
+    })
+    .from(schema.devices)
+    .innerJoin(schema.deviceModels, eq(schema.devices.deviceModelId, schema.deviceModels.id))
+    .where(eq(schema.devices.id, row.deviceId))
+    .limit(1);
+  const org = await db.query.organizations.findFirst({
+    where: eq(schema.organizations.id, row.fromOrganizationId),
+    columns: { name: true },
+  });
+  return ok({ offer: offerPreview(row, rows[0] ?? null, org?.name ?? 'Unknown organization') });
+}
+
+/** DELETE /transfer-offers/{code} — the SOURCE withdraws it. */
+async function cancelOffer(
+  auth: OrgAuthContext,
+  code: string,
+): Promise<APIGatewayProxyResultV2> {
+  const row = await offerByCode(code);
+  // 404 rather than 403 for an offer belonging to another organization: a code
+  // the caller does not own must read as absent.
+  if (!row || row.fromOrganizationId !== auth.organizationId) {
+    return notFound('Transfer offer not found');
+  }
+  if (row.status !== 'pending') {
+    return conflict(`This offer is already ${row.status}.`);
+  }
+  const [cancelled] = await db
+    .update(schema.deviceTransferOffers)
+    .set({ status: 'cancelled', resolvedAt: new Date(), resolvedByUserId: auth.userId })
+    .where(
+      and(
+        eq(schema.deviceTransferOffers.id, row.id),
+        eq(schema.deviceTransferOffers.status, 'pending'),
+      ),
+    )
+    .returning();
+  if (!cancelled) return conflict('This offer was resolved by someone else.');
+  return { statusCode: 204, body: '' };
+}
+
+/** POST /transfer-offers/{code}/decline — the destination refuses it. */
+async function declineOffer(
+  auth: OrgAuthContext,
+  code: string,
+): Promise<APIGatewayProxyResultV2> {
+  const row = await offerByCode(code);
+  if (!row) return notFound('Transfer offer not found');
+  if (row.status !== 'pending') return conflict(`This offer is already ${row.status}.`);
+  const [declined] = await db
+    .update(schema.deviceTransferOffers)
+    .set({ status: 'declined', resolvedAt: new Date(), resolvedByUserId: auth.userId })
+    .where(
+      and(
+        eq(schema.deviceTransferOffers.id, row.id),
+        eq(schema.deviceTransferOffers.status, 'pending'),
+      ),
+    )
+    .returning();
+  if (!declined) return conflict('This offer was resolved by someone else.');
+  // The source sees this through its own listing (Q3): the row it created now
+  // reads `declined`, with `resolvedAt` set, rather than silently expiring.
+  return ok({ offer: offerView(declined, { direction: 'incoming' }) });
+}
+
+/** POST /transfer-offers/{code}/accept — the destination takes the device. */
+async function acceptOffer(
+  event: APIGatewayProxyEventV2,
+  auth: OrgAuthContext,
+  code: string,
+): Promise<APIGatewayProxyResultV2> {
+  let body: { workspaceId?: unknown };
+  try {
+    body = JSON.parse(event.body ?? '{}') as { workspaceId?: unknown };
+  } catch {
+    return badRequest('Invalid JSON body');
+  }
+  if (typeof body.workspaceId !== 'string' || body.workspaceId === '') {
+    return badRequest('workspaceId is required');
+  }
+  const unknownFields = Object.keys(body).filter((k) => k !== 'workspaceId');
+  if (unknownFields.length > 0) {
+    return badRequest(`unknown field(s): ${unknownFields.join(', ')}`);
+  }
+
+  const orgWorkspaceIds = await resolveWorkspaceScope(auth);
+  if (!orgWorkspaceIds.includes(body.workspaceId)) {
+    return notFound(`Workspace "${body.workspaceId}" not found`);
+  }
+
+  const row = await offerByCode(code);
+  if (!row) return notFound('Transfer offer not found');
+  if (row.status !== 'pending') return conflict(`This offer is already ${row.status}.`);
+  if (row.fromOrganizationId === auth.organizationId) {
+    return badRequest(
+      'This offer was created by your own organization. Use POST /devices/{id}/transfer instead.',
+    );
+  }
+
+  // The offer records where the device WAS. If the source has since handed it to
+  // somebody else, the offer is a claim on a device its author no longer owns.
+  const owner = await db
+    .select({ organizationId: schema.workspaces.organizationId })
+    .from(schema.devices)
+    .innerJoin(schema.workspaces, eq(schema.devices.workspaceId, schema.workspaces.id))
+    .where(eq(schema.devices.id, row.deviceId))
+    .limit(1);
+  if (owner[0]?.organizationId !== row.fromOrganizationId) {
+    return conflict(
+      'The device is no longer owned by the organization that offered it; this offer is stale.',
+    );
+  }
+
+  // Race-safe state transition first, exactly as `claimRegistration` does it:
+  // only one concurrent caller flips `pending`, so a double-accept is refused by
+  // the database rather than by a check-then-act that two requests can both pass.
+  const [claimed] = await db
+    .update(schema.deviceTransferOffers)
+    .set({
+      status: 'accepted',
+      acceptedByOrganizationId: auth.organizationId,
+      acceptedWorkspaceId: body.workspaceId,
+      resolvedAt: new Date(),
+      resolvedByUserId: auth.userId,
+    })
+    .where(
+      and(
+        eq(schema.deviceTransferOffers.id, row.id),
+        eq(schema.deviceTransferOffers.status, 'pending'),
+        gt(schema.deviceTransferOffers.expiresAt, sql`now()`),
+      ),
+    )
+    .returning();
+  if (!claimed) return conflict('This offer was resolved by someone else, or has expired.');
+
+  let summary: TransferSummary;
+  try {
+    summary = await transferDevice({
+      deviceId: row.deviceId,
+      toWorkspaceId: body.workspaceId,
+      actor: { userId: auth.userId, apiKeyId: auth.apiKeyId },
+      offerId: row.id,
+    });
+  } catch (err) {
+    // Put the offer back so the code can be retried, the same rollback
+    // `claimRegistration` performs when provisioning fails after the flip.
+    await db
+      .update(schema.deviceTransferOffers)
+      .set({
+        status: 'pending',
+        acceptedByOrganizationId: null,
+        acceptedWorkspaceId: null,
+        resolvedAt: null,
+        resolvedByUserId: null,
+      })
+      .where(eq(schema.deviceTransferOffers.id, row.id))
+      .catch(() => undefined);
+    if (err instanceof TransferError) return transferErrorResponse(err);
+    console.error('transfer offer accept failed', { offerId: row.id, err });
+    return errorResponse(
+      502,
+      'TRANSFER_FAILED',
+      'The device could not be told about its new workspace, so the transfer was ' +
+        'rolled back and the offer is still open. Try again in a moment.',
+    );
+  }
+
+  const [linked] = await db
+    .update(schema.deviceTransferOffers)
+    .set({ transferId: summary.transferId })
+    .where(eq(schema.deviceTransferOffers.id, row.id))
+    .returning();
+
+  const device = await db.query.devices.findFirst({
+    where: eq(schema.devices.id, row.deviceId),
+  });
+  if (!device) return notFound('Device not found');
+  return ok({
+    device: deviceResponse(device),
+    transfer: transferResponse(summary),
+    offer: offerView(linked ?? claimed, { deviceName: device.name, direction: 'incoming' }),
+  });
+}
+
+/**
+ * The code-scoped half. These routes are reached by an organization that has no
+ * relationship to the device, so there is no device-ownership check to make —
+ * the CODE is the authorization, and the role gate is about what the caller may
+ * do inside its OWN organization.
+ *
+ * The preview alone takes no role: it hands back the allowlist above and
+ * nothing else, and refusing a `viewer` who was sent a code would only mean they
+ * cannot tell an admin what arrived.
+ */
+async function offerRoutes(
+  event: APIGatewayProxyEventV2,
+  routeKey: string,
+  code: string | undefined,
+): Promise<APIGatewayProxyResultV2> {
+  const readOnly = routeKey === 'GET /transfer-offers/{code}' || routeKey === 'GET /transfer-offers';
+  let auth: OrgAuthContext;
+  try {
+    auth = await requireOrgWideContext(event, readOnly ? undefined : ['owner', 'admin']);
+  } catch (err) {
+    if (err instanceof AuthError) return authErrorResponse(err);
+    throw err;
+  }
+
+  if (routeKey === 'GET /transfer-offers') return listOffers(event, auth);
+
+  if (!code) return badRequest('offer code required in path');
+  switch (routeKey) {
+    case 'GET /transfer-offers/{code}':
+      return getOffer(code);
+    case 'DELETE /transfer-offers/{code}':
+      return cancelOffer(auth, code);
+    case 'POST /transfer-offers/{code}/accept':
+      return acceptOffer(event, auth, code);
+    case 'POST /transfer-offers/{code}/decline':
+      return declineOffer(auth, code);
+    default:
+      return methodNotAllowed(event.requestContext.http.method, 'GET, POST, DELETE');
+  }
+}
+
+const restHandler = async (
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> => {
+  const routeKey = canonicalRouteKey(event);
+  const deviceId = event.pathParameters?.id;
+  const code = event.pathParameters?.code;
+
+  if (routeKey.includes('/devices/{id}/')) {
+    if (!deviceId) return badRequest('device id required in path');
+    return deviceRoutes(event, routeKey, deviceId);
+  }
+  return offerRoutes(event, routeKey, code);
 };
 
 export const handler = apiHandler(restHandler);

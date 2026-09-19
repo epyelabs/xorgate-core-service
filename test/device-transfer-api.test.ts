@@ -99,8 +99,13 @@ vi.mock('../src/db/index', async () => {
       if (!node || typeof node !== 'object') return;
       if (Array.isArray(node)) return node.forEach(walk);
       if (Array.isArray(node.queryChunks)) node.queryChunks.forEach(walk);
-      if (node.value !== undefined && typeof node.value !== 'object') out.push(String(node.value));
-      if (Array.isArray(node.value)) node.value.forEach((v: unknown) => out.push(String(v)));
+      // A bound Param carries a primitive `value`; a StringChunk carries an
+      // ARRAY of literal SQL fragments ('(', ' and ', ' = '). Only the former is
+      // a value anyone bound, so the array form is skipped rather than collected
+      // as noise every matcher would then have to tolerate.
+      if (node.value !== undefined && !Array.isArray(node.value) && typeof node.value !== 'object') {
+        out.push(String(node.value));
+      }
     };
     walk(where);
     return out;

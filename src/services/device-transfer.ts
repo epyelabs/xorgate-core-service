@@ -296,6 +296,43 @@ async function orphanedAttachments(
   return rows;
 }
 
+/**
+ * Attachments a move to ANY other organization would detach.
+ *
+ * The offer flow (Phase 4) needs this and `orphanedAttachments` cannot serve it:
+ * at offer-creation time the DESTINATION organization is unknown, so the
+ * question is not "which attachments does the destination not own" but "which
+ * would be orphaned by an organization change at all" — which is every
+ * attachment whose template belongs to the device's current organization, i.e.
+ * every attachment it has.
+ *
+ * README §4.5 is the reason this is computed at CREATION rather than at accept:
+ * the SOURCE is the party that loses the attachments and the source is not
+ * present when the offer is accepted, so by then it is too late to reconsider.
+ */
+export async function attachmentsAtRiskOnOrgChange(
+  deviceId: string,
+  organizationId: string,
+): Promise<{ id: string; templateId: string; templateName: string }[]> {
+  return db
+    .select({
+      id: schema.workflowAttachments.id,
+      templateId: schema.workflowTemplates.id,
+      templateName: schema.workflowTemplates.name,
+    })
+    .from(schema.workflowAttachments)
+    .innerJoin(
+      schema.workflowTemplates,
+      eq(schema.workflowAttachments.templateId, schema.workflowTemplates.id),
+    )
+    .where(
+      and(
+        eq(schema.workflowAttachments.deviceId, deviceId),
+        eq(schema.workflowTemplates.organizationId, organizationId),
+      ),
+    );
+}
+
 async function countRows(
   query: Promise<{ n: number }[]>,
 ): Promise<number> {

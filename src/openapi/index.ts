@@ -10,6 +10,7 @@ import { workspacesPaths } from './workspaces';
 import { deviceModelsPaths } from './device-models';
 import { devicesPaths } from './devices';
 import { deviceRegistrationsPaths } from './device-registrations';
+import { transferOffersPaths } from './transfer-offers';
 import { mediaSessionsPaths } from './media-sessions';
 import { telemetryPaths } from './telemetry';
 import { livePaths } from './live';
@@ -92,6 +93,14 @@ const TAGS = [
     'x-displayName': 'Devices',
     description:
       'Device records, their configuration document, their IoT identity, and the one-shot commands you can send them.',
+  },
+  {
+    name: 'TransferOffers',
+    'x-displayName': 'Transfer offers',
+    description:
+      'Handing a device to an organization you have no membership in. The source mints a code, ' +
+      'the destination redeems it. A move between workspaces of the SAME organization needs none ' +
+      'of this — see POST /devices/{id}/transfer.',
   },
   {
     name: 'Device Registrations',
@@ -260,6 +269,7 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...deviceModelsPaths,
       ...devicesPaths,
       ...deviceRegistrationsPaths,
+      ...transferOffersPaths,
       ...telemetryPaths,
       ...mediaSessionsPaths,
       ...livePaths,
