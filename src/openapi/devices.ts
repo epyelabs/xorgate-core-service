@@ -432,6 +432,181 @@ export const devicesPaths = {
       },
     },
   },
+  '/devices/{id}/transfer': {
+    parameters: deviceIdParams,
+    post: {
+      operationId: 'transferDevice',
+      summary: 'Move a device to another workspace',
+      description:
+        'Changes which workspace — and therefore which organization — owns a device.\n\n' +
+        '**What moves.** Everything. The device record, its IoT identity and certificates, its ' +
+        'video channels, ALL of its historical telemetry, and ALL of its recorded footage. ' +
+        'Telemetry and media are stored against the device, not against a tenant, so they ' +
+        'travel with it and nothing is purged. For a transfer between organizations that is a ' +
+        'data-disclosure event; call the preview first and show the operator what it says.\n\n' +
+        '**What does not move.** Workflow attachments pointing at the source organization\'s ' +
+        'templates are DETACHED (the destination cannot see those templates), and the names are ' +
+        'returned in `transfer.detachedWorkflowAttachments`. Workflow runs already executing are ' +
+        'left to finish. Session tokens scoped to the source workspace stop seeing the device ' +
+        'and are not revoked. Completed run history, dataset items and the registration record ' +
+        'stay where they are — they are history of the device under its former owner.\n\n' +
+        '**The device does not have to be online.** Nothing on the device changes: certificates ' +
+        'and identity are untouched and the tenancy is never stored on the box. An offline ' +
+        'device has its new tenancy staged in the cloud and adopts it the moment it next ' +
+        'connects — no reboot, no re-provisioning, no site visit. That is a normal success, ' +
+        'reported through `transfer.warnings`, not an error.\n\n' +
+        '**Completion is two-step, and the response says which step it is at.** The ownership ' +
+        'change is complete and authoritative the moment this returns 200. Whether the DEVICE ' +
+        'has caught up is a separate question, answered by `transfer.adoption`: `pending` is ' +
+        'the normal immediate answer, `confirmed` appears once the device reports publishing ' +
+        'under the new tenancy, and `unknown` means it has never reported a telemetry scope ' +
+        '(every agent older than v0.0.6). Poll `GET /devices/{id}` to watch it settle.\n\n' +
+        '**Cross-organization.** Pass `organizationId` to move the device into another ' +
+        'organization you personally administer (`owner` or `admin` in BOTH). Without that ' +
+        'shared membership — a genuine handover to a customer — use a transfer offer instead: ' +
+        '`POST /devices/{id}/transfer-offers`. API keys cannot use the shared-membership path ' +
+        'at all, because a key is bound to one organization by its own record.\n\n' +
+        '**Operational precondition.** A device whose agent predates `v0.0.6` has no fallback ' +
+        'to the unscoped telemetry topic, so a transfer that it cannot immediately act on can ' +
+        'leave it unable to publish until its agent process is restarted. Update the fleet ' +
+        'before transferring fielded devices.',
+      tags: ['Devices'],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['workspaceId'],
+              properties: {
+                workspaceId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description: 'The DESTINATION workspace.',
+                },
+                organizationId: {
+                  type: 'string',
+                  format: 'uuid',
+                  description:
+                    'The DESTINATION organization. Only needed when it differs from the ' +
+                    'active one, and only usable by a user holding `owner` or `admin` in it.',
+                },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description:
+            'Transferred. Includes the case where the device is offline and will converge on ' +
+            'its next connect — read `transfer.warnings` and `transfer.adoption`.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['device', 'transfer'],
+                properties: {
+                  device: { $ref: '#/components/schemas/Device' },
+                  transfer: { $ref: '#/components/schemas/TransferSummary' },
+                },
+              },
+            },
+          },
+        },
+        '400': {
+          description:
+            'Malformed body, an unknown field, or a destination equal to the device\'s current ' +
+            'workspace (`SAME_WORKSPACE`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': {
+          description:
+            'The caller is a `member` or `viewer`, holds a workspace-scoped session token (a ' +
+            'transfer spans two workspaces, so such a credential can never be authorized for ' +
+            'both), or is an API key attempting the shared-membership cross-organization path.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '404': {
+          description:
+            'The device was not found, or the destination workspace is not one the caller can ' +
+            'reach. Deliberately indistinguishable: confirming that another tenant\'s ' +
+            'workspace exists would itself be a leak.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            'A device with the same serial already exists in the destination workspace ' +
+            '(`SERIAL_COLLISION` — serials are unique per workspace), or another transfer of ' +
+            'this device is already running (`TRANSFER_IN_PROGRESS`), or the device moved while ' +
+            'the request was being prepared (`CONCURRENT_MODIFICATION`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '502': {
+          description:
+            'The device could not be told about its new workspace, so the transfer was ROLLED ' +
+            'BACK and nothing changed (`TRANSFER_FAILED`). Safe to retry.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+      },
+    },
+  },
+  '/devices/{id}/transfer/preview': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'previewDeviceTransfer',
+      summary: 'What a transfer would do, without doing it',
+      description:
+        'A dry run of `POST /devices/{id}/transfer`. Writes nothing.\n\n' +
+        'It exists so a confirmation can NAME the consequences before the operator agrees ' +
+        'rather than report them afterwards — in particular the workflow attachments a ' +
+        'cross-organization move will detach, which cannot be reconsidered once the transfer ' +
+        'has run.\n\n' +
+        'Refusals come back in `blockers` rather than as an error status, so the reason can be ' +
+        'shown in place. `POST` turns the first blocker into its own 400 or 409.',
+      parameters: [
+        {
+          name: 'workspaceId',
+          in: 'query',
+          required: true,
+          schema: { type: 'string', format: 'uuid' },
+          description: 'The DESTINATION workspace.',
+        },
+        {
+          name: 'organizationId',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', format: 'uuid' },
+          description:
+            'The DESTINATION organization, for the shared-membership cross-organization path. ' +
+            'Same authorization as on `POST`.',
+        },
+      ],
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'What the transfer would do.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['preview'],
+                properties: { preview: { $ref: '#/components/schemas/TransferPreview' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
   '/devices/{id}/reboot': {
     parameters: deviceIdParams,
     post: {

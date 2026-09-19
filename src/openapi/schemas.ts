@@ -1235,5 +1235,173 @@ export function openApiSchemas(): Record<string, unknown> {
         count: { type: 'integer', description: 'Templates in this organization carrying the tag.' },
       },
     },
+
+    // ---- Device transfer ---------------------------------------------------
+
+    TransferTenancy: {
+      type: 'object',
+      required: ['workspaceId', 'organizationId'],
+      properties: {
+        workspaceId: { type: 'string', format: 'uuid' },
+        organizationId: { type: 'string', format: 'uuid' },
+      },
+    },
+    TransferAdoption: {
+      type: 'string',
+      enum: ['confirmed', 'pending', 'unknown'],
+      description:
+        'Whether the DEVICE has confirmed it is now publishing under the new tenancy. ' +
+        '`pending` is the normal answer immediately after a transfer and is not an error: ' +
+        'the ownership change is already complete and authoritative in the cloud, and the ' +
+        'device adopts it from the retained config on its next connect. `unknown` means the ' +
+        'device has never reported a telemetry scope at all — every agent older than v0.0.6 ' +
+        'is in this state — and must NOT be read as "not scoped". Read it back from ' +
+        '`GET /devices/{id}`; a scope change deliberately does not move the config revision, ' +
+        'so the revision is not evidence either way.',
+    },
+    TransferSummary: {
+      type: 'object',
+      required: [
+        'id',
+        'deviceId',
+        'from',
+        'to',
+        'crossOrg',
+        'detachedWorkflowAttachments',
+        'kvsChannelsRetagged',
+        'scopeAttributes',
+        'adoption',
+        'warnings',
+      ],
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'The transfer record, for audit and support.' },
+        deviceId: { type: 'string', format: 'uuid' },
+        from: { $ref: '#/components/schemas/TransferTenancy' },
+        to: { $ref: '#/components/schemas/TransferTenancy' },
+        crossOrg: {
+          type: 'boolean',
+          description: 'True when the destination workspace belongs to a different organization.',
+        },
+        detachedWorkflowAttachments: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Template names whose attachments were removed by the cross-organization sweep. ' +
+            'Always empty for a same-organization move.',
+        },
+        kvsChannelsRetagged: {
+          type: 'integer',
+          description: 'Video signaling channels re-tagged to the new tenancy.',
+        },
+        scopeAttributes: {
+          type: 'string',
+          enum: ['unchanged', 'written', 'failed'],
+          description:
+            'What happened to the IoT thing attributes that authorize the device\'s telemetry ' +
+            'topic. `failed` is a DEGRADED SUCCESS: the device moved and was told its new ' +
+            'topic, but the broker was not told to allow it, so it publishes on the legacy ' +
+            '(still-ingested) telemetry plane until any setting save re-asserts the ' +
+            'attributes. Workspace-scoped credentials cannot see its telemetry meanwhile.',
+        },
+        adoption: { $ref: '#/components/schemas/TransferAdoption' },
+        warnings: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Human-readable notes about what this transfer did and did not do — an offline ' +
+            'device, detached workflows, history travelling with the device, session tokens ' +
+            'that lose sight of it. Surface these; none of them is an error.',
+        },
+      },
+    },
+    TransferBlocker: {
+      type: 'object',
+      required: ['code', 'message'],
+      properties: {
+        code: {
+          type: 'string',
+          enum: ['SAME_WORKSPACE', 'SERIAL_COLLISION', 'TRANSFER_IN_PROGRESS'],
+        },
+        message: { type: 'string' },
+      },
+    },
+    TransferPreview: {
+      type: 'object',
+      required: [
+        'deviceId',
+        'from',
+        'to',
+        'crossOrg',
+        'workflowAttachments',
+        'runningWorkflowRuns',
+        'openMediaSessions',
+        'staleSessionTokens',
+        'kvsChannels',
+        'carriesHistory',
+        'blockers',
+        'warnings',
+      ],
+      properties: {
+        deviceId: { type: 'string', format: 'uuid' },
+        deviceName: { type: 'string', nullable: true },
+        serial: { type: 'string', nullable: true },
+        from: {
+          allOf: [{ $ref: '#/components/schemas/TransferTenancy' }],
+          description: 'With `workspaceName` and `organizationName` added, for display.',
+        },
+        to: {
+          allOf: [{ $ref: '#/components/schemas/TransferTenancy' }],
+          description: 'With `workspaceName` and `organizationName` added, for display.',
+        },
+        crossOrg: { type: 'boolean' },
+        workflowAttachments: {
+          type: 'array',
+          description:
+            'Attachments the cross-organization sweep would DETACH, named so a confirmation ' +
+            'dialog can show them before the operator agrees rather than after. Their ' +
+            'templates belong to the source organization and the destination cannot see them.',
+          items: {
+            type: 'object',
+            required: ['id', 'templateId', 'templateName'],
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              templateId: { type: 'string', format: 'uuid' },
+              templateName: { type: 'string' },
+            },
+          },
+        },
+        runningWorkflowRuns: {
+          type: 'integer',
+          description: 'Runs executing right now. They are left to finish; their history is stamped with the organization that started them.',
+        },
+        openMediaSessions: {
+          type: 'integer',
+          description: 'Recording sessions still accepting uploads. They keep uploading — segments are keyed by device, not by tenant.',
+        },
+        staleSessionTokens: {
+          type: 'integer',
+          description: 'Live workspace-scoped session tokens naming the SOURCE workspace. They stop seeing the device and are NOT revoked.',
+        },
+        kvsChannels: { type: 'integer' },
+        carriesHistory: {
+          type: 'boolean',
+          enum: [true],
+          description:
+            'Always true, and stated rather than implied. Every historical telemetry reading ' +
+            'and every recorded segment is stored against the device and MOVES WITH IT. ' +
+            'Nothing is purged. For a cross-organization transfer that is a data-disclosure ' +
+            'event and the confirmation must say so.',
+        },
+        blockers: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/TransferBlocker' },
+          description:
+            'Non-empty means the transfer would be refused. Returned rather than thrown so ' +
+            'the dialog can explain the refusal; `POST .../transfer` turns the first of them ' +
+            'into its 400 or 409.',
+        },
+        warnings: { type: 'array', items: { type: 'string' } },
+      },
+    },
   };
 }

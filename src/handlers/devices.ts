@@ -24,13 +24,13 @@ import {
   CONFIG_NAMESPACES,
   initialConfigDocument,
   parseUiPrefsPatch,
-  publicConfigDocument,
   validateConfigPatch,
   validateNamespaceValue,
   type DeviceConfigDocument,
 } from '../config-registry/index';
 import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
 import { apiHandler } from '../utils/api-handler';
+import { deviceResponse, type DeviceRow } from '../services/device-view';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
@@ -47,31 +47,6 @@ const LEGACY_PUT_FIELDS: { field: string; namespace: string }[] = CONFIG_NAMESPA
 
 /** Old cloud-only PUT fields, now `PATCH /devices/{id}/ui-prefs`. */
 const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
-
-type DeviceRow = typeof schema.devices.$inferSelect;
-
-/**
- * A device row as it leaves the API.
- *
- * Cleared config namespaces (`null`, settings_sync_hardening finding 2) are
- * stripped, so every client keeps seeing the two states the OpenAPI contract
- * documents: a namespace is either configured or absent. The marker exists so
- * the PUBLISHER can tell "reverted" from "never configured"; nothing outside
- * this service needs it, and the deployed frontend would read a present-but-
- * null key as "the cloud manages this".
- */
-function deviceResponse(row: DeviceRow): DeviceRow & { firmwareVersion: string | null } {
-  return {
-    ...row,
-    config: publicConfigDocument(row.config) as DeviceConfigDocument,
-    // TODO(agent-version-alias): drop `firmwareVersion` once the renamed
-    // frontend is deployed (device_update_management, Phase 4). Its zod device
-    // schema is strict — `firmwareVersion: z.string().nullable()` with no
-    // `.catch` — so serving only the new name would fail the parse for every
-    // browser still holding the old bundle, breaking the whole device page.
-    firmwareVersion: row.agentVersion,
-  };
-}
 
 async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
   if (orgWorkspaceIds.length === 0) return undefined;

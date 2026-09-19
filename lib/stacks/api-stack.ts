@@ -795,6 +795,23 @@ export class XorgateCoreApiStack extends cdk.Stack {
       bundling: bundlingWithSdk,
     });
 
+    // Device transfer (plans/transfer-device-ownership). Its own function rather
+    // than another arm of DevicesFn: the ordered sequence makes an IoT publish, an
+    // IoT UpdateThing and a KVS re-tag on one request, and it must not share a
+    // cold start (or a timeout) with the settings-save path. 30 s for the same
+    // reason DeviceProvisioningFn has it — several AWS round-trips per request.
+    const deviceTransferFn = new nodejs.NodejsFunction(this, "DeviceTransferFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-transfer.ts"),
+        "POST /devices/{id}/transfer + transfer offers — move a device between tenancies",
+      ),
+      timeout: cdk.Duration.seconds(30),
+      // Bundles @aws-sdk/client-iot-data-plane (the retained config publish),
+      // @aws-sdk/client-iot (the thing attributes) and
+      // @aws-sdk/client-kinesis-video (the channel re-tag).
+      bundling: bundlingWithSdk,
+    });
+
     const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-commands.ts"),
@@ -2159,6 +2176,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DevicesInt",
       devicesFn,
     );
+    const deviceTransferInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceTransferInt",
+      deviceTransferFn,
+    );
     const deviceCommandsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceCommandsInt",
       deviceCommandsFn,
@@ -2431,6 +2452,20 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.PATCH],
       integration: devicesInt,
     });
+    // Transfer. `preview` is a read with no writes — it is what lets the
+    // confirmation dialog NAME the workflow attachments a cross-org move will
+    // detach, before the operator confirms rather than after.
+    addRoutes({
+      path: "/devices/{id}/transfer",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceTransferInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/transfer/preview",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceTransferInt,
+    });
+
     addRoutes({
       path: "/devices/{id}/provision",
       methods: [apigwv2.HttpMethod.POST],
