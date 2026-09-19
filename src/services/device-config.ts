@@ -170,7 +170,68 @@ export async function deviceHardwareBlock(
 }
 
 /**
- * Publish the retained per-device config message. Throws on failure.
+ * Publish the retained per-device config message, and nothing else. Throws on
+ * failure; returns the scope it published (null when the device or its
+ * workspace is gone, in which case the message carries no `scope` at all).
+ *
+ * This is the INSTRUCTION half of a tenancy change, split out from
+ * `publishDeviceConfig` in Phase 1 of transfer-device-ownership so a caller can
+ * choose the order. For an ordinary config save the order does not matter and
+ * `publishDeviceConfig` is the right call. For a TRANSFER it matters completely:
+ * the device has to be told its new topic BEFORE the broker is told to stop
+ * accepting the old one, or a running agent is stranded (README §2.2/§2.3, and
+ * the ordering note on `ensureThingScopeAttributes`). The transfer path is
+ *
+ *   update devices.workspace_id
+ *   const scope = await publishDeviceConfigOnly(id, doc, rev)   // unchanged rev
+ *   await ensureThingScopeAttributes(id, scope)                 // immediately
+ *
+ * and the returned scope is what the second call should use: it is the exact
+ * tenancy the device was just handed, so the two halves cannot disagree even if
+ * the row changes under a concurrent write.
+ *
+ * ⚠️ Publish at the device's CURRENT `config_rev`. Bumping the rev to force a
+ * republish is what turned the 2026-09-18 incident into a storm — the reconciler
+ * republishes whenever `report.rev < config_rev`, and a device that cannot
+ * converge never stops reporting behind. `scope` is applied by the agent
+ * OUTSIDE its rev guard, so an unchanged rev takes effect anyway.
+ */
+export async function publishDeviceConfigOnly(
+  deviceId: string,
+  doc: DeviceConfigDocument | null | undefined,
+  rev: number,
+): Promise<DeviceScope | null> {
+  const scope = await deviceScope(deviceId);
+  await publishRetainedConfig(deviceId, doc, rev, scope);
+  return scope;
+}
+
+/**
+ * Publish the retained per-device config message, asserting the device's
+ * tenancy attributes on its IoT thing first. Throws if the publish fails; the
+ * attribute write is best-effort (see `ensureThingScopeAttributes`).
+ *
+ * **The attributes-first order here is deliberate and is NOT the transfer
+ * order.** Which direction is safe depends on whether the device already holds
+ * a scope, and the two callers are different:
+ *
+ * - This path (a config save, a model-edit fanout, a claim seeding the topic)
+ *   never CHANGES the tenancy; it asserts the one the device already has, or
+ *   sets the first one on a device still using the unscoped topic. Writing the
+ *   attribute there only ever ADDS a permitted topic — the unscoped topic it is
+ *   currently using stays permitted by the policy's `PublishReceive` statement
+ *   — so there is no window in which the device is publishing somewhere it is
+ *   not allowed.
+ * - A TRANSFER moves the tenancy, and the attribute write REVOKES the old
+ *   topic. Attributes-first there leaves a running agent publishing into a
+ *   topic the broker now refuses, which closes the connection, on every
+ *   reconnect, forever (README §2.3). That path must use
+ *   `publishDeviceConfigOnly` and then `ensureThingScopeAttributes`.
+ *
+ * What Phase 1 changed for THIS function is not the order but the cost: the
+ * attribute write is now a genuine no-op when the attributes already match,
+ * which on this path is every call after the first. That is what stopped the
+ * reconciler amplifying a stuck device into an account-wide storm.
  *
  * A failed publish leaves the DB ahead of the device; today the handler turns
  * that into a 502 telling the operator to re-save. Phase 3 removes that crutch:
@@ -183,16 +244,29 @@ export async function publishDeviceConfig(
   doc: DeviceConfigDocument | null | undefined,
   rev: number,
 ): Promise<void> {
-  // Resolved here rather than passed in, deliberately. Every caller already has
-  // the device row and could supply it, and every future caller would have to
-  // remember to — and a caller that forgot would silently publish a message
-  // telling the device it has no tenant, which reverts it to the unscoped
-  // topic. One indexed read on an operation that happens when someone saves
-  // settings is the cheaper side of that trade.
   const scope = await deviceScope(deviceId);
   if (scope) await ensureThingScopeAttributes(deviceId, scope);
-  const hardware = await deviceHardwareBlock(deviceId);
+  await publishRetainedConfig(deviceId, doc, rev, scope);
+}
 
+/**
+ * The publish itself, with the scope already resolved.
+ *
+ * The scope is resolved by the two exported wrappers rather than passed in by
+ * their callers, deliberately. Every caller already has the device row and could
+ * supply it, and every future caller would have to remember to — and a caller
+ * that forgot would silently publish a message telling the device it has no
+ * tenant, which reverts it to the unscoped topic. One indexed read on an
+ * operation that happens when someone saves settings is the cheaper side of
+ * that trade.
+ */
+async function publishRetainedConfig(
+  deviceId: string,
+  doc: DeviceConfigDocument | null | undefined,
+  rev: number,
+  scope: DeviceScope | null,
+): Promise<void> {
+  const hardware = await deviceHardwareBlock(deviceId);
   const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope, hardware);
   const client = await iotDataClient();
   await client.send(

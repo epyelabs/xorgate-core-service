@@ -1,4 +1,4 @@
-import { IoTClient, UpdateThingCommand } from '@aws-sdk/client-iot';
+import { DescribeThingCommand, IoTClient, UpdateThingCommand } from '@aws-sdk/client-iot';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 
@@ -19,11 +19,19 @@ import { db, schema } from '../db/index';
  *   (`${iot:Connection.Thing.Attributes[xgOrgId]}`), which this file writes.
  *
  * The attributes are the enforcement half and the config message is the
- * instruction half, so they are written together and from one place. Getting
- * only the config message out would produce a device that publishes to a topic
- * the broker refuses; getting only the attributes out would produce a device
- * that is allowed to use a topic it does not know about. Neither is dangerous —
- * both fail closed — but both are confusing, so they move as a pair.
+ * instruction half, so they are written together and from one place.
+ *
+ * They are NOT symmetric, which cost ~50 minutes of production to learn
+ * (2026-09-18; transfer-device-ownership README §2.3). Getting only the config
+ * message out is benign: the device tries a topic the broker refuses, and on an
+ * agent from Phase 1 of that plan onwards it drops back to the unscoped topic,
+ * which is still ingested. Getting only the ATTRIBUTES out is not benign when
+ * the device is online, because the attribute does not ADD a topic — it MOVES
+ * the one topic this thing may publish on. A running agent pinned to the old
+ * topic is then refused on every publish, and IoT Core closes the connection on
+ * an unauthorized publish, so it reconnects into the same state forever. Publish
+ * first, write the attributes immediately after, and never straddle a slow call
+ * between them.
  */
 
 const iot = new IoTClient({});
@@ -59,29 +67,46 @@ export function scopedTelemetryTopic(scope: DeviceScope, deviceId: string): stri
   return `xorgate/orgs/${scope.organizationId}/ws/${scope.workspaceId}/devices/${deviceId}/telemetry`;
 }
 
+/** What `ensureThingScopeAttributes` actually did. */
+export type ScopeAttributeResult = 'unchanged' | 'written' | 'failed';
+
 /**
  * Write the tenancy attributes onto the IoT thing, so the device policy's
  * topic variables resolve.
  *
- * Idempotent, and safe to call on every config publish: `UpdateThing` with the
- * same attributes is a no-op write. Best-effort by design — a failure here
- * means the device is refused when it tries the scoped topic and keeps using
- * the legacy one, which is exactly the state it was already in, so turning it
- * into a 5xx on a config save would be trading a working device for an error
- * message.
+ * **Reads before it writes, and skips the write when the attributes already
+ * match.** `UpdateThing` is not a no-op: an identical payload still bumps the
+ * thing's `version` and re-evaluates policy for connected sessions. That is not
+ * theoretical — on 2026-09-18 a device that could not converge had its boot
+ * report re-trigger this on every reconnect and the version went 118 -> 255 in
+ * minutes, turning one bad state into a storm
+ * (transfer-device-ownership README §2.2). The `DescribeThing` costs one call on
+ * a path that runs when someone saves settings, and it is the cheaper side of
+ * that trade by a wide margin.
  *
- * NOTE the missing counterpart: nothing clears these when a device moves
- * workspace, because nothing moves a device between workspaces —
- * `PUT /devices/{id}` is metadata-only and no other route writes
- * `devices.workspace_id`. The day a move endpoint exists it has to call this,
- * and until then a stale attribute can only be produced by editing the database
- * by hand.
+ * Best-effort by design — a failure here means the device is refused when it
+ * tries the scoped topic and keeps using the legacy one, which is exactly the
+ * state it was already in, so turning it into a 5xx on a config save would be
+ * trading a working device for an error message. A failed DESCRIBE falls through
+ * to the write rather than skipping it: not knowing the current attributes is a
+ * reason to write, not a reason to assume they are right.
+ *
+ * ⚠️ **Ordering.** For a device that is ONLINE this write is what authorizes a
+ * topic; the retained config message is what instructs it. Landing this FIRST
+ * strands a running agent on a topic the broker now refuses — publish, refused,
+ * connection closed, reconnect, repeat, with no remote exit. Anything moving a
+ * device's tenancy must publish the config first and call this immediately
+ * after (README §2.2/§2.3); `publishDeviceConfigOnly` in `device-config.ts` is
+ * the publish half. Phase 1 of that plan gave the agent an unscoped-topic
+ * fallback so a mistake here costs a demotion to the legacy plane rather than an
+ * outage — but the fleet is only as protected as its oldest installed agent.
  */
 export async function ensureThingScopeAttributes(
   deviceId: string,
   scope: DeviceScope,
-): Promise<void> {
+): Promise<ScopeAttributeResult> {
   try {
+    if (await thingScopeMatches(deviceId, scope)) return 'unchanged';
     await iot.send(
       new UpdateThingCommand({
         thingName: deviceId,
@@ -94,11 +119,38 @@ export async function ensureThingScopeAttributes(
         },
       }),
     );
+    return 'written';
   } catch (err) {
     console.warn(
       `[device-scope] could not write scope attributes for ${deviceId}; ` +
         'it stays on the unscoped telemetry topic',
       err,
     );
+    return 'failed';
+  }
+}
+
+/**
+ * Does the thing already carry exactly this tenancy?
+ *
+ * False on ANY doubt — a describe that failed, a thing that is gone, an
+ * attribute that is missing — because the caller's fallback for "don't know" is
+ * to write, and a redundant write is merely wasteful where a skipped one leaves
+ * a device unable to publish.
+ */
+async function thingScopeMatches(deviceId: string, scope: DeviceScope): Promise<boolean> {
+  try {
+    const thing = await iot.send(new DescribeThingCommand({ thingName: deviceId }));
+    const attrs = thing.attributes ?? {};
+    return (
+      attrs[ORG_ATTRIBUTE] === scope.organizationId &&
+      attrs[WORKSPACE_ATTRIBUTE] === scope.workspaceId
+    );
+  } catch (err) {
+    console.warn(
+      `[device-scope] could not read scope attributes for ${deviceId}; writing them`,
+      err,
+    );
+    return false;
   }
 }

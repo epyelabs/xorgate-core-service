@@ -96,6 +96,84 @@ export type DeviceConfigReport = z.infer<typeof reportSchema>;
  */
 const MAX_REPORT_BYTES = 32_768;
 
+/**
+ * Republish rate guard (transfer-device-ownership Phase 1.3).
+ *
+ * A device that cannot converge reports every time it reconnects, and each
+ * report asks this handler to republish. That is a retry loop wearing the
+ * costume of self-healing, and it is what turned one stranded device into an
+ * account-wide storm on 2026-09-18. A device that cannot converge is an ALERT,
+ * not a retry.
+ *
+ * The two cases are told apart by CADENCE, not by count alone. The legitimate
+ * repair path — a retained message the broker dropped — fires once per connect
+ * or once an hour; the pathological one fires every few seconds. So a run is
+ * only a run while consecutive republishes for the SAME target rev land inside
+ * `WINDOW_MS` of each other. A gap longer than that starts over, which keeps
+ * the hourly heartbeat's repair working forever while capping the fast loop at
+ * `MAX_REPUBLISHES`.
+ *
+ * ⚠️ This is Lambda-container-local state, deliberately: the alternative is a
+ * column and a migration for something whose only job is to stop a fast loop.
+ * A device whose reports fan out across N warm containers therefore gets up to
+ * N times the budget. That is fine for the purpose — the bound is small and
+ * finite either way, and the loop this exists to break happened inside a single
+ * container's lifetime.
+ */
+const REPUBLISH_WINDOW_MS = 10 * 60_000;
+const MAX_REPUBLISHES = 3;
+/** Ceiling on tracked devices, so a big fleet cannot grow a warm container. */
+const MAX_TRACKED_DEVICES = 5_000;
+
+interface RepublishRun {
+  /** The `config_rev` we have been trying to get this device onto. */
+  rev: number;
+  count: number;
+  lastAt: number;
+}
+
+export const republishGuard = {
+  runs: new Map<string, RepublishRun>(),
+
+  /** True if this republish should go ahead. Logs once when it starts refusing. */
+  allow(deviceId: string, configRev: number, now: number): boolean {
+    const prev = this.runs.get(deviceId);
+    const continues =
+      prev !== undefined && prev.rev === configRev && now - prev.lastAt <= REPUBLISH_WINDOW_MS;
+    const run: RepublishRun = continues
+      ? { rev: configRev, count: prev.count + 1, lastAt: now }
+      : { rev: configRev, count: 1, lastAt: now };
+    if (this.runs.size >= MAX_TRACKED_DEVICES && !this.runs.has(deviceId)) {
+      // Cheapest correct eviction: drop everything and start counting again.
+      // Losing the counts costs at most one extra republish per device.
+      this.runs.clear();
+    }
+    this.runs.set(deviceId, run);
+    if (run.count <= MAX_REPUBLISHES) return true;
+    if (run.count === MAX_REPUBLISHES + 1) {
+      console.error('device-config-report: republish loop guard tripped; giving up', {
+        deviceId,
+        configRev,
+        attempts: MAX_REPUBLISHES,
+        detail:
+          'the device keeps reporting an older rev after repeated republishes — ' +
+          'it cannot apply this config, which is an alert, not something to retry',
+      });
+    }
+    return false;
+  },
+
+  /** Forget a device's run — it converged, so the next divergence starts clean. */
+  clear(deviceId: string): void {
+    this.runs.delete(deviceId);
+  },
+
+  /** Tests only. */
+  reset(): void {
+    this.runs.clear();
+  },
+};
+
 export const handler = async (event: unknown): Promise<void> => {
   const parsed = reportSchema.safeParse(event);
   if (!parsed.success) {
@@ -194,15 +272,29 @@ export const handler = async (event: unknown): Promise<void> => {
     return;
   }
 
-  if (report.rev >= configRev) return;
+  if (report.rev >= configRev) {
+    // Converged. Forget any republish run we were counting for this device.
+    republishGuard.clear(deviceId);
+    return;
+  }
 
   // The device is behind. Republishing the retained desired document is the
   // repair path for a publish that failed after the DB commit, for a retained
   // message the broker dropped, and for a device that applied while the
-  // backend was mid-deploy. It terminates on its own: once the device applies
-  // it, its next report carries `rev === configRev` and this branch stops
-  // firing. A device that CANNOT apply re-triggers at most once per report
-  // (on connect + hourly), not in a loop.
+  // backend was mid-deploy. Once the device applies it, its next report carries
+  // `rev === configRev` and this branch stops firing.
+  //
+  // The comment that used to stand here claimed a device that CANNOT apply
+  // "re-triggers at most once per report … not in a loop". That was false, and
+  // on 2026-09-18 it was expensively false: the republish itself severed the
+  // connection that produced the next report, so every ~3 s reconnect made
+  // another boot report, which made another republish, which made another
+  // `UpdateThing` — the thing's version went 118 -> 255 in minutes
+  // (transfer-device-ownership README §2.2). Phase 1 removed the amplifier
+  // (`ensureThingScopeAttributes` no longer writes when the attributes already
+  // match, and it no longer runs ahead of the publish), and the guard below
+  // makes the loop structurally impossible rather than merely unlikely.
+  if (!republishGuard.allow(deviceId, configRev, Date.now())) return;
   try {
     await publishDeviceConfig(deviceId, config as DeviceConfigDocument, configRev);
     console.log('device-config-report: republished desired config', {

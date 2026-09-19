@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as realSchema from '../src/db/schema';
 
 /**
@@ -28,7 +28,7 @@ vi.mock('../src/services/device-config', () => ({
     (publishDeviceConfig as unknown as (...a: unknown[]) => Promise<void>)(...args),
 }));
 
-const { handler } = await import('../src/handlers/device-config-report');
+const { handler, republishGuard } = await import('../src/handlers/device-config-report');
 
 const DEVICE = 'a73f7a36-2a9c-45c4-a66c-54d3b018a7f7';
 
@@ -54,6 +54,11 @@ function rowAt(configRev: number, config: unknown = { gnssAntBias: true }): void
 beforeEach(() => {
   vi.clearAllMocks();
   rowAt(12);
+  // The republish loop guard is module state that outlives a test (it is
+  // Lambda-container state in production, by design). Every test below that
+  // expects a republish would otherwise be at the mercy of how many earlier
+  // tests used the same device id.
+  republishGuard.reset();
 });
 
 describe('device-config-report: mirroring', () => {
@@ -270,6 +275,89 @@ describe('device-config-report: self-heal republish', () => {
       throw new Error('data api timeout');
     };
     await expect(handler(report())).rejects.toThrow('data api timeout');
+  });
+});
+
+/**
+ * The republish loop guard (transfer-device-ownership Phase 1.3).
+ *
+ * The comment this replaced claimed a device that cannot apply "re-triggers at
+ * most once per report … not in a loop". On 2026-09-18 that was wrong in the
+ * expensive direction: the republish severed the connection that produced the
+ * next report, so a stranded device re-triggered every ~3 s for 50 minutes and
+ * its thing `version` went 118 -> 255. A device that cannot converge is an
+ * alert, not a retry.
+ */
+describe('device-config-report: republish loop guard', () => {
+  /** A device stuck behind: it keeps reporting rev 12 while the cloud is at 15. */
+  async function stuckReport(atMs: number): Promise<void> {
+    vi.setSystemTime(atMs);
+    rowAt(15);
+    await handler(report({ rev: 12, origin: 'boot', ts: 1_800_000_000_000 + atMs }));
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  // Not left installed: the guard is the only thing in this file that cares
+  // about the clock, and a leaked fake one would quietly change every test
+  // declared after it.
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('gives up after a small number of fast republishes, and says so once', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // The real loop: a boot report every ~3.3 s because the connection keeps
+    // being closed under it.
+    for (let i = 0; i < 40; i += 1) await stuckReport(i * 3_300);
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(3);
+    const tripped = err.mock.calls.filter((c) =>
+      String(c[0]).includes('republish loop guard tripped'),
+    );
+    expect(tripped).toHaveLength(1);
+    err.mockRestore();
+  });
+
+  it('keeps mirroring the report it refuses to act on', async () => {
+    for (let i = 0; i < 10; i += 1) await stuckReport(i * 3_300);
+    // Every report still landed in `reported_config`; only the republish stopped.
+    expect(set).toHaveBeenCalledTimes(10);
+  });
+
+  it('does not touch the slow repair path — one report an hour always republishes', async () => {
+    // The legitimate case this exists alongside: a retained message the broker
+    // dropped, noticed on the device's connect/hourly report. That cadence must
+    // never be capped, or a genuinely repairable device would stay broken.
+    for (let i = 0; i < 12; i += 1) await stuckReport(i * 3_600_000);
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(12);
+  });
+
+  it('starts a fresh budget when the cloud moves to a new rev', async () => {
+    for (let i = 0; i < 10; i += 1) await stuckReport(i * 3_300);
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(3);
+    // An operator saves a setting: new target, and the device deserves a fresh
+    // attempt at THAT one.
+    vi.setSystemTime(40_000);
+    rowAt(16);
+    await handler(report({ rev: 12, origin: 'boot', ts: 1_800_000_040_000 }));
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(4);
+  });
+
+  it('forgets the run once the device converges', async () => {
+    for (let i = 0; i < 10; i += 1) await stuckReport(i * 3_300);
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(3);
+    // It applied. Nothing to republish, and the counter is cleared…
+    vi.setSystemTime(40_000);
+    rowAt(15);
+    await handler(report({ rev: 15, origin: 'boot', ts: 1_800_000_040_000 }));
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(3);
+    // …so the next genuine divergence is served immediately.
+    vi.setSystemTime(43_000);
+    rowAt(16);
+    await handler(report({ rev: 15, origin: 'boot', ts: 1_800_000_043_000 }));
+    expect(publishDeviceConfig).toHaveBeenCalledTimes(4);
   });
 });
 
