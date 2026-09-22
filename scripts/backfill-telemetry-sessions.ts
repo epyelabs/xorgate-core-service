@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const totals = { indexed: 0, alreadyIndexed: 0, missing: 0, failed: 0, normalized: 0, built: 0, closed: 0 };
+  const totals = { indexed: 0, alreadyIndexed: 0, missing: 0, failed: 0, normalized: 0, built: 0, closed: 0, orphaned: 0 };
   for (let pass = 1; pass <= args.maxPasses; pass++) {
     const started = Date.now();
     const out = await invoke(lambda, fn, { job: 'telemetry-backfill', limit: args.limit });
@@ -109,20 +109,22 @@ async function main(): Promise<void> {
     totals.missing += r.missing;
     totals.failed += r.failed;
     totals.normalized += r.normalized;
+    totals.orphaned = r.orphaned;
     if (h) {
       totals.built += h.built;
       totals.closed += h.closed;
     }
     console.log(
       `pass ${pass}: indexed=${r.indexed} already=${r.alreadyIndexed} missing=${r.missing} failed=${r.failed} ` +
-        `normalized=${r.normalized} remaining=${r.remaining}` +
+        `normalized=${r.normalized} remaining=${r.remaining} orphaned=${r.orphaned}` +
         (h ? ` | closed=${h.closed} built=${h.built} pendingBuilds=${h.pendingBuilds} buildFailures=${h.buildFailures}` : '') +
         ` (${Date.now() - started} ms)`,
     );
-    const progressed = r.indexed + r.alreadyIndexed + r.missing + r.failed > 0;
+    // A failure is not progress: a pass that only fails would repeat forever.
+    const progressed = r.indexed + r.alreadyIndexed + r.missing > 0;
     if (r.remaining <= 0 || !progressed) {
       if (r.remaining > 0) {
-        console.log(`stopping: ${r.remaining} ingest-log rows remain but the last pass made no progress`);
+        console.log(`stopping: ${r.remaining} ingest-log rows remain but the last pass made no progress (see the sweeper's CloudWatch log)`);
       }
       break;
     }

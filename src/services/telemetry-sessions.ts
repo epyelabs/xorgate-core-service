@@ -444,6 +444,12 @@ export interface ReconcileResult {
   normalized: number;
   /** Ingest-log rows without an index row BEFORE this call, minus what it indexed. */
   remaining: number;
+  /**
+   * Ingest-log rows whose device no longer exists (deleted device; its S3
+   * objects and log rows outlive the row the session FK needs). Never
+   * indexed, never retried; the sweeper's ingest-log expiry removes them.
+   */
+  orphaned: number;
 }
 
 /**
@@ -470,22 +476,30 @@ export async function reconcileTelemetryIndex(opts: ReconcileOptions = {}): Prom
     failed: 0,
     normalized: 0,
     remaining: 0,
+    orphaned: 0,
   };
 
   const log = schema.telemetryIngestLog;
   const seg = schema.telemetrySegments;
-  const [{ remaining }] = await db
-    .select({ remaining: sql<number>`count(*)::int` })
+  const dev = schema.devices;
+  const [counts] = await db
+    .select({
+      remaining: sql<number>`count(*) filter (where ${dev.id} is not null)::int`,
+      orphaned: sql<number>`count(*) filter (where ${dev.id} is null)::int`,
+    })
     .from(log)
     .leftJoin(seg, eq(seg.s3Key, log.s3Key))
+    .leftJoin(dev, eq(dev.id, log.deviceId))
     .where(isNull(seg.s3Key));
-  result.remaining = remaining;
+  result.remaining = counts.remaining;
+  result.orphaned = counts.orphaned;
   if (limit <= 0) return result;
 
   const pending = await db
     .select({ s3Key: log.s3Key, ingestedAt: log.ingestedAt })
     .from(log)
     .leftJoin(seg, eq(seg.s3Key, log.s3Key))
+    .innerJoin(dev, eq(dev.id, log.deviceId))
     .where(isNull(seg.s3Key))
     .orderBy(asc(log.ingestedAt))
     .limit(limit);
