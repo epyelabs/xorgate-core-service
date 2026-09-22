@@ -179,6 +179,13 @@ describe('speed / position / altitude / gpsQuality', () => {
     expect(s.source).toBe('gps.speed');
   });
 
+  it('speed: a session that never moves still reports a zero max (10 Hz bench session, dev 2026-09-22)', () => {
+    const s = run(drive({ n: 30, speedKph: 0 }), [speedInsight]).speed as any;
+    expect(s.maxKph).toBe(0);
+    expect(s.maxAt).toBe(T0);
+    expect(s.avgMovingKph).toBe(0);
+  });
+
   it('position: first and last accepted fix as [lon, lat]', () => {
     const samples = drive({ n: 5, speedKph: 36 });
     samples[4].values['gps.fix_quality'] = 0; // last fix rejected -> end is sample 3

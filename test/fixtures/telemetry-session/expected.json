@@ -1,0 +1,95 @@
+{
+  "deviceId": "a73f7a36-2a9c-45c4-a66c-54d3b018a7f7",
+  "sessionId": "019fe89f-e9a8-7882-bfb0-aee70ea2b8df",
+  "rateHz": 1,
+  "builtAt": 1790108431600,
+  "source": {
+    "segments": 52,
+    "seqFrom": 0,
+    "seqTo": 51,
+    "samples": 3153,
+    "bytes": 267392,
+    "missingSegments": 0,
+    "invalidLines": 0
+  },
+  "from": 1786314223040,
+  "to": 1786320771303,
+  "timeSource": "rtc",
+  "groups": {
+    "gps": {
+      "bucketMs": 5000,
+      "buckets": 633,
+      "metrics": 13
+    },
+    "imu": {
+      "bucketMs": 15000,
+      "buckets": 213,
+      "metrics": 10
+    },
+    "lte": {
+      "bucketMs": 1000,
+      "buckets": 192,
+      "metrics": 5
+    },
+    "system": {
+      "bucketMs": 15000,
+      "buckets": 213,
+      "metrics": 7
+    }
+  },
+  "bbox": [
+    -79.574472,
+    43.598321,
+    -79.517906,
+    43.66587
+  ],
+  "insights": {
+    "computed": {
+      "duration": 1,
+      "distance": 1,
+      "speed": 1,
+      "position": 1,
+      "altitude": 1,
+      "gpsQuality": 1,
+      "system": 1,
+      "lte": 1,
+      "stops": 1
+    },
+    "distance": {
+      "meters": 25181.6,
+      "unit": "m",
+      "method": "haversine-2d",
+      "accept": {
+        "minFixQuality": 1,
+        "maxHdop": 5,
+        "maxJumpMps": 60,
+        "breakGapMs": 30000,
+        "stationaryRule": "speed",
+        "movingThresholdKph": 2,
+        "minStepM": 10
+      },
+      "fixesUsed": 3074,
+      "fixesRejected": 0,
+      "crossCheckMeters": 25103.8
+    },
+    "duration": {
+      "totalMs": 6548263,
+      "recordedMs": 3158305,
+      "movingMs": 2006220,
+      "idleMs": 1073115,
+      "movingThresholdKph": 2,
+      "breakGapMs": 30000
+    },
+    "speed": {
+      "maxKph": 116.1,
+      "maxAt": 1786319242175,
+      "avgMovingKph": 45,
+      "movingThresholdKph": 2,
+      "unit": "km/h",
+      "source": "gps.speed"
+    },
+    "eventCount": 3
+  },
+  "gzipBytes": 23579,
+  "jsonBytes": 93768
+}
