@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isTelemetryArtifactKey,
   iterateSegmentLines,
   parseSegment,
   parseTelemetryObjectKey,
@@ -17,6 +18,13 @@ describe('parseTelemetryObjectKey', () => {
     expect(
       parseTelemetryObjectKey(`telemetry/v1/${DEVICE}/${SESSION}/1753000000000-00003.jsonl.gz`),
     ).toEqual({ deviceId: DEVICE, sessionId: SESSION, startTsMs: 1753000000000, seq: 3 });
+  });
+
+  it('recognises the artifacts the sweeper writes next to the segments', () => {
+    expect(isTelemetryArtifactKey(`telemetry/v1/${DEVICE}/${SESSION}/overview.v1.json.gz`)).toBe(true);
+    expect(isTelemetryArtifactKey(`telemetry/v1/${DEVICE}/${SESSION}/raw.v2.jsonl.gz`)).toBe(true);
+    expect(isTelemetryArtifactKey(`telemetry/v1/${DEVICE}/${SESSION}/1753000000000-00003.jsonl.gz`)).toBe(false);
+    expect(parseTelemetryObjectKey(`telemetry/v1/${DEVICE}/${SESSION}/overview.v1.json.gz`)).toBeNull();
   });
 
   it('rejects foreign shapes', () => {

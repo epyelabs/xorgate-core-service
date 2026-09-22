@@ -19,6 +19,16 @@ export interface TelemetryObjectKey {
   seq: number;
 }
 
+/**
+ * Artifacts WE write under a session's prefix (telemetry-session-artifacts
+ * plan): `overview.v<n>.json.gz`, and any future sibling. Their Object Created
+ * events reach the ingest rule (prefix match) and must be ignored quietly.
+ */
+const ARTIFACT_RE =
+  /^telemetry\/v1\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/[a-z][a-z0-9-]*\.v\d+\.[a-z0-9.]+$/;
+
+export const isTelemetryArtifactKey = (key: string): boolean => ARTIFACT_RE.test(key);
+
 export function parseTelemetryObjectKey(key: string): TelemetryObjectKey | null {
   const m = KEY_RE.exec(key);
   if (!m) return null;

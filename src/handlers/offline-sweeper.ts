@@ -147,7 +147,8 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
 /**
  * Direct-invoke jobs. `telemetry-backfill` indexes ingest-log objects that
  * predate the index (bounded per call; the script loops until `remaining` is
- * 0) and then runs one housekeeping pass so builds start immediately.
+ * 0) and, once nothing remains, runs one housekeeping pass per call so the
+ * script can drain the build queue.
  * `telemetry-session-inspect` returns one session's index rows with presigned
  * GET URLs for its overview and segments: the same presigning the Phase 2
  * manifest will do, exposed early so the artifacts can be opened and measured
@@ -160,8 +161,11 @@ async function runJob(job: SweeperJob, deadline?: number): Promise<unknown> {
     case 'telemetry-backfill': {
       const reconcile = await reconcileTelemetryIndex({ bucket, limit: job.limit ?? 50, deadline });
       console.log('offline-sweeper: telemetry backfill', reconcile);
+      // Build only once every object is indexed: a session built while its
+      // later segments are still being indexed just goes stale and is built
+      // again (correct, but wasted work on a 2 000-object prod backfill).
       const housekeeping =
-        deadline === undefined || Date.now() < deadline
+        reconcile.remaining === 0 && (deadline === undefined || Date.now() < deadline)
           ? await runTelemetryHousekeeping({ bucket, deadline })
           : null;
       return {

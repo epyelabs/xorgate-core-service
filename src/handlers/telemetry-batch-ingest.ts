@@ -6,6 +6,7 @@ import { db, schema } from '../db/index';
 import {
   DEFAULT_MAX_AGE_MS,
   DEFAULT_MAX_FUTURE_MS,
+  isTelemetryArtifactKey,
   parseSegment,
   parseTelemetryObjectKey,
 } from '../services/telemetry-batch';
@@ -69,6 +70,12 @@ export const handler = async (
     return;
   }
 
+  if (isTelemetryArtifactKey(key)) {
+    // Our own overview.v1.json.gz (built by the sweeper) shares the prefix
+    // the rule matches on. Not a segment; nothing to do.
+    console.log('telemetry-batch-ingest: artifact object, ignoring', { key });
+    return;
+  }
   const parsedKey = parseTelemetryObjectKey(key);
   if (!parsedKey) {
     console.error('telemetry-batch-ingest: unrecognized key shape, dropping', { key });

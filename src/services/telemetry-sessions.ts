@@ -442,7 +442,7 @@ export interface ReconcileResult {
   missing: number;
   failed: number;
   normalized: number;
-  /** Ingest-log rows still without an index row after this call (best effort). */
+  /** Ingest-log rows without an index row BEFORE this call, minus what it indexed. */
   remaining: number;
 }
 
@@ -474,16 +474,23 @@ export async function reconcileTelemetryIndex(opts: ReconcileOptions = {}): Prom
 
   const log = schema.telemetryIngestLog;
   const seg = schema.telemetrySegments;
+  const [{ remaining }] = await db
+    .select({ remaining: sql<number>`count(*)::int` })
+    .from(log)
+    .leftJoin(seg, eq(seg.s3Key, log.s3Key))
+    .where(isNull(seg.s3Key));
+  result.remaining = remaining;
+  if (limit <= 0) return result;
+
   const pending = await db
     .select({ s3Key: log.s3Key, ingestedAt: log.ingestedAt })
     .from(log)
     .leftJoin(seg, eq(seg.s3Key, log.s3Key))
     .where(isNull(seg.s3Key))
     .orderBy(asc(log.ingestedAt))
-    .limit(limit + 1);
-  result.remaining = pending.length;
+    .limit(limit);
 
-  for (const row of pending.slice(0, limit)) {
+  for (const row of pending) {
     if (Date.now() >= deadline) break;
     const parsedKey = parseTelemetryObjectKey(row.s3Key);
     if (!parsedKey) {
