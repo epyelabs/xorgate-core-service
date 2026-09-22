@@ -117,7 +117,7 @@ async function main(): Promise<void> {
     console.log(
       `pass ${pass}: indexed=${r.indexed} already=${r.alreadyIndexed} missing=${r.missing} failed=${r.failed} ` +
         `normalized=${r.normalized} remaining=${r.remaining} orphaned=${r.orphaned}` +
-        (h ? ` | closed=${h.closed} built=${h.built} pendingBuilds=${h.pendingBuilds} buildFailures=${h.buildFailures}` : '') +
+        (h ? ` | closed=${h.closed} built=${h.built} pendingBuilds=${h.pendingBuilds} buildFailures=${h.buildFailures} bytesBackfilled=${h.bytesBackfilled ?? 0}` : '') +
         ` (${Date.now() - started} ms)`,
     );
     // A failure is not progress: a pass that only fails would repeat forever.
@@ -137,7 +137,7 @@ async function main(): Promise<void> {
     const h = out.housekeeping;
     if (!h) break;
     totals.built += h.built;
-    console.log(`build pass ${pass}: built=${h.built} pendingBuilds=${h.pendingBuilds} buildFailures=${h.buildFailures} normalized=${h.normalized}`);
+    console.log(`build pass ${pass}: built=${h.built} pendingBuilds=${h.pendingBuilds} buildFailures=${h.buildFailures} normalized=${h.normalized} bytesBackfilled=${h.bytesBackfilled ?? 0}`);
     if (h.pendingBuilds <= 0 || (h.built === 0 && h.buildFailures > 0)) break;
   }
   console.log('done', totals);
