@@ -98,7 +98,8 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
       telemetry.closed > 0 ||
       telemetry.built > 0 ||
       telemetry.buildFailures > 0 ||
-      telemetry.normalized > 0
+      telemetry.normalized > 0 ||
+      telemetry.bytesBackfilled > 0
     ) {
       const { builds: _builds, ...summary } = telemetry;
       console.log('offline-sweeper: telemetry sessions', summary);
@@ -150,9 +151,11 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
  * 0) and, once nothing remains, runs one housekeeping pass per call so the
  * script can drain the build queue.
  * `telemetry-session-inspect` returns one session's index rows with presigned
- * GET URLs for its overview and segments: the same presigning the Phase 2
- * manifest will do, exposed early so the artifacts can be opened and measured
- * from a workstation whose IAM user has no object access to the bucket.
+ * GET URLs for its overview and segments. Kept after Phase 2 shipped the same
+ * presigning in the replay manifest, as an OPERATOR tool: it needs no API
+ * credential and no device ownership, only Lambda invoke, so support can open
+ * any session's artifacts from a workstation with no object access to the
+ * bucket (`npm run backfill:telemetry -- --stage <stage> --inspect <sessionId>`).
  */
 async function runJob(job: SweeperJob, deadline?: number): Promise<unknown> {
   const bucket = process.env.BUCKET_NAME;

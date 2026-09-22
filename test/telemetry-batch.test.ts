@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { INDEX_FUTURE_SLACK_MS, plausibleSampleTs } from '../src/services/telemetry-batch';
 import {
   isTelemetryArtifactKey,
   iterateSegmentLines,
@@ -207,5 +208,19 @@ describe('telemetry payload recording block', () => {
   it('mirrors the device RecordingStatus shape', () => {
     expect(recordingStatusSchema.safeParse(recording).success).toBe(true);
     expect(recordingStatusSchema.safeParse({ ...recording, backlogBytes: -1 }).success).toBe(false);
+  });
+});
+
+describe('plausibleSampleTs (telemetry-session-artifacts Phase 2)', () => {
+  const arrived = Date.UTC(2026, 6, 29, 23, 34, 19);
+  it('keeps a sample at, before, or within a day after its upload', () => {
+    expect(plausibleSampleTs(arrived - 3_600_000, arrived)).toBe(arrived - 3_600_000);
+    expect(plausibleSampleTs(arrived, arrived)).toBe(arrived);
+    expect(plausibleSampleTs(arrived + 8 * 60_000, arrived)).toBe(arrived + 8 * 60_000); // real rtc skew on dev
+    expect(plausibleSampleTs(arrived + INDEX_FUTURE_SLACK_MS, arrived)).toBe(arrived + INDEX_FUTURE_SLACK_MS);
+  });
+  it('replaces a sample stamped past the slack (the 2080 RTC) with the arrival time', () => {
+    expect(plausibleSampleTs(Date.UTC(2080, 0, 6), arrived)).toBe(arrived);
+    expect(plausibleSampleTs(arrived + INDEX_FUTURE_SLACK_MS + 1, arrived)).toBe(arrived);
   });
 });

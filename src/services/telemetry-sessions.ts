@@ -11,7 +11,12 @@ import type { PgColumn } from 'drizzle-orm/pg-core';
 import { db, schema } from '../db/index';
 import { recordingConfig } from '../config/recording';
 import { tsParam } from '../utils/sql';
-import { parseTelemetryObjectKey, summarizeSegment, type SegmentHeaderInfo } from './telemetry-batch';
+import {
+  parseTelemetryObjectKey,
+  plausibleSampleTs,
+  summarizeSegment,
+  type SegmentHeaderInfo,
+} from './telemetry-batch';
 import { gzipOverview, OverviewBuilder, overviewKeyFor } from './telemetry-overview';
 import { promotedInsightColumns } from './telemetry-insights/index';
 
@@ -81,9 +86,18 @@ export async function indexSegment(
   input: IndexSegmentInput,
   opts: IndexSegmentOptions = {},
 ): Promise<boolean> {
-  const startTs = new Date(input.firstTs ?? input.keyStartTsMs);
-  const endTs = new Date(input.lastTs ?? input.firstTs ?? input.keyStartTsMs);
   const arrivedAt = opts.backfill?.arrivedAt ?? new Date();
+  // Bounds come from the device clock and feed the manifest's overlap join, so
+  // an implausible future ts (a 2080 RTC) must not make a session "overlap"
+  // every window for decades: clamp to the arrival time (P2; manual/026
+  // repaired the rows indexed before this).
+  const startMs = plausibleSampleTs(input.firstTs ?? input.keyStartTsMs, arrivedAt.getTime());
+  const endMs = Math.max(
+    startMs,
+    plausibleSampleTs(input.lastTs ?? input.firstTs ?? input.keyStartTsMs, arrivedAt.getTime()),
+  );
+  const startTs = new Date(startMs);
+  const endTs = new Date(endMs);
   const status = opts.backfill ? 'closed' : 'open';
 
   await tx
@@ -211,8 +225,14 @@ export interface ClosedTelemetrySession {
  * ARRIVAL for `mediaSessionCloseAfterMs` (server clock). A straggler re-opens
  * the session through indexSegment and marks its overview stale; the next
  * pass closes and rebuilds it.
+ *
+ * `deviceId` scopes it for close-on-read (the replay manifest and the sessions
+ * listing run it best-effort, like `closeStaleMediaSessions(deviceId)`), so a
+ * device someone is looking at reads honestly on dev, where the sweeper
+ * schedule is off. Closing does not build: the overview stays null until the
+ * housekeeping tick (prod) or a manual pass (dev) gets to it.
  */
-export async function closeStaleTelemetrySessions(): Promise<ClosedTelemetrySession[]> {
+export async function closeStaleTelemetrySessions(deviceId?: string): Promise<ClosedTelemetrySession[]> {
   const staleSecs = Math.round(recordingConfig.mediaSessionCloseAfterMs / 1000);
   const t = schema.telemetrySessions;
   return db
@@ -221,6 +241,7 @@ export async function closeStaleTelemetrySessions(): Promise<ClosedTelemetrySess
     .where(
       and(
         eq(t.status, 'open'),
+        deviceId ? eq(t.deviceId, deviceId) : undefined,
         sql`${t.lastSegmentAt} < now() - make_interval(secs => ${sql.raw(String(staleSecs))})`,
       ),
     )
@@ -318,6 +339,7 @@ export async function buildSessionOverview(sessionId: string, bucket = BUCKET): 
     .set({
       overviewKey: key,
       overviewBuiltAt: new Date(builtAt),
+      overviewBytes: body.length,
       overviewStale: false,
       insights: sql`${JSON.stringify(object.insights)}::jsonb`,
       insightsComputed: sql`${JSON.stringify(object.insights.computed)}::jsonb`,
@@ -346,6 +368,11 @@ export interface HousekeepingOptions {
   maxBuilds?: number;
   /** Un-normalised segment rows to retry per pass. */
   maxNormalizeRetries?: number;
+  /**
+   * Sessions built before manual/026 whose `overview_bytes` is still null:
+   * one HEAD each per pass (Phase 2). Zero once the backfill has caught up.
+   */
+  maxBytesBackfills?: number;
   /** Stop starting new work once this epoch-ms is reached. */
   deadline?: number;
 }
@@ -356,6 +383,8 @@ export interface HousekeepingResult {
   buildFailures: number;
   pendingBuilds: number;
   normalized: number;
+  /** `overview_bytes` rows filled from a HEAD this pass (pre-026 artifacts). */
+  bytesBackfilled: number;
   builds: BuildResult[];
 }
 
@@ -376,6 +405,7 @@ export async function runTelemetryHousekeeping(opts: HousekeepingOptions = {}): 
     buildFailures: 0,
     pendingBuilds: 0,
     normalized: 0,
+    bytesBackfilled: 0,
     builds: [],
   };
 
@@ -426,7 +456,64 @@ export async function runTelemetryHousekeeping(opts: HousekeepingOptions = {}): 
     if (outcome === 'copied' || outcome === 'already') result.normalized++;
   }
 
+  // Phase 2: artifacts built before `overview_bytes` existed (manual/026) get
+  // their size from ONE HEAD each, bounded per pass, so the manifest never
+  // HEADs per request. Self-terminating: every filled row leaves the set.
+  if (Date.now() < deadline) {
+    result.bytesBackfilled = await backfillOverviewBytes(bucket, {
+      limit: opts.maxBytesBackfills ?? 25,
+      deadline,
+    });
+  }
+
   return result;
+}
+
+/**
+ * Fill `overview_bytes` on closed sessions that have an artifact but no
+ * recorded size (built before manual/026). One HEAD per row; an artifact that
+ * is gone (lifecycle) is flagged stale so the builder rewrites it, and a
+ * transient HEAD failure is left for the next pass. Returns rows filled.
+ */
+export async function backfillOverviewBytes(
+  bucket: string,
+  opts: { limit?: number; deadline?: number } = {},
+): Promise<number> {
+  const t = schema.telemetrySessions;
+  const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
+  const rows = await db
+    .select({ id: t.id, overviewKey: t.overviewKey })
+    .from(t)
+    .where(and(sql`${t.overviewKey} is not null`, isNull(t.overviewBytes)))
+    .orderBy(asc(t.overviewBuiltAt))
+    .limit(opts.limit ?? 25);
+  let filled = 0;
+  for (const row of rows) {
+    if (Date.now() >= deadline || !row.overviewKey) break;
+    try {
+      const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: row.overviewKey }));
+      if (typeof head.ContentLength !== 'number') continue;
+      await db
+        .update(t)
+        .set({ overviewBytes: head.ContentLength })
+        .where(and(eq(t.id, row.id), isNull(t.overviewBytes)));
+      filled++;
+    } catch (err) {
+      if (isNotFound(err)) {
+        await db
+          .update(t)
+          .set({ overviewStale: true, updatedAt: sql`now()` })
+          .where(eq(t.id, row.id));
+        console.warn('telemetry-sessions: overview object missing, flagged for rebuild', {
+          sessionId: row.id,
+          key: row.overviewKey,
+        });
+        continue;
+      }
+      console.error('telemetry-sessions: overview HEAD failed', { sessionId: row.id, err });
+    }
+  }
+  return filled;
 }
 
 export interface ReconcileOptions {

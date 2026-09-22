@@ -10,7 +10,14 @@ import { badRequest, conflict, methodNotAllowed, notFound, ok } from '../utils/r
 import { pageMeta, parseListParams, type ListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { closeStaleMediaSessions } from '../services/media-sessions';
-import { buildSessionTimeline } from '../services/replay-manifest';
+import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
+import {
+  buildSessionTimeline,
+  buildTelemetryManifest,
+  REPLAY_TELEMETRY_MAX_SEGMENTS,
+  type ReplayTelemetry,
+  type SessionTimeline,
+} from '../services/replay-manifest';
 import {
   foldRunRows,
   runCountQuery,
@@ -31,6 +38,10 @@ const PLAYBACK_TTL_SECONDS = 3600;
 const REPLAY_MAX_SEGMENTS = 600;
 const REPLAY_MAX_SESSIONS = 10;
 const REPLAY_MAX_RANGE_MS = 24 * 60 * 60 * 1000;
+// Telemetry sessions overlapping the replay window ride along with their
+// presigned overview + segment URLs (telemetry-session-artifacts plan, Phase
+// 2). Their cap is separate from the video one (README Q7) and is honoured by
+// truncation, never a 400: services/replay-manifest.ts REPLAY_TELEMETRY_MAX_SEGMENTS.
 // Clients refetch the manifest when urlExpiresAt nears; report expiry with a
 // safety margin so they refresh BEFORE URLs actually die mid-scrub.
 const REPLAY_URL_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -368,6 +379,15 @@ async function listRuns(
  * Honest-degradation rules (R6): a sessionId whose segments all expired
  * returns the session with empty segments/gaps (telemetry-only replay);
  * range mode omits sessions with no in-range media.
+ *
+ * Since the telemetry-session-artifacts plan (Phase 2) the response also
+ * carries `replay.telemetry`: the TELEMETRY sessions overlapping the replay
+ * window (README §2.6: a different id space, joined by time), each with its
+ * presigned `overview.v1.json.gz` (null while open) and its normalised raw
+ * segments clipped to the window, plus the session's `insights`. Every URL is
+ * presigned in the same batch as the video segments and shares `urlExpiresAt`.
+ * `?telemetry=0` omits the block; a device with no telemetry gets
+ * `{ sessions: [], truncated: false }`.
  */
 async function replayManifest(
   event: APIGatewayProxyEventV2,
@@ -382,14 +402,28 @@ async function replayManifest(
   if (!sessionIdParam && !hasRangeParams) {
     return badRequest('Provide "sessionId", or "from" and "to"');
   }
+  if (qs.telemetry !== undefined && !['0', '1', 'true', 'false'].includes(qs.telemetry)) {
+    return badRequest('"telemetry" must be "0" or "1"');
+  }
+  const includeTelemetry = qs.telemetry !== '0' && qs.telemetry !== 'false';
   if (!BUCKET) return conflict('Storage bucket is not configured');
 
   // Same advisory close-on-read as the sessions list (best-effort): the
-  // manifest's session.status feeds the replay page's open/closed badge.
+  // manifest's session.status feeds the replay page's open/closed badge. The
+  // telemetry index gets the same treatment so `telemetry.sessions[].status`
+  // is honest on dev, where the sweeper schedule is off (closing does not
+  // build: the overview stays null until a housekeeping pass).
   try {
     await closeStaleMediaSessions(deviceId);
   } catch (err) {
     console.warn('replay-manifest: close-on-read failed', { deviceId, err });
+  }
+  if (includeTelemetry) {
+    try {
+      await closeStaleTelemetrySessions(deviceId);
+    } catch (err) {
+      console.warn('replay-manifest: telemetry close-on-read failed', { deviceId, err });
+    }
   }
 
   let sessionRows;
@@ -466,23 +500,11 @@ async function replayManifest(
     else bySession.set(row.sessionId, [row]);
   }
 
-  // Batch presign: local SigV4 crypto, no S3 round trips — cheap even at the
-  // 600-segment cap. NOT inside a DB transaction, so Promise.all is fine.
-  const urlExpiresAt = Date.now() + PLAYBACK_TTL_SECONDS * 1000 - REPLAY_URL_REFRESH_MARGIN_MS;
-  const urlByKey = new Map(
-    await Promise.all(
-      segmentRows.map(async (row): Promise<[string, string]> => [
-        row.s3Key,
-        await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: row.s3Key }), {
-          expiresIn: PLAYBACK_TTL_SECONDS,
-        }),
-      ]),
-    ),
-  );
-
+  // Timelines first (pure): the replay window they define is the clock the
+  // replay runs on, and it is what the telemetry sessions are joined by.
   let fromMs = rangeFromMs ?? Number.POSITIVE_INFINITY;
   let toMs = rangeToMs ?? Number.NEGATIVE_INFINITY;
-  const sessions = [];
+  const timelines: { s: (typeof sessionRows)[number]; timeline: SessionTimeline | null }[] = [];
   for (const s of sessionRows) {
     const timeline = buildSessionTimeline(bySession.get(s.id) ?? [], {
       // Evicted-head detection only makes sense against the session's own
@@ -496,7 +518,7 @@ async function replayManifest(
       if (rangeToMs !== null) continue;
       fromMs = s.startedAt.getTime();
       toMs = (s.endedAt ?? s.startedAt).getTime();
-      sessions.push(sessionManifestShape(s, [], []));
+      timelines.push({ s, timeline: null });
       continue;
     }
     if (timeline.outOfOrder) {
@@ -509,21 +531,97 @@ async function replayManifest(
       fromMs = Math.min(fromMs, timeline.fromTs);
       toMs = Math.max(toMs, timeline.toTs);
     }
-    sessions.push(
-      sessionManifestShape(
-        s,
-        timeline.segments.map(({ s3Key, ...seg }) => ({
-          ...seg,
-          url: urlByKey.get(s3Key) as string,
-        })),
-        timeline.gaps,
-      ),
-    );
+    timelines.push({ s, timeline });
   }
 
-  return ok({
-    replay: { deviceId, from: fromMs, to: toMs, sessions, urlExpiresAt },
-  });
+  // Telemetry sessions overlapping the window, and their normalised segments
+  // clipped to it (telemetry-session-artifacts Phase 2). Both predicates are
+  // the ones buildTelemetryManifest applies; SQL runs them so the read stays
+  // an indexed range scan on (device_id, started_at) / (session_id, start_ts),
+  // and the pure function owns the cap, the ordering and the shape.
+  let telemetry: ReplayTelemetry | null = null;
+  if (includeTelemetry) {
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs) {
+      telemetry = { sessions: [], truncated: false };
+    } else {
+      const fromIso = new Date(fromMs).toISOString();
+      const toIso = new Date(toMs).toISOString();
+      const t = schema.telemetrySessions;
+      const telemetrySessions = await db.query.telemetrySessions.findMany({
+        where: and(
+          eq(t.deviceId, deviceId),
+          sql`${t.startedAt} < ${tsParam(toIso)}`,
+          sql`coalesce(${t.endedAt}, ${t.startedAt}) >= ${tsParam(fromIso)}`,
+        ),
+        orderBy: [asc(t.startedAt)],
+      });
+      const g = schema.telemetrySegments;
+      const telemetrySegments = telemetrySessions.length
+        ? await db.query.telemetrySegments.findMany({
+            where: and(
+              inArray(
+                g.sessionId,
+                telemetrySessions.map((row) => row.id),
+              ),
+              eq(g.normalized, true),
+              sql`${g.startTs} < ${tsParam(toIso)}`,
+              sql`${g.endTs} >= ${tsParam(fromIso)}`,
+            ),
+            orderBy: [asc(g.startTs), asc(g.seq)],
+            // One past the cap is enough to know it was hit.
+            limit: REPLAY_TELEMETRY_MAX_SEGMENTS + 1,
+          })
+        : [];
+      telemetry = buildTelemetryManifest(telemetrySessions, telemetrySegments, { fromMs, toMs });
+    }
+  }
+
+  // Batch presign: local SigV4 crypto, no S3 round trips — cheap even at the
+  // 600 + 1 500 segment caps. NOT inside a DB transaction, so Promise.all is
+  // fine. Video segments, telemetry overviews and telemetry segments all go in
+  // the same batch and share one urlExpiresAt.
+  const keys = new Set<string>(segmentRows.map((row) => row.s3Key));
+  for (const ts of telemetry?.sessions ?? []) {
+    if (ts.overview) keys.add(ts.overview.s3Key);
+    for (const seg of ts.segments) keys.add(seg.s3Key);
+  }
+  const urlExpiresAt = Date.now() + PLAYBACK_TTL_SECONDS * 1000 - REPLAY_URL_REFRESH_MARGIN_MS;
+  const urlByKey = new Map(
+    await Promise.all(
+      [...keys].map(async (key): Promise<[string, string]> => [
+        key,
+        await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: key }), {
+          expiresIn: PLAYBACK_TTL_SECONDS,
+        }),
+      ]),
+    ),
+  );
+  const urlFor = (key: string): string => urlByKey.get(key) as string;
+
+  const sessions = timelines.map(({ s, timeline }) =>
+    timeline
+      ? sessionManifestShape(
+          s,
+          timeline.segments.map(({ s3Key, ...seg }) => ({ ...seg, url: urlFor(s3Key) })),
+          timeline.gaps,
+        )
+      : sessionManifestShape(s, [], []),
+  );
+
+  const replay: Record<string, unknown> = { deviceId, from: fromMs, to: toMs, sessions, urlExpiresAt };
+  if (telemetry) {
+    replay.telemetry = {
+      sessions: telemetry.sessions.map((ts) => ({
+        ...ts,
+        overview: ts.overview
+          ? (({ s3Key, ...overview }) => ({ ...overview, url: urlFor(s3Key) }))(ts.overview)
+          : null,
+        segments: ts.segments.map(({ s3Key, ...seg }) => ({ ...seg, url: urlFor(s3Key) })),
+      })),
+      truncated: telemetry.truncated,
+    };
+  }
+  return ok({ replay });
 }
 
 function sessionManifestShape(

@@ -291,4 +291,85 @@ export const telemetryPaths = {
       },
     },
   },
+  '/devices/{id}/telemetry/sessions': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'listDeviceTelemetrySessions',
+      summary: 'List recorded telemetry sessions with their insights',
+      description:
+        'The index of what the device RECORDED, one row per telemetry session, with the counters ' +
+        'and the `insights` block computed when its overview was built (distance, duration, max ' +
+        'speed, stops, GPS quality, ...). This is the read for a sessions table or a roll-up such ' +
+        'as "kilometres this month": it never opens an artifact and never touches object storage. ' +
+        'No URLs; to play a session\'s telemetry, ask the replay manifest for its window.\n\n' +
+        'A telemetry session is NOT a video session: both ids are minted independently on the ' +
+        'device, so relate them by time. `from`/`to` match sessions OVERLAPPING the range, exactly ' +
+        'like `GET /devices/{id}/sessions`, so a recording run\'s distance is the sum over the ' +
+        'telemetry sessions returned for the run\'s window. `insights` is `null` on a session whose ' +
+        'overview has not been built yet (it is `open`, or closed within the last minute or so). ' +
+        'Listing has the same side effect as the media list: it closes stale sessions as it goes.\n\n' +
+        'Paginated: `page.total` is exact. Sorted by session start, newest first by default.',
+      tags: ['Telemetry'],
+      parameters: [
+        {
+          name: 'limit',
+          in: 'query',
+          required: false,
+          schema: { type: 'integer', minimum: 1, maximum: 200, default: 25 },
+          description: 'Sessions per page. Out of range is a 400.',
+        },
+        { $ref: '#/components/parameters/OffsetQuery' },
+        { $ref: '#/components/parameters/OrderQuery' },
+        {
+          name: 'sort',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['startedAt'], default: 'startedAt' },
+        },
+        {
+          name: 'status',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['open', 'closed', 'any'] },
+          description: 'Filter by lifecycle state. Omit or pass `any` for both.',
+        },
+        {
+          name: 'from',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', format: 'date-time' },
+          description: 'Sessions still recording at or after this instant (overlap semantics).',
+        },
+        {
+          name: 'to',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', format: 'date-time' },
+          description: 'Sessions that started before this instant (overlap semantics).',
+        },
+      ],
+      responses: {
+        '200': {
+          description: 'One page of telemetry sessions.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['sessions', 'page'],
+                properties: {
+                  sessions: { type: 'array', items: { $ref: '#/components/schemas/TelemetrySession' } },
+                  page: { $ref: '#/components/schemas/PageMeta' },
+                },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
 };

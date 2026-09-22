@@ -938,7 +938,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const telemetryHistoryFn = new nodejs.NodejsFunction(this, "TelemetryHistoryFn", {
       ...standardFnProps(
         path.join(entryBase, "telemetry-history.ts"),
-        "GET /devices/{id}/telemetry(+/latest,/recent,/readings) — historical telemetry reads",
+        "GET /devices/{id}/telemetry(+/latest,/recent,/readings,/sessions) — historical telemetry reads",
       ),
       // Range queries scan monthly partitions; give them more headroom than the default.
       memorySize: 256,
@@ -2617,6 +2617,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     addRoutes({
       path: "/devices/{id}/telemetry/readings",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
+    });
+    // Recorded-telemetry session index + insights (telemetry-session-artifacts
+    // plan, Phase 2). Reads the two P1 index tables only; no S3, no new IAM.
+    addRoutes({
+      path: "/devices/{id}/telemetry/sessions",
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });

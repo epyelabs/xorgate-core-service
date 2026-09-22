@@ -5,6 +5,8 @@ import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/a
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { pageMeta, parseListParams } from '../utils/list-params';
+import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
 import {
   boundedTotalQuery,
   capTotal,
@@ -26,6 +28,8 @@ import { apiHandler } from '../utils/api-handler';
  *   GET /devices/{id}/telemetry/latest                        — device_latest rows
  *   GET /devices/{id}/telemetry/recent[&metric][&limit]       — the most recent N rows
  *   GET /devices/{id}/telemetry/readings[&...]                — raw rows, paginated by ts
+ *   GET /devices/{id}/telemetry/sessions[&from&to&status...]  — recorded telemetry
+ *       SESSIONS (the S3 artifact index + insights), paginated; no URLs
  *
  * The /readings variant backs the Telemetry History table: raw (un-averaged)
  * rows paginated over DISTINCT timestamps (one sample = one display row), so a
@@ -539,6 +543,96 @@ async function handleReadings(
   });
 }
 
+const SESSIONS_DEFAULT_LIMIT = 25;
+const SESSIONS_MAX_LIMIT = 200;
+
+/**
+ * GET /devices/{id}/telemetry/sessions — the recorded-telemetry session index
+ * (telemetry-session-artifacts plan, Phase 2, README §4.2 / Q12): one row per
+ * device-minted telemetry session with its counters and the D12 `insights`
+ * mirror, so a Sessions tab or a "km this month" roll-up never opens a replay
+ * or touches S3. No URLs here; the replay manifest presigns. Timestamps are
+ * ISO like the rest of the sessions dialect (the manifest's epoch-ms
+ * exception stays confined to the manifest).
+ *
+ * Time filter = OVERLAP with [from, to), like `GET /devices/{id}/sessions`.
+ * Same close-on-read as the media list, because the dev sweeper schedule is
+ * off and a status nobody advances is a lie.
+ */
+async function handleSessions(
+  deviceId: string,
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> {
+  const parsed = parseListParams(event, {
+    defaultLimit: SESSIONS_DEFAULT_LIMIT,
+    maxLimit: SESSIONS_MAX_LIMIT,
+    sortable: ['startedAt'],
+    defaultSort: 'startedAt',
+    statusValues: ['open', 'closed'],
+  });
+  if ('error' in parsed) return parsed.error;
+  const { limit, offset, order, status, from, to } = parsed;
+
+  try {
+    await closeStaleTelemetrySessions(deviceId);
+  } catch (err) {
+    console.warn('telemetry/sessions: close-on-read failed', { deviceId, err });
+  }
+
+  const t = schema.telemetrySessions;
+  const where = and(
+    eq(t.deviceId, deviceId),
+    status ? eq(t.status, status) : undefined,
+    // tsParam casts are load-bearing on the Data API — see the header comment.
+    from ? sql`coalesce(${t.endedAt}, ${t.startedAt}) >= ${tsParam(from)}` : undefined,
+    to ? sql`${t.startedAt} < ${tsParam(to)}` : undefined,
+  );
+
+  const totalRows = await db.select({ total: sql<number>`count(*)::int` }).from(t).where(where);
+  const total = Number(totalRows[0]?.total ?? 0);
+
+  const rows = await db
+    .select({
+      id: t.id,
+      status: t.status,
+      rateHz: t.rateHz,
+      timeSource: t.timeSource,
+      startedAt: t.startedAt,
+      endedAt: t.endedAt,
+      lastSegmentAt: t.lastSegmentAt,
+      segmentCount: t.segmentCount,
+      sampleCount: t.sampleCount,
+      byteCount: t.byteCount,
+      overviewBuiltAt: t.overviewBuiltAt,
+      overviewBytes: t.overviewBytes,
+      insights: t.insights,
+    })
+    .from(t)
+    .where(where)
+    .orderBy(order === 'asc' ? asc(t.startedAt) : desc(t.startedAt))
+    .limit(limit)
+    .offset(offset);
+
+  const sessions = rows.map((r) => ({
+    id: r.id,
+    deviceId,
+    status: r.status,
+    rateHz: r.rateHz,
+    timeSource: r.timeSource,
+    from: r.startedAt.toISOString(),
+    to: (r.endedAt ?? r.startedAt).toISOString(),
+    lastSegmentAt: r.lastSegmentAt.toISOString(),
+    segments: r.segmentCount,
+    // bigint columns: the Data API hands some of these back as strings.
+    samples: Number(r.sampleCount),
+    bytes: Number(r.byteCount),
+    overviewBuiltAt: r.overviewBuiltAt ? r.overviewBuiltAt.toISOString() : null,
+    overviewBytes: r.overviewBytes,
+    insights: r.insights ?? null,
+  }));
+  return ok({ sessions, page: pageMeta(parsed, total) });
+}
+
 const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
@@ -586,6 +680,7 @@ const restHandler = async (
   if (path.endsWith('/telemetry/readings')) {
     return handleReadings(id, event, device.ioCapabilities);
   }
+  if (path.endsWith('/telemetry/sessions')) return handleSessions(id, event);
   return handleHistory(id, event);
 };
 

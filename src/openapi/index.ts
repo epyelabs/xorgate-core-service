@@ -188,7 +188,8 @@ const DESCRIPTION = [
   '`{"error": {"code", "message", "details?"}}`.',
   '',
   '**Pagination.** Only `GET /devices`, `GET /devices/{id}/sessions`,',
-  '`GET /devices/{id}/telemetry/readings` and `GET /workflow-templates` paginate; they accept',
+  '`GET /devices/{id}/telemetry/readings`, `GET /devices/{id}/telemetry/sessions` and',
+  '`GET /workflow-templates` paginate; they accept',
   '`limit`/`offset`/`order`/`sort`',
   'and return a `page` block. Every other list endpoint returns its whole collection unbounded:',
   'organizations, memberships, workspaces, device models, API keys, video channels, the',
@@ -226,6 +227,12 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     openapi: '3.0.3',
     info: {
       title: 'Xorgate Core API',
+      // 0.9.0: recorded telemetry became S3 artifacts. The replay manifest
+      // gained `replay.telemetry` (presigned overview + raw segments per
+      // telemetry session, with insights) and `GET /devices/{id}/telemetry/
+      // sessions` lists the index. Purely additive; old clients ignore the
+      // new field.
+      //
       // 0.8.0: workflow templates gained tags, and the three READ operations a
       // program needs to find a template by one came into the document. Purely
       // additive.
@@ -235,7 +242,7 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // `channelArn` field was removed from `VideoChannel`. The most breaking
       // release this document has had, which is exactly why it happened before
       // anyone outside xorgate consumed it.
-      version: '0.8.0',
+      version: '0.9.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

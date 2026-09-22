@@ -230,6 +230,20 @@ export function parseSegment(text: string, opts: ParseSegmentOptions): ParsedSeg
 }
 
 /** What the session index needs from a segment file, without building any rows. */
+/**
+ * A sample cannot postdate its own upload by more than this. Beyond it the
+ * device clock is garbage (dev has two sessions whose second segment is
+ * stamped 2080 by an RTC that jumped), and the object's ARRIVAL time is the
+ * honest estimate of when it was recorded. A day of slack covers any real
+ * skew an `rtc` boot shows (minutes, on the dev fleet) without touching it.
+ */
+export const INDEX_FUTURE_SLACK_MS = 24 * 60 * 60 * 1000;
+
+/** Sample ts for the session index: itself when plausible, else the arrival time (telemetry-session-artifacts P2). */
+export function plausibleSampleTs(ts: number, arrivedAtMs: number, slackMs = INDEX_FUTURE_SLACK_MS): number {
+  return ts > arrivedAtMs + slackMs ? arrivedAtMs : ts;
+}
+
 export interface SegmentSummary {
   header: SegmentHeaderInfo | null;
   sampleLines: number;

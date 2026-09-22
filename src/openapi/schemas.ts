@@ -850,8 +850,12 @@ export function openApiSchemas(): Record<string, unknown> {
         'Everything a replay player needs in one response: per-session gap-aware timelines plus a ' +
         'presigned GET URL per segment. All timestamps are epoch milliseconds (the replay-clock unit), ' +
         'unlike the ISO strings elsewhere in this API. Format-neutral by design: no codec strings or ' +
-        'playlist syntax, so clients parse media details from the segment bytes.',
+        'playlist syntax, so clients parse media details from the segment bytes.\n\n' +
+        'Since API 0.9.0 it also carries `telemetry`: the recorded-telemetry sessions overlapping the ' +
+        'replay window, as presigned S3 artifacts (see the schema). Omitted only when the request ' +
+        'said `telemetry=0`; a server older than 0.9.0 never sends it, so treat it as optional.',
       properties: {
+        telemetry: { $ref: '#/components/schemas/ReplayTelemetry' },
         deviceId: { type: 'string', format: 'uuid' },
         from: {
           type: 'integer',
@@ -939,6 +943,246 @@ export function openApiSchemas(): Record<string, unknown> {
               },
             },
           },
+        },
+      },
+    },
+    ReplayTelemetry: {
+      type: 'object',
+      required: ['sessions', 'truncated'],
+      description:
+        'Recorded telemetry for the replay window, served as immutable S3 artifacts by presigned URL ' +
+        '(telemetry session artifacts). A **telemetry session** is a different id from a video ' +
+        'session: both are minted independently on the device, so they are joined by TIME, not by ' +
+        'id. This block lists every telemetry session with at least one segment overlapping ' +
+        '`replay.from`..`replay.to`, in start order (a session whose bounds straddle the window ' +
+        'but whose data sits in a recording hole is not listed). A device with recording off, or ' +
+        'nothing recorded in the window, returns ' +
+        '`{ "sessions": [], "truncated": false }`. Every URL here shares `replay.urlExpiresAt` with ' +
+        'the video URLs, so one refetch refreshes all of them.',
+      properties: {
+        sessions: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/ReplayTelemetrySession' },
+        },
+        truncated: {
+          type: 'boolean',
+          description:
+            'True when the window contained more than 1,500 telemetry segments (about 24 hours at ' +
+            'the default 60 s rotation) and only the earliest 1,500 by `startTs` are listed. Not an ' +
+            'error: narrow the window to reach the rest. The cap is separate from the 600 video ' +
+            'segments, which are still a 400.',
+        },
+      },
+    },
+    ReplayTelemetrySession: {
+      type: 'object',
+      required: ['id', 'status', 'rateHz', 'timeSource', 'from', 'to', 'overview', 'segments', 'insights'],
+      description:
+        'One telemetry session overlapping the replay window. Two tiers of artifact: `overview` is ' +
+        'the precomputed, downsampled `overview.v1` object (route line, scrub preview, every ' +
+        'metric, gzipped columnar JSON, typically 15 to 40 KB), and `segments` are the raw 60 s ' +
+        'files the device recorded, clipped to the window. All timestamps epoch ms.',
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'Device-minted UUIDv7 of the TELEMETRY session.' },
+        status: {
+          type: 'string',
+          enum: ['open', 'closed'],
+          description:
+            'Advisory, same rule as media sessions: `closed` about 10 minutes after segments stop ' +
+            'arriving; a straggler segment reopens it and the overview is rebuilt on the next close.',
+        },
+        rateHz: { type: 'integer', nullable: true, description: 'Sample rate the device recorded at.' },
+        timeSource: {
+          type: 'string',
+          nullable: true,
+          enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'],
+          description:
+            'The WORST clock quality seen across the session\'s segment headers. `rtc` is common on ' +
+            'a boot that never synced; `unsynced` means wall-clock correlation with video is ' +
+            'untrustworthy.',
+        },
+        from: { type: 'integer', description: 'Epoch ms of the first sample in the session (not clipped to the window).' },
+        to: { type: 'integer', description: 'Epoch ms of the last sample in the session so far.' },
+        overview: {
+          nullable: true,
+          allOf: [{ $ref: '#/components/schemas/ReplayTelemetryOverview' }],
+          description:
+            '`null` while the session is `open`, and for a short while after it closes until the ' +
+            'artifact is built. A client then builds its own overview from `segments`, which is ' +
+            'cheap (about 5 KB per minute recorded), and polls the manifest about every 60 s while ' +
+            'any session is open.',
+        },
+        segments: {
+          type: 'array',
+          description:
+            'Only the segments overlapping the replay window, ordered by `startTs`. Each is the ' +
+            'device\'s own gzipped JSONL file, served with `Content-Encoding: gzip` so `fetch()` ' +
+            'inflates it natively: a header line, then one `{ ts, mono, seq, metrics }` sample per ' +
+            'line. Immutable and safe to cache by URL path.',
+          items: { $ref: '#/components/schemas/ReplayTelemetrySegment' },
+        },
+        insights: {
+          nullable: true,
+          allOf: [{ $ref: '#/components/schemas/TelemetryInsights' }],
+          description: 'The session\'s insights, byte-identical to the block inside the overview object. `null` until the overview has been built.',
+        },
+      },
+    },
+    ReplayTelemetryOverview: {
+      type: 'object',
+      required: ['format', 'url', 'bytes', 'builtAt'],
+      properties: {
+        format: {
+          type: 'string',
+          enum: ['overview.v1'],
+          description:
+            'The artifact format. Additive fields keep `overview.v1`; a breaking change is a new ' +
+            'format name, and this field says which one the URL serves.',
+        },
+        url: {
+          type: 'string',
+          format: 'uri',
+          description: 'Presigned S3 GET. `Content-Type: application/json`, `Content-Encoding: gzip`.',
+        },
+        bytes: {
+          type: 'integer',
+          nullable: true,
+          description: 'Gzipped size, for fetch budgeting. `null` for an artifact built before sizes were recorded.',
+        },
+        builtAt: { type: 'integer', description: 'Epoch ms the artifact was (re)built.' },
+      },
+    },
+    ReplayTelemetrySegment: {
+      type: 'object',
+      required: ['seq', 'startTs', 'endTs', 'samples', 'bytes', 'url'],
+      properties: {
+        seq: { type: 'integer', description: 'Device sequence within the session. Order by `startTs`, never by `seq`.' },
+        startTs: { type: 'integer', description: 'Epoch ms of the first sample IN THE FILE.' },
+        endTs: { type: 'integer', description: 'Epoch ms of the last sample in the file.' },
+        samples: { type: 'integer', description: 'Valid sample lines in the file.' },
+        bytes: { type: 'integer', description: 'Gzipped object size.' },
+        url: { type: 'string', format: 'uri', description: 'Presigned S3 GET for the `.jsonl.gz`.' },
+      },
+    },
+    TelemetryInsights: {
+      type: 'object',
+      required: ['computed', 'computedAt', 'events'],
+      additionalProperties: true,
+      description:
+        'Per-session summaries computed from the segments when the overview is built, one ' +
+        'namespace per insight. Versioned PER INSIGHT: `computed` maps each insight id to the ' +
+        'version that produced it, so a consumer can tell `distance` v1 from a future v2 without a ' +
+        'format bump. Additive: new insight ids appear as new keys, so read the ones you know and ' +
+        'ignore the rest. A scalar that could not be computed is `{ "value": null, "reason": ... }`. ' +
+        'Every insight is a pure function of the recorded segments (nothing that depends on a ' +
+        'geofence, an org setting or a model), which is what makes a rebuild reproducible. The ' +
+        'v1 set: `duration`, `distance`, `speed`, `position`, `altitude`, `gpsQuality`, `system`, ' +
+        '`lte`, and `stops` (an event list). See the platform-concepts page on telemetry sessions ' +
+        'for each block\'s fields.',
+      properties: {
+        computed: {
+          type: 'object',
+          additionalProperties: { type: 'integer' },
+          description: '`{ insightId: version }` for every insight present.',
+          example: { duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1 },
+        },
+        computedAt: { type: 'integer', description: 'Epoch ms.' },
+        duration: {
+          type: 'object',
+          description: '`totalMs`, `movingMs`, `idleMs`, `movingThresholdKph`.',
+          additionalProperties: true,
+          example: { totalMs: 3497000, movingMs: 2811000, idleMs: 686000, movingThresholdKph: 2 },
+        },
+        distance: {
+          type: 'object',
+          description:
+            '`meters` by haversine over ACCEPTED fixes, with the acceptance rule (`accept`), the ' +
+            'fix counts, and `crossCheckMeters` (the integral of `gps.speed` over the same fixes). ' +
+            'A large disagreement between the two marks a suspect trace.',
+          additionalProperties: true,
+          example: { meters: 25181.6, method: 'haversine-2d', fixesUsed: 3074, fixesRejected: 0, crossCheckMeters: 25103.8 },
+        },
+        speed: { type: 'object', additionalProperties: true, example: { maxKph: 116.1, avgMovingKph: 45, source: 'gps.speed' } },
+        position: {
+          type: 'object',
+          additionalProperties: true,
+          description: '`start` and `end` as `[lon, lat]`.',
+          example: { start: [-79.5745, 43.5983], end: [-79.5179, 43.6659] },
+        },
+        altitude: { type: 'object', additionalProperties: true, example: { minM: 14, maxM: 31, gainM: 42, lossM: 39 } },
+        gpsQuality: { type: 'object', additionalProperties: true, example: { fixRatio: 0.98, avgSatellites: 7.6, avgHdop: 0.9 } },
+        system: { type: 'object', additionalProperties: true, example: { maxCpuTempC: 71.5, throttledMs: 0 } },
+        lte: { type: 'object', additionalProperties: true, example: { minRssi: -101, avgRssi: -83, resets: 0 } },
+        events: {
+          type: 'array',
+          description:
+            'Timestamped findings (stops in v1), bounded per kind, so a timeline can pin them and a ' +
+            'click can seek. Never a per-sample series.',
+          items: {
+            type: 'object',
+            required: ['kind', 'ts'],
+            properties: {
+              kind: { type: 'string', example: 'stop' },
+              ts: { type: 'integer', description: 'Epoch ms.' },
+              endTs: { type: 'integer' },
+              position: {
+                type: 'array',
+                items: { type: 'number' },
+                minItems: 2,
+                maxItems: 2,
+                description: '`[lon, lat]`.',
+              },
+              value: { type: 'number' },
+              unit: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    TelemetrySession: {
+      type: 'object',
+      required: [
+        'id',
+        'deviceId',
+        'status',
+        'rateHz',
+        'timeSource',
+        'from',
+        'to',
+        'lastSegmentAt',
+        'segments',
+        'samples',
+        'bytes',
+        'overviewBuiltAt',
+        'overviewBytes',
+        'insights',
+      ],
+      description:
+        'One recorded-telemetry session as the index knows it: lifecycle, counters and the ' +
+        '`insights` mirror, with NO URLs (the replay manifest presigns). Timestamps are ISO-8601 ' +
+        'here, like the media sessions list; the manifest\'s epoch-ms exception does not apply.',
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'Device-minted UUIDv7 (sorts by start time).' },
+        deviceId: { type: 'string', format: 'uuid' },
+        status: { type: 'string', enum: ['open', 'closed'], description: 'Advisory; see the manifest schema.' },
+        rateHz: { type: 'integer', nullable: true },
+        timeSource: { type: 'string', nullable: true, enum: ['ntp', 'gps', 'nitz', 'rtc', 'unsynced'] },
+        from: { type: 'string', format: 'date-time', description: 'First sample in the session.' },
+        to: { type: 'string', format: 'date-time', description: 'Last sample so far.' },
+        lastSegmentAt: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Server-side arrival time of the newest segment: the close-detection clock.',
+        },
+        segments: { type: 'integer', description: 'Segment files indexed.' },
+        samples: { type: 'integer', description: 'Valid sample lines across them.' },
+        bytes: { type: 'integer', description: 'Gzipped bytes across them.' },
+        overviewBuiltAt: { type: 'string', format: 'date-time', nullable: true, description: '`null` until the overview artifact exists.' },
+        overviewBytes: { type: 'integer', nullable: true, description: 'Gzipped size of the overview; `null` until built or backfilled.' },
+        insights: {
+          nullable: true,
+          allOf: [{ $ref: '#/components/schemas/TelemetryInsights' }],
+          description: '`null` until the overview has been built.',
         },
       },
     },

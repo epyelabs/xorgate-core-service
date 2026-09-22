@@ -124,3 +124,175 @@ export function buildSessionTimeline(
     outOfOrder,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Telemetry block (telemetry-session-artifacts plan, Phase 2; README §4.2)
+// ---------------------------------------------------------------------------
+//
+// The replay is addressed by (device, window); telemetry sessions are joined
+// to it by OVERLAP with that window, never by id (README §2.6: video and
+// telemetry sessions are minted independently on the device). The handler
+// runs the same predicates in SQL to keep the query indexed and small; this
+// is the contract, unit-tested, and the shape the manifest emits minus the
+// URLs, which the handler presigns in the same batch as the video segments.
+
+/** Q7: telemetry has its own presign budget, separate from the 600 video segments. */
+export const REPLAY_TELEMETRY_MAX_SEGMENTS = 1500;
+
+export const REPLAY_TELEMETRY_OVERVIEW_FORMAT = 'overview.v1';
+
+export interface TelemetrySessionInput {
+  id: string;
+  status: string;
+  rateHz: number | null;
+  timeSource: string | null;
+  startedAt: Date;
+  endedAt: Date | null;
+  overviewKey: string | null;
+  overviewBuiltAt: Date | null;
+  overviewBytes: number | null;
+  insights: unknown;
+}
+
+export interface TelemetrySegmentInput {
+  sessionId: string;
+  seq: number;
+  startTs: Date;
+  endTs: Date;
+  samples: number;
+  bytes: number;
+  normalized: boolean;
+  s3Key: string;
+}
+
+export interface ReplayTelemetryOverview {
+  format: typeof REPLAY_TELEMETRY_OVERVIEW_FORMAT;
+  /** Gzipped size; null for an artifact built before the size was recorded. */
+  bytes: number | null;
+  builtAt: number; // epoch ms
+  s3Key: string; // stripped before the response; presigning input
+}
+
+export interface ReplayTelemetrySegment {
+  seq: number;
+  startTs: number; // epoch ms, first sample in the file
+  endTs: number; // epoch ms, last sample in the file
+  samples: number;
+  bytes: number;
+  s3Key: string; // stripped before the response; presigning input
+}
+
+export interface ReplayTelemetrySession {
+  id: string;
+  status: string;
+  rateHz: number | null;
+  timeSource: string | null;
+  from: number; // epoch ms
+  to: number;
+  /** null while the session is open or its artifact is not built yet (D6). */
+  overview: ReplayTelemetryOverview | null;
+  /** Only the normalised segments overlapping the window, by startTs. */
+  segments: ReplayTelemetrySegment[];
+  insights: unknown | null;
+}
+
+export interface ReplayTelemetry {
+  sessions: ReplayTelemetrySession[];
+  /** The segment cap was hit; the client should narrow the window. */
+  truncated: boolean;
+}
+
+/** A session overlaps [from, to) when it started before `to` and had not ended before `from`. */
+export function telemetrySessionOverlaps(
+  s: Pick<TelemetrySessionInput, 'startedAt' | 'endedAt'>,
+  fromMs: number,
+  toMs: number,
+): boolean {
+  const started = s.startedAt.getTime();
+  const ended = (s.endedAt ?? s.startedAt).getTime();
+  return started < toMs && ended >= fromMs;
+}
+
+/** A segment overlaps [from, to) by its sample bounds. */
+export function telemetrySegmentOverlaps(
+  seg: Pick<TelemetrySegmentInput, 'startTs' | 'endTs'>,
+  fromMs: number,
+  toMs: number,
+): boolean {
+  return seg.startTs.getTime() < toMs && seg.endTs.getTime() >= fromMs;
+}
+
+/**
+ * Assemble the `telemetry` block for a window. Pure: sessions in, segments
+ * in, shape out (URLs are added by the caller). Rules:
+ *  - sessions that do not overlap the window are dropped; the rest are
+ *    ordered by startedAt;
+ *  - segments are clipped to the window and to `normalized = true` (an
+ *    un-normalised object would reach a client as raw gzip), ordered by
+ *    startTs then seq, and CAPPED at `maxSegments` across all sessions: the
+ *    first `maxSegments` by startTs survive and `truncated` is set, never a 400;
+ *  - a session is LISTED only when at least one of its segments survived the
+ *    clip: a session whose bounds straddle the window but whose data sits in
+ *    a recording hole (or, before manual/026, behind a garbage clock) has
+ *    nothing to show for this window, and its overview would draw another
+ *    time's route over this one;
+ *  - `overview` is null while the session is open or has no artifact yet.
+ */
+export function buildTelemetryManifest(
+  sessions: TelemetrySessionInput[],
+  segments: TelemetrySegmentInput[],
+  window: { fromMs: number; toMs: number },
+  opts: { maxSegments?: number } = {},
+): ReplayTelemetry {
+  const maxSegments = opts.maxSegments ?? REPLAY_TELEMETRY_MAX_SEGMENTS;
+  const { fromMs, toMs } = window;
+
+  const kept = sessions
+    .filter((s) => telemetrySessionOverlaps(s, fromMs, toMs))
+    .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime() || (a.id < b.id ? -1 : 1));
+  const keptIds = new Set(kept.map((s) => s.id));
+
+  const inWindow = segments
+    .filter((seg) => seg.normalized && keptIds.has(seg.sessionId) && telemetrySegmentOverlaps(seg, fromMs, toMs))
+    .sort((a, b) => a.startTs.getTime() - b.startTs.getTime() || a.seq - b.seq);
+  const truncated = inWindow.length > maxSegments;
+  const budgeted = truncated ? inWindow.slice(0, maxSegments) : inWindow;
+
+  const bySession = new Map<string, ReplayTelemetrySegment[]>();
+  for (const seg of budgeted) {
+    const shaped: ReplayTelemetrySegment = {
+      seq: seg.seq,
+      startTs: seg.startTs.getTime(),
+      endTs: seg.endTs.getTime(),
+      samples: seg.samples,
+      bytes: seg.bytes,
+      s3Key: seg.s3Key,
+    };
+    const list = bySession.get(seg.sessionId);
+    if (list) list.push(shaped);
+    else bySession.set(seg.sessionId, [shaped]);
+  }
+
+  return {
+    sessions: kept.filter((s) => bySession.has(s.id)).map((s) => ({
+      id: s.id,
+      status: s.status,
+      rateHz: s.rateHz,
+      timeSource: s.timeSource,
+      from: s.startedAt.getTime(),
+      to: (s.endedAt ?? s.startedAt).getTime(),
+      overview:
+        s.status === 'closed' && s.overviewKey && s.overviewBuiltAt
+          ? {
+              format: REPLAY_TELEMETRY_OVERVIEW_FORMAT,
+              bytes: s.overviewBytes,
+              builtAt: s.overviewBuiltAt.getTime(),
+              s3Key: s.overviewKey,
+            }
+          : null,
+      segments: bySession.get(s.id) ?? [],
+      insights: s.insights ?? null,
+    })),
+    truncated,
+  };
+}

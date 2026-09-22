@@ -217,7 +217,17 @@ export const mediaSessionsPaths = {
         'overlapping the range, segments clipped to it, optional `streamKey` filter), never both. ' +
         'Caps: 600 segments in total, and in range mode 10 sessions and 24 hours. Exceeding a cap ' +
         'is a 400 telling you to narrow the request. Refetch before `urlExpiresAt` (epoch ms), ' +
-        'which is the real URL TTL minus a 5-minute safety margin.',
+        'which is the real URL TTL minus a 5-minute safety margin.\n\n' +
+        '**Telemetry rides along.** `replay.telemetry` lists the recorded-telemetry sessions that ' +
+        'overlap the replay window (in session mode, the merged video timeline; in range mode, ' +
+        '`from`..`to`), each with a presigned `overview.v1` artifact and its raw segments clipped ' +
+        'to the window, plus the session\'s `insights`. Nothing in it touches a database or a ' +
+        'Lambda on fetch: the browser GETs the objects straight from storage, and the URLs share ' +
+        '`urlExpiresAt` with the video ones. An `open` session has `overview: null`; build it from ' +
+        'its `segments` and poll the manifest about every 60 s until it closes. Telemetry has its ' +
+        'own cap of 1,500 segments, honoured by truncation (`telemetry.truncated: true`), not by a ' +
+        '400. Pass `telemetry=0` to omit the block; a device that recorded nothing in the window ' +
+        'returns `{ "sessions": [] }`.',
       tags: ['Media Sessions'],
       parameters: [
         {
@@ -241,6 +251,15 @@ export const mediaSessionsPaths = {
           required: false,
           schema: { type: 'string', example: 'cam0' },
           description: 'Range mode only: limit to one camera.',
+        },
+        {
+          name: 'telemetry',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['0', '1'], default: '1' },
+          description:
+            '`0` omits `replay.telemetry` (video-only clients, or a client that fetches telemetry ' +
+            'by other means). Anything else, or absent, includes it.',
         },
       ],
       responses: {

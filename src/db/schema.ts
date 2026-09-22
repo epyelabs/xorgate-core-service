@@ -548,6 +548,9 @@ export const telemetrySessions = pgTable(
     // telemetry/v1/<dev>/<sess>/overview.v1.json.gz once built; NULL while open.
     overviewKey: text('overview_key'),
     overviewBuiltAt: timestamp('overview_built_at', { withTimezone: true }),
+    // Gzipped size of the artifact, recorded at PUT time (manual/026) so the
+    // replay manifest never HEADs per request; NULL until built or backfilled.
+    overviewBytes: integer('overview_bytes'),
     // A segment arrived after the last build: rebuild on the next close pass.
     overviewStale: boolean('overview_stale').default(false).notNull(),
     insights: jsonb('insights'),
