@@ -9,6 +9,7 @@ import {
   parseSegment,
   parseTelemetryObjectKey,
 } from '../services/telemetry-batch';
+import { ensureSegmentNormalized, indexSegment } from '../services/telemetry-sessions';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge (same as media-finalize).
 interface S3ObjectCreatedDetail {
@@ -47,6 +48,16 @@ class AlreadyIngested extends Error {}
  * redelivery re-ingests atomically; a duplicate delivery hits the PK and rolls
  * back its readings. Age-window rejection (partition safety) skips lines, not
  * files — see services/telemetry-batch.ts.
+ *
+ * Session index (telemetry-session-artifacts plan, Phase 1): the same
+ * transaction also upserts `telemetry_sessions` / `telemetry_segments`
+ * (services/telemetry-sessions.ts indexSegment), including for a file whose
+ * every line is outside the partition window: the artifact builder reads S3,
+ * not the window, and a 91-day-old segment is still part of its session.
+ * After the commit the object's metadata is normalised (Content-Encoding:
+ * gzip, README Q14) with a CopyObject onto itself; that re-fires this event
+ * once, and the fast-path dedupe below absorbs it (and re-checks the header,
+ * because a device uploader retry can re-PUT a key AFTER normalisation).
  */
 export const handler = async (
   event: EventBridgeEvent<'Object Created', S3ObjectCreatedDetail>,
@@ -72,6 +83,12 @@ export const handler = async (
   });
   if (existing) {
     console.log('telemetry-batch-ingest: already ingested, skipping', { key });
+    // The only path that sees a re-PUT after normalisation (and our own
+    // re-fired copy event): HEAD, and re-copy only if the header is missing.
+    const normalized = await ensureSegmentNormalized(bucket, key);
+    if (normalized !== 'already') {
+      console.log('telemetry-batch-ingest: normalised on duplicate delivery', { key, normalized });
+    }
     return;
   }
 
@@ -87,6 +104,7 @@ export const handler = async (
   // Fetch + gunzip. S3 failures throw (transient); a corrupt gzip is permanent.
   const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   const gz = Buffer.from(await obj.Body!.transformToByteArray());
+  const objectBytes = event.detail.object.size ?? obj.ContentLength ?? gz.length;
   let text: string;
   try {
     text = gunzipSync(gz).toString('utf8');
@@ -109,26 +127,31 @@ export const handler = async (
   }
 
   const skipped = parsed.skippedInvalid + parsed.skippedAge;
-  if (parsed.rows.length === 0) {
-    // Nothing insertable (e.g. all lines outside the partition window). Still
-    // log the object so redeliveries don't re-parse it forever.
-    await db
-      .insert(schema.telemetryIngestLog)
-      .values({ s3Key: key, deviceId, sessionId, rowsInserted: 0, linesSkipped: skipped })
-      .onConflictDoNothing();
-    console.warn('telemetry-batch-ingest: no insertable rows', { key, skipped });
-    return;
-  }
+  const indexInput = {
+    s3Key: key,
+    deviceId,
+    sessionId,
+    seq: parsedKey.seq,
+    header: parsed.header,
+    firstTs: parsed.firstTs,
+    lastTs: parsed.lastTs,
+    samples: parsed.sampleLines,
+    bytes: objectBytes,
+    keyStartTsMs: parsedKey.startTsMs,
+  };
 
   try {
     await db.transaction(async (tx) => {
       // Sequential batches — RDS Data API forbids interleaving inside a
       // transaction (no Promise.all here, per the driver's known limits).
+      // A file with nothing insertable (every line outside the partition
+      // window) skips the readings but is STILL indexed and logged.
       for (let i = 0; i < parsed.rows.length; i += INSERT_BATCH_ROWS) {
         await tx
           .insert(schema.telemetryReadings)
           .values(parsed.rows.slice(i, i + INSERT_BATCH_ROWS));
       }
+      await indexSegment(tx, indexInput);
       const logged = await tx
         .insert(schema.telemetryIngestLog)
         .values({
@@ -150,13 +173,25 @@ export const handler = async (
     throw err; // transient DB failure → Lambda retry / DLQ
   }
 
-  console.log('telemetry-batch-ingest: ingested', {
-    key,
-    deviceId,
-    sessionId,
-    samples: parsed.samples,
-    rows: parsed.rows.length,
-    skippedInvalid: parsed.skippedInvalid,
-    skippedAge: parsed.skippedAge,
-  });
+  if (parsed.rows.length === 0) {
+    console.warn('telemetry-batch-ingest: no insertable rows (indexed only)', { key, skipped });
+  } else {
+    console.log('telemetry-batch-ingest: ingested', {
+      key,
+      deviceId,
+      sessionId,
+      samples: parsed.samples,
+      rows: parsed.rows.length,
+      skippedInvalid: parsed.skippedInvalid,
+      skippedAge: parsed.skippedAge,
+      firstTs: parsed.firstTs,
+      lastTs: parsed.lastTs,
+    });
+  }
+
+  // README Q14, AFTER the commit so the ingest-log row exists before the
+  // re-fired Object Created event can arrive. Never throws; a failure leaves
+  // normalized=false for the sweeper to retry.
+  const normalized = await ensureSegmentNormalized(bucket, key);
+  console.log('telemetry-batch-ingest: normalised', { key, normalized });
 };

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  iterateSegmentLines,
   parseSegment,
   parseTelemetryObjectKey,
+  summarizeSegment,
+  worstTimeSource,
 } from '../src/services/telemetry-batch';
 import { recordingStatusSchema, telemetryPayloadSchema } from '../src/schemas/telemetry';
 import { flattenTelemetryToRows } from '../src/schemas/telemetry';
@@ -95,6 +98,65 @@ describe('parseSegment', () => {
       { ts: NOW, mono: 1, seq: 0, metrics: { imu: { a: { value: 1 } } } },
     ]);
     expect(parseSegment(text, OPTS).deviceIdMismatch).toBe(true);
+  });
+});
+
+describe('parseSegment session-index fields (telemetry-session-artifacts Phase 1)', () => {
+  it('lifts the first header and the min/max ts over every valid sample line', () => {
+    const text = segmentText([
+      header,
+      { ts: NOW - 500, mono: 1, seq: 0, metrics: { imu: { a: { value: 1 } } } },
+      { ts: NOW - 91 * 86400_000, mono: 2, seq: 1, metrics: { imu: { a: { value: 2 } } } }, // outside the window
+      { ts: NOW - 400, mono: 3, seq: 2, metrics: { imu: { a: { value: 3 } } } },
+    ]);
+    const parsed = parseSegment(text, OPTS);
+    expect(parsed.header).toEqual({ rateHz: 10, timeSource: 'ntp', startedAt: NOW - 1000, bootId: 'b' });
+    expect(parsed.samples).toBe(2);
+    expect(parsed.sampleLines).toBe(3);
+    expect(parsed.skippedAge).toBe(1);
+    // The index describes the FILE: the age-skipped line still bounds the window.
+    expect(parsed.firstTs).toBe(NOW - 91 * 86400_000);
+    expect(parsed.lastTs).toBe(NOW - 400);
+  });
+
+  it('keeps the WORST time source across header re-emissions, in either order', () => {
+    const downgrade = segmentText([header, { ...header, timeSource: 'unsynced' }]);
+    expect(parseSegment(downgrade, OPTS).header?.timeSource).toBe('unsynced');
+    const upgrade = segmentText([{ ...header, timeSource: 'rtc' }, { ...header, timeSource: 'ntp' }]);
+    expect(parseSegment(upgrade, OPTS).header?.timeSource).toBe('rtc');
+    expect(worstTimeSource('ntp', 'gps')).toBe('gps');
+    expect(worstTimeSource(null, 'ntp')).toBe('ntp');
+    expect(worstTimeSource('ntp', undefined)).toBe('ntp');
+    expect(worstTimeSource('weird', 'ntp')).toBe('weird');
+  });
+
+  it('tolerates a header without provenance fields and a file without a header', () => {
+    const bare = segmentText([{ type: 'header', deviceId: DEVICE, sessionId: SESSION }, { ts: NOW, mono: 1, seq: 0, metrics: {} }]);
+    expect(parseSegment(bare, OPTS).header).toEqual({ rateHz: null, timeSource: null, startedAt: null, bootId: null });
+    const none = segmentText([{ ts: NOW, mono: 1, seq: 0, metrics: {} }]);
+    const parsed = parseSegment(none, OPTS);
+    expect(parsed.header).toBeNull();
+    expect(parsed.firstTs).toBe(NOW);
+    expect(parsed.samples).toBe(1);
+    expect(parsed.rows).toEqual([]);
+  });
+
+  it('summarizeSegment: header + bounds + counts, no rows, no age window', () => {
+    const text = segmentText([
+      header,
+      { ts: NOW - 400 * 86400_000, mono: 1, seq: 0, metrics: { imu: { a: { value: 1 } } } },
+      { ...header, timeSource: 'rtc' },
+      { ts: NOW, mono: 2, seq: 1, metrics: { imu: { a: { value: 1 } } } },
+    ]) + 'not json\n';
+    expect(summarizeSegment(text)).toEqual({
+      header: { rateHz: 10, timeSource: 'rtc', startedAt: NOW - 1000, bootId: 'b' },
+      sampleLines: 2,
+      invalidLines: 1,
+      firstTs: NOW - 400 * 86400_000,
+      lastTs: NOW,
+    });
+    expect([...iterateSegmentLines('\n\n')]).toEqual([]);
+    expect([...iterateSegmentLines('{"type":"header","deviceId":"x"}\n')]).toEqual([{ kind: 'invalid' }]);
   });
 });
 

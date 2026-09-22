@@ -998,9 +998,15 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const offlineSweeperFn = new nodejs.NodejsFunction(this, "OfflineSweeperFn", {
       ...standardFnProps(
         path.join(entryBase, "offline-sweeper.ts"),
-        "Schedule (1m) -> offline sweep + media-session close + segment expiry",
+        "Schedule (1m) -> offline sweep + media/telemetry-session close + overview build + segment expiry",
       ),
-      timeout: cdk.Duration.seconds(30),
+      // Telemetry-session overview builds (telemetry-session-artifacts plan,
+      // Phase 1): up to 10 per tick, each streaming a session's segments from
+      // S3 through the builder. The S3 grants come from the shared
+      // lambdaRole's bucket.grantReadWrite above (GET segments, PUT
+      // overview.*, and the CopyObject that normalises segment metadata).
+      memorySize: 512,
+      timeout: cdk.Duration.seconds(60),
       bundling: bundlingWithSdk,
     });
     new events.Rule(this, "OfflineSweeperSchedule", {

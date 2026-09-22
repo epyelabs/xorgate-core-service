@@ -7,6 +7,7 @@ import {
   integer,
   boolean,
   doublePrecision,
+  bigint,
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
@@ -508,6 +509,89 @@ export const telemetryIngestLog = pgTable('telemetry_ingest_log', {
   linesSkipped: integer('lines_skipped').default(0).notNull(),
   ingestedAt: timestamp('ingested_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// --- Telemetry session index (telemetry-session-artifacts plan, Phase 1, D7) ---
+//
+// One row per device-minted telemetry session (the uuidv7 in the segment key
+// and header) and one per uploaded segment object. Written by
+// telemetry-batch-ingest inside its existing transaction, so a segment is
+// never indexed without its ingest-log row and vice versa. The index is what
+// the replay manifest (Phase 2) range-scans on (device_id, started_at); it
+// never lists S3. Lifecycle is advisory and mirrors media_sessions: the
+// sweeper flips open -> closed after `mediaSessionCloseAfterMs` without a
+// segment ARRIVAL, then builds the session's overview.v1.json.gz artifact.
+// A straggler segment re-opens the session and marks the overview stale.
+//
+// `insights` mirrors the artifact's block (D12) so lists and fleet roll-ups
+// never touch S3; the three promoted columns are the ones a list sorts,
+// filters or sums on. Everything else stays in the jsonb.
+export const telemetrySessions = pgTable(
+  'telemetry_sessions',
+  {
+    id: uuid('id').primaryKey(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    // Min / max sample ts seen across the session's segments (device clock).
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+    endedAt: timestamp('ended_at', { withTimezone: true }),
+    // Server arrival clock of the newest segment: the close-detection clock.
+    lastSegmentAt: timestamp('last_segment_at', { withTimezone: true }).defaultNow().notNull(),
+    // open | closed (text, not pgEnum: aws-data-api enum-cast issue).
+    status: text('status').default('open').notNull(),
+    rateHz: integer('rate_hz'),
+    // Worst seen across the session's segment headers: ntp > gps > nitz > rtc > unsynced.
+    timeSource: text('time_source'),
+    segmentCount: integer('segment_count').default(0).notNull(),
+    sampleCount: bigint('sample_count', { mode: 'number' }).default(0).notNull(),
+    byteCount: bigint('byte_count', { mode: 'number' }).default(0).notNull(),
+    // telemetry/v1/<dev>/<sess>/overview.v1.json.gz once built; NULL while open.
+    overviewKey: text('overview_key'),
+    overviewBuiltAt: timestamp('overview_built_at', { withTimezone: true }),
+    // A segment arrived after the last build: rebuild on the next close pass.
+    overviewStale: boolean('overview_stale').default(false).notNull(),
+    insights: jsonb('insights'),
+    // { [insightId]: version } per computer that produced the mirror above.
+    insightsComputed: jsonb('insights_computed').$type<Record<string, number>>(),
+    distanceM: doublePrecision('distance_m'),
+    durationMs: bigint('duration_ms', { mode: 'number' }),
+    maxSpeedKph: doublePrecision('max_speed_kph'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index('telemetry_sessions_device_started_idx').on(t.deviceId, t.startedAt),
+    index('telemetry_sessions_device_ended_idx').on(t.deviceId, t.endedAt),
+    index('telemetry_sessions_open_idx')
+      .on(t.status, t.lastSegmentAt)
+      .where(sql`${t.status} = 'open'`),
+  ],
+);
+
+export const telemetrySegments = pgTable(
+  'telemetry_segments',
+  {
+    s3Key: text('s3_key').primaryKey(),
+    sessionId: uuid('session_id')
+      .references(() => telemetrySessions.id, { onDelete: 'cascade' })
+      .notNull(),
+    deviceId: uuid('device_id').notNull(),
+    seq: integer('seq').notNull(),
+    // First / last sample ts IN THE FILE (device clock), not the key's startTsMs.
+    startTs: timestamp('start_ts', { withTimezone: true }).notNull(),
+    endTs: timestamp('end_ts', { withTimezone: true }).notNull(),
+    samples: integer('samples').notNull(),
+    bytes: integer('bytes').notNull(),
+    // Object metadata carries Content-Encoding: gzip (Q14 normalisation), so
+    // every platform's fetch() inflates it natively. The manifest filters on it.
+    normalized: boolean('normalized').default(false).notNull(),
+    uploadedAt: timestamp('uploaded_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('telemetry_segments_session_seq_idx').on(t.sessionId, t.seq),
+    index('telemetry_segments_session_start_idx').on(t.sessionId, t.startTs),
+  ],
+);
 
 // A continuous recording run for one stream. Groups segments and holds the CMAF init key.
 // Populated (offline recording plan, Phase 4) by media-segment-ingest from device-uploaded
@@ -1069,6 +1153,10 @@ export type TelemetryReading = InferSelectModel<typeof telemetryReadings>;
 export type NewTelemetryReading = InferInsertModel<typeof telemetryReadings>;
 export type DeviceLatest = InferSelectModel<typeof deviceLatest>;
 export type NewDeviceLatest = InferInsertModel<typeof deviceLatest>;
+export type TelemetrySession = InferSelectModel<typeof telemetrySessions>;
+export type NewTelemetrySession = InferInsertModel<typeof telemetrySessions>;
+export type TelemetrySegment = InferSelectModel<typeof telemetrySegments>;
+export type NewTelemetrySegment = InferInsertModel<typeof telemetrySegments>;
 export type MediaSession = InferSelectModel<typeof mediaSessions>;
 export type NewMediaSession = InferInsertModel<typeof mediaSessions>;
 export type MediaSegment = InferSelectModel<typeof mediaSegments>;
