@@ -64,27 +64,33 @@ const env: cdk.Environment = {
 // WorkflowScheduler both run at `rate(1 minute)`), which keeps the cluster
 // awake and stops it auto-pausing. On the shared sandbox that costs ~$1.45/day.
 //
-// DEFAULT OFF IN BOTH STAGES as of 2026-08-19. Dev has always been off for the
+// DEFAULT OFF IN DEV, ON IN PROD (since 2026-09-22; see below). Dev has always been off for the
 // cost reason. Prod joined it because prod was created empty, on a cluster
 // deliberately configured with a 0-ACU floor and a 30-minute auto-pause: a
 // one-minute poller with no devices and no workflows to act on would have
 // billed a full always-on cluster to do nothing, which is exactly what the
 // 0-ACU floor was chosen to avoid.
 //
-// >>> TURN THIS ON FOR PROD BEFORE PROD CARRIES ANYTHING. <<<
-// With it off, devices are never marked offline and scheduled workflows never
-// fire. The trigger is the first real device or the first workflow schedule in
-// production, not a date:
+// PROD DEFAULT FLIPPED TO ON 2026-09-22 (owner decision, telemetry-session-
+// artifacts plan, Phase 2). Prod carries real devices and the artifact design
+// depends on the sweeper: it closes sessions and builds each telemetry
+// session's overview + insights, expires index rows, sweeps devices offline
+// and fires scheduled workflows. With it off none of that happens on its own
+// (prod ran that way from 2026-08-19 to 2026-09-22: zero scheduled sweeper
+// invocations, sessions closed only on read). The cost is an always-awake
+// prod cluster, roughly $44/month at the 0.5 ACU it idles at.
 //
-//   npm run deploy:prod -- --context scheduledJobs=on
+// Dev stays off (shared sandbox, auto-pause). Either stage can be overridden
+// per deploy:
 //
-// (or flip the default below, which is better once prod is permanently live).
+//   npm run deploy:dev  -- --context scheduledJobs=on
+//   npm run deploy:prod -- --context scheduledJobs=off
 const scheduledJobsCtx = app.node.tryGetContext('scheduledJobs') as
   | 'on'
   | 'off'
   | undefined;
 const disableScheduledJobs =
-  scheduledJobsCtx === 'on' ? false : scheduledJobsCtx === 'off' ? true : true;
+  scheduledJobsCtx === 'on' ? false : scheduledJobsCtx === 'off' ? true : stage !== 'prod';
 
 // Telemetry retention (improve-recording-history-fetching plan, phase 4).
 // SHIPS DORMANT AND STAYS DORMANT until someone opts in on the command line:
