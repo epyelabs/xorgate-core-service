@@ -4,7 +4,7 @@ import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
-import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { badRequest, gzipIfAccepted, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
 import {
@@ -59,8 +59,11 @@ import { apiHandler } from '../utils/api-handler';
  *
  * 1. **Payload.** ~89 % of a flat page is the strings "ts"/"metric"/"value"/
  *    "unit" and a re-serialised ISO timestamp repeated once per reading, and
- *    this API does not gzip (HTTP APIs have no compression setting). Measured
- *    141 814 B for a 100-timestamp page against 14 998 B pivoted.
+ *    the HTTP API itself does not gzip (no compression setting). Measured
+ *    141 814 B for a 100-timestamp page against 14 998 B pivoted. Since
+ *    telemetry-session-artifacts P5 the function gzips its own responses for
+ *    callers that accept it (README D11, `gzipIfAccepted`), which shrinks
+ *    both shapes further on the wire.
  * 2. **Round-trips.** The column set used to be derived client-side from the
  *    device model, so the table needed getDevice → getDeviceModel → readings
  *    before rendering a single row. The join here costs one indexed PK lookup
@@ -684,4 +687,8 @@ const restHandler = async (
   return handleHistory(id, event);
 };
 
-export const handler = apiHandler(restHandler);
+// README D11 (telemetry-session-artifacts P5): every JSON body this handler
+// serves is gzipped when the caller sends `Accept-Encoding: gzip` (the flat
+// readings shape measured 19x smaller; see utils/responses.ts). Applied after
+// the route so the handlers above stay shape-only.
+export const handler = apiHandler(async (event) => gzipIfAccepted(event, await restHandler(event)));
