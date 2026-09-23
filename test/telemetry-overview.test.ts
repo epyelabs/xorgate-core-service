@@ -86,6 +86,7 @@ describe('buildOverview', () => {
     expect(o.from).toBe(T0);
     expect(o.to).toBe(T0 + 119_000);
     expect(o.source).toEqual({
+      droppedSamples: 0,
       segments: 1,
       seqFrom: 0,
       seqTo: 0,

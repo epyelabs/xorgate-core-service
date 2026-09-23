@@ -80,6 +80,17 @@ export const attachmentTriggerSchema = z.discriminatedUnion('type', [
     type: z.literal('segment_uploaded'),
     streamKeys: z.array(z.string()).min(1),
   }),
+  // The telemetry twin of session_completed (telemetry-session-artifacts P6,
+  // README Q15): fires once a device-recorded TELEMETRY session has closed
+  // (10 quiet minutes, the same advisory close media uses) AND its overview
+  // artifact is built, so the trigger payload carries the session's
+  // `insights` block (distance, duration, stops, ...). Not stream-keyed: a
+  // device has one telemetry recorder. AT-LEAST-ONCE like the media twin: a
+  // straggler segment reopens the session and it fires again after the
+  // re-close with a rebuilt payload; consumers dedupe on sessionId.
+  z.object({
+    type: z.literal('telemetry_session_completed'),
+  }),
   z.object({
     type: z.literal('schedule'),
     cron: z.string().min(1),
@@ -132,6 +143,9 @@ export const manualRunContextSchema = z.discriminatedUnion('triggerType', [
     sessionId: z.string().min(1),
     seq: z.number().int().nonnegative().optional(),
   }),
+  // Run a telemetry-session-triggered workflow by hand over one telemetry
+  // session (its recorded window becomes the run's telemetry window).
+  z.object({ triggerType: z.literal('telemetry_session_completed'), sessionId: z.string().min(1) }),
   z.object({ triggerType: z.literal('schedule'), selection: scheduleRunSelectionSchema }),
   z.object({ triggerType: z.literal('telemetry_condition'), window: manualWindowSchema }),
 ]);

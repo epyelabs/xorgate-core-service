@@ -144,10 +144,24 @@ async function subscribedAttachments(
   deviceId: string,
   type: StreamKeyedTrigger['type'],
   streamKey: string,
-): Promise<{
+): Promise<SubscribedAttachments> {
+  return attachmentsMatching(deviceId, (t): t is StreamKeyedTrigger => t.type === type && t.streamKeys.includes(streamKey));
+}
+
+interface SubscribedAttachments {
   workspaceId: string;
   matches: Array<{ id: string; templateId: string; version: number; definition: WorkflowDefinition }>;
-}> {
+}
+
+/**
+ * Enabled attachments on `deviceId` with at least one trigger `matches`
+ * accepts, each resolved to the template version that would actually run.
+ * The stream-keyed media triggers and the telemetry-session trigger share it.
+ */
+async function attachmentsMatching(
+  deviceId: string,
+  matches: (t: AttachmentTrigger) => boolean,
+): Promise<SubscribedAttachments> {
   const empty = { workspaceId: '', matches: [] };
   const device = await db.query.devices.findFirst({
     where: eq(schema.devices.id, deviceId),
@@ -175,14 +189,10 @@ async function subscribedAttachments(
       ),
     );
 
-  const subscribed = rows.filter((a) =>
-    ((a.triggers as AttachmentTrigger[]) ?? []).some(
-      (t): t is StreamKeyedTrigger => t.type === type && t.streamKeys.includes(streamKey),
-    ),
-  );
+  const subscribed = rows.filter((a) => ((a.triggers as AttachmentTrigger[]) ?? []).some(matches));
   if (subscribed.length === 0) return empty;
 
-  const matches: Array<{ id: string; templateId: string; version: number; definition: WorkflowDefinition }> = [];
+  const resolved: SubscribedAttachments['matches'] = [];
   for (const a of subscribed) {
     const resolvedVersion = a.pinnedVersion ?? a.publishedVersion;
     if (resolvedVersion == null) continue;
@@ -196,14 +206,93 @@ async function subscribedAttachments(
         ),
       );
     if (!ver) continue;
-    matches.push({
+    resolved.push({
       id: a.id,
       templateId: a.templateId,
       version: resolvedVersion,
       definition: ver.definition as WorkflowDefinition,
     });
   }
-  return { workspaceId: device.workspaceId, matches };
+  return { workspaceId: device.workspaceId, matches: resolved };
+}
+
+// --- Telemetry-session trigger: telemetry_session_completed -----------------
+
+/** The telemetry_sessions columns the trigger payload is built from. */
+export interface TelemetrySessionForTrigger {
+  id: string;
+  deviceId: string;
+  startedAt: Date;
+  endedAt: Date | null;
+  rateHz: number | null;
+  timeSource: string | null;
+  segmentCount: number;
+  sampleCount: number;
+  insights: unknown;
+}
+
+/**
+ * The `telemetry_session_completed` run context (pure, unit-tested). Carries
+ * the session's identity, bounds and its whole `insights` block (README D12:
+ * the canonical, versioned summaries) plus an explicit `window`, which is
+ * what the dispatcher's resolveTriggeredWindow reads, so a `source.telemetry`
+ * node in the run gets exactly the session's recorded span through
+ * readTelemetryWindow (artifacts when cold, Postgres when hot).
+ */
+export function telemetrySessionTriggerContext(session: TelemetrySessionForTrigger): Record<string, unknown> {
+  const from = session.startedAt.toISOString();
+  const to = (session.endedAt ?? session.startedAt).toISOString();
+  return {
+    type: 'telemetry_session_completed',
+    sessionId: session.id,
+    deviceId: session.deviceId,
+    from,
+    to,
+    rateHz: session.rateHz,
+    timeSource: session.timeSource,
+    segmentCount: session.segmentCount,
+    sampleCount: session.sampleCount,
+    insights: session.insights ?? null,
+    window: { from, to },
+  };
+}
+
+/**
+ * Fire workflow runs for a device-recorded TELEMETRY session that has closed
+ * and whose overview (hence insights) is built (telemetry-session-artifacts
+ * P6 item 9, README Q15). Called from the sweeper's telemetry housekeeping
+ * pass (services/telemetry-sessions.ts fireTelemetrySessionCompleted), which
+ * is the one place a close and a build meet; the manifest's and listing's
+ * close-on-read only close, and the next tick fires for them.
+ *
+ * AT-LEAST-ONCE like the media twin: a straggler segment reopens the session,
+ * the next pass re-closes and rebuilds it, and `completed_fired_at <
+ * last_segment_at` re-arms the fire with the rebuilt insights. Consumers that
+ * must run once per session dedupe on triggerContext.sessionId. Returns the
+ * number of runs fired.
+ */
+export async function evaluateTelemetrySessionCompletedTriggers(
+  session: TelemetrySessionForTrigger,
+): Promise<number> {
+  const { workspaceId, matches } = await attachmentsMatching(
+    session.deviceId,
+    (t) => t.type === 'telemetry_session_completed',
+  );
+  if (matches.length === 0) return 0;
+  const triggerContext = telemetrySessionTriggerContext(session);
+  for (const a of matches) {
+    await fireWorkflowRun({
+      workspaceId,
+      deviceId: session.deviceId,
+      attachmentId: a.id,
+      templateId: a.templateId,
+      templateVersion: a.version,
+      definition: a.definition,
+      trigger: 'event',
+      triggerContext,
+    });
+  }
+  return matches.length;
 }
 
 /**

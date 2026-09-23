@@ -101,6 +101,13 @@ function deriveTriggeredBy(trigger: string, ctx: unknown): string {
       ? `segment_uploaded · ${c.streamKey} #${c.seq}`
       : `segment_uploaded · ${c.streamKey}`;
   }
+  if (type === 'telemetry_session_completed') {
+    const insights = c.insights as { distance?: { meters?: unknown } } | null | undefined;
+    const meters = insights?.distance?.meters;
+    return typeof meters === 'number'
+      ? `telemetry_session_completed · ${(meters / 1000).toFixed(1)} km`
+      : 'telemetry_session_completed';
+  }
   if (type === 'telemetry_condition' && Array.isArray(c.matched) && c.matched.length > 0) {
     const first = c.matched[0] as Record<string, unknown>;
     if (typeof first?.metric === 'string') return `telemetry_condition · ${first.metric}`;

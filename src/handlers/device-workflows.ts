@@ -14,6 +14,7 @@ import {
   ok,
 } from '../utils/responses';
 import { attachWorkflowSchema, manualRunContextSchema } from '../schemas/workflows';
+import { telemetrySessionTriggerContext } from '../services/workflow-triggers';
 import type { ManualRunContext, WorkflowDefinition } from '../schemas/workflows';
 import {
   computeRequiredCapabilities,
@@ -277,7 +278,13 @@ const restHandler = async (
         );
       if (!ver) return badRequest(`Version ${resolvedVersion} not found for this template`);
 
-      const triggerContext = await buildManualContext(deviceId, context);
+      let triggerContext: Record<string, unknown>;
+      try {
+        triggerContext = await buildManualContext(deviceId, context);
+      } catch (err) {
+        if (err instanceof ManualContextError) return badRequest(err.message);
+        throw err;
+      }
       await fireWorkflowRun({
         workspaceId: device.workspaceId,
         deviceId,
@@ -300,6 +307,9 @@ const restHandler = async (
       return methodNotAllowed(method, 'GET, POST, PATCH, DELETE');
   }
 };
+
+/** A "Run now" context that names something the device does not have (400, not 500). */
+class ManualContextError extends Error {}
 
 // Resolve a "Run now" context into the run's triggerContext, always including a
 // concrete telemetry window (the inline runner reads triggerContext.window).
@@ -340,6 +350,20 @@ async function buildManualContext(
       // undefined = the session's newest segment (see media-session-input.ts).
       ...(context.triggerType === 'segment_uploaded' ? { seq: context.seq ?? null } : {}),
     };
+  }
+
+  // A telemetry session run: the same payload the sweeper fires (services/
+  // workflow-triggers.ts telemetrySessionTriggerContext), built from the row
+  // as it is now (insights null if the overview is not built yet).
+  if (context.triggerType === 'telemetry_session_completed') {
+    const session = await db.query.telemetrySessions.findFirst({
+      where: and(
+        eq(schema.telemetrySessions.id, context.sessionId),
+        eq(schema.telemetrySessions.deviceId, deviceId),
+      ),
+    });
+    if (!session) throw new ManualContextError(`Telemetry session ${context.sessionId} not found on this device`);
+    return telemetrySessionTriggerContext(session);
   }
 
   if (context.triggerType === 'telemetry_condition') {

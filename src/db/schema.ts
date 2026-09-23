@@ -556,6 +556,12 @@ export const telemetrySessions = pgTable(
     insights: jsonb('insights'),
     // { [insightId]: version } per computer that produced the mirror above.
     insightsComputed: jsonb('insights_computed').$type<Record<string, number>>(),
+    // When `telemetry_session_completed` workflow triggers last fired for this
+    // session (manual/027). NULL = never. A session fires when it is closed
+    // with a built, non-stale overview and (completed_fired_at IS NULL OR
+    // completed_fired_at < last_segment_at): a straggler arrival after the
+    // last fire re-arms it, a manual rebuild does not.
+    completedFiredAt: timestamp('completed_fired_at', { withTimezone: true }),
     distanceM: doublePrecision('distance_m'),
     durationMs: bigint('duration_ms', { mode: 'number' }),
     maxSpeedKph: doublePrecision('max_speed_kph'),

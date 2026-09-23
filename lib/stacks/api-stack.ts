@@ -20,6 +20,7 @@ import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
 import * as fs from "fs";
 import * as path from "path";
@@ -1026,12 +1027,110 @@ export class XorgateCoreApiStack extends cdk.Stack {
       memorySize: 512,
       timeout: cdk.Duration.seconds(60),
       bundling: bundlingWithSdk,
+      // JSON log records (telemetry-session-artifacts P6 item 8): the build
+      // lines below are logged as one object each, which the runtime emits as
+      // `message: { msg, ms, gzipBytes, ... }` so the metric filters can select
+      // and extract fields. Text-format lines stay readable in the console.
+      loggingFormat: lambda.LoggingFormat.JSON,
     });
     new events.Rule(this, "OfflineSweeperSchedule", {
       description: "Housekeeping: offline sweep + media-session close (P2 telemetry / offline recording)",
       enabled: !props.disableScheduledJobs,
       schedule: events.Schedule.rate(cdk.Duration.minutes(1)),
       targets: [new targets.LambdaFunction(offlineSweeperFn)],
+    });
+
+    // --- Telemetry overview builds: metrics, one alarm, one dashboard row ---
+    // (telemetry-session-artifacts P6 item 8). Metric filters on the sweeper's
+    // log group; the group is referenced by NAME, not through `fn.logGroup`
+    // (which would add a LogRetention custom resource and force INFINITE
+    // retention). The group must exist before the filters are created, which
+    // it does on every stage that has invoked the function once; a brand-new
+    // stage deploys the function, invokes it (the schedule), then adds these on
+    // the next deploy. The `msg` strings are the contract with
+    // services/telemetry-sessions.ts BUILD_LOG_MSG / BUILD_FAILED_LOG_MSG.
+    const sweeperLogGroup = logs.LogGroup.fromLogGroupName(
+      this,
+      "OfflineSweeperLogGroup",
+      `/aws/lambda/${offlineSweeperFn.functionName}`,
+    );
+    const artifactMetricsNamespace = "Xorgate/TelemetryArtifacts";
+    const builtPattern = logs.FilterPattern.stringValue("$.message.msg", "=", "telemetry-sessions: overview built");
+    const overviewBuilds = new logs.MetricFilter(this, "TelemetryOverviewBuildsFilter", {
+      logGroup: sweeperLogGroup,
+      metricNamespace: artifactMetricsNamespace,
+      metricName: "OverviewBuilds",
+      filterPattern: builtPattern,
+      metricValue: "1",
+    });
+    const overviewBuildMs = new logs.MetricFilter(this, "TelemetryOverviewBuildMsFilter", {
+      logGroup: sweeperLogGroup,
+      metricNamespace: artifactMetricsNamespace,
+      metricName: "OverviewBuildMs",
+      filterPattern: builtPattern,
+      metricValue: "$.message.ms",
+    });
+    const overviewBytes = new logs.MetricFilter(this, "TelemetryOverviewBytesFilter", {
+      logGroup: sweeperLogGroup,
+      metricNamespace: artifactMetricsNamespace,
+      metricName: "OverviewGzipBytes",
+      filterPattern: builtPattern,
+      metricValue: "$.message.gzipBytes",
+    });
+    // The failure line is matched as a plain term so it fires under either log
+    // format (the value is the count, not a field). No dimensions on any of
+    // these: a metric filter only accepts JSON-selector dimension values and a
+    // term pattern accepts none, and the stages are separate accounts anyway.
+    const overviewBuildFailures = new logs.MetricFilter(this, "TelemetryOverviewBuildFailuresFilter", {
+      logGroup: sweeperLogGroup,
+      metricNamespace: artifactMetricsNamespace,
+      metricName: "OverviewBuildFailures",
+      filterPattern: logs.FilterPattern.literal('"overview build failed"'),
+      metricValue: "1",
+    });
+    const overviewBuildFailureAlarm = new cloudwatch.Alarm(this, "TelemetryOverviewBuildFailureAlarm", {
+      alarmDescription:
+        "A telemetry session overview build failed in the sweeper (telemetry-session-artifacts). " +
+        "The session stays closed with overview_key null / overview_stale and is retried every tick; " +
+        "look for 'overview build failed' in the OfflineSweeperFn log for the sessionId and error.",
+      metric: overviewBuildFailures.metric({ statistic: "Sum", period: cdk.Duration.minutes(5) }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    overviewBuildFailureAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+    new cloudwatch.Dashboard(this, "TelemetryArtifactsDashboard", {
+      dashboardName: `xorgate-telemetry-artifacts-${props.stage}`,
+      widgets: [
+        [
+          new cloudwatch.GraphWidget({
+            title: "Overview builds / min",
+            width: 8,
+            left: [
+              overviewBuilds.metric({ statistic: "Sum", period: cdk.Duration.minutes(1), label: "builds" }),
+              overviewBuildFailures.metric({ statistic: "Sum", period: cdk.Duration.minutes(1), label: "failures", color: "#d13212" }),
+            ],
+          }),
+          new cloudwatch.GraphWidget({
+            title: "Overview build time (ms)",
+            width: 8,
+            left: [
+              overviewBuildMs.metric({ statistic: "p50", period: cdk.Duration.minutes(5), label: "p50" }),
+              overviewBuildMs.metric({ statistic: "p99", period: cdk.Duration.minutes(5), label: "p99" }),
+              overviewBuildMs.metric({ statistic: "Maximum", period: cdk.Duration.minutes(5), label: "max" }),
+            ],
+          }),
+          new cloudwatch.GraphWidget({
+            title: "Overview artifact size (gzipped bytes)",
+            width: 8,
+            left: [
+              overviewBytes.metric({ statistic: "Average", period: cdk.Duration.minutes(5), label: "avg" }),
+              overviewBytes.metric({ statistic: "Maximum", period: cdk.Duration.minutes(5), label: "max" }),
+            ],
+          }),
+        ],
+      ],
     });
 
     // EventBridge monthly -> pre-create upcoming telemetry_readings partitions

@@ -65,7 +65,25 @@ export interface OverviewSegmentInput {
   bytes: number;
   /** Gunzipped JSONL. */
   text: string;
+  /**
+   * Server arrival time of the object (epoch ms). When given, a sample
+   * stamped more than {@link FUTURE_SAMPLE_SLACK_MS} after it is dropped and
+   * counted in `source.droppedSamples` (P6): an RTC that jumped to 2080 must
+   * not stretch the session's bounds or its grids. The ingest index applies
+   * the same one-day rule (telemetry-batch.ts plausibleSampleTs).
+   */
+  uploadedAt?: number;
 }
+
+/** A sample later than its segment's arrival by more than this is not a sample. */
+export const FUTURE_SAMPLE_SLACK_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A gap between consecutive samples longer than this is a recording hole and
+ * does not count as recorded time when choosing a group's bucket width (P6).
+ * Same value as the insights' `breakGapMs`.
+ */
+export const RECORDED_GAP_MS = 30_000;
 
 export interface OverviewGroupV1 {
   bucketMs: number;
@@ -87,6 +105,8 @@ export interface OverviewSourceV1 {
   /** Segments the index knew of whose object was already gone (lifecycle). */
   missingSegments: number;
   invalidLines: number;
+  /** Samples dropped for being stamped more than a day after their segment arrived (P6). */
+  droppedSamples: number;
 }
 
 export interface OverviewV1 {
@@ -132,6 +152,15 @@ class GroupGrid {
   samples = 0;
   first: number | null = null;
   last: number | null = null;
+  /**
+   * Time covered by consecutive samples closer than RECORDED_GAP_MS (P6):
+   * the span the ladder is chosen over, so a drive with long recording holes
+   * (the golden session: 1.8 h of wall clock for 53 min recorded) is not
+   * bucketed for the holes. `ts` is sparse, so the bucket count stays at or
+   * under the target either way; this only stops it landing far under.
+   */
+  recordedMs = 0;
+  private prevTs: number | null = null;
   private coarsened = false;
 
   constructor(
@@ -146,6 +175,11 @@ class GroupGrid {
     this.samples++;
     if (this.first === null || ts < this.first) this.first = ts;
     if (this.last === null || ts > this.last) this.last = ts;
+    if (this.prevTs !== null) {
+      const dt = ts - this.prevTs;
+      if (dt > 0 && dt <= RECORDED_GAP_MS) this.recordedMs += dt;
+    }
+    this.prevTs = ts;
     // Past the target at a sub-second native period: fold to the 1 s rung now
     // so the grid stays bounded (the final rung is at least this coarse).
     if (!this.coarsened && this.samples > this.target && this.bucketMs < 1000) {
@@ -201,7 +235,12 @@ class GroupGrid {
 
   finish(): OverviewGroupV1 {
     if (this.samples > this.target && this.first !== null && this.last !== null) {
-      this.coarsen(chooseBucketMs(this.last - this.first, this.target));
+      // Recorded span, not wall span (P6): holes produce no buckets, so the
+      // ladder fitted to the wall span under-fills the target several times
+      // over on a drive with long parked stretches. Fall back to the wall
+      // span when the samples never sat within a gap of each other.
+      const span = this.recordedMs > 0 ? this.recordedMs : this.last - this.first;
+      this.coarsen(chooseBucketMs(span, this.target));
     }
     const starts = [...this.buckets.keys()].sort((a, b) => a - b);
     const metrics = [...this.metrics].sort();
@@ -238,6 +277,7 @@ export class OverviewBuilder {
     bytes: 0,
     missingSegments: 0,
     invalidLines: 0,
+    droppedSamples: 0,
   };
 
   constructor(private readonly meta: OverviewSessionMeta) {
@@ -261,6 +301,10 @@ export class OverviewBuilder {
       if (line.kind === 'header') {
         if (this.rateHz === null && line.header.rateHz) this.rateHz = line.header.rateHz;
         this.timeSource = worstTimeSource(this.timeSource, line.header.timeSource);
+        continue;
+      }
+      if (segment.uploadedAt !== undefined && line.sample.ts > segment.uploadedAt + FUTURE_SAMPLE_SLACK_MS) {
+        this.source.droppedSamples++;
         continue;
       }
       this.feedSample(line.sample.ts, line.sample.metrics);

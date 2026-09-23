@@ -1,12 +1,13 @@
 import { gunzipSync } from 'node:zlib';
 import {
   CopyObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { and, asc, eq, isNull, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import { db, schema } from '../db/index';
 import { recordingConfig } from '../config/recording';
@@ -19,6 +20,7 @@ import {
 } from './telemetry-batch';
 import { gzipOverview, OverviewBuilder, overviewKeyFor } from './telemetry-overview';
 import { promotedInsightColumns } from './telemetry-insights/index';
+import { evaluateTelemetrySessionCompletedTriggers } from './workflow-triggers';
 
 /**
  * Telemetry session index + overview artifacts (telemetry-session-artifacts
@@ -279,6 +281,7 @@ export async function buildSessionOverview(sessionId: string, bucket = BUCKET): 
       s3Key: schema.telemetrySegments.s3Key,
       seq: schema.telemetrySegments.seq,
       bytes: schema.telemetrySegments.bytes,
+      uploadedAt: schema.telemetrySegments.uploadedAt,
     })
     .from(schema.telemetrySegments)
     .where(eq(schema.telemetrySegments.sessionId, sessionId))
@@ -313,7 +316,9 @@ export async function buildSessionOverview(sessionId: string, bucket = BUCKET): 
       builder.noteMissingSegment();
       continue;
     }
-    builder.feedSegment({ key: seg.s3Key, seq: seg.seq, bytes: seg.bytes, text });
+    // `uploadedAt` lets the builder drop samples an RTC stamped in the far
+    // future (P6; the same one-day rule the ingest index applies).
+    builder.feedSegment({ key: seg.s3Key, seq: seg.seq, bytes: seg.bytes, text, uploadedAt: seg.uploadedAt.getTime() });
   }
 
   const builtAt = Date.now();
@@ -373,6 +378,8 @@ export interface HousekeepingOptions {
    * one HEAD each per pass (Phase 2). Zero once the backfill has caught up.
    */
   maxBytesBackfills?: number;
+  /** Sessions whose `telemetry_session_completed` triggers to evaluate per pass (P6). */
+  maxTriggerFires?: number;
   /** Stop starting new work once this epoch-ms is reached. */
   deadline?: number;
 }
@@ -385,8 +392,23 @@ export interface HousekeepingResult {
   normalized: number;
   /** `overview_bytes` rows filled from a HEAD this pass (pre-026 artifacts). */
   bytesBackfilled: number;
+  /** Sessions whose `telemetry_session_completed` triggers were evaluated this pass. */
+  completedFired: number;
+  /** Workflow runs those evaluations started. */
+  completedRuns: number;
   builds: BuildResult[];
 }
+
+/**
+ * Log lines the CloudWatch metric filters read (api-stack.ts, P6 item 8).
+ * ONE object per line, so under the sweeper's JSON log format the runtime
+ * emits it as `message: { msg, ... }` and a filter can select on
+ * `$.message.msg` and extract `$.message.ms` / `$.message.gzipBytes`. The
+ * `msg` strings are part of that contract: change them together with the
+ * filters. Under the text log format (local runs) they print as util.inspect.
+ */
+export const BUILD_LOG_MSG = 'telemetry-sessions: overview built';
+export const BUILD_FAILED_LOG_MSG = 'telemetry-sessions: overview build failed';
 
 /**
  * The sweeper's step 2b (README D6, Q5): close stale sessions, then build the
@@ -406,6 +428,8 @@ export async function runTelemetryHousekeeping(opts: HousekeepingOptions = {}): 
     pendingBuilds: 0,
     normalized: 0,
     bytesBackfilled: 0,
+    completedFired: 0,
+    completedRuns: 0,
     builds: [],
   };
 
@@ -430,11 +454,21 @@ export async function runTelemetryHousekeeping(opts: HousekeepingOptions = {}): 
       result.built++;
       result.pendingBuilds--;
       result.builds.push(built);
-      console.log('telemetry-sessions: overview built', built);
+      console.log({ msg: BUILD_LOG_MSG, ...built });
     } catch (err) {
       result.buildFailures++;
-      console.error('telemetry-sessions: overview build failed', { sessionId: row.id, err });
+      console.error({ msg: BUILD_FAILED_LOG_MSG, sessionId: row.id, err: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  // P6 item 9: `telemetry_session_completed` workflow triggers, for every
+  // session that is closed with a current overview and has not fired since
+  // its last segment arrived (the just-built ones by construction, plus any a
+  // close-on-read closed and an earlier tick built).
+  if (Date.now() < deadline) {
+    const fired = await fireTelemetrySessionCompleted({ limit: opts.maxTriggerFires ?? 25, deadline });
+    result.completedFired = fired.sessions;
+    result.completedRuns = fired.runs;
   }
 
   // Normalisation retries. Skip rows younger than two minutes: their ingest
@@ -514,6 +548,121 @@ export async function backfillOverviewBytes(
     }
   }
   return filled;
+}
+
+/**
+ * Evaluate `telemetry_session_completed` workflow triggers (P6 item 9, README
+ * Q15) for sessions that owe a fire: closed, overview built and not stale,
+ * and `completed_fired_at` null or older than `last_segment_at` (manual/027).
+ * The fire is recorded BEFORE the evaluation so a crash mid-way re-fires at
+ * most the session it was on (at-least-once, like the media twin), and it is
+ * recorded even when no attachment subscribes, so the row does not stay in
+ * the candidate set forever. Best-effort per session: one bad template never
+ * blocks the pass. Oldest first, bounded per pass.
+ */
+export async function fireTelemetrySessionCompleted(
+  opts: { limit?: number; deadline?: number } = {},
+): Promise<{ sessions: number; runs: number }> {
+  const t = schema.telemetrySessions;
+  const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
+  const rows = await db
+    .select({
+      id: t.id,
+      deviceId: t.deviceId,
+      startedAt: t.startedAt,
+      endedAt: t.endedAt,
+      rateHz: t.rateHz,
+      timeSource: t.timeSource,
+      segmentCount: t.segmentCount,
+      sampleCount: t.sampleCount,
+      insights: t.insights,
+      lastSegmentAt: t.lastSegmentAt,
+    })
+    .from(t)
+    .where(
+      and(
+        eq(t.status, 'closed'),
+        sql`${t.overviewKey} is not null`,
+        eq(t.overviewStale, false),
+        sql`(${t.completedFiredAt} is null or ${t.completedFiredAt} < ${t.lastSegmentAt})`,
+      ),
+    )
+    .orderBy(asc(t.lastSegmentAt))
+    .limit(opts.limit ?? 25);
+  let sessions = 0;
+  let runs = 0;
+  for (const row of rows) {
+    if (Date.now() >= deadline) break;
+    // Claim first (the predicate re-checked in the UPDATE): a pass that lost
+    // the race to a concurrent one skips the row instead of firing twice.
+    const claimed = await db
+      .update(t)
+      .set({ completedFiredAt: sql`now()` })
+      .where(
+        and(
+          eq(t.id, row.id),
+          sql`(${t.completedFiredAt} is null or ${t.completedFiredAt} < ${t.lastSegmentAt})`,
+        ),
+      )
+      .returning({ id: t.id });
+    if (claimed.length === 0) continue;
+    sessions++;
+    try {
+      const n = await evaluateTelemetrySessionCompletedTriggers(row);
+      runs += n;
+      if (n > 0) console.log('telemetry-sessions: telemetry_session_completed fired', { sessionId: row.id, runs: n });
+    } catch (err) {
+      console.error('telemetry-sessions: telemetry_session_completed trigger eval failed', { sessionId: row.id, err });
+    }
+  }
+  return { sessions, runs };
+}
+
+export interface DeleteSessionResult {
+  sessionId: string;
+  found: boolean;
+  segments: number;
+  objectsDeleted: number;
+  ingestLogRows: number;
+}
+
+/**
+ * Operator job: remove one telemetry session completely (its overview and
+ * segment objects, its ingest-log rows, and the index rows via the FK
+ * cascade), so a later backfill pass cannot re-index it. For fixture / noise
+ * sessions on dev (P2 and P3 wrote four under Toronto Node 01); the local
+ * IAM user has no s3:DeleteObject, the sweeper's role does.
+ */
+export async function deleteTelemetrySession(sessionId: string, bucket = BUCKET): Promise<DeleteSessionResult> {
+  if (!bucket) throw new Error('BUCKET_NAME is not set');
+  const session = await db.query.telemetrySessions.findFirst({ where: eq(schema.telemetrySessions.id, sessionId) });
+  if (!session) return { sessionId, found: false, segments: 0, objectsDeleted: 0, ingestLogRows: 0 };
+  const segments = await db
+    .select({ s3Key: schema.telemetrySegments.s3Key })
+    .from(schema.telemetrySegments)
+    .where(eq(schema.telemetrySegments.sessionId, sessionId));
+  const keys = segments.map((s) => s.s3Key);
+  if (session.overviewKey) keys.push(session.overviewKey);
+  let objectsDeleted = 0;
+  for (let i = 0; i < keys.length; i += 1000) {
+    const chunk = keys.slice(i, i + 1000);
+    const out = await s3.send(
+      new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true } }),
+    );
+    objectsDeleted += chunk.length - (out.Errors?.length ?? 0);
+    for (const e of out.Errors ?? []) console.error('telemetry-sessions: delete object failed', { key: e.Key, code: e.Code });
+  }
+  let ingestLogRows = 0;
+  if (segments.length > 0) {
+    const gone = await db
+      .delete(schema.telemetryIngestLog)
+      .where(inArray(schema.telemetryIngestLog.s3Key, segments.map((s) => s.s3Key)))
+      .returning({ s3Key: schema.telemetryIngestLog.s3Key });
+    ingestLogRows = gone.length;
+  }
+  await db.delete(schema.telemetrySessions).where(eq(schema.telemetrySessions.id, sessionId));
+  console.log('telemetry-sessions: session deleted', { sessionId, segments: segments.length, objectsDeleted, ingestLogRows });
+  return { sessionId, found: true, segments: segments.length, objectsDeleted, ingestLogRows };
 }
 
 export interface ReconcileOptions {

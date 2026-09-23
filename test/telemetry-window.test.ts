@@ -7,6 +7,7 @@ import { parseSegment } from '../src/services/telemetry-batch';
 import {
   hotWindowBoundaryMs,
   hotWindowDays,
+  isDataApiResultTooLarge,
   mergeSamples,
   readTelemetryWindow,
   readTelemetryWindowFromArtifacts,
@@ -246,11 +247,13 @@ describe('readTelemetryWindow routing', () => {
   const boundary = hotWindowBoundaryMs(NOW, 90);
   const query = (window: { fromMs: number; toMs: number }) => ({ deviceId: DEVICE, metrics: FOUR, window });
   const s = (ts: number, v: number): TelemetrySample => ({ ts, signals: { 'gps.lat': v } });
+  /** No index estimate: the pre-P6 behaviour (Postgres for every hot part). */
+  const none = async () => null;
 
   it('a window inside the hot window reads Postgres only', async () => {
     const postgres = vi.fn(async () => [s(boundary + 10, 1)]);
     const artifacts = vi.fn(async () => []);
-    const got = await readTelemetryWindow(query({ fromMs: boundary + 1, toMs: boundary + DAY }), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts } });
+    const got = await readTelemetryWindow(query({ fromMs: boundary + 1, toMs: boundary + DAY }), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } });
     expect(got).toEqual([s(boundary + 10, 1)]);
     expect(artifacts).not.toHaveBeenCalled();
     expect(postgres).toHaveBeenCalledTimes(1);
@@ -260,7 +263,7 @@ describe('readTelemetryWindow routing', () => {
     const window = { fromMs: boundary - 2 * DAY, toMs: boundary - DAY };
     const artifacts = vi.fn(async () => [s(window.fromMs + 1, 1), s(window.fromMs + 2, 1)]);
     const postgres = vi.fn(async () => [s(window.fromMs + 2, 9), s(window.fromMs + 3, 9)]);
-    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts } });
+    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } });
     expect(got).toEqual([s(window.fromMs + 1, 1), s(window.fromMs + 2, 1), s(window.fromMs + 3, 9)]);
     expect(artifacts).toHaveBeenCalledWith(expect.objectContaining({ window }), expect.anything());
     expect(postgres).toHaveBeenCalledWith(expect.objectContaining({ window }));
@@ -270,8 +273,8 @@ describe('readTelemetryWindow routing', () => {
     const window = { fromMs: boundary - 2 * DAY, toMs: boundary - DAY };
     const fromS3 = [s(window.fromMs + 1, 1), s(window.fromMs + 2, 2)];
     const artifacts = vi.fn(async () => fromS3);
-    const before = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { artifacts, postgres: async () => fromS3 } });
-    const after = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { artifacts, postgres: async () => [] } });
+    const before = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { artifacts, postgres: async () => fromS3, estimateSamples: none } });
+    const after = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { artifacts, postgres: async () => [], estimateSamples: none } });
     expect(after).toEqual(before);
   });
 
@@ -286,7 +289,7 @@ describe('readTelemetryWindow routing', () => {
       calls.push({ who: 'postgres', window: q.window });
       return q.window.fromMs === boundary ? [s(boundary + 10, 2)] : [];
     });
-    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts } });
+    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } });
     expect(got).toEqual([s(boundary - 10, 1), s(boundary + 10, 2)]);
     expect(calls).toEqual([
       { who: 'artifacts', window: { fromMs: window.fromMs, toMs: boundary } },
@@ -299,9 +302,67 @@ describe('readTelemetryWindow routing', () => {
     const window = { fromMs: NOW - 50 * DAY, toMs: NOW - 49 * DAY };
     const artifacts = vi.fn(async () => []);
     const postgres = vi.fn(async () => []);
-    await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 40, readers: { postgres, artifacts } });
+    await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 40, readers: { postgres, artifacts, estimateSamples: none } });
     expect(artifacts).toHaveBeenCalledTimes(1);
-    await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts } });
+    await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } });
     expect(artifacts).toHaveBeenCalledTimes(1);
+  });
+
+  // P6: the Data API's 1 MiB result cap. A hot window whose indexed samples x
+  // metrics would not fit goes to the artifacts up front; one the estimate let
+  // through and the cap still refused falls back to them.
+  it('a hot window the index says is too big for the Data API reads the artifacts alone', async () => {
+    const window = { fromMs: boundary + 1, toMs: boundary + DAY };
+    const postgres = vi.fn(async () => [s(boundary + 10, 9)]);
+    const artifacts = vi.fn(async () => [s(boundary + 10, 1)]);
+    const estimateSamples = vi.fn(async () => 3_000); // x 4 metrics = 12 000 rows > 10 000
+    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples } });
+    expect(got).toEqual([s(boundary + 10, 1)]);
+    expect(estimateSamples).toHaveBeenCalledWith(DEVICE, window);
+    expect(postgres).not.toHaveBeenCalled();
+    expect(artifacts).toHaveBeenCalledTimes(1);
+  });
+
+  it('a hot window under the ceiling still reads Postgres', async () => {
+    const window = { fromMs: boundary + 1, toMs: boundary + DAY };
+    const postgres = vi.fn(async () => [s(boundary + 10, 9)]);
+    const artifacts = vi.fn(async () => []);
+    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: async () => 2_000 } });
+    expect(got).toEqual([s(boundary + 10, 9)]);
+    expect(artifacts).not.toHaveBeenCalled();
+  });
+
+  it('the ceiling is a seam and counts rows, not samples', async () => {
+    const window = { fromMs: boundary + 1, toMs: boundary + DAY };
+    const postgres = vi.fn(async () => []);
+    const artifacts = vi.fn(async () => []);
+    await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, postgresRowCeiling: 7_999, readers: { postgres, artifacts, estimateSamples: async () => 2_000 } });
+    expect(artifacts).toHaveBeenCalledTimes(1); // 2 000 x 4 = 8 000 > 7 999
+    expect(postgres).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the artifacts when Postgres refuses the result at the cap', async () => {
+    const window = { fromMs: boundary + 1, toMs: boundary + DAY };
+    const refused = Object.assign(new Error('The result exceeds the size limit 1 MB'), { name: 'UnsupportedResultException' });
+    const postgres = vi.fn(async () => { throw refused; });
+    const artifacts = vi.fn(async () => [s(boundary + 10, 1)]);
+    const got = await readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } });
+    expect(got).toEqual([s(boundary + 10, 1)]);
+    expect(artifacts).toHaveBeenCalledTimes(1);
+  });
+
+  it('any other Postgres failure still propagates', async () => {
+    const window = { fromMs: boundary + 1, toMs: boundary + DAY };
+    const postgres = vi.fn(async () => { throw new Error('connection reset'); });
+    const artifacts = vi.fn(async () => []);
+    await expect(readTelemetryWindow(query(window), { nowMs: NOW, hotWindowDays: 90, readers: { postgres, artifacts, estimateSamples: none } })).rejects.toThrow('connection reset');
+    expect(artifacts).not.toHaveBeenCalled();
+  });
+
+  it('recognises the Data API refusal by name or by message', () => {
+    expect(isDataApiResultTooLarge({ name: 'UnsupportedResultException' })).toBe(true);
+    expect(isDataApiResultTooLarge(new Error('The result exceeds the size limit 1 MB'))).toBe(true);
+    expect(isDataApiResultTooLarge(new Error('other'))).toBe(false);
+    expect(isDataApiResultTooLarge(null)).toBe(false);
   });
 });

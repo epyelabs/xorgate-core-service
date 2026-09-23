@@ -51,6 +51,27 @@ export const DEFAULT_HOT_WINDOW_DAYS = 90;
 /** Segment objects fetched at once on the artifact path (S3, not the Data API). */
 export const ARTIFACT_FETCH_CONCURRENCY = 6;
 
+/**
+ * Rows (samples x metrics) above which a HOT window is read from the
+ * artifacts instead of Postgres (P6, from the P5 finding): the RDS Data API
+ * caps a result at 1 MiB and its per-scalar encoding puts the Postgres path's
+ * ceiling at roughly 12 k rows (a 53-minute window with all 35 metrics dies
+ * with UnsupportedResultException). The estimate comes from the segment
+ * index (sum of `samples` over the overlapping files, times the metric
+ * count), so it costs one indexed query and is exact for a fully indexed
+ * window; a read the estimate lets through and the cap still refuses falls
+ * back to the artifacts as well.
+ */
+export const POSTGRES_ROW_CEILING = 10_000;
+
+/** The Data API's result-size refusal (aws-sdk client-rds-data), by name or by message. */
+export function isDataApiResultTooLarge(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: unknown; message?: unknown };
+  if (e.name === 'UnsupportedResultException') return true;
+  return typeof e.message === 'string' && /result exceeds the size limit/i.test(e.message);
+}
+
 export interface TelemetryWindowQuery {
   deviceId: string;
   metrics: string[];
@@ -321,17 +342,45 @@ function sortAndDedupe(samples: TelemetrySample[]): TelemetrySample[] {
 // The sanctioned entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * Samples the index holds for the device inside [fromMs, toMs): the sum of
+ * `telemetry_segments.samples` over the overlapping files. One indexed query;
+ * an over-estimate at the window's edges (a file straddling `from` counts
+ * whole), which only ever routes a borderline read to the artifacts.
+ */
+export async function estimateIndexedSamples(deviceId: string, window: Window): Promise<number> {
+  const t = schema.telemetrySegments;
+  const [row] = await db
+    .select({ samples: sql<number>`coalesce(sum(${t.samples}), 0)::bigint` })
+    .from(t)
+    .where(
+      and(
+        eq(t.deviceId, deviceId),
+        sql`${t.startTs} < ${tsParam(new Date(window.toMs).toISOString())}`,
+        sql`${t.endTs} >= ${tsParam(new Date(window.fromMs).toISOString())}`,
+      ),
+    );
+  return Number(row?.samples ?? 0);
+}
+
 export interface ReadTelemetryWindowOptions {
   /** Test seam: the wall clock the boundary is computed from. */
   nowMs?: number;
   /** Test seam: overrides TELEMETRY_HOT_WINDOW_DAYS. */
   hotWindowDays?: number;
-  /** Test seam: the two concrete readers. */
+  /** Test seam: the Postgres row ceiling (POSTGRES_ROW_CEILING). */
+  postgresRowCeiling?: number;
+  /** Test seam: the two concrete readers and the index estimate. */
   readers?: {
     postgres?: (query: TelemetryWindowQuery) => Promise<TelemetrySample[]>;
     artifacts?: (query: TelemetryWindowQuery, stats: ArtifactReadStats) => Promise<TelemetrySample[]>;
+    /** Indexed samples inside a window; null = unknown (read Postgres). */
+    estimateSamples?: (deviceId: string, window: Window) => Promise<number | null>;
   };
 }
+
+/** Why a hot part was served from the artifacts rather than Postgres. */
+export type HotRoute = 'postgres' | 'artifacts:estimate' | 'artifacts:result-cap';
 
 export async function readTelemetryWindow(
   query: TelemetryWindowQuery,
@@ -341,6 +390,8 @@ export async function readTelemetryWindow(
   const artifacts =
     opts.readers?.artifacts ??
     ((q: TelemetryWindowQuery, stats: ArtifactReadStats) => readTelemetryWindowFromArtifacts(q, artifactReaderDeps, stats));
+  const estimateSamples = opts.readers?.estimateSamples ?? estimateIndexedSamples;
+  const ceiling = opts.postgresRowCeiling ?? POSTGRES_ROW_CEILING;
   const days = opts.hotWindowDays ?? hotWindowDays();
   const boundaryMs = hotWindowBoundaryMs(opts.nowMs ?? Date.now(), days);
   const { cold, hot } = splitWindow(query.window, boundaryMs);
@@ -354,7 +405,39 @@ export async function readTelemetryWindow(
     coldSamples = mergeSamples(fromArtifacts, fromPostgres);
     coldStats = { ...stats, postgresSamples: fromPostgres.length, merged: coldSamples.length };
   }
-  const hotSamples = hot ? await postgres({ ...query, window: hot }) : [];
+
+  // The hot part: Postgres unless the index says the result would not fit
+  // the Data API's 1 MiB cap (P6), or the cap refuses it anyway. Artifacts
+  // alone in that case: the rows Postgres holds for a hot window are the same
+  // samples the files hold, and the Postgres read is exactly what failed.
+  let hotSamples: TelemetrySample[] = [];
+  let hotStats: { route: HotRoute; samples: number; estimatedRows: number | null; artifacts?: ArtifactReadStats } | null = null;
+  if (hot) {
+    const hotQuery = { ...query, window: hot };
+    const indexed = query.metrics.length > 0 ? await estimateSamples(query.deviceId, hot) : 0;
+    const estimatedRows = indexed === null ? null : indexed * query.metrics.length;
+    const readArtifacts = async (route: HotRoute) => {
+      const stats: ArtifactReadStats = { segments: 0, missingSegments: 0, samples: 0, rows: 0, truncated: false };
+      hotSamples = await artifacts(hotQuery, stats);
+      hotStats = { route, samples: hotSamples.length, estimatedRows, artifacts: stats };
+    };
+    if (estimatedRows !== null && estimatedRows > ceiling) {
+      await readArtifacts('artifacts:estimate');
+    } else {
+      try {
+        hotSamples = await postgres(hotQuery);
+        hotStats = { route: 'postgres', samples: hotSamples.length, estimatedRows };
+      } catch (err) {
+        if (!isDataApiResultTooLarge(err)) throw err;
+        console.warn('telemetry-window: Postgres result over the Data API cap, reading the artifacts', {
+          deviceId: query.deviceId,
+          metrics: query.metrics.length,
+          estimatedRows,
+        });
+        await readArtifacts('artifacts:result-cap');
+      }
+    }
+  }
 
   console.log('telemetry-window: read', {
     deviceId: query.deviceId,
@@ -363,7 +446,7 @@ export async function readTelemetryWindow(
     boundary: new Date(boundaryMs).toISOString(),
     hotWindowDays: days,
     cold: coldStats,
-    hot: hot ? { samples: hotSamples.length } : null,
+    hot: hotStats,
   });
 
   if (coldSamples.length === 0) return hotSamples;

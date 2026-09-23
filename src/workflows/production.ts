@@ -70,6 +70,10 @@ export type TriggeredVideoSelection =
 
 export function triggeredVideoSelection(triggerContext: unknown): TriggeredVideoSelection {
   const ctx = (triggerContext ?? {}) as Record<string, unknown>;
+  // A telemetry session is not a media session: its `sessionId` is a
+  // telemetry_sessions id and resolves to NO video (the run's telemetry window
+  // comes from the context's explicit `window`, see resolveTriggeredWindow).
+  if (ctx.type === 'telemetry_session_completed') return null;
   const sessionId = typeof ctx.sessionId === 'string' && ctx.sessionId ? ctx.sessionId : null;
   const streamKey = typeof ctx.streamKey === 'string' && ctx.streamKey ? ctx.streamKey : null;
   if (sessionId && ctx.type === 'segment_uploaded') {

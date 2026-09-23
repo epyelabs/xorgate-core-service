@@ -10,20 +10,21 @@
     "samples": 3153,
     "bytes": 267392,
     "missingSegments": 0,
-    "invalidLines": 0
+    "invalidLines": 0,
+    "droppedSamples": 0
   },
   "from": 1786314223040,
   "to": 1786320771303,
   "timeSource": "rtc",
   "groups": {
     "gps": {
-      "bucketMs": 5000,
-      "buckets": 633,
+      "bucketMs": 2000,
+      "buckets": 1576,
       "metrics": 13
     },
     "imu": {
-      "bucketMs": 15000,
-      "buckets": 213,
+      "bucketMs": 10000,
+      "buckets": 318,
       "metrics": 10
     },
     "lte": {
@@ -32,8 +33,8 @@
       "metrics": 5
     },
     "system": {
-      "bucketMs": 15000,
-      "buckets": 213,
+      "bucketMs": 10000,
+      "buckets": 318,
       "metrics": 7
     }
   },
@@ -90,6 +91,6 @@
     },
     "eventCount": 3
   },
-  "gzipBytes": 23579,
+  "gzipBytes": 38119,
   "jsonBytes": 93768
 }

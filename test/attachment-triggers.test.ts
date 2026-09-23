@@ -112,3 +112,21 @@ describe('manualRunContextSchema: "Run now" over a session', () => {
     ).toBe(false);
   });
 });
+
+// telemetry-session-artifacts P6 item 9 (README Q15): the telemetry twin of
+// session_completed. Not stream-keyed (one telemetry recorder per device).
+describe('attachmentTriggerSchema: telemetry_session_completed', () => {
+  it('accepts the bare trigger', () => {
+    expect(attachmentTriggerSchema.safeParse({ type: 'telemetry_session_completed' }).success).toBe(true);
+  });
+
+  it('accepts a manual run over one telemetry session', () => {
+    expect(
+      manualRunContextSchema.safeParse({
+        triggerType: 'telemetry_session_completed',
+        sessionId: '01a0cee6-0ca3-750b-bb29-9a8c41363905',
+      }).success,
+    ).toBe(true);
+    expect(manualRunContextSchema.safeParse({ triggerType: 'telemetry_session_completed' }).success).toBe(false);
+  });
+});

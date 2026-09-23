@@ -8,6 +8,7 @@ import {
   expireSegmentIndexRows,
 } from '../services/media-sessions';
 import {
+  deleteTelemetrySession,
   reconcileTelemetryIndex,
   runTelemetryHousekeeping,
 } from '../services/telemetry-sessions';
@@ -25,7 +26,8 @@ const INSPECT_URL_TTL_SECONDS = 3600;
  */
 export type SweeperJob =
   | { job: 'telemetry-backfill'; limit?: number }
-  | { job: 'telemetry-session-inspect'; sessionId: string };
+  | { job: 'telemetry-session-inspect'; sessionId: string }
+  | { job: 'telemetry-session-delete'; sessionId: string };
 
 const isJob = (event: unknown): event is SweeperJob =>
   typeof event === 'object' && event !== null && typeof (event as { job?: unknown }).job === 'string';
@@ -101,7 +103,8 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
       telemetry.built > 0 ||
       telemetry.buildFailures > 0 ||
       telemetry.normalized > 0 ||
-      telemetry.bytesBackfilled > 0
+      telemetry.bytesBackfilled > 0 ||
+      telemetry.completedFired > 0
     ) {
       const { builds: _builds, ...summary } = telemetry;
       console.log('offline-sweeper: telemetry sessions', summary);
@@ -200,6 +203,10 @@ async function runJob(job: SweeperJob, deadline?: number): Promise<unknown> {
       );
       return { session, overviewUrl, segments: segmentUrls };
     }
+    case 'telemetry-session-delete':
+      // Operator-only (P6): objects + ingest-log rows + index rows of ONE
+      // session, so a backfill pass cannot bring it back. Dev fixture cleanup.
+      return deleteTelemetrySession(job.sessionId, bucket);
     default:
       throw new Error(`unknown sweeper job ${JSON.stringify(job)}`);
   }
