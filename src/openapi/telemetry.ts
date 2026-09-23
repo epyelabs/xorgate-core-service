@@ -291,6 +291,44 @@ export const telemetryPaths = {
       },
     },
   },
+  '/devices/{id}/telemetry/insights': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'getDeviceTelemetryWindowInsights',
+      summary: 'Distance and moving time inside a window',
+      description:
+        'What the device drove INSIDE `[from, to)`, integrated over the overview artifacts of the ' +
+        'telemetry sessions overlapping the window with the same rules as each session\'s own ' +
+        '`insights.distance` (accepted fixes, the 60 m/s jump reject, the 30 s gap break, the ' +
+        '`gps.speed` stationary rule). Use it to roll up a media run, a day or a month: the ' +
+        'per-session `insights` on the sessions listing describe WHOLE sessions, and telemetry ' +
+        'sessions do not line up with video sessions (the recorder starts at boot, the camera after ' +
+        'its GPS gate), so summing whole sessions that merely overlap a run over-counts. The grid is ' +
+        'bucketed, so the number is within about a percent of the raw-sample insight ' +
+        '(`method: "overview-haversine"`). A session whose overview is not built yet (open, or ' +
+        'closed within the last minute) is listed with `source: "unbuilt"` and no numbers, and ' +
+        '`partial` is true. One object read per overlapping built session; the window may span ' +
+        'at most 31 days.',
+      tags: ['Telemetry'],
+      parameters: [
+        { name: 'from', in: 'query', required: true, schema: { type: 'string', format: 'date-time' } },
+        { name: 'to', in: 'query', required: true, schema: { type: 'string', format: 'date-time' } },
+      ],
+      responses: {
+        '200': {
+          description: 'The windowed roll-up.',
+          content: {
+            'application/json': { schema: { $ref: '#/components/schemas/TelemetryWindowInsights' } },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
   '/devices/{id}/telemetry/sessions': {
     parameters: deviceIdParams,
     get: {

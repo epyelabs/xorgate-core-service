@@ -2745,6 +2745,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: telemetryHistoryInt,
     });
+    // Windowed distance / moving time from the overview artifacts (the media
+    // run roll-up's read). One S3 GET per overlapping built session; the
+    // shared lambdaRole already reads the bucket.
+    addRoutes({
+      path: "/devices/{id}/telemetry/insights",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
+    });
 
     // The other N11 rename, now the only name: `iot/attach-policy` is gone.
     // Grant and revoke share a path but not a Lambda: the grant needs org

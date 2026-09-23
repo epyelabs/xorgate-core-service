@@ -1139,6 +1139,42 @@ export function openApiSchemas(): Record<string, unknown> {
         },
       },
     },
+    TelemetryWindowInsights: {
+      type: 'object',
+      required: ['from', 'to', 'sessions', 'distanceM', 'movingMs', 'telemetryMs', 'partial'],
+      description: 'Distance and moving time inside a window (GET /devices/{id}/telemetry/insights).',
+      properties: {
+        from: { type: 'string', format: 'date-time' },
+        to: { type: 'string', format: 'date-time' },
+        sessions: {
+          type: 'array',
+          description: 'The telemetry sessions overlapping the window, oldest first.',
+          items: {
+            type: 'object',
+            required: ['id', 'status', 'from', 'to', 'overlapMs', 'source', 'distanceM', 'movingMs', 'fixes'],
+            properties: {
+              id: { type: 'string', format: 'uuid' },
+              status: { type: 'string', enum: ['open', 'closed'] },
+              from: { type: 'string', format: 'date-time', description: 'The session\'s own bounds.' },
+              to: { type: 'string', format: 'date-time' },
+              overlapMs: { type: 'integer', description: 'Milliseconds of the window the session\'s bounds cover.' },
+              source: {
+                type: 'string',
+                enum: ['overview', 'unbuilt'],
+                description: '`overview`: numbers from the built artifact. `unbuilt`: no artifact yet, numbers null.',
+              },
+              distanceM: { type: 'number', nullable: true, description: 'Metres inside the window; 0 when built but nothing moved.' },
+              movingMs: { type: 'integer', nullable: true },
+              fixes: { type: 'integer', nullable: true, description: 'Overview points inside the window with an accepted fix.' },
+            },
+          },
+        },
+        distanceM: { type: 'number', nullable: true, description: 'Sum over the built sessions; null when none is built.' },
+        movingMs: { type: 'integer', nullable: true },
+        telemetryMs: { type: 'integer', description: 'Milliseconds of the window covered by any session (union).' },
+        partial: { type: 'boolean', description: 'At least one overlapping session has no built overview yet.' },
+      },
+    },
     TelemetrySession: {
       type: 'object',
       required: [

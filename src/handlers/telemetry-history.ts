@@ -7,6 +7,7 @@ import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, gzipIfAccepted, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
+import { readWindowInsights } from '../services/telemetry-overview-window';
 import {
   boundedTotalQuery,
   capTotal,
@@ -28,6 +29,7 @@ import { apiHandler } from '../utils/api-handler';
  *   GET /devices/{id}/telemetry/latest                        — device_latest rows
  *   GET /devices/{id}/telemetry/recent[&metric][&limit]       — the most recent N rows
  *   GET /devices/{id}/telemetry/readings[&...]                — raw rows, paginated by ts
+ *   GET /devices/{id}/telemetry/insights?from&to               — windowed distance / moving time
  *   GET /devices/{id}/telemetry/sessions[&from&to&status...]  — recorded telemetry
  *       SESSIONS (the S3 artifact index + insights), paginated; no URLs
  *
@@ -549,6 +551,38 @@ async function handleReadings(
 const SESSIONS_DEFAULT_LIMIT = 25;
 const SESSIONS_MAX_LIMIT = 200;
 
+/** Longest window the windowed-insights read accepts (one overview GET per overlapping session). */
+const WINDOW_INSIGHTS_MAX_MS = 31 * 24 * 60 * 60 * 1000;
+
+/**
+ * GET /devices/{id}/telemetry/insights?from&to — distance and moving time
+ * INSIDE a window, from the overview artifacts of the telemetry sessions
+ * overlapping it (services/telemetry-overview-window.ts). What a media run's
+ * roll-up must read: the sessions listing's `insights` are whole-session
+ * numbers, and a telemetry session that overlaps a run by a parked half
+ * minute (the recorder starts at boot, the camera after its GPS gate) must
+ * not lend the run its whole drive.
+ */
+async function handleWindowInsights(
+  deviceId: string,
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> {
+  const qs = event.queryStringParameters ?? {};
+  const fromMs = qs.from ? Date.parse(qs.from) : NaN;
+  const toMs = qs.to ? Date.parse(qs.to) : NaN;
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+    return badRequest('"from" and "to" are required ISO-8601 timestamps');
+  }
+  if (toMs <= fromMs) return badRequest('"to" must be after "from"');
+  if (toMs - fromMs > WINDOW_INSIGHTS_MAX_MS) return badRequest('the window may span at most 31 days');
+  try {
+    await closeStaleTelemetrySessions(deviceId);
+  } catch (err) {
+    console.warn('telemetry/insights: close-on-read failed', { deviceId, err });
+  }
+  return ok(await readWindowInsights(deviceId, { fromMs, toMs }));
+}
+
 /**
  * GET /devices/{id}/telemetry/sessions — the recorded-telemetry session index
  * (telemetry-session-artifacts plan, Phase 2, README §4.2 / Q12): one row per
@@ -684,6 +718,7 @@ const restHandler = async (
     return handleReadings(id, event, device.ioCapabilities);
   }
   if (path.endsWith('/telemetry/sessions')) return handleSessions(id, event);
+  if (path.endsWith('/telemetry/insights')) return handleWindowInsights(id, event);
   return handleHistory(id, event);
 };
 
