@@ -49,9 +49,11 @@ const isJob = (event: unknown): event is SweeperJob =>
  *     build `overview.v1.json.gz` for every closed session without a current
  *     artifact, bounded per tick, plus metadata-normalisation retries.
  *     Deliberately on THIS tick: no new schedule, no new Aurora wake source.
- *  3. Segment index-row expiry (Phase 6.3): delete media_segments /
- *     empty media_sessions / telemetry_ingest_log rows one day after the S3
- *     lifecycle expired their objects.
+ *  3. Segment index-row expiry (Phase 6.3 + telemetry-session-artifacts P5):
+ *     delete media_segments / empty media_sessions (90 d clock) and
+ *     telemetry_segments / empty telemetry_sessions / telemetry_ingest_log
+ *     (365 d artifact clock) one day after the S3 lifecycle expired their
+ *     objects.
  *  4. Session-token expiry (platform-auth Phase 3): delete `session_tokens`
  *     rows that expired more than a day ago. Hygiene only — the verify path
  *     checks `expires_at` itself and never trusts the table to be clean.
@@ -108,10 +110,11 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
     console.error('offline-sweeper: telemetry-session housekeeping failed', err);
   }
 
-  // 3: expire segment index rows behind the S3 lifecycle (Phase 6.3).
+  // 3: expire segment index rows behind the S3 lifecycle (Phase 6.3; the
+  // telemetry half on its own 365 d clock since telemetry-session-artifacts P5).
   try {
     const expired = await expireSegmentIndexRows();
-    if (expired.segments > 0 || expired.sessions > 0 || expired.ingestLog > 0) {
+    if (Object.values(expired).some((n) => n > 0)) {
       console.log('offline-sweeper: expired segment index rows', expired);
     }
   } catch (err) {

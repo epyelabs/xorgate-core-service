@@ -76,11 +76,14 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   // Arms telemetry retention in PartitionMaintenanceFn. SEPARATE from
   // disableScheduledJobs by design: turning the maintenance schedule on (which
   // dev needs, so future month partitions get created) must not start deleting
-  // history as a side effect. Default OFF — the mechanism ships dormant until
-  // production data exists and someone sets a real window (plan Q4).
-  // `--context telemetryRetention=on [--context telemetryRetentionDays=180]`
+  // history as a side effect. Defaults per stage in bin/app.ts (dev ON since
+  // telemetry-session-artifacts Phase 5, prod flipped by the owner);
+  // `--context telemetryRetention=on|off [--context telemetryRetentionDays=90]`
   telemetryRetention?: boolean;
   telemetryRetentionDays?: number;
+  // The readers' hot-window boundary (TELEMETRY_HOT_WINDOW_DAYS); defaults to
+  // telemetryRetentionDays. See commonEnv.
+  telemetryHotWindowDays?: number;
   bucket: s3.Bucket;
   // Public-read bucket holding device-agent tarballs; its URL is baked into the
   // per-request install.sh so devices can download the build without AWS creds.
@@ -597,10 +600,25 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // Defaults preserve today's behavior; override any at deploy via `--context <key>=<val>`.
       STATUS_FLAP_GUARD_MS: recCtx("statusFlapGuardMs", "10000"),
       DEVICE_OFFLINE_STALE_MS: recCtx("deviceOfflineStaleMs", "60000"),
-      // Device-recorded segment retention (offline recording plan, Phase 6.3).
-      // Drives the sweeper's DB row expiry; MUST match the S3 lifecycle age in
-      // storage-stack — both read the `segmentRetentionDays` context key.
+      // Device-recorded MEDIA segment retention (offline recording plan, Phase
+      // 6.3). Drives the sweeper's DB row expiry; MUST match the S3 lifecycle
+      // age in storage-stack — both read the `segmentRetentionDays` context key.
       SEGMENT_RETENTION_DAYS: recCtx("segmentRetentionDays", "90"),
+      // Recorded TELEMETRY artifact retention (telemetry-session-artifacts
+      // plan, Phase 5, README D8): the `telemetry/v1/` objects are the record
+      // and live 365 d; the sweeper expires telemetry_segments /
+      // telemetry_sessions / telemetry_ingest_log rows one day later. MUST
+      // match storage-stack, which reads the same `telemetryArtifactRetentionDays`
+      // context key.
+      TELEMETRY_ARTIFACT_RETENTION_DAYS: recCtx("telemetryArtifactRetentionDays", "365"),
+      // The `telemetry_readings` HOT WINDOW as the READERS see it
+      // (services/telemetry-window.ts): a workflow window older than this is
+      // served from the S3 artifacts (plus whatever rows Postgres still has),
+      // younger from Postgres alone. Defaults to the retention window so the
+      // two never disagree; `--context telemetryHotWindowDays=<n>` narrows it
+      // (safe in either direction: S3 is the record).
+      // (90 = DEFAULT_RETENTION_DAYS in src/services/telemetry-partitions.ts.)
+      TELEMETRY_HOT_WINDOW_DAYS: String(props.telemetryHotWindowDays ?? props.telemetryRetentionDays ?? 90),
       // Device-recorded media sessions (offline recording plan, Phase 4):
       // sweeper close window — no new segment ARRIVAL for this long -> closed.
       MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
@@ -1020,10 +1038,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // (a missing month partition breaks ingestion). Mid-month cron: the +1/+2
     // partitions from the previous run still cover us if one run fails.
     //
-    // The same function also owns TELEMETRY RETENTION, which SHIPS DORMANT.
-    // `telemetryRetention` is a SEPARATE switch from `scheduledJobs` on purpose:
-    // dev needs the schedule on so future months get created, and that must not
-    // start deleting history as a side effect. Nothing is dropped unless
+    // The same function also owns TELEMETRY RETENTION (the `telemetry_readings`
+    // hot window, telemetry-session-artifacts plan Phase 5). `telemetryRetention`
+    // is a SEPARATE switch from `scheduledJobs` on purpose: dev needs the
+    // schedule on so future months get created, and that must not start
+    // deleting history as a side effect. Nothing is dropped unless
     // TELEMETRY_RETENTION_ENABLED is the literal string "true", so the env var
     // is omitted entirely when the flag is off rather than set to "false".
     // Window/ceiling defaults and the guardrails: src/services/telemetry-partitions.ts.

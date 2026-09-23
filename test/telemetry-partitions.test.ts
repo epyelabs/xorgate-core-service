@@ -7,6 +7,7 @@ import {
   PARTITION_AUTOVACUUM_OPTS,
   boundary,
   monthStartUtc,
+  parseLowerBound,
   parseUpperBound,
   partitionAutovacuumClause,
   partitionName,
@@ -268,5 +269,27 @@ describe('planRetention', () => {
     expect(
       planRetention(dev, NOW, retentionConfig({ TELEMETRY_RETENTION_ENABLED: 'true' })).drop,
     ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// telemetry-session-artifacts P5: the artifact guard in the handler needs the
+// INCLUSIVE lower bound too, parsed with the same "fail towards keeping the
+// data" stance as the upper bound.
+// ---------------------------------------------------------------------------
+
+describe('parseLowerBound', () => {
+  it('reads the inclusive FROM edge of a range bound', () => {
+    expect(
+      parseLowerBound("FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00')"),
+    ).toEqual(new Date('2026-07-01T00:00:00Z'));
+  });
+
+  it('returns null for DEFAULT, MINVALUE and garbage (never droppable by the guard)', () => {
+    expect(parseLowerBound('DEFAULT')).toBeNull();
+    expect(parseLowerBound("FOR VALUES FROM (MINVALUE) TO ('2026-08-01 00:00:00+00')")).toBeNull();
+    expect(parseLowerBound("FOR VALUES FROM ('not a date') TO ('2026-08-01 00:00:00+00')")).toBeNull();
+    expect(parseLowerBound(null)).toBeNull();
+    expect(parseLowerBound(undefined)).toBeNull();
   });
 });

@@ -22,13 +22,30 @@ export class XorgateCoreStorageStack extends cdk.Stack {
     const isProd = stage === 'prod';
     const suffix = isProd ? '' : 'Dev';
 
-    // Retention for device-recorded segment objects (offline recording plan,
-    // Phase 6.3). One knob for both prefixes; keep in sync with the DB row
-    // expiry the sweeper runs (api-stack SEGMENT_RETENTION_DAYS reads the same
-    // context key). 90 d default for both stages until a prod policy is set.
+    // Retention for device-recorded MEDIA segment objects (offline recording
+    // plan, Phase 6.3). Keep in sync with the DB row expiry the sweeper runs
+    // (api-stack SEGMENT_RETENTION_DAYS reads the same context key). 90 d
+    // default for both stages.
     const retentionCtx = this.node.tryGetContext('segmentRetentionDays');
     const segmentRetentionDays =
       retentionCtx === undefined || retentionCtx === null ? 90 : Number(retentionCtx);
+
+    // Retention for recorded TELEMETRY artifacts (telemetry-session-artifacts
+    // plan, Phase 5, README D8 / Q1): the device's raw `.jsonl.gz` segments AND
+    // the `overview.v1.json.gz` objects the sweeper builds next to them, all
+    // under `telemetry/v1/`. These are the system of record for recorded
+    // telemetry (README D1): `telemetry_readings` is a 90-day hot window of
+    // derived rows, dropped by partition-maintenance, so the objects get the
+    // long clock. 365 d default, one knob, shared with the sweeper's index-row
+    // expiry (api-stack TELEMETRY_ARTIFACT_RETENTION_DAYS reads the same key).
+    //
+    // S3 Standard, deliberately no IA / Glacier transition: objects are ~5 KB
+    // and both cheaper classes bill a 128 KB minimum per object (and refuse
+    // the transition below it). Pack a session into one object before ever
+    // archiving.
+    const artifactCtx = this.node.tryGetContext('telemetryArtifactRetentionDays');
+    const telemetryArtifactRetentionDays =
+      artifactCtx === undefined || artifactCtx === null ? 365 : Number(artifactCtx);
 
     if (isProd) {
       // NO NAT GATEWAY, and no PRIVATE_WITH_EGRESS subnets that would need one.
@@ -110,19 +127,24 @@ export class XorgateCoreStorageStack extends cdk.Stack {
           expiration: cdk.Duration.days(7),
           abortIncompleteMultipartUploadAfter: cdk.Duration.days(1),
         },
-        // Device-recorded segment prefixes (offline recording plan, Phase 6.3):
-        // without expiry these grow without bound (~1.7 GB/h per recording
-        // device). Age is a context value shared with the sweeper's DB row
-        // expiry (SEGMENT_RETENTION_DAYS in api-stack) — override at deploy
-        // with `--context segmentRetentionDays=<n>`. telemetry_readings rows
-        // (the authoritative telemetry record) deliberately do NOT follow this
-        // clock — only the raw .jsonl.gz upload artifacts and the video
-        // segment objects expire.
+        // Recorded telemetry (telemetry-session-artifacts plan, Phase 5): the
+        // raw `<startTs>-<seq>.jsonl.gz` segments the device uploads and the
+        // `overview.v1.json.gz` the sweeper writes into the same session
+        // prefix share this ONE rule (same prefix, same age); it is the record
+        // for recorded telemetry, so it outlives the `telemetry_readings` hot
+        // window. Override at deploy with
+        // `--context telemetryArtifactRetentionDays=<n>`. The rule id is kept
+        // so CloudFormation updates the age in place instead of replacing it.
         {
           id: 'ExpireTelemetrySegmentUploads',
           prefix: 'telemetry/v1/',
-          expiration: cdk.Duration.days(segmentRetentionDays),
+          expiration: cdk.Duration.days(telemetryArtifactRetentionDays),
         },
+        // Device-recorded video segments (offline recording plan, Phase 6.3):
+        // without expiry these grow without bound (~1.7 GB/h per recording
+        // device). Age is a context value shared with the sweeper's DB row
+        // expiry (SEGMENT_RETENTION_DAYS in api-stack) — override at deploy
+        // with `--context segmentRetentionDays=<n>`.
         {
           id: 'ExpireMediaSessionSegments',
           prefix: 'media-sessions/v1/',

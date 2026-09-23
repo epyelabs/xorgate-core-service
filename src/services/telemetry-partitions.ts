@@ -10,28 +10,45 @@
  * in it), so both halves are month-boundary arithmetic and nothing else.
  *
  * ============================================================================
- * RETENTION SHIPS DORMANT — THAT IS THE DESIGN, NOT AN OVERSIGHT
+ * RETENTION: THE 90-DAY HOT WINDOW (telemetry-session-artifacts plan, Phase 5)
  * ============================================================================
- * Plan question Q4 ("how long do we keep telemetry?") is only half-answered:
- * the product is at prototyping stage, so there is no retention pressure and
- * nobody has a real constraint to satisfy yet. The mechanism is cheap to write
- * now and expensive to retrofit under pressure later, but an ENABLED retention
- * job in a prototype environment is just a way to lose data you wanted.
+ * This shipped DORMANT in the improve-recording-history-fetching plan (phase
+ * 4): the product was prototyping, nobody had a retention constraint, and an
+ * enabled deletion job in a prototype is a way to lose data you wanted. That
+ * reasoning ended on 2026-09-22 when the owner approved the telemetry-session-
+ * artifacts plan (README D1, D8, Q1): recorded telemetry's SYSTEM OF RECORD is
+ * now the device's own gzipped segment objects plus one overview object per
+ * session under `telemetry/v1/` in S3 (kept 365 days, storage-stack), indexed
+ * by `telemetry_sessions` / `telemetry_segments`, and `telemetry_readings` is
+ * a derived HOT WINDOW: 90 days, served from Postgres for the paginated table,
+ * `recent`, `lastNWindow` and the live-plane triggers (README D9). Workflow
+ * runs over older windows read the artifacts through the one sanctioned
+ * reader (services/telemetry-window.ts).
  *
- * So: `TELEMETRY_RETENTION_ENABLED` must be the literal string `true` before a
- * single partition is dropped. Absent, empty, `false`, `1`, `yes` — all off.
- * Enabling the maintenance SCHEDULE (`--context scheduledJobs=on`, which the
- * dev cluster needs anyway so future months get created) must not start
- * deleting history as a side effect, which is exactly why the gate is a
- * separate env var and not the schedule itself.
+ * So since Phase 5 (2026-09-23) retention is ENABLED on dev by default
+ * (bin/app.ts TELEMETRY_RETENTION_DEFAULT) and prod flips when the owner sets
+ * `prod: true` there. The gate itself is unchanged: `TELEMETRY_RETENTION_ENABLED`
+ * must be the literal string `true` before a single partition is dropped.
+ * Absent, empty, `false`, `1`, `yes` — all off. Enabling the maintenance
+ * SCHEDULE (`--context scheduledJobs=on`) still never starts deleting history
+ * as a side effect, which is exactly why the gate is a separate env var and
+ * not the schedule itself.
  *
- * The 90-day default window is a placeholder chosen to be defensible, not
- * researched: it is one full quarter, it comfortably covers the
- * `TELEMETRY_BATCH_MAX_AGE_DAYS = 90` window the batch ingester will accept
- * (so retention can never delete a month that a late segment upload could
- * still legitimately write into), and it is long enough that no realistic
- * field investigation loses its evidence. Set the real number when production
- * data exists.
+ * The 90-day window is no longer a placeholder: it is the approved hot window
+ * (Q1). It still comfortably covers the `TELEMETRY_BATCH_MAX_AGE_DAYS = 90`
+ * window the batch ingester accepts (so retention can never delete a month
+ * that a late segment upload could still legitimately write into: a sample
+ * the ingester accepts is younger than 90 days, and a partition is only
+ * dropped once its EXCLUSIVE UPPER BOUND is older than that), and the readers'
+ * boundary (TELEMETRY_HOT_WINDOW_DAYS) defaults to the same number so a window
+ * the readers treat as hot is always still in Postgres.
+ *
+ * One rule the phase added on top of the planner (handlers/partition-
+ * maintenance.ts): a month is held back, with a warning, while any telemetry
+ * session overlapping it has no overview artifact yet, because the artifact
+ * must exist before its rows may expire. Partitions older than the index
+ * (rows with no session at all) are dropped as approved: their objects left
+ * S3 under the old 90-day lifecycle long ago and nothing can rebuild them.
  */
 
 /** UTC month start `offset` months from `now`'s month. */
@@ -90,7 +107,7 @@ export interface RetentionConfig {
   maxDropsPerRun: number;
 }
 
-/** Placeholder window (see header). One quarter, ≥ the batch-ingest age window. */
+/** The approved hot window (README Q1). One quarter, ≥ the batch-ingest age window. */
 export const DEFAULT_RETENTION_DAYS = 90;
 
 /**
@@ -125,6 +142,8 @@ export interface PartitionInfo {
   name: string;
   /** Exclusive upper bound of the range, or null when it has none (DEFAULT). */
   upperBound: Date | null;
+  /** Inclusive lower bound, when the catalog text carries one (the artifact guard needs it). */
+  lowerBound?: Date | null;
 }
 
 /**
@@ -140,6 +159,20 @@ export interface PartitionInfo {
 export function parseUpperBound(boundExpr: string | null | undefined): Date | null {
   if (!boundExpr) return null;
   const m = /\bTO \('([^']+)'\)/.exec(boundExpr);
+  if (!m) return null;
+  const d = new Date(m[1].replace(' ', 'T').replace('+00', 'Z'));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * The INCLUSIVE lower bound of a RANGE partition, from the same catalog text,
+ * e.g. FROM ('2026-07-01 00:00:00+00'). Null for DEFAULT / MINVALUE / anything
+ * not understood, exactly like parseUpperBound. Used by the artifact guard in
+ * the handler to ask "which telemetry sessions overlap this month".
+ */
+export function parseLowerBound(boundExpr: string | null | undefined): Date | null {
+  if (!boundExpr) return null;
+  const m = /\bFROM \('([^']+)'\)/.exec(boundExpr);
   if (!m) return null;
   const d = new Date(m[1].replace(' ', 'T').replace('+00', 'Z'));
   return Number.isNaN(d.getTime()) ? null : d;

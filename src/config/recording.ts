@@ -32,13 +32,26 @@ export const recordingConfig = {
   mediaSessionCloseAfterMs: numEnv('MEDIA_SESSION_CLOSE_AFTER_MS', 10 * 60 * 1000),
   /**
    * Device-recorded segment retention (offline recording plan, Phase 6.3).
-   * S3 lifecycle rules expire `telemetry/v1/*` + `media-sessions/v1/*` objects
-   * at this age (storage-stack, same context key); the sweeper expires the
-   * matching DB index rows one day LATER, so S3 always deletes first and a
-   * row is never removed while its object still needs indexing (see
-   * expireSegmentIndexRows).
+   * S3 lifecycle rules expire `media-sessions/v1/*` objects at this age
+   * (storage-stack, same context key); the sweeper expires the matching DB
+   * index rows one day LATER, so S3 always deletes first and a row is never
+   * removed while its object still needs indexing (see expireSegmentIndexRows).
+   * `telemetry/v1/*` left this clock in telemetry-session-artifacts Phase 5:
+   * see telemetryArtifactRetentionDays below.
    */
   segmentRetentionDays: numEnv('SEGMENT_RETENTION_DAYS', 90),
+  /**
+   * Recorded TELEMETRY artifacts (telemetry-session-artifacts plan, Phase 5,
+   * README D8): the raw `.jsonl.gz` segments and the `overview.v1.json.gz`
+   * objects under `telemetry/v1/` are the system of record for recorded
+   * telemetry and live on their own, longer clock (365 d default, S3 Standard,
+   * storage-stack `telemetryArtifactRetentionDays`). The sweeper expires the
+   * matching `telemetry_segments` / `telemetry_sessions` / `telemetry_ingest_log`
+   * rows one day LATER, same lead rule as media. `telemetry_readings` rows are
+   * the HOT WINDOW now (TELEMETRY_RETENTION_DAYS, partition-maintenance), not
+   * the record.
+   */
+  telemetryArtifactRetentionDays: numEnv('TELEMETRY_ARTIFACT_RETENTION_DAYS', 365),
   /**
    * Media time-source upgrade experiment (optimize-system-process-cycle
    * Phase 1, Q6): when on, segment ingest monotonically upgrades

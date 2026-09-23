@@ -1,9 +1,11 @@
-import { sql } from 'drizzle-orm';
-import { db } from '../db/index';
+import { and, isNull, sql } from 'drizzle-orm';
+import { db, schema } from '../db/index';
+import { tsParam } from '../utils/sql';
 import {
   MAINTAINED_MONTH_OFFSETS,
   boundary,
   monthStartUtc,
+  parseLowerBound,
   parseUpperBound,
   partitionAutovacuumClause,
   partitionName,
@@ -31,10 +33,21 @@ import {
  *     future months keep a warm visibility map without another migration. See
  *     PARTITION_AUTOVACUUM_OPTS.
  *  2. RETENTION — detach + drop partitions older than the configured window.
- *     ⚠ It SHIPS DORMANT: `TELEMETRY_RETENTION_ENABLED` must be exactly
- *     `'true'`. Turning the schedule on (`--context scheduledJobs=on`) must not
- *     start deleting history as a side effect. The reasoning, the 90-day
- *     placeholder and the guardrails all live in services/telemetry-partitions.ts.
+ *     Dormant until telemetry-session-artifacts Phase 5 (2026-09-23) made
+ *     `telemetry_readings` the 90-day HOT WINDOW behind the S3 artifacts; on
+ *     since then on dev, prod by the owner (bin/app.ts). The gate is
+ *     unchanged: `TELEMETRY_RETENTION_ENABLED` must be exactly `'true'`, and
+ *     turning the schedule on (`--context scheduledJobs=on`) never starts
+ *     deleting history as a side effect. The reasoning, the window and the
+ *     guardrails all live in services/telemetry-partitions.ts.
+ *
+ *  3. THE ARTIFACT GUARD (Phase 5): before a month is dropped, every
+ *     telemetry session overlapping it must have its overview artifact
+ *     (`overview_key` set). A month with an unbuilt session is held back for
+ *     this run with a warning (the housekeeping tick builds it within
+ *     minutes, so the next run drops it); a month with no sessions at all
+ *     predates the index and drops as approved (its objects left S3 under the
+ *     old 90-day lifecycle; nothing can rebuild them).
  *
  * The month arithmetic and the retention planner are pure and live in
  * services/telemetry-partitions.ts with unit tests; this file is the I/O.
@@ -78,7 +91,35 @@ async function listPartitions(): Promise<PartitionInfo[]> {
     where i.inhparent = 'telemetry_readings'::regclass
     order by 1
   `);
-  return res.rows.map((r) => ({ name: r.name, upperBound: parseUpperBound(r.bound) }));
+  return res.rows.map((r) => ({
+    name: r.name,
+    upperBound: parseUpperBound(r.bound),
+    lowerBound: parseLowerBound(r.bound),
+  }));
+}
+
+/**
+ * The artifact guard: telemetry sessions overlapping [lower, upper) that have
+ * no overview artifact yet. Sessions still `open` count too (they close and
+ * build within minutes on the housekeeping tick). A partition with an
+ * unparseable lower bound is treated as guarded (held back) rather than
+ * assumed empty: "I don't understand this partition" fails towards keeping
+ * the data, same stance as parseUpperBound.
+ */
+async function unbuiltSessionsOverlapping(p: PartitionInfo): Promise<number | null> {
+  if (!p.lowerBound || !p.upperBound) return null;
+  const t = schema.telemetrySessions;
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(t)
+    .where(
+      and(
+        sql`${t.startedAt} < ${tsParam(p.upperBound.toISOString())}`,
+        sql`coalesce(${t.endedAt}, ${t.startedAt}) >= ${tsParam(p.lowerBound.toISOString())}`,
+        isNull(t.overviewKey),
+      ),
+    );
+  return Number(row?.n ?? 0);
 }
 
 /** Retention. Dormant unless explicitly armed — see the header. */
@@ -107,6 +148,20 @@ async function applyRetention(now: Date): Promise<void> {
   }
 
   for (const p of plan.drop) {
+    // The artifact guard (header, item 3): rows may expire only once the
+    // session artifacts that replace them exist.
+    const unbuilt = await unbuiltSessionsOverlapping(p);
+    if (unbuilt === null || unbuilt > 0) {
+      console.warn(
+        `partition-maintenance: RETENTION holding back ${p.name}: ` +
+          (unbuilt === null
+            ? 'its bounds could not be parsed'
+            : `${unbuilt} telemetry session(s) overlapping it have no overview artifact yet`) +
+          '. It will be reconsidered on the next run.',
+      );
+      continue;
+    }
+
     // Count BEFORE dropping — this log line is the only record that the rows
     // ever existed, so it has to be written while they still do.
     const countRes = await db.execute(sql.raw(`select count(*)::bigint as n from "${p.name}"`));

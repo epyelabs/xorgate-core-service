@@ -92,20 +92,49 @@ const scheduledJobsCtx = app.node.tryGetContext('scheduledJobs') as
 const disableScheduledJobs =
   scheduledJobsCtx === 'on' ? false : scheduledJobsCtx === 'off' ? true : stage !== 'prod';
 
-// Telemetry retention (improve-recording-history-fetching plan, phase 4).
-// SHIPS DORMANT AND STAYS DORMANT until someone opts in on the command line:
-//   npm run deploy:dev -- --context telemetryRetention=on
-//   [--context telemetryRetentionDays=180]
-// Deliberately NOT folded into scheduledJobs: dev wants the monthly maintenance
-// schedule on so future month partitions exist, and that must never imply
-// "start deleting history". There is no environment in which this defaults on;
-// the 90-day fallback window is a placeholder pending real production data
-// (plan Q4), and src/services/telemetry-partitions.ts refuses windows under 31
-// days and caps drops per run regardless.
-const telemetryRetention = app.node.tryGetContext('telemetryRetention') === 'on';
+// Telemetry retention: the `telemetry_readings` HOT WINDOW (90 days, owner
+// decision Q1 of plans/telemetry-session-artifacts, 2026-09-22). Recorded
+// telemetry's system of record is the S3 artifacts under `telemetry/v1/`
+// (kept 365 d, storage-stack); the Postgres rows are a derived copy that
+// partition-maintenance drops a month at a time once every row in the month
+// is older than the window (src/services/telemetry-partitions.ts).
+//
+// DEFAULT PER STAGE. Dev ON since Phase 5 (2026-09-23). Prod stays OFF here
+// until the OWNER flips `prod: true` below and runs `npm run deploy:prod`;
+// that is the one prod switch of the phase and is deliberately a code change,
+// not a `--context` flag, so a later plain deploy cannot silently turn it back
+// off (the scheduledJobs lesson of 2026-09-22). Before flipping it, confirm
+// prod's index is complete (PROGRESS.md P5 entry has the verification query).
+//
+// Still deliberately NOT folded into scheduledJobs: the maintenance schedule
+// exists so future month partitions get created, and that must never imply
+// "start deleting history". Per-deploy override either way:
+//   npm run deploy:dev  -- --context telemetryRetention=off
+//   npm run deploy:prod -- --context telemetryRetention=on [--context telemetryRetentionDays=90]
+// The planner refuses windows under 31 days and caps drops per run regardless,
+// and the handler holds back a month whose telemetry sessions have no
+// overview artifact yet (handlers/partition-maintenance.ts).
+const TELEMETRY_RETENTION_DEFAULT: Record<'dev' | 'prod', boolean> = {
+  dev: true,
+  prod: false, // OWNER: flip to true to enable the 90-day hot window on prod.
+};
+const telemetryRetentionCtx = app.node.tryGetContext('telemetryRetention') as 'on' | 'off' | undefined;
+const telemetryRetention =
+  telemetryRetentionCtx === 'on'
+    ? true
+    : telemetryRetentionCtx === 'off'
+      ? false
+      : TELEMETRY_RETENTION_DEFAULT[stage];
 const retentionDaysCtx = Number(app.node.tryGetContext('telemetryRetentionDays'));
 const telemetryRetentionDays =
   Number.isFinite(retentionDaysCtx) && retentionDaysCtx > 0 ? retentionDaysCtx : undefined;
+// The READERS' boundary (services/telemetry-window.ts): a workflow window older
+// than this reads the S3 artifacts. Defaults to the retention window; narrow it
+// per deploy with `--context telemetryHotWindowDays=<n>` (S3 is the record, so
+// a narrower boundary is always safe).
+const hotWindowCtx = Number(app.node.tryGetContext('telemetryHotWindowDays'));
+const telemetryHotWindowDays =
+  Number.isFinite(hotWindowCtx) && hotWindowCtx > 0 ? hotWindowCtx : undefined;
 
 // Google Hosted-UI federation ("Continue with Google" in xorgate-web). When
 // googleClientId resolves to nothing the auth stack stays Cognito-only. The
@@ -240,6 +269,7 @@ if (stage === 'prod') {
     disableScheduledJobs,
     telemetryRetention,
     telemetryRetentionDays,
+    telemetryHotWindowDays,
     // NO `vpc` and NO `dbSecurityGroup`, deliberately, which puts the prod
     // Lambdas on exactly the same footing as dev's: not VPC-attached, reaching
     // Postgres over the RDS Data API (src/db/index.ts speaks nothing else).
@@ -298,6 +328,7 @@ if (stage === 'prod') {
     disableScheduledJobs,
     telemetryRetention,
     telemetryRetentionDays,
+    telemetryHotWindowDays,
     bucket: storageStack.bucket,
     distBucket: storageStack.distBucket,
     dbClusterArn: cdk.Fn.importValue('EpyeSandboxClusterArn'),
