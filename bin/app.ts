@@ -99,12 +99,11 @@ const disableScheduledJobs =
 // partition-maintenance drops a month at a time once every row in the month
 // is older than the window (src/services/telemetry-partitions.ts).
 //
-// DEFAULT PER STAGE. Dev ON since Phase 5 (2026-09-23). Prod stays OFF here
-// until the OWNER flips `prod: true` below and runs `npm run deploy:prod`;
-// that is the one prod switch of the phase and is deliberately a code change,
-// not a `--context` flag, so a later plain deploy cannot silently turn it back
-// off (the scheduledJobs lesson of 2026-09-22). Before flipping it, confirm
-// prod's index is complete (PROGRESS.md P5 entry has the verification query).
+// DEFAULT PER STAGE, ON for both since 2026-09-23 (dev with Phase 5, prod the
+// same day on the owner's approval after the index verification in
+// PROGRESS.md). Deliberately a code default, not a `--context` flag, so a
+// later plain deploy cannot silently turn it back off (the scheduledJobs
+// lesson of 2026-09-22).
 //
 // Still deliberately NOT folded into scheduledJobs: the maintenance schedule
 // exists so future month partitions get created, and that must never imply
@@ -116,7 +115,10 @@ const disableScheduledJobs =
 // overview artifact yet (handlers/partition-maintenance.ts).
 const TELEMETRY_RETENTION_DEFAULT: Record<'dev' | 'prod', boolean> = {
   dev: true,
-  prod: false, // OWNER: flip to true to enable the 90-day hot window on prod.
+  // Prod armed 2026-09-23 (owner approval in chat; prod index verified: 91
+  // sessions, 0 unbuilt, 0 open; June/July partitions empty). First
+  // scheduled run 2026-10-15 02:00 UTC.
+  prod: true,
 };
 const telemetryRetentionCtx = app.node.tryGetContext('telemetryRetention') as 'on' | 'off' | undefined;
 const telemetryRetention =
