@@ -42,6 +42,20 @@ aws s3 cp --recursive ./out/depth/depth-anything-v2-small/1/ \
   s3://<core-bucket>/models/depth/depth-anything-v2-small/1/
 ```
 
+Metric depth (engine 0.4.0+, postprocess `depth-anything-metric`, output in
+metres): export with the engine repo's tool, which also writes the manifest's
+`files` checksum block, then publish the same way. Needs a service on engine
+0.4.0 or later: older services skip the manifest (unknown postprocess kind).
+
+```bash
+# in engines/xorgate-workflow-engine/tools/export
+python export_depth.py --variant metric-outdoor --version 1 --out ./out
+aws s3 cp --recursive ./out/depth/depth-anything-v2-metric-outdoor-small/1/ \
+  s3://<core-bucket>/models/depth/depth-anything-v2-metric-outdoor-small/1/
+```
+
+Published to dev on 2026-09-26; prod is pending the engine 0.4.0 rollout.
+
 ## Parity fixtures
 
 `export_yolo.py` renders a deterministic synthetic fixture image, runs the exported

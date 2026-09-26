@@ -44,7 +44,7 @@
     "@aws-sdk/credential-providers": "^3.1088.0",
     "@aws-sdk/s3-presigned-post": "^3.1087.0",
     "@aws-sdk/s3-request-presigner": "^3.800.0",
-    "@xorgate/workflow-engine": "0.3.0",
+    "@xorgate/workflow-engine": "0.4.0",
     "aws-jwt-verify": "^5.1.1",
     "cron-parser": "^5.6.1",
     "drizzle-orm": "^0.43.0",
