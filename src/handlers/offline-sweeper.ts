@@ -1,5 +1,5 @@
 import type { Context } from 'aws-lambda';
-import { and, asc, eq, lt, sql } from 'drizzle-orm';
+import { asc, eq, lt } from 'drizzle-orm';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { db, schema } from '../db/index';
@@ -13,6 +13,7 @@ import {
   runTelemetryHousekeeping,
 } from '../services/telemetry-sessions';
 import { recordingConfig } from '../config/recording';
+import { claimAndEmitPresence, offlineClaimSql } from '../services/device-presence';
 import { EXPIRED_TOKEN_GRACE_MS } from '../services/session-token-auth';
 import {
   expireWebhookHistory,
@@ -88,15 +89,10 @@ export const handler = async (event: unknown, context?: Context): Promise<unknow
   // 1: offline sweep.
   try {
     const staleSecs = Math.round(recordingConfig.deviceOfflineStaleMs / 1000);
-    await db
-      .update(schema.devices)
-      .set({ status: 'offline', updatedAt: new Date() })
-      .where(
-        and(
-          eq(schema.devices.status, 'online'),
-          sql`(${schema.devices.lastSeenAt} IS NULL OR ${schema.devices.lastSeenAt} < now() - make_interval(secs => ${sql.raw(String(staleSecs))}))`,
-        ),
-      );
+    // Every flipped row emits `device.offline` (source 'sweeper') in the same
+    // transaction as the flip (xorgate-webhooks P2).
+    const flipped = await claimAndEmitPresence(offlineClaimSql({ staleSecs }), 'sweeper');
+    if (flipped.length > 0) console.log('offline-sweeper: flipped devices offline', { count: flipped.length });
   } catch (err) {
     console.error('offline-sweeper: offline sweep failed', err);
   }

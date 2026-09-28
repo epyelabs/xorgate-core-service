@@ -1,8 +1,8 @@
-import { sql } from 'drizzle-orm';
 import { db } from '../db/index';
 import { telemetryPayloadSchema, flattenTelemetryToRows } from '../schemas/telemetry';
 import { buildDeviceLatestUpsert } from '../utils/upsert';
 import { evaluateTelemetryTriggers } from '../services/workflow-triggers';
+import { claimOnlineFromTelemetry } from '../services/device-presence';
 
 /**
  * Telemetry ingestion (P2). Invoked directly by the AWS IoT Topic Rule
@@ -89,15 +89,10 @@ export const handler = async (event: unknown): Promise<void> => {
   // Throttled heartbeat: re-assert online + bump last_seen at most every ~15s,
   // server-side `now()` (no timestamptz bind), never resurrect a decommissioned
   // device. The ~15s window keeps writes to ≤1/device/15s while leaving the
-  // 60s offline-sweeper room to win when telemetry stops.
-  await db.execute(sql`
-    UPDATE devices
-    SET last_seen_at = now(),
-        status = CASE WHEN status = 'decommissioned' THEN status ELSE 'online' END,
-        updated_at = now()
-    WHERE id = ${payload.deviceId}::uuid
-      AND (last_seen_at IS NULL OR last_seen_at < now() - interval '15 seconds')
-  `);
+  // 60s offline-sweeper room to win when telemetry stops. The same single
+  // statement claims the offline|provisioned -> online edge (never throttled);
+  // only that rare edge pays for the `device.online` outbox row (webhooks P2).
+  await claimOnlineFromTelemetry(payload.deviceId);
 
   // Workflow telemetry-condition triggers (cached, debounced). Best-effort:
   // steady-state cost is ~zero (devices with no such attachments hit a cached

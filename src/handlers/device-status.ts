@@ -1,7 +1,11 @@
-import { sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { db } from '../db/index';
 import { recordingConfig } from '../config/recording';
+import {
+  claimAndEmitPresence,
+  offlineClaimSql,
+  offlineSourceFor,
+  onlineClaimSql,
+} from '../services/device-presence';
 
 // The IoT topic rule injects `topicDeviceId` via `topic(3)` and forwards the
 // published JSON body: {v, deviceId, ts, online}. We trust the topic segment (the
@@ -65,14 +69,10 @@ export const handler = async (event: unknown): Promise<void> => {
   if (online) {
     lastOnlineAt.set(deviceId, now);
     // Re-assert online + bump last_seen so the sweeper doesn't immediately re-flip
-    // it. Never resurrect a decommissioned device.
-    await db.execute(sql`
-      UPDATE devices
-      SET status = CASE WHEN status = 'decommissioned' THEN status ELSE 'online' END,
-          last_seen_at = now(),
-          updated_at = now()
-      WHERE id = ${deviceId}::uuid
-    `);
+    // it. Never resurrect a decommissioned device. The same statement claims the
+    // offline|provisioned -> online edge and, when it flipped, writes the
+    // `device.online` outbox row in the same transaction (xorgate-webhooks P2).
+    await claimAndEmitPresence(onlineClaimSql(deviceId, { throttle: false }), 'connect');
     return;
   }
 
@@ -85,9 +85,8 @@ export const handler = async (event: unknown): Promise<void> => {
   }
 
   // Flip the badge at once — only an actually-online row, never a decommissioned one.
-  await db.execute(sql`
-    UPDATE devices
-    SET status = 'offline', updated_at = now()
-    WHERE id = ${deviceId}::uuid AND status = 'online'
-  `);
+  // Only a row that actually flipped emits `device.offline` (same transaction).
+  // The Last-Will carries the agent's CONNECT time as `ts`, a graceful stop the
+  // shutdown time, which is how `source` tells them apart.
+  await claimAndEmitPresence(offlineClaimSql({ deviceId }), offlineSourceFor(parsed.data.ts, now));
 };

@@ -1537,13 +1537,36 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // client beyond client-rds-data, so it uses the default bundling (the
     // corroborated recorder offline-stop that once required client-ecs went in
     // destroy-kvs-recorder Phase 3).
+    //
+    // xorgate-webhooks P2: a status flip now also writes the device.online /
+    // device.offline outbox row and enqueues it, so this bundles client-sqs
+    // and gets the function-level onFailure DLQ it never had (README §10): a
+    // Lambda that threw past its retries (DB down) left a flip AND its event
+    // unrecorded, which the rule's errorAction below does not catch.
+    const deviceStatusFnDlq = new sqs.Queue(this, "DeviceStatusFnDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
     const deviceStatusFn = new nodejs.NodejsFunction(this, "DeviceStatusFn", {
       ...standardFnProps(
         path.join(entryBase, "device-status.ts"),
-        "IoT rule -> device status (LWT)",
+        "IoT rule -> device status (LWT) + device.online/offline webhooks",
       ),
       timeout: cdk.Duration.seconds(20),
+      bundling: bundlingWithSdk,
+      onFailure: new lambdaDestinations.SqsDestination(deviceStatusFnDlq),
     });
+    const deviceStatusDlqAlarm = new cloudwatch.Alarm(this, "DeviceStatusFnDlqDepthAlarm", {
+      metric: deviceStatusFnDlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription:
+        "DeviceStatusFn async invoke failed past retries (status flip / presence webhook not recorded)",
+    });
+    deviceStatusDlqAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
 
     const deviceStatusRule = new iot.CfnTopicRule(this, "DeviceStatusRule", {
       ruleName: isProd ? "xorgate_device_status" : "xorgate_device_status_dev",
@@ -1790,6 +1813,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "S3 result.json(workflows/v1/*) -> finalize workflow run",
       ),
       timeout: cdk.Duration.seconds(30),
+      // xorgate-webhooks P2: enqueues workflow.event outbox rows (client-sqs).
+      bundling: bundlingWithSdk,
     });
     new events.Rule(this, "WorkflowRunFinalizeRule", {
       description: "CV runner result.json uploaded -> finalize workflow run",
