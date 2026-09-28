@@ -18,12 +18,14 @@ import {
 const definition = {
   schemaVersion: 2,
   nodes: [
-    { id: 'n1', type: 'source.telemetry', config: {} },
-    { id: 'n4', type: 'output.event', config: { kind: 'overspeed', webhook: 'dispatch' } },
-    { id: 'n5', type: 'output.event', config: { kind: 'audit', webhook: '  audit  ' } },
-    { id: 'n6', type: 'output.event', config: { kind: 'quiet' } },
-    { id: 'n7', type: 'output.event', config: { kind: 'blank', webhook: '' } },
-    { id: 'n8', type: 'output.capture', config: { webhook: 'not-an-event-node' } },
+    { id: 'n1', type: 'source.telemetry', data: { config: {} } },
+    { id: 'n4', type: 'output.event', data: { label: 'Overspeed', config: { kind: 'overspeed', webhook: 'dispatch' } } },
+    { id: 'n5', type: 'output.event', data: { config: { kind: 'audit', webhook: '  audit  ' } } },
+    { id: 'n6', type: 'output.event', data: { config: { kind: 'quiet' } } },
+    { id: 'n7', type: 'output.event', data: { config: { kind: 'blank', webhook: '' } } },
+    { id: 'n8', type: 'output.data_capture', data: { config: { webhook: 'not-an-event-node' } } },
+    // A flat `config` is not the definition shape; it is ignored.
+    { id: 'n9', type: 'output.event', config: { kind: 'flat', webhook: 'dispatch' } },
   ],
   edges: [],
 };
@@ -55,6 +57,11 @@ describe('webhookNamesByNode', () => {
       ['n4', 'dispatch'],
       ['n5', 'audit'],
     ]);
+  });
+
+  it('reads the node shape the engine fixtures and the editor save (data.config)', () => {
+    const def = { nodes: [{ id: 'n4', type: 'output.event', position: { x: 0, y: 0 }, data: { label: 'x', config: { kind: 'k', webhook: 'dispatch' } } }] };
+    expect(webhookNamesByNode(def).get('n4')).toBe('dispatch');
   });
 
   it('tolerates snapshots without nodes (v1 / junk)', () => {

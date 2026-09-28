@@ -25,9 +25,11 @@ export function webhookNamesByNode(definition: unknown): Map<string, string> {
   const nodes = (definition as { nodes?: unknown } | null)?.nodes;
   if (!Array.isArray(nodes)) return out;
   for (const node of nodes) {
-    const n = node as { id?: unknown; type?: unknown; config?: { webhook?: unknown } | null };
+    // Node config lives at `data.config` (the editor's node shape, as
+    // production.ts reads `streamKey`).
+    const n = node as { id?: unknown; type?: unknown; data?: { config?: { webhook?: unknown } | null } | null };
     if (n?.type !== OUTPUT_EVENT || typeof n.id !== 'string') continue;
-    const name = n.config?.webhook;
+    const name = n.data?.config?.webhook;
     if (typeof name === 'string' && name.trim().length > 0) out.set(n.id, name.trim());
   }
   return out;
