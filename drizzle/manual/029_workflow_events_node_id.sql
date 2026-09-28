@@ -1,0 +1,13 @@
+-- Xorgate webhooks, Phase 2 (plans/xorgate-webhooks/phase-2-presence-and-workflow-emitters.md
+-- §2.3): the emitting node of each workflow event.
+--
+-- Engine 0.5.0 stamps `nodeId` on every event record (result.json,
+-- events.jsonl, progress). Finalize now persists it, which is what joins an
+-- event back to its `output.event` node's `webhook` name (workflow.event
+-- routing) and lets `GET /workflow-runs/{id}` say `wouldDeliverTo` for a
+-- simulation. Nullable; no backfill (rows from engine <= 0.4.0 have no node).
+--
+-- Additive and idempotent. Apply through the RDS Data API BEFORE deploying the
+-- Phase 2 code: `workflow_events` is selected whole by the run detail route, so
+-- an unmigrated database 500s there. One statement.
+ALTER TABLE workflow_events ADD COLUMN IF NOT EXISTS node_id text;

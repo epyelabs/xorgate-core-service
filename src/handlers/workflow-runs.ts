@@ -14,6 +14,7 @@ import type { WorkflowDefinition } from '../schemas/workflows';
 import { runPrefix, runTopicPrefix, simTopicPrefix } from '@xorgate/workflow-engine';
 import { apiHandler } from '../utils/api-handler';
 import { artifactFileName } from '../workflows/host/result';
+import { webhookNamesByNode } from '../services/webhooks/workflow-events';
 
 const s3 = new S3Client({});
 const BUCKET = process.env.BUCKET_NAME;
@@ -231,6 +232,10 @@ const restHandler = async (
           .orderBy(asc(schema.workflowEvents.occurredAt)),
       ]);
 
+      // xorgate-webhooks P2: a simulation never delivers; it says where each
+      // event WOULD go (the emitting output.event node's `webhook` name).
+      const wouldDeliver = run.mode === 'simulation' ? webhookNamesByNode(run.definition) : null;
+
       return ok({
         run: {
           ...toSummary({ ...run, templateName: row.templateName, deviceName: row.deviceName, serial: row.serial }),
@@ -257,6 +262,13 @@ const restHandler = async (
             clipKey: e.clipS3Key ?? null,
             payloadSummary: e.payloadSummary,
             payload: e.payload ?? null,
+            // ADDITIVE (xorgate-webhooks P2): the emitting node (engine >= 0.5.0,
+            // else null) and, on simulation runs only, the endpoint name the
+            // node routes to in production (null = the node has no `webhook`).
+            nodeId: e.nodeId ?? null,
+            ...(wouldDeliver
+              ? { wouldDeliverTo: (e.nodeId && wouldDeliver.get(e.nodeId)) || null }
+              : {}),
           })),
           metrics: run.metrics,
           // v2 engine runs only (null on PoC runs): which engine produced the

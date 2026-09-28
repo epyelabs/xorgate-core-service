@@ -157,6 +157,7 @@ export const WEBHOOK_EVENT_CATALOG: readonly WebhookEventTypeInfo[] = [
     sample: {
       eventId: '0192f0a4-2222-7000-8000-000000000003',
       nodeId: 'n4',
+      webhook: 'dispatch',
       kind: 'harsh_brake',
       occurredAt: '2026-09-27T13:31:12.000Z',
       confidence: 1,

@@ -893,6 +893,10 @@ export const workflowEvents = pgTable(
     clipS3Key: text('clip_s3_key'),
     payloadSummary: text('payload_summary').default('').notNull(),
     payload: jsonb('payload'), // bboxes, observed values
+    // The emitting node (engine >= 0.5.0 `nodeId`); null on older rows.
+    // Migration 029 (xorgate-webhooks P2): joins the event to its output.event
+    // node's `webhook` name.
+    nodeId: text('node_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [

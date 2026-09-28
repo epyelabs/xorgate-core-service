@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { engineResultSchema, runPrefix, type EngineResult } from '@xorgate/workflow-engine';
+import { engineEventSchema, engineResultSchema, runPrefix, type EngineResult } from '@xorgate/workflow-engine';
 
 /**
  * The platform's ADDITIVE extension of the frozen `result.json` v2 contract
@@ -29,8 +29,18 @@ export const platformArtifactsSchema = engineResultSchema.shape.artifacts.extend
 });
 export type PlatformArtifacts = z.infer<typeof platformArtifactsSchema>;
 
+/**
+ * The emitting node of an event (engine >= 0.5.0 stamps it; xorgate-webhooks
+ * P2). Declared here too so a result.json from ANY engine version keeps it
+ * through parsing, and a 0.4.0 result (no `nodeId`) still finalizes.
+ */
+export const platformEventSchema = engineEventSchema.extend({
+  nodeId: z.string().optional(),
+});
+
 export const platformResultSchema = engineResultSchema.extend({
   artifacts: platformArtifactsSchema,
+  events: z.array(platformEventSchema),
 });
 /** `EngineResult` plus the optional `artifacts.videos` map; assignable to `EngineResult`. */
 export type PlatformEngineResult = z.infer<typeof platformResultSchema>;

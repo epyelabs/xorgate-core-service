@@ -1,11 +1,19 @@
 import type { EventBridgeEvent } from 'aws-lambda';
-import { eq } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
+import { and, eq } from 'drizzle-orm';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
 import { updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
 import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/host/finalize';
 import { platformResultSchema } from '../workflows/host/result';
+import { dispatchWebhookEvents, emitWebhookEvents } from '../services/webhooks/emit';
+import {
+  endpointIdsByName,
+  planWorkflowEventEmits,
+  webhookNamesByNode,
+  type WorkflowEventRunInfo,
+} from '../services/webhooks/workflow-events';
 
 const s3 = new S3Client({});
 
@@ -193,18 +201,79 @@ async function finalizeV2(raw: unknown, key: string): Promise<void> {
 
   // Sequential awaits throughout: the RDS Data API forbids concurrent statements.
   const stepRows = v2StepRows(run.id, result);
-  if (stepRows.length > 0) {
-    await db.insert(schema.workflowRunSteps).values(stepRows);
-  }
-  const eventRows = v2EventRows(run, result);
-  if (eventRows.length > 0) {
-    await db.insert(schema.workflowEvents).values(eventRows);
+  // Ids minted here rather than RETURNed: the outbox rows key on them and a
+  // RETURNING of every payload could exceed the Data API's 1 MiB response cap.
+  const eventRows = v2EventRows(run, result).map((row) => ({ id: randomUUID(), ...row }));
+
+  // workflow.event routing inputs (xorgate-webhooks P2, README D1): production
+  // runs only; the node's `webhook` name resolves to an endpoint of the
+  // template's org. Reads, so they stay outside the transaction.
+  const namesByNode = run.mode === 'production' ? webhookNamesByNode(run.definition) : new Map<string, string>();
+  let webhookRun: WorkflowEventRunInfo | null = null;
+  let endpointsByName = new Map<string, string>();
+  if (namesByNode.size > 0 && eventRows.some((e) => e.nodeId && namesByNode.has(e.nodeId))) {
+    const [tpl] = await db
+      .select({ organizationId: schema.workflowTemplates.organizationId })
+      .from(schema.workflowTemplates)
+      .where(eq(schema.workflowTemplates.id, run.templateId));
+    if (tpl) {
+      webhookRun = {
+        id: run.id,
+        organizationId: tpl.organizationId,
+        workspaceId: run.workspaceId,
+        templateId: run.templateId,
+        templateVersion: run.templateVersion,
+        trigger: run.trigger,
+        triggerContext: run.triggerContext,
+        deviceId: run.deviceId,
+      };
+      endpointsByName = await endpointIdsByName(db, tpl.organizationId, [...namesByNode.values()]);
+    }
   }
 
-  await db
-    .update(schema.workflowRuns)
-    .set(v2RunUpdate(result, run.startedAt, new Date()))
-    .where(eq(schema.workflowRuns.id, run.id));
+  // ONE transaction, run row first as the claim: a concurrent or redelivered
+  // finalize that loses the `status = 'running'` claim writes nothing, and a
+  // crash anywhere rolls the steps, events and outbox rows back with the run
+  // update, so the redelivery starts clean (events are never doubled and a
+  // workflow.event is never lost to a crash between the run update and the
+  // outbox insert). Dispatch happens after commit; the tick covers a crash there.
+  const outcome = await db.transaction(async (tx) => {
+    const claimed = await tx
+      .update(schema.workflowRuns)
+      .set(v2RunUpdate(result, run.startedAt, new Date()))
+      .where(and(eq(schema.workflowRuns.id, run.id), eq(schema.workflowRuns.status, 'running')))
+      .returning({ id: schema.workflowRuns.id });
+    if (claimed.length === 0) return null;
+    if (stepRows.length > 0) {
+      await tx.insert(schema.workflowRunSteps).values(stepRows);
+    }
+    if (eventRows.length > 0) {
+      await tx.insert(schema.workflowEvents).values(eventRows);
+    }
+    if (!webhookRun) return { webhookIds: [] as string[], unresolved: [] as string[], planned: 0 };
+    const plan = planWorkflowEventEmits(webhookRun, eventRows, namesByNode, endpointsByName);
+    const webhookIds = await emitWebhookEvents(tx, plan.emits);
+    return { webhookIds, unresolved: plan.unresolved, planned: plan.emits.length };
+  });
+  if (!outcome) {
+    console.log('workflow-run-finalize: v2 run finalized concurrently, skipping', { runId: run.id });
+    return;
+  }
+  if (outcome.unresolved.length > 0) {
+    console.warn('workflow-run-finalize: webhook name(s) with no endpoint in the org; events unrouted', {
+      runId: run.id,
+      webhooks: outcome.unresolved,
+    });
+  }
+  if (outcome.webhookIds.length > 0) {
+    const dispatched = await dispatchWebhookEvents(outcome.webhookIds);
+    console.log('workflow-run-finalize: workflow.event emitted', {
+      runId: run.id,
+      emitted: outcome.webhookIds.length,
+      sent: dispatched.sent.length,
+      dispatchDisabled: dispatched.disabled,
+    });
+  }
 
   await updateAttachmentStatusIfLatest(run, result.status);
   console.log('workflow-run-finalize: v2 run finalized', {

@@ -60,6 +60,40 @@ export async function emitWebhookEvent(dbx: WebhookDb, args: EmitWebhookEventArg
   return rows[0]?.id ?? null;
 }
 
+/** Rows per multi-row outbox insert (keeps one Data API request well under its size limits). */
+const EMIT_BATCH = 50;
+
+/**
+ * `emitWebhookEvent` for many rows at once (finalize: one `workflow.event`
+ * per persisted event of a run), one INSERT per `EMIT_BATCH` rows, sequential.
+ * Returns the ids of the rows actually inserted; deduped keys are absent.
+ */
+export async function emitWebhookEvents(
+  dbx: WebhookDb,
+  events: ReadonlyArray<EmitWebhookEventArgs>,
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < events.length; i += EMIT_BATCH) {
+    const rows = await dbx
+      .insert(schema.webhookEvents)
+      .values(
+        events.slice(i, i + EMIT_BATCH).map((args) => ({
+          id: uuidv7(),
+          organizationId: args.organizationId,
+          workspaceId: args.workspaceId,
+          type: args.type,
+          endpointId: args.endpointId ?? null,
+          dedupeKey: args.dedupeKey,
+          data: args.data,
+        })),
+      )
+      .onConflictDoNothing({ target: schema.webhookEvents.dedupeKey })
+      .returning({ id: schema.webhookEvents.id });
+    for (const r of rows) ids.push(r.id);
+  }
+  return ids;
+}
+
 /** True when this deployment enqueues deliveries (the `webhooks` stack flag). */
 export function webhooksDispatchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.WEBHOOKS_DISPATCH === 'on' && !!env.WEBHOOK_FANOUT_QUEUE_URL;

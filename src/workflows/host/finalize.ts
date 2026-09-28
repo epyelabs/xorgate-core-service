@@ -39,6 +39,8 @@ export interface V2EventRow {
   clipS3Key: string | null;
   payloadSummary: string;
   payload: unknown;
+  /** The emitting node (engine >= 0.5.0); null for older results. Migration 029. */
+  nodeId: string | null;
 }
 
 export function v2EventRows(
@@ -46,6 +48,7 @@ export function v2EventRows(
   result: EngineResult,
 ): V2EventRow[] {
   return result.events.map((e) => ({
+    nodeId: e.nodeId ?? null,
     runId: run.id,
     deviceId: run.deviceId,
     kind: e.kind,
