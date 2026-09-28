@@ -353,6 +353,10 @@ export const devices = pgTable(
     // of only in the publish trigger list. { activeStreamsViewType, imuView }.
     uiPrefs: jsonb('ui_prefs').$type<Record<string, unknown>>().default({}).notNull(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+    // When `status` last changed (xorgate-webhooks, migration 028). Written by
+    // the status writers' edge claims from Phase 2 on; the presence events'
+    // dedupe key is built from it. Null on rows no edge has touched yet.
+    statusChangedAt: timestamp('status_changed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -1382,3 +1386,129 @@ export const deviceTransferOffers = pgTable(
     index('device_transfer_offers_from_org_status_idx').on(t.fromOrganizationId, t.status),
   ],
 );
+
+// --- Webhooks (plans/xorgate-webhooks, migration drizzle/manual/028) --------
+//
+// The endpoint registry (URL + a Secrets Manager secret, no routing of its
+// own), device-side routing, the outbox and the delivery log. Workflow events
+// are routed by the output.event node's `webhook` name, resolved to an
+// endpoint at finalize and stamped on the outbox row as `endpointId`.
+
+export const webhookEndpoints = pgTable(
+  'webhook_endpoints',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    // The handle templates and the device picker reference, unique per org.
+    name: text('name').notNull(),
+    url: text('url').notNull(),
+    description: text('description'),
+    // The secret itself lives in Secrets Manager under
+    // xorgate/orgs/<orgId>/webhooks/<id>; a rotation bumps this, which is what
+    // invalidates the deliver Lambda's process cache.
+    secretVersion: integer('secret_version').default(1).notNull(),
+    enabled: boolean('enabled').default(true).notNull(),
+    disabledAt: timestamp('disabled_at', { withTimezone: true }),
+    disabledReason: text('disabled_reason'), // manual | gone | (P5) failing
+    consecutiveFailures: integer('consecutive_failures').default(0).notNull(),
+    lastDeliveryAt: timestamp('last_delivery_at', { withTimezone: true }),
+    lastSuccessAt: timestamp('last_success_at', { withTimezone: true }),
+    createdBy: text('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('webhook_endpoints_org_name_idx').on(t.organizationId, t.name),
+    index('webhook_endpoints_org_enabled_idx').on(t.organizationId).where(sql`${t.enabled}`),
+  ],
+);
+
+export const webhookRoutes = pgTable(
+  'webhook_routes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    // Null is reserved for a workspace-wide default route (README Q9, not v1).
+    deviceId: uuid('device_id').references(() => devices.id, { onDelete: 'cascade' }),
+    workspaceId: uuid('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
+    endpointId: uuid('endpoint_id')
+      .references(() => webhookEndpoints.id, { onDelete: 'cascade' })
+      .notNull(),
+    // Subset of the device-routable types (services/webhooks/catalog.ts).
+    // Written through textArrayParam: the Data API has no array binding.
+    eventTypes: text('event_types').array().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [uniqueIndex('webhook_routes_device_endpoint_idx').on(t.deviceId, t.endpointId)],
+);
+
+export const webhookEvents = pgTable(
+  'webhook_events',
+  {
+    // uuidv7 minted in app code (utils/uuidv7.ts): time-ordered, and the
+    // envelope `id` / `webhook-id` consumers dedupe on.
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    workspaceId: uuid('workspace_id'),
+    type: text('type').notNull(),
+    // Set for node-routed events (workflow.event) and ping; null = resolve
+    // through webhook_routes by data.deviceId.
+    endpointId: uuid('endpoint_id').references(() => webhookEndpoints.id, { onDelete: 'set null' }),
+    dedupeKey: text('dedupe_key').notNull(),
+    data: jsonb('data').$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    // Set once the fan-out message is on the queue; null = the tick re-enqueues.
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('webhook_events_dedupe_key_idx').on(t.dedupeKey),
+    index('webhook_events_undispatched_idx').on(t.createdAt).where(sql`${t.dispatchedAt} is null`),
+  ],
+);
+
+export const webhookDeliveries = pgTable(
+  'webhook_deliveries',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    eventId: uuid('event_id')
+      .references(() => webhookEvents.id, { onDelete: 'cascade' })
+      .notNull(),
+    endpointId: uuid('endpoint_id')
+      .references(() => webhookEndpoints.id, { onDelete: 'cascade' })
+      .notNull(),
+    // A manual redelivery is a new row pointing at the delivery it repeats.
+    redeliveryOf: uuid('redelivery_of'),
+    status: text('status').default('pending').notNull(), // pending | delivered | failed | exhausted
+    // Attempts made so far; the deliver Lambda claims attempt n+1 on `attempt = n`.
+    attempt: integer('attempt').default(0).notNull(),
+    // When the next attempt is due, or the lease of one in flight (the tick
+    // re-enqueues pending rows whose value has passed).
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }),
+    responseStatus: integer('response_status'),
+    responseMs: integer('response_ms'),
+    responseExcerpt: text('response_excerpt'),
+    error: text('error'),
+    deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('webhook_deliveries_event_endpoint_idx')
+      .on(t.eventId, t.endpointId)
+      .where(sql`${t.redeliveryOf} is null`),
+    index('webhook_deliveries_due_idx').on(t.nextAttemptAt).where(sql`${t.status} = 'pending'`),
+    index('webhook_deliveries_endpoint_idx').on(t.endpointId, t.createdAt.desc()),
+  ],
+);
+
+export type WebhookEndpoint = InferSelectModel<typeof webhookEndpoints>;
+export type WebhookRoute = InferSelectModel<typeof webhookRoutes>;
+export type WebhookEvent = InferSelectModel<typeof webhookEvents>;
+export type WebhookDelivery = InferSelectModel<typeof webhookDeliveries>;

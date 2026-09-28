@@ -92,6 +92,25 @@ const scheduledJobsCtx = app.node.tryGetContext('scheduledJobs') as
 const disableScheduledJobs =
   scheduledJobsCtx === 'on' ? false : scheduledJobsCtx === 'off' ? true : stage !== 'prod';
 
+// Webhooks rollout switch (plans/xorgate-webhooks README Q15, read in
+// src/services/webhooks/emit.ts as WEBHOOKS_DISPATCH). OFF means emitters
+// still write outbox rows (webhook_events) but nothing is enqueued, delivered
+// or re-enqueued by the tick; ON dispatches. Same shape as scheduledJobs:
+//
+// DEFAULT ON IN DEV, OFF IN PROD until the webhooks plan's Phase 5 flips it.
+//   npm run deploy:dev  -- --context webhooks=off
+//   npm run deploy:prod -- --context webhooks=on
+const webhooksCtx = app.node.tryGetContext('webhooks') as 'on' | 'off' | undefined;
+const webhooks = webhooksCtx === 'on' ? true : webhooksCtx === 'off' ? false : stage !== 'prod';
+// The dev-only webhook echo receiver (README D8): a Lambda Function URL tests
+// point endpoints at, never a public receiver. Default on for dev; the API
+// stack refuses it on prod. `--context webhookEcho=off` drops it on dev.
+const webhookEchoCtx = app.node.tryGetContext('webhookEcho') as 'on' | 'off' | undefined;
+if (webhookEchoCtx === 'on' && stage === 'prod') {
+  throw new Error('--context webhookEcho=on is dev-only; it must never deploy to prod');
+}
+const webhookEcho = stage !== 'prod' && webhookEchoCtx !== 'off';
+
 // Telemetry retention: the `telemetry_readings` HOT WINDOW (90 days, owner
 // decision Q1 of plans/telemetry-session-artifacts, 2026-09-22). Recorded
 // telemetry's system of record is the S3 artifacts under `telemetry/v1/`
@@ -269,6 +288,8 @@ if (stage === 'prod') {
     // Prod did not pass this at all until 2026-08-19, so the schedules were
     // silently enabled there while dev disabled them. See the note above.
     disableScheduledJobs,
+    webhooks,
+    webhookEcho,
     telemetryRetention,
     telemetryRetentionDays,
     telemetryHotWindowDays,
@@ -328,6 +349,8 @@ if (stage === 'prod') {
     env,
     stage,
     disableScheduledJobs,
+    webhooks,
+    webhookEcho,
     telemetryRetention,
     telemetryRetentionDays,
     telemetryHotWindowDays,

@@ -1,3 +1,4 @@
+import { webhookSchemas } from './webhooks';
 import { configOpenApiSchemas } from '../config-registry/openapi';
 import { namespaceJsonSchema } from '../config-registry/contract';
 import { ioCapabilitiesSchema } from '../schemas/capabilities';
@@ -13,6 +14,7 @@ import { ioCapabilitiesSchema } from '../schemas/capabilities';
  */
 export function openApiSchemas(): Record<string, unknown> {
   return {
+    ...webhookSchemas,
     ApiError: {
       type: 'object',
       required: ['error'],

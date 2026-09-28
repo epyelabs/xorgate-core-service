@@ -85,6 +85,14 @@ export interface XorgateCoreApiStackProps extends cdk.StackProps {
   // The readers' hot-window boundary (TELEMETRY_HOT_WINDOW_DAYS); defaults to
   // telemetryRetentionDays. See commonEnv.
   telemetryHotWindowDays?: number;
+  // xorgate-webhooks rollout switch (README Q15, Phase 1). When false, emitters
+  // still write outbox rows but nothing is enqueued and the tick does not
+  // re-enqueue (WEBHOOKS_DISPATCH=off). Defaults per stage in bin/app.ts
+  // (dev on, prod off until Phase 5); `--context webhooks=on|off`.
+  webhooks?: boolean;
+  // Deploy the dev-only WebhookEchoFn receiver (a Function URL, auth NONE) for
+  // tests (README D8). Refused on prod. `--context webhookEcho=on|off`.
+  webhookEcho?: boolean;
   bucket: s3.Bucket;
   // Public-read bucket holding device-agent tarballs; its URL is baked into the
   // per-request install.sh so devices can download the build without AWS creds.
@@ -564,6 +572,35 @@ export class XorgateCoreApiStack extends cdk.Stack {
       return v === undefined || v === null ? def : String(v);
     };
 
+    // --- Webhooks (plans/xorgate-webhooks, Phase 1, README D4) ---------------
+    // Two queues, the WorkflowRunQueue shape: fan-out ({eventId} -> one
+    // delivery row per endpoint) and delivery ({deliveryId, attempt} -> one
+    // signed POST). DLQ after 3 receives, alarmed below. Created before
+    // commonEnv so every Lambda (the emitters of Phases 2 and 3 live all over
+    // the stack) gets the URLs. Visibility 60 s covers both consumers' 30 s.
+    if (props.webhookEcho && isProd) {
+      throw new Error("webhookEcho is a dev-only test receiver and must never deploy to prod");
+    }
+    const webhookFanoutDlq = new sqs.Queue(this, "WebhookFanoutDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const webhookFanoutQueue = new sqs.Queue(this, "WebhookFanoutQueue", {
+      visibilityTimeout: cdk.Duration.seconds(60),
+      retentionPeriod: cdk.Duration.days(4),
+      deadLetterQueue: { queue: webhookFanoutDlq, maxReceiveCount: 3 },
+    });
+    const webhookDeliveryDlq = new sqs.Queue(this, "WebhookDeliveryDlq", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+    const webhookDeliveryQueue = new sqs.Queue(this, "WebhookDeliveryQueue", {
+      visibilityTimeout: cdk.Duration.seconds(60),
+      retentionPeriod: cdk.Duration.days(4),
+      deadLetterQueue: { queue: webhookDeliveryDlq, maxReceiveCount: 3 },
+    });
+    // Every emitter, the sweeper and the webhook Lambdas share lambdaRole.
+    webhookFanoutQueue.grantSendMessages(lambdaRole);
+    webhookDeliveryQueue.grantSendMessages(lambdaRole);
+
     const commonEnv: Record<string, string> = {
       NODE_ENV: isProd ? "production" : "development",
       STAGE: stage,
@@ -634,6 +671,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
         "mediaSegmentMaxFutureMs",
         String(24 * 60 * 60 * 1000),
       ),
+      // Webhooks: read by services/webhooks/emit.ts (webhooksDispatchEnabled)
+      // and deliver.ts. WEBHOOKS_DISPATCH is the rollout flag (props.webhooks).
+      WEBHOOK_FANOUT_QUEUE_URL: webhookFanoutQueue.queueUrl,
+      WEBHOOK_DELIVERY_QUEUE_URL: webhookDeliveryQueue.queueUrl,
+      WEBHOOKS_DISPATCH: props.webhooks ? "on" : "off",
     };
 
     // The workflow engine (@xorgate/workflow-engine) locates its own
@@ -1852,6 +1894,83 @@ export class XorgateCoreApiStack extends cdk.Stack {
 
     // Per-org connector credentials (M7): set/rotate/clear/validate BYO API
     // keys (google_roads / here / anthropic) stored as
+    // --- Webhook Lambdas (xorgate-webhooks Phase 1) ---------------------------
+    // WebhooksFn serves the whole REST surface (endpoints, deliveries, the event
+    // catalog AND the device routes) from one function and one integration: the
+    // stack sits near CloudFormation's 500-resource cap, so no second Lambda.
+    // Bundles the SDK (client-sqs for test/redeliver, client-secrets-manager for
+    // the endpoint secrets under xorgate/orgs/<orgId>/webhooks/*).
+    const webhooksFn = new nodejs.NodejsFunction(this, "WebhooksFn", {
+      ...standardFnProps(
+        path.join(entryBase, "webhooks.ts"),
+        "webhook endpoints, deliveries, event types, device routes",
+      ),
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
+      bundling: bundlingWithSdk,
+    });
+    const webhookFanoutFn = new nodejs.NodejsFunction(this, "WebhookFanoutFn", {
+      ...standardFnProps(
+        path.join(entryBase, "webhook-fanout.ts"),
+        "SQS -> webhook outbox row -> one delivery per routed endpoint",
+      ),
+      timeout: cdk.Duration.seconds(30),
+      bundling: bundlingWithSdk,
+    });
+    webhookFanoutFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(webhookFanoutQueue, {
+        batchSize: 1,
+        reportBatchItemFailures: true,
+      }),
+    );
+    const webhookDeliverFn = new nodejs.NodejsFunction(this, "WebhookDeliverFn", {
+      ...standardFnProps(
+        path.join(entryBase, "webhook-deliver.ts"),
+        "SQS -> one signed webhook POST (10 s timeout, no redirects) + retry schedule",
+      ),
+      // One 10 s POST plus a handful of Data API statements.
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      bundling: bundlingWithSdk,
+    });
+    webhookDeliverFn.addEventSource(
+      new lambdaEventSources.SqsEventSource(webhookDeliveryQueue, {
+        batchSize: 1,
+        reportBatchItemFailures: true,
+      }),
+    );
+    for (const [id, dlq, what] of [
+      ["WebhookFanoutDlqDepthAlarm", webhookFanoutDlq, "fan-out"],
+      ["WebhookDeliveryDlqDepthAlarm", webhookDeliveryDlq, "delivery"],
+    ] as const) {
+      const alarm = new cloudwatch.Alarm(this, id, {
+        metric: dlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        alarmDescription: `Webhook ${what} messages failed 3 receives and landed in the DLQ (a database error, not an endpoint failure)`,
+      });
+      alarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
+    }
+    // Dev-only test receiver (README D8): never a public third-party receiver.
+    if (props.webhookEcho) {
+      const webhookEchoFn = new nodejs.NodejsFunction(this, "WebhookEchoFn", {
+        ...standardFnProps(
+          path.join(entryBase, "webhook-echo.ts"),
+          "DEV ONLY: logs webhook requests, answers 204 (or ?status=)",
+          false,
+        ),
+        environment: { STAGE: stage },
+      });
+      const echoUrl = webhookEchoFn.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
+      new cdk.CfnOutput(this, "WebhookEchoUrl", {
+        value: echoUrl.url,
+        description: "Dev-only webhook echo receiver (logs to /aws/lambda/<WebhookEchoFn>)",
+      });
+      new cdk.CfnOutput(this, "WebhookEchoFunctionName", { value: webhookEchoFn.functionName });
+    }
+
     // xorgate/orgs/<orgId>/<provider> secrets. Bundles the SDK
     // (client-secrets-manager); the validate probes call the providers
     // outbound, so give it probe headroom over the 10 s default.
@@ -2387,6 +2506,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
       trainingJobsFn,
     );
     const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
+    const webhooksInt = new apigwv2int.HttpLambdaIntegration("WebhooksInt", webhooksFn);
 
     // Inject the API base into the docs Lambda now that the api exists. The
     // public hostname wins when there is one: `servers` in the served document
@@ -2493,6 +2613,53 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/api-keys/{id}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: apiKeysInt,
+    });
+
+    // Webhooks (xorgate-webhooks Phase 1). All on WebhooksFn, device routes too.
+    addRoutes({
+      path: "/webhooks",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH, apigwv2.HttpMethod.DELETE],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}/test",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}/rotate-secret",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}/deliveries",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}/deliveries/{deliveryId}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhooks/{id}/deliveries/{deliveryId}/redeliver",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/webhook-event-types",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: webhooksInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/webhooks",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
+      integration: webhooksInt,
     });
 
     addRoutes({

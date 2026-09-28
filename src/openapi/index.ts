@@ -16,6 +16,7 @@ import { telemetryPaths } from './telemetry';
 import { livePaths } from './live';
 import { searchPaths } from './search';
 import { workflowTemplatesPaths } from './workflow-templates';
+import { deviceWebhooksPaths, webhookEventsSection, webhooksPaths } from './webhooks';
 
 /**
  * The OpenAPI document, assembled from one module per resource.
@@ -133,6 +134,16 @@ const TAGS = [
       'finds them by. Reading only: authoring happens in the editor.',
   },
   {
+    name: 'Webhooks',
+    'x-displayName': 'Webhooks',
+    description:
+      'Signed HTTPS callbacks when something happens: a device goes online or offline, a ' +
+      'recording session starts, ends or completes, a workflow emits an event. Register an ' +
+      'endpoint once, then route to it from a device (`PUT /devices/{id}/webhooks`) or from a ' +
+      "workflow's Emit Event node. Deliveries follow Standard Webhooks and are retried for about " +
+      '44 hours. The payload of each event type is under `x-webhooks`.',
+  },
+  {
     name: 'Search',
     'x-displayName': 'Search',
     description: 'Cross-resource lookup within the active organization.',
@@ -189,7 +200,7 @@ const DESCRIPTION = [
   '',
   '**Pagination.** Only `GET /devices`, `GET /devices/{id}/sessions`,',
   '`GET /devices/{id}/telemetry/readings`, `GET /devices/{id}/telemetry/sessions` and',
-  '`GET /workflow-templates` paginate; they accept',
+  '`GET /workflow-templates`, `GET /webhooks` and `GET /webhooks/{id}/deliveries` paginate; they accept',
   '`limit`/`offset`/`order`/`sort`',
   'and return a `page` block. Every other list endpoint returns its whole collection unbounded:',
   'organizations, memberships, workspaces, device models, API keys, video channels, the',
@@ -242,7 +253,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // `channelArn` field was removed from `VideoChannel`. The most breaking
       // release this document has had, which is exactly why it happened before
       // anyone outside xorgate consumed it.
-      version: '0.9.0',
+      // 0.10.0: webhooks. The endpoint registry, its delivery log, the event
+      // catalog and a device's routes (tag Webhooks), plus the per-event
+      // payloads under `x-webhooks` (3.0.3 has no `webhooks` section). Purely
+      // additive.
+      version: '0.10.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so
@@ -266,6 +281,9 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
     // each module: the modules stay readable in the canonical unversioned
     // spelling that `scope.ts` and the route table also use, and retiring or
     // bumping the prefix is a one-line change in one place.
+    // Event payloads a receiver implements (OAS 3.1 `webhooks`, as the 3.0
+    // extension). Not paths: nothing here is served by the API.
+    'x-webhooks': webhookEventsSection(),
     paths: withVersionPrefix({
       ...usersPaths,
       ...organizationsPaths,
@@ -281,6 +299,8 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...mediaSessionsPaths,
       ...livePaths,
       ...workflowTemplatesPaths,
+      ...webhooksPaths,
+      ...deviceWebhooksPaths,
       ...searchPaths,
       ...metaPaths,
     }),

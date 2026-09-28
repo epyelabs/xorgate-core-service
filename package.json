@@ -61,6 +61,7 @@
     "drizzle-kit": "^0.31.10",
     "esbuild": "^0.25.0",
     "ffmpeg-static": "^5.2.0",
+    "standardwebhooks": "1.0.0",
     "ts-node": "^10.9.2",
     "typescript": "~5.9.3",
     "vitest": "^2.1.9"
