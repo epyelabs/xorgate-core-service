@@ -24,7 +24,7 @@ export const platformCatalog: Catalog = coreCatalog;
  * conscious edit here (design §3.9). Deployed dev/prod expose it as
  * `GET /workflow-catalog` `.catalogVersion` and as the response ETag.
  */
-export const EXPECTED_CATALOG_VERSION = '2b2a3c052696cf1e';
+export const EXPECTED_CATALOG_VERSION = 'f8861576c807e382';
 
 /** The served `GET /workflow-catalog` payload: computed once per process, ETag'd by hash. */
 export const platformCatalogPayload: WorkflowCatalogPayload = buildCatalogPayload(platformCatalog);
