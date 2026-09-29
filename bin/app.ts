@@ -97,11 +97,13 @@ const disableScheduledJobs =
 // still write outbox rows (webhook_events) but nothing is enqueued, delivered
 // or re-enqueued by the tick; ON dispatches. Same shape as scheduledJobs:
 //
-// DEFAULT ON IN DEV, OFF IN PROD until the webhooks plan's Phase 5 flips it.
-//   npm run deploy:dev  -- --context webhooks=off
-//   npm run deploy:prod -- --context webhooks=on
+// DEFAULT ON IN BOTH STAGES. Prod was switched on 2026-09-29 (webhooks plan
+// Phase 5); before that the prod default was off, so a plain deploy:prod would
+// have silently switched delivery back off. Turning it off is now explicit:
+//   npm run deploy:prod -- --context webhooks=off   (kill switch; rows keep
+//   accumulating undispatched, see the P5 backlog-stamp note before re-enabling)
 const webhooksCtx = app.node.tryGetContext('webhooks') as 'on' | 'off' | undefined;
-const webhooks = webhooksCtx === 'on' ? true : webhooksCtx === 'off' ? false : stage !== 'prod';
+const webhooks = webhooksCtx !== 'off';
 // The dev-only webhook echo receiver (README D8): a Lambda Function URL tests
 // point endpoints at, never a public receiver. Default on for dev; the API
 // stack refuses it on prod. `--context webhookEcho=off` drops it on dev.
