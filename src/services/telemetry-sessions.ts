@@ -11,7 +11,7 @@ import { and, asc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import { db, schema } from '../db/index';
 import { recordingConfig } from '../config/recording';
-import { tsParam } from '../utils/sql';
+import { isoSql, tsParam } from '../utils/sql';
 import {
   parseTelemetryObjectKey,
   plausibleSampleTs,
@@ -21,6 +21,13 @@ import {
 import { gzipOverview, OverviewBuilder, overviewKeyFor } from './telemetry-overview';
 import { promotedInsightColumns } from './telemetry-insights/index';
 import { evaluateTelemetrySessionCompletedTriggers } from './workflow-triggers';
+import { dispatchWebhookEvents, emitWebhookEvents } from './webhooks/emit';
+import {
+  emitTelemetrySessionCompleted,
+  telemetryCloseSql,
+  telemetryEndedEvents,
+  type TelemetryClosedRow,
+} from './webhooks/sessions';
 
 /**
  * Telemetry session index + overview artifacts (telemetry-session-artifacts
@@ -77,17 +84,30 @@ export interface IndexSegmentOptions {
 const timeSourceRankSql = (expr: SQL | PgColumn) =>
   sql`(case ${expr} when 'ntp' then 4 when 'gps' then 3 when 'nitz' then 2 when 'rtc' then 1 when 'unsynced' then 0 else -1 end)`;
 
+export interface IndexSegmentResult {
+  /** False when the segment was already indexed (nothing changed). */
+  indexed: boolean;
+  /**
+   * True when THIS call created the session row (xorgate-webhooks P3: the
+   * live ingest emits `telemetry_session.started` for it; the backfill does
+   * not). Only meaningful with `indexed`: a duplicate rolls the caller back.
+   */
+  created: boolean;
+  /** The session start this call wrote when it created the row (device clock, clamped). */
+  startedAt: Date;
+}
+
 /**
  * Index one segment inside the caller's transaction. Sequence (no Promise.all,
  * Data API): session row if absent -> segment row (ON CONFLICT DO NOTHING) ->
- * if it was new, roll the session forward. Returns false when the segment was
- * already indexed (nothing changed).
+ * if it was new, roll the session forward. Emits nothing: the caller decides
+ * whether a created session is news (live ingest) or history (backfill).
  */
 export async function indexSegment(
   tx: Tx,
   input: IndexSegmentInput,
   opts: IndexSegmentOptions = {},
-): Promise<boolean> {
+): Promise<IndexSegmentResult> {
   const arrivedAt = opts.backfill?.arrivedAt ?? new Date();
   // Bounds come from the device clock and feed the manifest's overlap join, so
   // an implausible future ts (a 2080 RTC) must not make a session "overlap"
@@ -102,7 +122,7 @@ export async function indexSegment(
   const endTs = new Date(endMs);
   const status = opts.backfill ? 'closed' : 'open';
 
-  await tx
+  const createdRows = await tx
     .insert(schema.telemetrySessions)
     .values({
       id: input.sessionId,
@@ -115,7 +135,9 @@ export async function indexSegment(
       timeSource: input.header?.timeSource ?? null,
       overviewStale: Boolean(opts.backfill),
     })
-    .onConflictDoNothing();
+    .onConflictDoNothing()
+    .returning({ id: schema.telemetrySessions.id });
+  const created = createdRows.length > 0;
 
   const inserted = await tx
     .insert(schema.telemetrySegments)
@@ -132,7 +154,7 @@ export async function indexSegment(
     })
     .onConflictDoNothing()
     .returning({ s3Key: schema.telemetrySegments.s3Key });
-  if (inserted.length === 0) return false;
+  if (inserted.length === 0) return { indexed: false, created, startedAt: startTs };
 
   const t = schema.telemetrySessions;
   const newSource = input.header?.timeSource ?? null;
@@ -155,7 +177,7 @@ export async function indexSegment(
       updatedAt: sql`now()`,
     })
     .where(eq(t.id, input.sessionId));
-  return true;
+  return { indexed: true, created, startedAt: startTs };
 }
 
 export type NormalizeResult = 'already' | 'copied' | 'missing' | 'failed';
@@ -236,18 +258,17 @@ export interface ClosedTelemetrySession {
  */
 export async function closeStaleTelemetrySessions(deviceId?: string): Promise<ClosedTelemetrySession[]> {
   const staleSecs = Math.round(recordingConfig.mediaSessionCloseAfterMs / 1000);
-  const t = schema.telemetrySessions;
-  return db
-    .update(t)
-    .set({ status: 'closed', updatedAt: sql`now()` })
-    .where(
-      and(
-        eq(t.status, 'open'),
-        deviceId ? eq(t.deviceId, deviceId) : undefined,
-        sql`${t.lastSegmentAt} < now() - make_interval(secs => ${sql.raw(String(staleSecs))})`,
-      ),
-    )
-    .returning({ id: t.id, deviceId: t.deviceId });
+  // xorgate-webhooks P3: close + `telemetry_session.ended` outbox rows in one
+  // transaction (README D3), dispatched after commit. Every closer (sweeper,
+  // manifest and listing close-on-read) goes through here.
+  const { rows, eventIds } = await db.transaction(async (tx) => {
+    const res = await tx.execute<TelemetryClosedRow & Record<string, unknown>>(telemetryCloseSql(staleSecs, deviceId));
+    const rows = (res?.rows ?? []) as TelemetryClosedRow[];
+    const eventIds = await emitWebhookEvents(tx, telemetryEndedEvents(rows));
+    return { rows, eventIds };
+  });
+  await dispatchWebhookEvents(eventIds);
+  return rows.map((r) => ({ id: r.id, deviceId: r.device_id }));
 }
 
 export interface BuildResult {
@@ -564,6 +585,8 @@ export async function fireTelemetrySessionCompleted(
   opts: { limit?: number; deadline?: number } = {},
 ): Promise<{ sessions: number; runs: number }> {
   const t = schema.telemetrySessions;
+  const d = schema.devices;
+  const w = schema.workspaces;
   const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
   const rows = await db
     .select({
@@ -577,8 +600,23 @@ export async function fireTelemetrySessionCompleted(
       sampleCount: t.sampleCount,
       insights: t.insights,
       lastSegmentAt: t.lastSegmentAt,
+      // xorgate-webhooks P3 (`telemetry_session.completed`): the rest of the
+      // payload, the timestamps as SQL-rendered ISO strings (the `ended` key
+      // carries last_segment_at in exactly this shape), and the device's scope.
+      byteCount: t.byteCount,
+      distanceM: t.distanceM,
+      durationMs: t.durationMs,
+      maxSpeedKph: t.maxSpeedKph,
+      startedAtIso: sql<string>`${isoSql(sql`${t.startedAt}`)}`,
+      endedAtIso: sql<string | null>`${isoSql(sql`${t.endedAt}`)}`,
+      lastSegmentAtIso: sql<string>`${isoSql(sql`${t.lastSegmentAt}`)}`,
+      previousCompletedFiredAt: sql<string | null>`${isoSql(sql`${t.completedFiredAt}`)}`,
+      workspaceId: d.workspaceId,
+      organizationId: w.organizationId,
     })
     .from(t)
+    .leftJoin(d, eq(d.id, t.deviceId))
+    .leftJoin(w, eq(w.id, d.workspaceId))
     .where(
       and(
         eq(t.status, 'closed'),
@@ -591,21 +629,30 @@ export async function fireTelemetrySessionCompleted(
     .limit(opts.limit ?? 25);
   let sessions = 0;
   let runs = 0;
+  const eventIds: string[] = [];
   for (const row of rows) {
     if (Date.now() >= deadline) break;
     // Claim first (the predicate re-checked in the UPDATE): a pass that lost
-    // the race to a concurrent one skips the row instead of firing twice.
-    const claimed = await db
-      .update(t)
-      .set({ completedFiredAt: sql`now()` })
-      .where(
-        and(
-          eq(t.id, row.id),
-          sql`(${t.completedFiredAt} is null or ${t.completedFiredAt} < ${t.lastSegmentAt})`,
-        ),
-      )
-      .returning({ id: t.id });
-    if (claimed.length === 0) continue;
+    // the race to a concurrent one skips the row instead of firing twice. The
+    // webhook outbox row commits with the claim (README D3); the key carries
+    // the claimed `completed_fired_at`, read back from this UPDATE.
+    const claim = await db.transaction(async (tx) => {
+      const claimed = await tx
+        .update(t)
+        .set({ completedFiredAt: sql`now()` })
+        .where(
+          and(
+            eq(t.id, row.id),
+            sql`(${t.completedFiredAt} is null or ${t.completedFiredAt} < ${t.lastSegmentAt})`,
+          ),
+        )
+        .returning({ id: t.id, completedFiredAt: sql<string>`${isoSql(sql`${t.completedFiredAt}`)}` });
+      if (claimed.length === 0) return null;
+      const eventId = await emitTelemetrySessionCompleted(tx, row, claimed[0]!.completedFiredAt);
+      return { eventId };
+    });
+    if (!claim) continue;
+    if (claim.eventId) eventIds.push(claim.eventId);
     sessions++;
     try {
       const n = await evaluateTelemetrySessionCompletedTriggers(row);
@@ -615,6 +662,7 @@ export async function fireTelemetrySessionCompleted(
       console.error('telemetry-sessions: telemetry_session_completed trigger eval failed', { sessionId: row.id, err });
     }
   }
+  await dispatchWebhookEvents(eventIds);
   return { sessions, runs };
 }
 
@@ -773,7 +821,12 @@ export async function reconcileTelemetryIndex(opts: ReconcileOptions = {}): Prom
     }
     const summary = summarizeSegment(text);
     try {
-      const wasNew = await db.transaction((tx) =>
+      // Backfill: a session this creates is history, already closed. It must
+      // NOT emit `telemetry_session.started` (xorgate-webhooks P3), so the
+      // result's `created` is deliberately ignored here, and no close ever
+      // emits its `ended`, which keeps its `completed` silent too
+      // (services/webhooks/sessions.ts emitTelemetrySessionCompleted).
+      const { indexed: wasNew } = await db.transaction((tx) =>
         indexSegment(
           tx,
           {

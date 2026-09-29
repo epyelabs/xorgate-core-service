@@ -1010,6 +1010,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // masked by a longer budget. (Was 15 s, which the old unbounded
       // count(distinct ts) on /telemetry/readings blew through as a 500.)
       timeout: cdk.Duration.seconds(25),
+      // xorgate-webhooks P3: close-on-read emits telemetry_session.ended and
+      // enqueues it (client-sqs).
+      bundling: bundlingWithSdk,
     });
 
     // SNS topic for operational alarms (kvs-webrtc-lts §13 T3). Alarms that fire on a
@@ -1358,6 +1361,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
         // Partition-age acceptance window (services/telemetry-batch.ts).
         TELEMETRY_BATCH_MAX_AGE_DAYS: recCtx("telemetryBatchMaxAgeDays", "90"),
       },
+      // xorgate-webhooks P3: enqueues telemetry_session.started (client-sqs).
+      bundling: bundlingWithSdk,
       onFailure: new lambdaDestinations.SqsDestination(telemetryBatchFnDlq),
     });
     const telemetryBatchRuleDlq = new sqs.Queue(this, "TelemetryBatchIngestRuleDlq", {
@@ -1412,6 +1417,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // against a cold Aurora resume.
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
+      // xorgate-webhooks P3: enqueues media_session.started, and
+      // segment_uploaded triggers enqueue runs (client-sqs).
+      bundling: bundlingWithSdk,
       onFailure: new lambdaDestinations.SqsDestination(mediaSegmentFnDlq),
     });
     const mediaSegmentRuleDlq = new sqs.Queue(this, "MediaSegmentIngestRuleDlq", {

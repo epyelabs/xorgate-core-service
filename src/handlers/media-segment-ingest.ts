@@ -14,6 +14,8 @@ import {
 } from '../services/media-segments';
 import { recordingConfig } from '../config/recording';
 import { evaluateSegmentUploadedTriggers } from '../services/workflow-triggers';
+import { dispatchWebhookEvents } from '../services/webhooks/emit';
+import { emitMediaSessionStarted } from '../services/webhooks/sessions';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge.
 interface S3ObjectCreatedDetail {
@@ -154,11 +156,18 @@ export const handler = async (
   const sidecarRank = timeSourceRank(sidecar.data.timeSource);
   const upgradeTimeSource = recordingConfig.mediaTimeSourceUpgrade && sidecarRank >= 0;
 
+  let startedEventId: string | null = null;
   try {
-    await db.transaction(async (tx) => {
+    startedEventId = await db.transaction(async (tx) => {
       // Session row first (media_segments.session_id FK). Sequential statements
-      // only — RDS Data API forbids interleaving inside a transaction.
-      await tx.insert(schema.mediaSessions).values(session).onConflictDoNothing();
+      // only — RDS Data API forbids interleaving inside a transaction. A
+      // returned row means THIS delivery created the session (xorgate-webhooks
+      // P3: `media_session.started`).
+      const created = await tx
+        .insert(schema.mediaSessions)
+        .values(session)
+        .onConflictDoNothing()
+        .returning({ id: schema.mediaSessions.id });
       const inserted = await tx
         .insert(schema.mediaSegments)
         .values(segment)
@@ -185,6 +194,21 @@ export const handler = async (
             : {}),
         })
         .where(eq(schema.mediaSessions.id, sessionId));
+      // The outbox row commits with the session it announces (README D3); a
+      // duplicate delivery rolled back above, so it never gets here.
+      if (created.length === 0) return null;
+      return emitMediaSessionStarted(tx, {
+        sessionId,
+        deviceId,
+        streamKey,
+        startedAt: session.startedAt,
+        timeSource: session.timeSource ?? null,
+        codec: session.codec ?? null,
+        width: session.width ?? null,
+        height: session.height ?? null,
+        fps: session.fps ?? null,
+        firstSeq: seq,
+      });
     });
   } catch (err) {
     if (err instanceof AlreadyIngested) {
@@ -205,6 +229,9 @@ export const handler = async (
     sizeBytes: segment.sizeBytes,
     finalized: segment.finalized,
   });
+
+  // Never throws; with the `webhooks` flag off it only leaves the row for the log.
+  await dispatchWebhookEvents([startedEventId]);
 
   // Near-realtime media trigger (destroy-kvs-recorder Phase W, decision L):
   // fires only for attachments subscribed to `segment_uploaded` on this stream,

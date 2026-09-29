@@ -1,7 +1,9 @@
-import { and, eq, sql, type SQL } from 'drizzle-orm';
+import { and, sql, type SQL } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { recordingConfig } from '../config/recording';
 import { evaluateSessionCompletedTriggers } from './workflow-triggers';
+import { dispatchWebhookEvents, emitWebhookEvents } from './webhooks/emit';
+import { mediaCloseSql, mediaEndedEvents, type MediaClosedRow } from './webhooks/sessions';
 
 /**
  * Advisory close for device-recorded media sessions (offline recording plan,
@@ -20,23 +22,24 @@ import { evaluateSessionCompletedTriggers } from './workflow-triggers';
  */
 export async function closeStaleMediaSessions(deviceId?: string): Promise<number> {
   const staleSecs = Math.round(recordingConfig.mediaSessionCloseAfterMs / 1000);
-  const closed = await db
-    .update(schema.mediaSessions)
-    .set({ status: 'closed' })
-    .where(
-      and(
-        eq(schema.mediaSessions.status, 'open'),
-        deviceId ? eq(schema.mediaSessions.deviceId, deviceId) : undefined,
-        sql`coalesce(${schema.mediaSessions.lastSegmentAt}, ${schema.mediaSessions.createdAt}) < now() - make_interval(secs => ${sql.raw(String(staleSecs))})`,
-      ),
-    )
-    .returning({
-      id: schema.mediaSessions.id,
-      deviceId: schema.mediaSessions.deviceId,
-      streamKey: schema.mediaSessions.streamKey,
-      startedAt: schema.mediaSessions.startedAt,
-      endedAt: schema.mediaSessions.endedAt,
-    });
+  // xorgate-webhooks P3: the close and its `media_session.ended` outbox rows
+  // commit together (README D3), so a crash after the close cannot lose the
+  // event. The emit lives HERE, not in a caller: the sweeper and the
+  // close-on-read API routes both close through this function.
+  const { rows, eventIds } = await db.transaction(async (tx) => {
+    const res = await tx.execute<MediaClosedRow & Record<string, unknown>>(mediaCloseSql(staleSecs, deviceId));
+    const rows = (res?.rows ?? []) as MediaClosedRow[];
+    const eventIds = await emitWebhookEvents(tx, mediaEndedEvents(rows));
+    return { rows, eventIds };
+  });
+  await dispatchWebhookEvents(eventIds);
+  const closed = rows.map((r) => ({
+    id: r.id,
+    deviceId: r.device_id,
+    streamKey: r.stream_key,
+    startedAt: new Date(r.started_at),
+    endedAt: r.ended_at ? new Date(r.ended_at) : null,
+  }));
 
   // Phase 6.4: each open→closed transition fires `session_completed` workflow
   // triggers (at-least-once — a straggler-reopened session fires again on

@@ -146,7 +146,9 @@ export const WEBHOOK_EVENT_CATALOG: readonly WebhookEventTypeInfo[] = [
       durationMs: 2520000,
       maxSpeedKph: 104.2,
       insights: {},
-      overview: { apiPath: `/v1/devices/${DEVICE}/telemetry/sessions/${SESSION}` },
+      overview: {
+        apiPath: `/v1/devices/${DEVICE}/replay-manifest?from=2026-09-27T13%3A10%3A00.000Z&to=2026-09-27T13%3A52%3A00.000Z`,
+      },
     },
   },
   {

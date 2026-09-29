@@ -11,6 +11,8 @@ import {
   parseTelemetryObjectKey,
 } from '../services/telemetry-batch';
 import { ensureSegmentNormalized, indexSegment } from '../services/telemetry-sessions';
+import { dispatchWebhookEvents } from '../services/webhooks/emit';
+import { emitTelemetrySessionStarted } from '../services/webhooks/sessions';
 
 // Shape of the S3 "Object Created" event delivered via EventBridge (same as media-finalize).
 interface S3ObjectCreatedDetail {
@@ -147,8 +149,9 @@ export const handler = async (
     keyStartTsMs: parsedKey.startTsMs,
   };
 
+  let startedEventId: string | null = null;
   try {
-    await db.transaction(async (tx) => {
+    startedEventId = await db.transaction(async (tx) => {
       // Sequential batches — RDS Data API forbids interleaving inside a
       // transaction (no Promise.all here, per the driver's known limits).
       // A file with nothing insertable (every line outside the partition
@@ -158,7 +161,7 @@ export const handler = async (
           .insert(schema.telemetryReadings)
           .values(parsed.rows.slice(i, i + INSERT_BATCH_ROWS));
       }
-      await indexSegment(tx, indexInput);
+      const indexed = await indexSegment(tx, indexInput);
       const logged = await tx
         .insert(schema.telemetryIngestLog)
         .values({
@@ -171,6 +174,17 @@ export const handler = async (
         .onConflictDoNothing()
         .returning({ s3Key: schema.telemetryIngestLog.s3Key });
       if (logged.length === 0) throw new AlreadyIngested(key);
+      // xorgate-webhooks P3: this delivery created the session, so the outbox
+      // row commits with it (README D3). A duplicate delivery threw above and
+      // rolled the session back, so a re-ingest can never emit a second one.
+      if (!indexed.created) return null;
+      return emitTelemetrySessionStarted(tx, {
+        sessionId,
+        deviceId,
+        startedAt: indexed.startedAt,
+        rateHz: parsed.header?.rateHz ?? null,
+        timeSource: parsed.header?.timeSource ?? null,
+      });
     });
   } catch (err) {
     if (err instanceof AlreadyIngested) {
@@ -195,6 +209,9 @@ export const handler = async (
       lastTs: parsed.lastTs,
     });
   }
+
+  // Never throws; with the `webhooks` flag off it only leaves the row for the log.
+  await dispatchWebhookEvents([startedEventId]);
 
   // README Q14, AFTER the commit so the ingest-log row exists before the
   // re-fired Object Created event can arrive. Never throws; a failure leaves

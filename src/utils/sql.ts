@@ -46,3 +46,12 @@ export const uuidParam = (id: string): SQL => sql`${id}::uuid`;
  */
 export const textArrayParam = (values: readonly string[]): SQL =>
   sql`ARRAY[${sql.join(values.map((value) => sql`${value}`), sql`, `)}]::text[]`;
+
+/**
+ * A timestamptz rendered in SQL in the exact `Date#toISOString()` shape
+ * (`2026-09-28T20:00:00.123Z`). Webhook dedupe keys embed timestamps the
+ * claim statement returned; computing the string in SQL keeps it identical
+ * across statements and Lambdas, with no driver or TZ parsing in between.
+ */
+export const isoSql = (col: SQL): SQL =>
+  sql`to_char(${col} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;

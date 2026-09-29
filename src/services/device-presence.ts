@@ -1,5 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/index';
+import { isoSql } from '../utils/sql';
 import { dispatchWebhookEvents, emitWebhookEvent, type WebhookDb } from './webhooks/emit';
 
 /**
@@ -51,8 +52,7 @@ export interface PresenceEdge {
 }
 
 /** timestamptz -> the exact `toISOString()` shape, computed in SQL (no TZ games on the Data API). */
-const iso = (col: SQL): SQL =>
-  sql`to_char(${col} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+const iso = isoSql;
 
 const HEARTBEAT_THROTTLE = sql`interval '15 seconds'`;
 

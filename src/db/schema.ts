@@ -646,6 +646,10 @@ export const mediaSessions = pgTable(
     // close-detection clock (upload can lag recording by hours; never use
     // device timestamps to decide "no longer arriving").
     lastSegmentAt: timestamp('last_segment_at', { withTimezone: true }),
+    // When the advisory close last emitted `media_session.ended` (xorgate-webhooks
+    // P3, manual/030). Non-null at close time = a straggler reopened it: the
+    // event says `reopened: true`.
+    endedFiredAt: timestamp('ended_fired_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [index('media_sessions_device_stream_started_idx').on(t.deviceId, t.streamKey, t.startedAt)],

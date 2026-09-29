@@ -1,0 +1,15 @@
+-- Xorgate webhooks, Phase 3 (plans/xorgate-webhooks/phase-3-session-emitters.md
+-- §3.2): when a media session last fired `media_session.ended`.
+--
+-- The advisory close in services/media-sessions.ts sets it to now() in the
+-- same UPDATE that flips status open -> closed, and reads the previous value
+-- in that statement: non-null means the session had ended before and was
+-- reopened by a straggler segment, so the event carries `reopened: true`.
+-- (Telemetry sessions need no twin: `completed_fired_at` plays that role.)
+-- Nullable, no backfill: sessions closed before this column existed read as
+-- "never ended" once, which is the honest answer for the webhook log.
+--
+-- Additive and idempotent. Apply through the RDS Data API BEFORE deploying the
+-- Phase 3 code: `media_sessions` is selected whole by several routes, so an
+-- unmigrated database 500s there. One statement.
+ALTER TABLE media_sessions ADD COLUMN IF NOT EXISTS ended_fired_at timestamptz;
