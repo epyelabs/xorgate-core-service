@@ -160,6 +160,11 @@ export const modelJobMessageSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('version_build'), versionId: z.string().uuid() }),
   z.object({ kind: z.literal('train'), jobId: z.string().uuid() }),
   z.object({ kind: z.literal('autolabel'), jobId: z.string().uuid() }),
+  // Not a Models job: the device data purge (plans/device-wf-data-delete)
+  // rides this queue and dispatcher for their 15-minute budget and cursor
+  // pattern rather than adding a queue + Lambda to a stack near the 500-
+  // resource cap. The row (`device_purges`) is the authority, as always.
+  z.object({ kind: z.literal('device_purge'), purgeId: z.string().uuid() }),
 ]);
 export type ModelJobMessage = z.infer<typeof modelJobMessageSchema>;
 

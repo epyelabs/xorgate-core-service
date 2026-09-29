@@ -31,6 +31,7 @@ import {
 import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
 import { apiHandler } from '../utils/api-handler';
 import { deviceResponse, type DeviceRow } from '../services/device-view';
+import { handleDevicePurgeRoutes } from './device-purges';
 
 const VALID_STATUSES = ['provisioned', 'online', 'offline', 'decommissioned'] as const;
 
@@ -123,6 +124,12 @@ const restHandler = async (
   const method = event.requestContext.http.method;
   const routeKey = canonicalRouteKey(event); // e.g. "PATCH /devices/{id}/config"
   const id = event.pathParameters?.id;
+
+  // The purge sub-resource carries its own gates (the POST is organization-
+  // wide, like a transfer), so it is dispatched before the generic one below.
+  if (routeKey === 'POST /devices/{id}/purges' || routeKey.startsWith('GET /devices/{id}/purges')) {
+    return handleDevicePurgeRoutes(event, routeKey, id);
+  }
 
   let auth;
   try {

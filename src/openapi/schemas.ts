@@ -32,7 +32,8 @@ export function openApiSchemas(): Record<string, unknown> {
                 'Stable error code. The full set a client can see: `UNAUTHORIZED` (401), ' +
                 '`ORGANIZATION_REQUIRED` (400, multi-org caller sent no `X-Organization-Id`), ' +
                 '`BAD_REQUEST` (400), `FORBIDDEN` / `NO_ORGANIZATION` / `INSUFFICIENT_ROLE` (403), ' +
-                '`NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405), `CONFLICT` (409), ' +
+                '`NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405), `CONFLICT` / `PURGE_IN_PROGRESS` / ' +
+                '`TRANSFER_PENDING` (409), `PURGE_DISPATCH_FAILED` (502), ' +
                 '`SERVER_ERROR` (500, an unhandled failure; quote `requestId` when reporting it), ' +
                 '`CONFIG_PUBLISH_FAILED` / `COMMAND_PUBLISH_FAILED` / `DIST_MANIFEST_UNAVAILABLE` / ' +
                 '`DIST_MANIFEST_INVALID` (502).',
@@ -1518,6 +1519,145 @@ export function openApiSchemas(): Record<string, unknown> {
       },
     },
 
+    // ---- Device data purge (plans/device-wf-data-delete) --------------------
+    DevicePurgeScope: {
+      type: 'string',
+      enum: ['workflows', 'telemetry', 'media'],
+      description:
+        '`workflows`: attached workflows, their production runs and artifacts. `telemetry`: ' +
+        'recorded telemetry sessions and every stored reading. `media`: recorded video ' +
+        'sessions and thumbnails.',
+    },
+    DevicePurgeCreate: {
+      type: 'object',
+      required: ['scopes'],
+      properties: {
+        scopes: {
+          type: 'array',
+          minItems: 1,
+          items: { $ref: '#/components/schemas/DevicePurgeScope' },
+          description: 'Which kinds of data to remove. Duplicates are ignored.',
+        },
+      },
+    },
+    DevicePurgeCounts: {
+      type: 'object',
+      description:
+        'What the purge has removed so far. Every key is present once the job has started; ' +
+        'scopes that were not requested stay at 0.',
+      properties: {
+        attachments: { type: 'integer' },
+        runs: { type: 'integer' },
+        runObjects: { type: 'integer', description: 'S3 objects under the deleted runs.' },
+        telemetrySessions: { type: 'integer' },
+        telemetryObjects: { type: 'integer' },
+        ingestLogRows: { type: 'integer' },
+        readings: { type: 'integer', description: 'Stored telemetry rows.' },
+        mediaSessions: { type: 'integer' },
+        mediaObjects: { type: 'integer' },
+      },
+    },
+    DevicePurge: {
+      type: 'object',
+      required: [
+        'id',
+        'deviceId',
+        'workspaceId',
+        'organizationId',
+        'scopes',
+        'status',
+        'cutoff',
+        'counts',
+        'requestedBy',
+        'requestedAt',
+        'stalled',
+      ],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        deviceId: { type: 'string', format: 'uuid' },
+        workspaceId: { type: 'string', format: 'uuid' },
+        organizationId: { type: 'string', format: 'uuid' },
+        scopes: { type: 'array', items: { $ref: '#/components/schemas/DevicePurgeScope' } },
+        status: {
+          type: 'string',
+          enum: ['queued', 'running', 'succeeded', 'failed'],
+          description:
+            '`queued` until a worker picks it up, `running` while it walks its steps, then ' +
+            '`succeeded` or `failed` (see `error`). A failed purge may have removed part of ' +
+            'the data; `counts` says how much, and a new purge picks up the rest.',
+        },
+        cutoff: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Data older than this is removed; uploads after it are kept.',
+        },
+        cursor: {
+          type: 'object',
+          nullable: true,
+          description:
+            'Where the job is. `step` is one of `workflows.attachments`, `workflows.stop`, ' +
+            '`workflows.runs`, `telemetry.s3`, `telemetry.sessions`, `telemetry.ingestLog`, ' +
+            '`telemetry.readings`, `media.s3`, `media.sessions`, `done`; the other keys are ' +
+            'the step\'s own position and are not a stable contract.',
+          properties: { step: { type: 'string' } },
+          additionalProperties: true,
+        },
+        counts: { $ref: '#/components/schemas/DevicePurgeCounts' },
+        error: { type: 'string', nullable: true },
+        requestedBy: {
+          type: 'string',
+          description: 'User id or API key id of the principal that asked.',
+        },
+        requestedAt: { type: 'string', format: 'date-time' },
+        startedAt: { type: 'string', format: 'date-time', nullable: true },
+        finishedAt: { type: 'string', format: 'date-time', nullable: true },
+        leaseUntil: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description: 'Worker lease. Operational detail; clients read `status` and `stalled`.',
+        },
+        stalled: {
+          type: 'boolean',
+          description:
+            'True when the purge is `running` but no worker has renewed its lease for over 30 ' +
+            'minutes: the job died mid-way. A new `POST` closes it and starts over.',
+        },
+      },
+    },
+    DevicePurgePreview: {
+      type: 'object',
+      required: ['workflows', 'telemetry', 'media'],
+      properties: {
+        workflows: {
+          type: 'object',
+          required: ['attachments', 'runs'],
+          properties: {
+            attachments: { type: 'integer', description: 'Workflows attached to the device.' },
+            runs: { type: 'integer', description: 'Production runs the purge would delete.' },
+          },
+        },
+        telemetry: {
+          type: 'object',
+          required: ['sessions', 'readingsFrom', 'readingsTo'],
+          properties: {
+            sessions: { type: 'integer', description: 'Recorded telemetry sessions.' },
+            readingsFrom: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'Oldest stored reading, or null when there are none.',
+            },
+            readingsTo: { type: 'string', format: 'date-time', nullable: true },
+          },
+        },
+        media: {
+          type: 'object',
+          required: ['sessions'],
+          properties: { sessions: { type: 'integer', description: 'Recorded video sessions.' } },
+        },
+      },
+    },
     // ---- Device transfer ---------------------------------------------------
 
     TransferTenancy: {

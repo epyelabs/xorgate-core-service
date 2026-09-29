@@ -2176,7 +2176,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const modelJobDispatchFn = new nodejs.NodejsFunction(this, "ModelJobDispatchFn", {
       ...standardFnProps(
         path.join(entryBase, "model-job-dispatch.ts"),
-        "SQS -> claim + run Models jobs (import | version_build)",
+        "SQS -> claim + run Models jobs (import | version_build | train | autolabel) and device purges",
       ),
       timeout: cdk.Duration.minutes(15),
       memorySize: 1536,
@@ -2193,6 +2193,8 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     modelJobDispatchFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
     datasetsFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
+    // `POST /devices/{id}/purges` hands the device data purge to the same queue.
+    devicesFn.addEnvironment("MODEL_JOB_QUEUE_URL", modelJobQueue.queueUrl);
 
     // --- Models M3: training and assist jobs on SageMaker ---------------------
     // The forge image lives in a repo of this account, retagged out of band
@@ -2870,6 +2872,29 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/devices/{id}/transfer/preview",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceTransferInt,
+    });
+    // Device data purge (plans/device-wf-data-delete): wipe attached workflows
+    // and their runs, recorded telemetry and recorded media, keeping the device.
+    // Served by the devices Lambda with its own gates (owner|admin; the POST
+    // refuses workspace-scoped tokens like a transfer). The POST records a
+    // `device_purges` row and hands the work to the ModelJobQueue worker;
+    // `preview` is the read the confirmation dialog shows counts from. The
+    // static `/preview` segment is matched ahead of `/{purgeId}` by the HTTP
+    // API's most-specific-route rule.
+    addRoutes({
+      path: "/devices/{id}/purges",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: devicesInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/purges/preview",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: devicesInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/purges/{purgeId}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: devicesInt,
     });
     // Cross-organization handover. The device-scoped route mints a code; the
     // `/transfer-offers/{code}` routes are reached by an organization that has

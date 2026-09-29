@@ -3,6 +3,7 @@ import { modelJobMessageSchema } from '../models/schemas';
 import { runRecordingImport } from '../services/dataset-import';
 import { buildDatasetVersion } from '../services/dataset-version-build';
 import { dispatchTrainingJob } from '../services/training-dispatch';
+import { runDevicePurge } from '../services/device-purge';
 
 /**
  * `ModelJobQueue` consumer (xorgate-models design §4d). SQS event source,
@@ -16,6 +17,12 @@ import { dispatchTrainingJob } from '../services/training-dispatch';
  * The import needs the ffmpeg layer (FFMPEG_PATH) and the function's full
  * 15-minute budget; it chunks across invocations through the queue when a
  * session is longer than one invocation can walk.
+ *
+ * `device_purge` (plans/device-wf-data-delete) is not a Models job at all; it
+ * rides here for the same budget and the same cursor discipline, claiming its
+ * `device_purges` row through a lease and re-enqueueing itself when time runs
+ * low. `ApproximateReceiveCount` tells it when SQS is about to give up, so it
+ * can mark the row failed instead of leaving a purge that spins forever.
  */
 export const handler = async (event: SQSEvent, context: Context): Promise<SQSBatchResponse> => {
   const bucket = process.env.BUCKET_NAME;
@@ -51,6 +58,15 @@ export const handler = async (event: SQSEvent, context: Context): Promise<SQSBat
         case 'train':
         case 'autolabel':
           await dispatchTrainingJob(bucket, message.jobId, log);
+          break;
+        case 'device_purge':
+          await runDevicePurge({
+            bucket,
+            purgeId: message.purgeId,
+            remainingMs: () => context.getRemainingTimeInMillis(),
+            receiveCount: Number(record.attributes?.ApproximateReceiveCount ?? '1'),
+            log,
+          });
           break;
       }
     } catch (err) {

@@ -607,6 +607,170 @@ export const devicesPaths = {
       },
     },
   },
+  '/devices/{id}/purges': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'listDevicePurges',
+      summary: 'List purges of a device (owner/admin only)',
+      description:
+        'The purge history of a device, newest first: the audit record of who wiped what and ' +
+        'when, and the way a client finds a purge that is still running. At most 20.',
+      parameters: [
+        {
+          name: 'limit',
+          in: 'query',
+          required: false,
+          schema: { type: 'integer', minimum: 1, maximum: 20, default: 10 },
+        },
+      ],
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'Purges, newest first.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['purges'],
+                properties: {
+                  purges: { type: 'array', items: { $ref: '#/components/schemas/DevicePurge' } },
+                },
+              },
+            },
+          },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+    post: {
+      operationId: 'createDevicePurge',
+      summary: 'Purge a device\'s data (owner/admin only)',
+      description:
+        'Deletes the history a device has accumulated while keeping the device itself: its row, ' +
+        'identity and certificate, live video channels, settings, webhook routes and the ' +
+        'latest-value cache all stay, and the agent keeps running. What goes is chosen per ' +
+        '`scope`:\n\n' +
+        '- `workflows`: every workflow attached to the device is detached, and every production ' +
+        'run those attachments produced (and the runs of workflows detached earlier) is deleted ' +
+        'with its steps, events and S3 artifacts. Runs still executing are stopped. The ' +
+        'organization\'s workflow templates and their simulation runs are untouched.\n' +
+        '- `telemetry`: recorded telemetry sessions, their segments, overview artifacts, ' +
+        'ingest log and every stored reading.\n' +
+        '- `media`: recorded video sessions, their segments and thumbnails.\n\n' +
+        'Everything older than the moment of the request (`cutoff`) is removed; what the ' +
+        'device uploads afterwards stays. A recording in progress is cut at that point. The ' +
+        'work runs asynchronously: this returns `202` with the purge row, and `GET ' +
+        '/devices/{id}/purges/{purgeId}` reports progress until `status` is `succeeded` or ' +
+        '`failed`. One purge per device at a time. There is no undo.\n\n' +
+        'Organization-wide: a workspace-scoped session token is refused (`WORKSPACE_SCOPED`).',
+      tags: ['Devices'],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/DevicePurgeCreate' },
+            example: { scopes: ['workflows', 'telemetry', 'media'] },
+          },
+        },
+      },
+      responses: {
+        '202': {
+          description: 'Purge queued. Poll `GET /devices/{id}/purges/{purgeId}` for the outcome.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['purge'],
+                properties: { purge: { $ref: '#/components/schemas/DevicePurge' } },
+              },
+            },
+          },
+        },
+        '400': { $ref: '#/components/responses/BadRequest' },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            'A purge of this device is already queued or running (`PURGE_IN_PROGRESS`; ' +
+            '`details.purgeId` names it), or a cross-organization transfer offer for the device ' +
+            'is pending (`TRANSFER_PENDING`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '502': {
+          description:
+            'The purge was recorded but could not be queued (`PURGE_DISPATCH_FAILED`). Nothing ' +
+            'was deleted; the row is marked `failed`. Safe to retry.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+      },
+    },
+  },
+  '/devices/{id}/purges/preview': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'previewDevicePurge',
+      summary: 'What a purge would remove, without removing it',
+      description:
+        'Counts per scope for the confirmation step of `POST /devices/{id}/purges`. Writes ' +
+        'nothing. Stored readings are reported as a time span rather than a count: counting ' +
+        'them is the expensive part of the purge itself.',
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'What a purge of each scope would remove, as of now.',
+          content: {
+            'application/json': { schema: { $ref: '#/components/schemas/DevicePurgePreview' } },
+          },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
+  '/devices/{id}/purges/{purgeId}': {
+    parameters: [
+      ...deviceIdParams,
+      {
+        name: 'purgeId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string', format: 'uuid' },
+      },
+    ],
+    get: {
+      operationId: 'getDevicePurge',
+      summary: 'Get a purge (owner/admin only)',
+      description:
+        'One purge: its status, what it has removed so far (`counts`) and where it is ' +
+        '(`cursor.step`). Poll every few seconds while `status` is `queued` or `running`.',
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'The purge.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['purge'],
+                properties: { purge: { $ref: '#/components/schemas/DevicePurge' } },
+              },
+            },
+          },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
   '/devices/{id}/reboot': {
     parameters: deviceIdParams,
     post: {

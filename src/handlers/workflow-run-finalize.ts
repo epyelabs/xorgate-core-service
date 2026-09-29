@@ -4,6 +4,7 @@ import { and, eq } from 'drizzle-orm';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
+import { drainPrefix } from '../services/s3-drain';
 import { updateAttachmentStatusIfLatest } from '../services/workflow-triggers';
 import { v2EventRows, v2RunUpdate, v2StepRows } from '../workflows/host/finalize';
 import { platformResultSchema } from '../workflows/host/result';
@@ -88,7 +89,7 @@ export const handler = async (
     return; // nothing actionable
   }
   if ((raw as { resultVersion?: unknown })?.resultVersion === 2) {
-    return finalizeV2(raw, key);
+    return finalizeV2(raw, key, bucket);
   }
 
   // --- v1 (cv-runner) path, unchanged ---
@@ -105,6 +106,7 @@ export const handler = async (
   });
   if (!run) {
     console.warn('workflow-run-finalize: run not found', { runId: parsed.runId, key });
+    await drainOrphanedRun(bucket, key);
     return;
   }
   if (run.status !== 'running') {
@@ -175,7 +177,7 @@ export const handler = async (
 // workflows/host/finalize.ts so the smoke script can unit-test it.
 // Deploy note: needs migrations 0013 (engine_version) and 0014 (artifacts)
 // applied before any v2 producer is enabled.
-async function finalizeV2(raw: unknown, key: string): Promise<void> {
+async function finalizeV2(raw: unknown, key: string, bucket: string): Promise<void> {
   let result;
   try {
     result = platformResultSchema.parse(raw);
@@ -189,6 +191,7 @@ async function finalizeV2(raw: unknown, key: string): Promise<void> {
   });
   if (!run) {
     console.warn('workflow-run-finalize: v2 run not found', { runId: result.runId, key });
+    await drainOrphanedRun(bucket, key);
     return;
   }
   if (run.status !== 'running') {
@@ -283,4 +286,21 @@ async function finalizeV2(raw: unknown, key: string): Promise<void> {
     outputs: Object.keys(result.artifacts.outputs).length,
     videos: Object.keys(result.artifacts.videos ?? {}).length,
   });
+}
+
+/**
+ * A result.json whose run row is gone (the device, the template or a purge
+ * took it) would otherwise leave the whole run prefix behind forever: nothing
+ * under `workflows/v2/runs/` or `workflows/v1/` has a lifecycle rule. The key
+ * names the run directory, so sweep it. Best-effort, like the finalize itself.
+ */
+async function drainOrphanedRun(bucket: string, key: string): Promise<void> {
+  if (!key.startsWith('workflows/v2/runs/') && !key.startsWith('workflows/v1/')) return;
+  const prefix = key.slice(0, key.lastIndexOf('/') + 1);
+  try {
+    const out = await drainPrefix(bucket, prefix);
+    console.log('workflow-run-finalize: drained orphaned run prefix', { prefix, deleted: out.deleted });
+  } catch (err) {
+    console.warn('workflow-run-finalize: orphan drain failed', { prefix, err });
+  }
 }

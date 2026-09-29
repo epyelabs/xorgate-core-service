@@ -1260,6 +1260,45 @@ export const deletedDevices = pgTable('deleted_devices', {
   deletedAt: timestamp('deleted_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
+// --- Device data purge (plans/device-wf-data-delete, drizzle/manual/031) ---
+//
+// One row per purge request: the audit record and the resumable job state. The
+// queue worker (services/device-purge.ts) claims a row by taking `lease_until`,
+// persists `cursor` + `counts` after every chunk and re-enqueues itself when the
+// Lambda budget runs low, so a duplicate SQS delivery resumes from the row
+// rather than starting over. `status`: queued | running | succeeded | failed.
+//
+// `device_id` cascades on purpose (a deleted device's tombstone is its record);
+// the tenancy ids carry no FK, exactly as `deleted_devices`.
+export const devicePurges = pgTable(
+  'device_purges',
+  {
+    // uuidv7 minted in app code (utils/uuidv7.ts): sorts by request time.
+    id: uuid('id').primaryKey(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    organizationId: uuid('organization_id').notNull(),
+    // Subset of 'workflows' | 'telemetry' | 'media' (services/device-purge-rules.ts).
+    scopes: text('scopes').array().notNull(),
+    status: text('status').default('queued').notNull(),
+    // Everything older than this goes; what the device uploads after it stays.
+    cutoff: timestamp('cutoff', { withTimezone: true }).notNull(),
+    cursor: jsonb('cursor'),
+    counts: jsonb('counts').default({}).notNull(),
+    error: text('error'),
+    /** User id or API key id, whichever principal asked (like deleted_devices.deleted_by). */
+    requestedBy: text('requested_by').notNull(),
+    requestedAt: timestamp('requested_at', { withTimezone: true }).defaultNow().notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+    // Worker lease: a row whose lease is in the past is claimable again.
+    leaseUntil: timestamp('lease_until', { withTimezone: true }),
+  },
+  (t) => [index('device_purges_device_requested_idx').on(t.deviceId, t.requestedAt)],
+);
+
 // --- Device transfer (plans/transfer-device-ownership) ---
 
 // The audit trail for a tenancy change, and the state machine that makes one

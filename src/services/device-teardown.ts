@@ -1,9 +1,4 @@
 import {
-  DeleteObjectsCommand,
-  ListObjectsV2Command,
-  S3Client,
-} from '@aws-sdk/client-s3';
-import {
   DeleteSignalingChannelCommand,
   KinesisVideoClient,
   ResourceNotFoundException,
@@ -12,6 +7,7 @@ import { inArray } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { deleteThing } from './iot-provisioning';
 import { deviceStoragePrefixes } from './destroy-rules';
+import { drainPrefix } from './s3-drain';
 
 /**
  * Everything a device owns OUTSIDE the rows that cascade off `devices`: its
@@ -38,7 +34,6 @@ import { deviceStoragePrefixes } from './destroy-rules';
  * records `s3Drained: false` so the state is visible.
  */
 
-const s3 = new S3Client({});
 const kvs = new KinesisVideoClient({});
 const BUCKET = process.env.BUCKET_NAME;
 
@@ -61,30 +56,6 @@ export interface TeardownSummary {
   s3Pending: number;
   /** Human-readable, already logged; returned so callers can decide to surface them. */
   errors: string[];
-}
-
-/** Drain one prefix within the page budget. Returns true when nothing is left. */
-async function drainPrefix(prefix: string, budget: { pages: number }): Promise<boolean> {
-  if (!BUCKET) return true;
-  let token: string | undefined;
-  while (budget.pages > 0) {
-    budget.pages -= 1;
-    const page = await s3.send(
-      new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix, ContinuationToken: token }),
-    );
-    const keys = (page.Contents ?? []).flatMap((o) => (o.Key ? [o.Key] : []));
-    if (keys.length) {
-      await s3.send(
-        new DeleteObjectsCommand({
-          Bucket: BUCKET,
-          Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true },
-        }),
-      );
-    }
-    if (!page.IsTruncated) return true;
-    token = page.NextContinuationToken;
-  }
-  return false;
 }
 
 async function deleteChannel(channelArn: string): Promise<void> {
@@ -155,8 +126,9 @@ export async function teardownDevices(
     const budget = { pages: S3_PAGE_BUDGET_PER_DEVICE };
     let complete = true;
     for (const prefix of deviceStoragePrefixes(device.id)) {
+      if (!BUCKET) break;
       try {
-        if (!(await drainPrefix(prefix, budget))) complete = false;
+        if (!(await drainPrefix(BUCKET, prefix, { budget })).complete) complete = false;
       } catch (err) {
         complete = false;
         fail(`S3 prefix ${prefix}`, err);
