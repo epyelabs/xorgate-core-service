@@ -170,7 +170,9 @@ export const webhooksPaths = {
       description:
         'Any of `name`, `url`, `description`, `enabled`. Disabling records `disabledAt` and ' +
         '`disabledReason: "manual"`; re-enabling clears them and resets `consecutiveFailures`. ' +
-        'An endpoint that answered `410 Gone` is disabled automatically (`disabledReason: "gone"`).',
+        'An endpoint that answered `410 Gone` is disabled automatically (`disabledReason: "gone"`), and so is ' +
+        'one with 5 exhausted deliveries in a row whose oldest exhaustion is at least 24 h old ' +
+        '(`disabledReason: "failing"`; the org owners are emailed).',
       tags: ['Webhooks'],
       requestBody: {
         required: true,
@@ -442,7 +444,12 @@ export const webhookSchemas: Record<string, unknown> = {
       secretVersion: { type: 'integer', description: 'Bumped by each rotation.' },
       enabled: { type: 'boolean' },
       disabledAt: { type: 'string', format: 'date-time', nullable: true },
-      disabledReason: { type: 'string', nullable: true, example: 'manual' },
+      disabledReason: {
+        type: 'string',
+        nullable: true,
+        example: 'manual',
+        description: '`manual` (PATCH), `gone` (the endpoint answered 410) or `failing` (auto-disabled after repeated exhausted deliveries).',
+      },
       consecutiveFailures: { type: 'integer', description: 'Exhausted deliveries in a row.' },
       lastDeliveryAt: { type: 'string', format: 'date-time', nullable: true },
       lastSuccessAt: { type: 'string', format: 'date-time', nullable: true },

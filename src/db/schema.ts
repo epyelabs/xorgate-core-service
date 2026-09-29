@@ -1419,7 +1419,7 @@ export const webhookEndpoints = pgTable(
     secretVersion: integer('secret_version').default(1).notNull(),
     enabled: boolean('enabled').default(true).notNull(),
     disabledAt: timestamp('disabled_at', { withTimezone: true }),
-    disabledReason: text('disabled_reason'), // manual | gone | (P5) failing
+    disabledReason: text('disabled_reason'), // manual | gone | failing (auto-disable, deliver.ts)
     consecutiveFailures: integer('consecutive_failures').default(0).notNull(),
     lastDeliveryAt: timestamp('last_delivery_at', { withTimezone: true }),
     lastSuccessAt: timestamp('last_success_at', { withTimezone: true }),

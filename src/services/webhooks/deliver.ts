@@ -1,6 +1,8 @@
 import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import { and, asc, eq, isNull, sql } from 'drizzle-orm';
 import { db, schema } from '../../db/index';
+import { webhookEndpointDisabledEmail } from '../../email/templates';
+import { brandContext, sendEmail } from '../email';
 import { tsParam } from '../../utils/sql';
 import { PING_TYPE, WEBHOOK_API_VERSION } from './catalog';
 import { dispatchWebhookEvents, webhookSqs, webhooksDispatchEnabled, type WebhookDb } from './emit';
@@ -176,6 +178,37 @@ export interface DeliverDeps {
   fetch?: typeof fetch;
   now?: () => number;
   secrets?: typeof signingSecrets;
+  notify?: typeof notifyEndpointDisabled;
+}
+
+/**
+ * The one structured line per delivery attempt. With the deliver Lambda's JSON
+ * log format it lands as `{"message": {...}}`; the stack's metric filters
+ * select `$.message.msg = "webhooks"` and read `outcome` and `ms`, so these
+ * field names are a contract with lib/stacks/api-stack.ts.
+ */
+export const DELIVERY_LOG_MSG = 'webhooks';
+
+export function deliveryLogLine(p: {
+  deliveryId: string;
+  eventId: string;
+  organizationId: string;
+  endpointId: string;
+  type: string;
+  attempt: number;
+  httpStatus: number | null;
+  ms: number;
+  outcome: AttemptOutcome;
+  error: string | null;
+}): Record<string, unknown> {
+  const { outcome, error, ...rest } = p;
+  return {
+    msg: DELIVERY_LOG_MSG,
+    ...rest,
+    outcome: outcome.status,
+    ...(outcome.status === 'retry' ? { retryInSeconds: outcome.delaySeconds } : {}),
+    ...(error ? { error } : {}),
+  };
 }
 
 export type DeliverResult =
@@ -288,6 +321,14 @@ export async function deliverOnce(msg: DeliveryMessage, deps: DeliverDeps = {}):
       .update(ep)
       .set({ lastDeliveryAt: at, consecutiveFailures: sql`${ep.consecutiveFailures} + 1`, updatedAt: at })
       .where(eq(ep.id, endpoint.id));
+    // The delivery row is already final, so a throw here would only send SQS
+    // round a message that is then skipped; log it and let the next
+    // exhaustion try again.
+    try {
+      await autoDisableIfFailing(endpoint.id, { db: dbx, notify: deps.notify });
+    } catch (err) {
+      console.error('webhooks: auto-disable check failed', { endpointId: endpoint.id, err });
+    }
   } else if (outcome.status === 'failed' && outcome.disableEndpoint) {
     await dbx
       .update(ep)
@@ -300,19 +341,142 @@ export async function deliverOnce(msg: DeliveryMessage, deps: DeliverDeps = {}):
   if (outcome.status === 'retry' && outcome.delaySeconds <= MAX_QUEUE_DELAY_SECONDS) {
     await enqueueDelivery({ deliveryId: delivery.id, attempt }, outcome.delaySeconds);
   }
-  console.log('webhooks: delivery attempt', {
-    deliveryId: delivery.id,
-    eventId: event.id,
-    endpointId: endpoint.id,
-    type: event.type,
-    attempt,
-    httpStatus,
-    ms,
-    outcome: outcome.status,
-    ...(outcome.status === 'retry' ? { retryInSeconds: outcome.delaySeconds } : {}),
-    ...(error ? { error } : {}),
-  });
+  console.log(
+    deliveryLogLine({
+      deliveryId: delivery.id,
+      eventId: event.id,
+      organizationId: endpoint.organizationId,
+      endpointId: endpoint.id,
+      type: event.type,
+      attempt,
+      httpStatus,
+      ms,
+      outcome,
+      error,
+    }),
+  );
   return { status: outcome.status, attempt, httpStatus, ms };
+}
+
+// ---------------------------------------------------------------------------
+// Auto-disable (README D4, Q7; Phase 5)
+
+/** Exhausted deliveries in a row (the endpoint's consecutive_failures) that can disable it. */
+export const AUTO_DISABLE_AFTER = 5;
+/** ...and only once the oldest of those exhaustions is at least this old. */
+export const AUTO_DISABLE_MIN_SPAN_SECONDS = 24 * 60 * 60;
+export const AUTO_DISABLE_REASON = 'failing';
+
+/**
+ * The threshold, as a pure function (the SQL in autoDisableIfFailing is the
+ * same rule). `oldestExhaustedAt` is when the oldest of the last
+ * AUTO_DISABLE_AFTER exhausted deliveries was exhausted. Measuring the span
+ * from the exhaustion times, not the deliveries' creation, is what makes the
+ * 24 h mean something: every exhausted delivery was created about two days
+ * before it gave up, so a burst of events during one outage exhausts together
+ * and must not disable the endpoint on its own. It takes failures that keep
+ * going for another day.
+ */
+export function shouldAutoDisable(
+  consecutiveFailures: number,
+  oldestExhaustedAt: Date | null,
+  now: Date,
+): boolean {
+  if (consecutiveFailures < AUTO_DISABLE_AFTER || !oldestExhaustedAt) return false;
+  return now.getTime() - oldestExhaustedAt.getTime() >= AUTO_DISABLE_MIN_SPAN_SECONDS * 1000;
+}
+
+export interface DisabledEndpoint {
+  id: string;
+  name: string;
+  url: string;
+  organizationId: string;
+  consecutiveFailures: number;
+}
+
+/**
+ * Disable the endpoint if it has failed enough, and tell the org's owners.
+ * One conditional UPDATE is the claim (`enabled` in the WHERE), so concurrent
+ * exhaustions disable it and send the email once. Called after each
+ * exhaustion; returns the endpoint when this call disabled it.
+ */
+export async function autoDisableIfFailing(
+  endpointId: string,
+  opts: { db?: WebhookDb; notify?: typeof notifyEndpointDisabled } = {},
+): Promise<DisabledEndpoint | null> {
+  const dbx = opts.db ?? db;
+  const res = await dbx.execute<{
+    id: string;
+    name: string;
+    url: string;
+    organization_id: string;
+    consecutive_failures: number;
+  }>(sql`
+    update webhook_endpoints e
+    set enabled = false, disabled_at = now(), disabled_reason = ${AUTO_DISABLE_REASON}, updated_at = now()
+    where e.id = ${endpointId}::uuid
+      and e.enabled
+      and e.consecutive_failures >= ${sql.raw(String(AUTO_DISABLE_AFTER))}
+      and (
+        select min(x.updated_at) from (
+          select d.updated_at from webhook_deliveries d
+          where d.endpoint_id = e.id and d.status = 'exhausted'
+          order by d.updated_at desc
+          limit ${sql.raw(String(AUTO_DISABLE_AFTER))}
+        ) x
+      ) <= now() - make_interval(secs => ${sql.raw(String(AUTO_DISABLE_MIN_SPAN_SECONDS))})
+    returning e.id, e.name, e.url, e.organization_id, e.consecutive_failures
+  `);
+  const row = res.rows[0];
+  if (!row) return null;
+  const disabled: DisabledEndpoint = {
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    organizationId: row.organization_id,
+    consecutiveFailures: Number(row.consecutive_failures),
+  };
+  console.warn({ msg: 'webhooks: endpoint auto-disabled', reason: AUTO_DISABLE_REASON, ...disabled });
+  try {
+    await (opts.notify ?? notifyEndpointDisabled)(disabled, dbx);
+  } catch (err) {
+    console.error('webhooks: auto-disable email failed', { endpointId, err });
+  }
+  return disabled;
+}
+
+/** Best-effort: one email per org owner (services/email.ts swallows SES failures). */
+export async function notifyEndpointDisabled(
+  endpoint: DisabledEndpoint,
+  dbx: WebhookDb = db,
+): Promise<{ sent: number; owners: number }> {
+  const [org] = await dbx
+    .select({ name: schema.organizations.name })
+    .from(schema.organizations)
+    .where(eq(schema.organizations.id, endpoint.organizationId));
+  const owners = await dbx
+    .select({ email: schema.users.email, name: schema.users.name })
+    .from(schema.memberships)
+    .innerJoin(schema.users, eq(schema.users.id, schema.memberships.userId))
+    .where(and(eq(schema.memberships.organizationId, endpoint.organizationId), eq(schema.memberships.role, 'owner')));
+  let sent = 0;
+  for (const owner of owners) {
+    const ok = await sendEmail(
+      owner.email,
+      webhookEndpointDisabledEmail(brandContext(), {
+        email: owner.email,
+        name: owner.name ?? null,
+        organizationName: org?.name ?? 'your organization',
+        endpointName: endpoint.name,
+        endpointUrl: endpoint.url,
+        endpointPath: `/webhooks/${endpoint.id}`,
+        consecutiveFailures: endpoint.consecutiveFailures,
+      }),
+    );
+    if (ok) sent += 1;
+  }
+  console.log({ msg: 'webhooks: auto-disable email', endpointId: endpoint.id, owners: owners.length, sent });
+  return { sent, owners: owners.length };
 }
 
 // ---------------------------------------------------------------------------

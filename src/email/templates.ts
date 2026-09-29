@@ -376,3 +376,50 @@ export function attributeVerificationEmail(
     ]),
   };
 }
+
+/**
+ * A webhook endpoint was switched off by the delivery subsystem because it
+ * kept failing (services/webhooks/deliver.ts autoDisableIfFailing). Sent to
+ * the org's owners; the endpoint page has the delivery log and the enable
+ * switch, and enabling it clears the failure count.
+ */
+export function webhookEndpointDisabledEmail(
+  ctx: BrandContext,
+  p: {
+    email: string;
+    name?: string | null;
+    organizationName: string;
+    endpointName: string;
+    endpointUrl: string;
+    endpointPath: string;
+    consecutiveFailures: number;
+  },
+): RenderedEmail {
+  const subject = `Webhook endpoint ${p.endpointName} disabled`;
+  const href = `${ctx.appUrl}${p.endpointPath}`;
+  const why =
+    `${p.consecutiveFailures} deliveries in a row used up every retry (8 attempts over about two days each), ` +
+    'so xorgate stopped sending to it. Events that happen while it is disabled are not queued for it.';
+  return {
+    subject,
+    html: layout({
+      ...ctx,
+      preheader: `${p.endpointName} in ${p.organizationName} kept failing and was disabled.`,
+      title: subject,
+      paragraphs: [
+        greeting(p.name),
+        `The webhook endpoint <strong>${escapeHtml(p.endpointName)}</strong> in <strong>${escapeHtml(p.organizationName)}</strong> (<span style="font-family:${MONO};">${escapeHtml(p.endpointUrl)}</span>) was disabled.`,
+        escapeHtml(why),
+        'Check the delivery log for the responses it returned, fix the receiver, then enable the endpoint again. Failed deliveries can be redelivered from the log.',
+      ],
+      button: { label: 'Open the endpoint', href },
+      recipient: p.email,
+    }),
+    text: textVersion([
+      subject,
+      `The webhook endpoint ${p.endpointName} in ${p.organizationName} (${p.endpointUrl}) was disabled.`,
+      why,
+      `Check the delivery log, fix the receiver, then enable the endpoint again: ${href}`,
+    ]),
+  };
+}

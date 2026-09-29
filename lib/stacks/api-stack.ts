@@ -1145,7 +1145,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     overviewBuildFailureAlarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
-    new cloudwatch.Dashboard(this, "TelemetryArtifactsDashboard", {
+    // Also carries the webhooks row (added below, next to the webhook Lambdas):
+    // one dashboard for the plane's ops metrics, no extra CFN resource.
+    const opsDashboard = new cloudwatch.Dashboard(this, "TelemetryArtifactsDashboard", {
       dashboardName: `xorgate-telemetry-artifacts-${props.stage}`,
       widgets: [
         [
@@ -1965,6 +1967,9 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       bundling: bundlingWithSdk,
+      // JSON so the per-attempt `{msg: "webhooks", …}` line is selectable as
+      // $.message.* by the metric filters below (deliver.ts deliveryLogLine).
+      loggingFormat: lambda.LoggingFormat.JSON,
     });
     webhookDeliverFn.addEventSource(
       new lambdaEventSources.SqsEventSource(webhookDeliveryQueue, {
@@ -1986,6 +1991,83 @@ export class XorgateCoreApiStack extends cdk.Stack {
       });
       alarm.addAlarmAction(new cwActions.SnsAction(alarmTopic));
     }
+    // Delivery metrics (Phase 5) from the one JSON line per attempt
+    // (services/webhooks/deliver.ts DELIVERY_LOG_MSG + deliveryLogLine). Same
+    // by-name log group reference as the overview-build filters above: the
+    // group must exist before the filters deploy, i.e. the function has been
+    // invoked once on the stage. `outcome` is delivered | retry | failed |
+    // exhausted; a 0-result delivery (skipped) logs no such line.
+    const webhookDeliverLogGroup = logs.LogGroup.fromLogGroupName(
+      this,
+      "WebhookDeliverLogGroup",
+      `/aws/lambda/${webhookDeliverFn.functionName}`,
+    );
+    const webhookMetricsNamespace = "Xorgate/Webhooks";
+    const deliveryPattern = logs.FilterPattern.stringValue("$.message.msg", "=", "webhooks");
+    const webhookAttempts = new logs.MetricFilter(this, "WebhookDeliveryAttemptsFilter", {
+      logGroup: webhookDeliverLogGroup,
+      metricNamespace: webhookMetricsNamespace,
+      metricName: "DeliveryAttempts",
+      filterPattern: deliveryPattern,
+      metricValue: "1",
+      dimensions: { outcome: "$.message.outcome" },
+    });
+    const webhookAttemptMs = new logs.MetricFilter(this, "WebhookDeliveryMsFilter", {
+      logGroup: webhookDeliverLogGroup,
+      metricNamespace: webhookMetricsNamespace,
+      metricName: "DeliveryMs",
+      filterPattern: deliveryPattern,
+      metricValue: "$.message.ms",
+    });
+    const perMinute = { statistic: "Sum", period: cdk.Duration.minutes(1) };
+    opsDashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Webhook delivery attempts / min",
+        width: 6,
+        left: (
+          [
+            ["delivered", "#2ca02c"],
+            ["retry", "#ff7f0e"],
+            ["failed", "#9467bd"],
+            ["exhausted", "#d13212"],
+          ] as const
+        ).map(([outcome, color]) =>
+          webhookAttempts.metric({ ...perMinute, dimensionsMap: { outcome }, label: outcome, color }),
+        ),
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Webhook POST time (ms)",
+        width: 6,
+        left: [
+          webhookAttemptMs.metric({ statistic: "p50", period: cdk.Duration.minutes(5), label: "p50" }),
+          webhookAttemptMs.metric({ statistic: "p99", period: cdk.Duration.minutes(5), label: "p99" }),
+          webhookAttemptMs.metric({ statistic: "Maximum", period: cdk.Duration.minutes(5), label: "max" }),
+        ],
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Webhook queues (visible messages)",
+        width: 6,
+        left: [
+          webhookFanoutQueue.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1), label: "fan-out" }),
+          webhookDeliveryQueue.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1), label: "delivery" }),
+        ],
+        right: [
+          webhookFanoutDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1), label: "fan-out DLQ", color: "#d13212" }),
+          webhookDeliveryDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1), label: "delivery DLQ", color: "#9467bd" }),
+          deviceStatusFnDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1), label: "DeviceStatusFn DLQ", color: "#8c564b" }),
+        ],
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Webhook Lambda errors / min",
+        width: 6,
+        left: [
+          webhookFanoutFn.metricErrors({ ...perMinute, label: "fan-out" }),
+          webhookDeliverFn.metricErrors({ ...perMinute, label: "deliver" }),
+          deviceStatusFn.metricErrors({ ...perMinute, label: "device-status" }),
+        ],
+      }),
+    );
+
     // Dev-only test receiver (README D8): never a public third-party receiver.
     if (props.webhookEcho) {
       const webhookEchoFn = new nodejs.NodejsFunction(this, "WebhookEchoFn", {
