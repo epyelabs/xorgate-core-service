@@ -357,6 +357,13 @@ export const devices = pgTable(
     // the status writers' edge claims from Phase 2 on; the presence events'
     // dedupe key is built from it. Null on rows no edge has touched yet.
     statusChangedAt: timestamp('status_changed_at', { withTimezone: true }),
+    // A device-simulator device (plans/xorgate-device-simulator, migration 032):
+    // the real agent in `--mode replay` in a container on a sim host. FIXED AT
+    // CREATION by `POST /device-simulations` and never patchable — the one
+    // server-side fact that lets the `simulation` config namespace exist without
+    // making "turn this device into a simulator" a cloud write any real device
+    // could receive. Its `device_simulations` row carries the rest.
+    simulated: boolean('simulated').default(false).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -364,6 +371,7 @@ export const devices = pgTable(
     uniqueIndex('devices_workspace_serial_idx').on(t.workspaceId, t.serial),
     index('devices_workspace_idx').on(t.workspaceId),
     index('devices_model_idx').on(t.deviceModelId),
+    index('devices_simulated_idx').on(t.workspaceId).where(sql`simulated`),
   ],
 );
 
@@ -1164,6 +1172,7 @@ export type DeviceModel = InferSelectModel<typeof deviceModels>;
 export type NewDeviceModel = InferInsertModel<typeof deviceModels>;
 export type Device = InferSelectModel<typeof devices>;
 export type NewDevice = InferInsertModel<typeof devices>;
+export type DeviceSimulation = InferSelectModel<typeof deviceSimulations>;
 export type DeviceRegistration = InferSelectModel<typeof deviceRegistrations>;
 export type NewDeviceRegistration = InferInsertModel<typeof deviceRegistrations>;
 export type KvsChannel = InferSelectModel<typeof kvsChannels>;
@@ -1298,6 +1307,41 @@ export const devicePurges = pgTable(
   },
   (t) => [index('device_purges_device_requested_idx').on(t.deviceId, t.requestedAt)],
 );
+
+// --- Device simulations (plans/xorgate-device-simulator, drizzle/manual/032) ---
+//
+// 1:1 with a `simulated` device: what the sim host should do with it (desired)
+// and what the host last said it is doing (reported). The host polls
+// `GET /sim-hosts/desired` and writes the `host_*` columns through
+// `POST /sim-hosts/heartbeat`; the console reads them through
+// `GET /device-simulations/{id}`.
+//
+// `desired_state` is a level ('running' | 'stopped'), but powering a sim back on
+// after the DEVICE parked itself (`power_off`) is an EDGE: a level "running"
+// alone would undo every power_off within one host pass. `start_requested_at`
+// is that edge — `POST /device-simulations/{id}/start` stamps it and the host
+// powers a parked sim on only when it is newer than the park (README Q8).
+//
+// `scenario_id` is the scenario the sim was CREATED with (the first-boot
+// default the host hands the container); the live choice is the device's
+// `simulation` config namespace. The provision bundle is not here: it lives in
+// Secrets Manager `xorgate/sim-devices/<deviceId>`, deleted by device teardown.
+export const deviceSimulations = pgTable('device_simulations', {
+  deviceId: uuid('device_id')
+    .primaryKey()
+    .references(() => devices.id, { onDelete: 'cascade' }),
+  scenarioId: text('scenario_id').notNull(),
+  desiredState: text('desired_state').default('running').notNull(),
+  startRequestedAt: timestamp('start_requested_at', { withTimezone: true }),
+  // Reported by the sim host. host_state: pending | starting | running | stopped | error.
+  hostId: text('host_id'),
+  hostState: text('host_state').default('pending').notNull(),
+  hostMessage: text('host_message'),
+  hostReportedAt: timestamp('host_reported_at', { withTimezone: true }),
+  /** User id or API key id, whichever principal created it (like deleted_devices.deleted_by). */
+  createdBy: text('created_by').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
 
 // --- Device transfer (plans/transfer-device-ownership) ---
 

@@ -51,13 +51,13 @@ interface Pin {
 const PINS: Pin[] = [
   {
     file: 'src/config-registry/config-contract.json',
-    // 2026-08-31: recording defaults lowered — telemetry rateHz 10 → 1 and
-    // video preset 1080p15-2mbps → 720p15-1mbps. Re-vendored into the SDK in
-    // the same change (vendor/config-contract.json + `npm run generate`), so
-    // this pin moves with a copy that is actually in sync.
-    sha256: '9003d2ec66c610a60dcdfbe06a9f0b7425ce24e3ff69140564286bc717e1dd55',
+    // 2026-10-01: the `simulation` namespace (plans/xorgate-device-simulator,
+    // Phase 3). Re-vendored into the SDK in the same change (SDK 0.11.0:
+    // vendor/config-contract.json + `npm run generate`, which now emits
+    // SimulationConfig). Previous pin, 2026-08-31: recording defaults lowered.
+    sha256: '6de0e20048034e68843d8b3959efd5fa051b6c3c908a035eee3578a937317d60',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
-    pinnedAt: '2026-08-31',
+    pinnedAt: '2026-10-01',
   },
   {
     file: 'src/schemas/capabilities.ts',

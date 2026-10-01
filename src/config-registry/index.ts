@@ -25,6 +25,7 @@ import { lteRecoveryNamespace, type LteRecoveryConfig } from './lte-recovery';
 import { timeSyncNamespace, type TimeSyncConfig } from './time-sync';
 import { cellularNamespace, type CellularConfig } from './cellular';
 import { cameraMountNamespace, type CameraMountConfig } from './camera-mount';
+import { simulationNamespace, type SimulationConfig } from './simulation';
 
 export * from './types';
 export * from './gnss-ant-bias';
@@ -34,6 +35,7 @@ export * from './lte-recovery';
 export * from './time-sync';
 export * from './cellular';
 export * from './camera-mount';
+export * from './simulation';
 export * from './ui-prefs';
 
 /**
@@ -49,6 +51,7 @@ export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
   timeSyncNamespace,
   cellularNamespace,
   cameraMountNamespace,
+  simulationNamespace,
 ];
 
 export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
@@ -85,6 +88,7 @@ export interface DeviceConfigDocument {
   timeSync?: TimeSyncConfig | null;
   cellular?: CellularConfig | null;
   cameraMount?: CameraMountConfig | null;
+  simulation?: SimulationConfig | null;
 }
 
 /**
@@ -159,12 +163,26 @@ export function validateNamespaceValue(
 }
 
 /**
+ * Namespaces only a simulated device may hold (plans/xorgate-device-simulator).
+ * `devices.simulated` is fixed at creation, so this is what keeps "make this
+ * device a simulator" out of reach of every cloud write to real hardware: the
+ * PATCH route and the device's local-change mirror both ask here first.
+ */
+export const SIMULATED_ONLY_NAMESPACES: readonly string[] = ['simulation'];
+
+/** False when `key` is simulator-only and the device is not simulated. */
+export function namespaceAllowedFor(key: string, opts: { simulated?: boolean }): boolean {
+  return opts.simulated === true || !SIMULATED_ONLY_NAMESPACES.includes(key);
+}
+
+/**
  * Validate a partial config document (a `PATCH /devices/{id}/config` body).
  * All-or-nothing: the first invalid namespace fails the whole request, so a
  * multi-namespace save can never half-commit.
  */
 export function validateConfigPatch(
   body: unknown,
+  opts: { simulated?: boolean } = {},
 ): { value: Record<string, unknown> } | { error: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { error: 'body must be a partial config document' };
@@ -176,6 +194,12 @@ export function validateConfigPatch(
   if (unknown.length > 0) {
     return {
       error: `unknown config namespace(s): ${unknown.join(', ')} (known: ${CONFIG_NAMESPACE_KEYS.join(', ')})`,
+    };
+  }
+  const refused = keys.filter((k) => !namespaceAllowedFor(k, opts));
+  if (refused.length > 0) {
+    return {
+      error: `config namespace(s) ${refused.join(', ')} apply only to simulated devices`,
     };
   }
   const out: Record<string, unknown> = {};

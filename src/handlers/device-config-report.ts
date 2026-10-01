@@ -5,6 +5,7 @@ import { publishDeviceConfig } from '../services/device-config';
 import {
   applyConfigPatch,
   configNamespace,
+  namespaceAllowedFor,
   validateNamespaceValue,
   type DeviceConfigDocument,
 } from '../config-registry/index';
@@ -242,6 +243,7 @@ export const handler = async (event: unknown): Promise<void> => {
     .returning({
       config: schema.devices.config,
       configRev: schema.devices.configRev,
+      simulated: schema.devices.simulated,
     });
 
   if (updated.length === 0) {
@@ -256,7 +258,7 @@ export const handler = async (event: unknown): Promise<void> => {
     return;
   }
 
-  const { config, configRev } = updated[0];
+  const { config, configRev, simulated } = updated[0];
   console.log('device-config-report: stored', {
     deviceId,
     origin: report.origin,
@@ -268,7 +270,7 @@ export const handler = async (event: unknown): Promise<void> => {
   });
 
   if (report.origin === 'local') {
-    await mirrorLocalChange(deviceId, report, config as DeviceConfigDocument, configRev);
+    await mirrorLocalChange(deviceId, report, config as DeviceConfigDocument, configRev, simulated);
     return;
   }
 
@@ -368,6 +370,7 @@ async function mirrorLocalChange(
   report: DeviceConfigReport,
   config: DeviceConfigDocument,
   configRev: number,
+  simulated: boolean,
 ): Promise<void> {
   const changed = report.changed ?? {};
 
@@ -416,6 +419,15 @@ async function mirrorLocalChange(
   for (const [ns, value] of Object.entries(changed)) {
     if (!configNamespace(ns)) {
       console.warn('device-config-report: unknown namespace in local change, skipping', {
+        deviceId,
+        namespace: ns,
+      });
+      continue;
+    }
+    // The same fence as PATCH /config: a real device's local `simulation`
+    // edit must never become cloud desired state (plans/xorgate-device-simulator).
+    if (!namespaceAllowedFor(ns, { simulated })) {
+      console.warn('device-config-report: simulator-only namespace on a real device, skipping', {
         deviceId,
         namespace: ns,
       });

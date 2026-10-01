@@ -10,6 +10,7 @@ import { workspacesPaths } from './workspaces';
 import { deviceModelsPaths } from './device-models';
 import { devicesPaths } from './devices';
 import { deviceRegistrationsPaths } from './device-registrations';
+import { deviceSimulationsPaths } from './device-simulations';
 import { transferOffersPaths } from './transfer-offers';
 import { mediaSessionsPaths } from './media-sessions';
 import { telemetryPaths } from './telemetry';
@@ -94,6 +95,14 @@ const TAGS = [
     'x-displayName': 'Devices',
     description:
       'Device records, their configuration document, their IoT identity, and the one-shot commands you can send them.',
+  },
+  {
+    name: 'Device Simulations',
+    'x-displayName': 'Device Simulations',
+    description:
+      'Devices with no hardware: the real device agent replaying a recorded drive on a loop, ' +
+      'hosted for you. Create one here; everything else about it is a normal device under ' +
+      '/devices.',
   },
   {
     name: 'Transfer Offers',
@@ -257,7 +266,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // catalog and a device's routes (tag Webhooks), plus the per-event
       // payloads under `x-webhooks` (3.0.3 has no `webhooks` section). Purely
       // additive.
-      version: '0.10.0',
+      // 0.11.0: device simulations. `Device.simulated`, `GET /devices?simulated=`,
+      // the `simulation` config namespace, and the Device Simulations section
+      // (create, scenarios, read, start). The sim host's plane is private.
+      // Purely additive.
+      version: '0.11.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so
@@ -294,6 +307,7 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       ...deviceModelsPaths,
       ...devicesPaths,
       ...deviceRegistrationsPaths,
+      ...deviceSimulationsPaths,
       ...transferOffersPaths,
       ...telemetryPaths,
       ...mediaSessionsPaths,

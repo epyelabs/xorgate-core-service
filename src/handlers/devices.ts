@@ -158,11 +158,14 @@ const restHandler = async (
     } catch {
       return badRequest('Invalid JSON body');
     }
-    const parsed = validateConfigPatch(body);
-    if ('error' in parsed) return badRequest(parsed.error);
-
     const device = await findDevice(id, orgWorkspaceIds);
     if (!device) return notFound(`Device "${id}" not found`);
+
+    // Validated against THIS device: the `simulation` namespace exists only
+    // for devices created as simulated, and real hardware must never be able
+    // to receive it (plans/xorgate-device-simulator, README §3.3).
+    const parsed = validateConfigPatch(body, { simulated: device.simulated });
+    if ('error' in parsed) return badRequest(parsed.error);
 
     const nextConfig = applyConfigPatch(device.config, parsed.value) as DeviceConfigDocument;
     return writeConfig(id, orgWorkspaceIds, nextConfig);
@@ -241,9 +244,19 @@ const restHandler = async (
         wsFilter = [headerWorkspaceId];
       }
 
+      // `?simulated=true|false` (plans/xorgate-device-simulator): the console's
+      // Simulated filter. Absent = every device, exactly as before.
+      const simulatedParam = event.queryStringParameters?.simulated;
+      if (simulatedParam !== undefined && simulatedParam !== 'true' && simulatedParam !== 'false') {
+        return badRequest('simulated must be true or false');
+      }
+
       const where = and(
         inArray(schema.devices.workspaceId, wsFilter),
         status ? eq(schema.devices.status, status) : undefined,
+        simulatedParam !== undefined
+          ? eq(schema.devices.simulated, simulatedParam === 'true')
+          : undefined,
       );
 
       const sortCol =
@@ -278,11 +291,17 @@ const restHandler = async (
         serial?: string;
         name?: string;
         status?: string;
+        simulated?: unknown;
       };
       try {
         body = JSON.parse(event.body ?? '{}');
       } catch {
         return badRequest('Invalid JSON body');
+      }
+      // A simulated device needs its provision bundle stored and a sim host
+      // told about it; a bare row flagged `simulated` would be neither.
+      if (body.simulated !== undefined && body.simulated !== false) {
+        return badRequest('register a simulated device with POST /device-simulations');
       }
       if (!body.workspaceId) return badRequest('workspaceId is required');
       if (!body.deviceModelId) return badRequest('deviceModelId is required');
@@ -350,6 +369,11 @@ const restHandler = async (
       }
       if (body.lastSeenAt !== undefined) {
         return badRequest('lastSeenAt is not settable via the API — telemetry ingest owns it');
+      }
+      if (body.simulated !== undefined) {
+        return badRequest(
+          'simulated is fixed at creation — register a simulated device with POST /device-simulations',
+        );
       }
 
       const updates: Record<string, unknown> = {};

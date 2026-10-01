@@ -58,6 +58,15 @@ export const devicesPaths = {
             'Filter by device status. An empty value or the literal `any` means "no filter"; any ' +
             'other unknown value is a 400.',
         },
+        {
+          name: 'simulated',
+          in: 'query',
+          required: false,
+          schema: { type: 'string', enum: ['true', 'false'] },
+          description:
+            '`true` lists only simulated devices (see Device Simulations), `false` only real ' +
+            'ones. Absent lists both. Any other value is a 400.',
+        },
       ],
       tags: ['Devices'],
       responses: {

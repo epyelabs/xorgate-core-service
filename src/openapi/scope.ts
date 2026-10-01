@@ -92,6 +92,14 @@ export const OUT_OF_SCOPE_PATH_PREFIXES: readonly string[] = [
   '/datasets',
   '/training-jobs',
   '/models',
+  // The device simulator's host plane (plans/xorgate-device-simulator) — not
+  // moving, but PRIVATE: it accepts only the dedicated sim-host token, one
+  // operation returns X.509 private key material, and it is served by a
+  // single `ANY /sim-hosts/{proxy+}` route (the API stack is at the
+  // CloudFormation resource limit), which no per-operation document could
+  // describe. Its contract lives in src/handlers/sim-hosts.ts and
+  // device/xorgate-sim-host/src/source/http.ts.
+  '/sim-hosts',
 ];
 
 /**

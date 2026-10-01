@@ -1,4 +1,5 @@
 import { webhookSchemas } from './webhooks';
+import { deviceSimulationSchemas } from './device-simulations';
 import { configOpenApiSchemas } from '../config-registry/openapi';
 import { namespaceJsonSchema } from '../config-registry/contract';
 import { ioCapabilitiesSchema } from '../schemas/capabilities';
@@ -15,6 +16,7 @@ import { ioCapabilitiesSchema } from '../schemas/capabilities';
 export function openApiSchemas(): Record<string, unknown> {
   return {
     ...webhookSchemas,
+    ...deviceSimulationSchemas,
     ApiError: {
       type: 'object',
       required: ['error'],
@@ -33,7 +35,8 @@ export function openApiSchemas(): Record<string, unknown> {
                 '`ORGANIZATION_REQUIRED` (400, multi-org caller sent no `X-Organization-Id`), ' +
                 '`BAD_REQUEST` (400), `FORBIDDEN` / `NO_ORGANIZATION` / `INSUFFICIENT_ROLE` (403), ' +
                 '`NOT_FOUND` (404), `METHOD_NOT_ALLOWED` (405), `CONFLICT` / `PURGE_IN_PROGRESS` / ' +
-                '`TRANSFER_PENDING` (409), `PURGE_DISPATCH_FAILED` (502), ' +
+                '`TRANSFER_PENDING` / `SIMULATION_QUOTA_EXCEEDED` (409), `PURGE_DISPATCH_FAILED` / ' +
+                '`SIMULATION_PROVISION_FAILED` (502), ' +
                 '`SERVER_ERROR` (500, an unhandled failure; quote `requestId` when reporting it), ' +
                 '`CONFIG_PUBLISH_FAILED` / `COMMAND_PUBLISH_FAILED` / `DIST_MANIFEST_UNAVAILABLE` / ' +
                 '`DIST_MANIFEST_INVALID` (502).',
@@ -513,6 +516,14 @@ export function openApiSchemas(): Record<string, unknown> {
           description:
             'Machine-managed: telemetry ingest, the MQTT last-will and the offline sweeper own ' +
             'this. Writing it through `PUT /devices/{id}` is rejected 400.',
+        },
+        simulated: {
+          type: 'boolean',
+          description:
+            'A device-simulator device: the real agent replaying a recorded drive in a container, ' +
+            'created by `POST /device-simulations`. Fixed at creation and never writable. ' +
+            'Everything else about it is a normal device; only a simulated device accepts the ' +
+            '`simulation` config namespace.',
         },
         needsModel: {
           type: 'boolean',

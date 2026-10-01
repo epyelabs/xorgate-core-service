@@ -455,6 +455,35 @@ export class XorgateCoreApiStack extends cdk.Stack {
         ],
       }),
     );
+    // Device simulator (plans/xorgate-device-simulator): one provision bundle
+    // per simulated device at xorgate/sim-devices/<deviceId> — written by the
+    // create route, read by the sim-host plane, deleted by device teardown
+    // (DevicesFn, WorkspacesFn, OrganizationsFn, MeFn all reach it) — and the
+    // hand-rotated sim-host bearer token, read-only. Name-pattern grants:
+    // Secrets Manager suffixes the ARN.
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "SimDeviceBundleSecrets",
+        actions: [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:DeleteSecret",
+        ],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:xorgate/sim-devices/*`,
+        ],
+      }),
+    );
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "SimHostTokenRead",
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:xorgate/sim-host-token*`,
+        ],
+      }),
+    );
     // Warm simulator sessions (M5): the simulations handler creates/sends to
     // per-editing-session SQS queues and looks for a running session task
     // before launching one (ecs:ListTasks is cluster-conditioned; its resource
@@ -914,6 +943,33 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // config topic for the new device (same reason DevicesFn bundles it).
       bundling: bundlingWithSdk,
     });
+
+    // Device simulator (plans/xorgate-device-simulator, Phase 3). The create
+    // route provisions like a claim (thing, cert, KVS channels, config publish)
+    // AND stores the provision bundle in Secrets Manager, and its rollback runs
+    // the device teardown primitive — so it gets the destroy timeout and the
+    // same bundled SDK clients as DevicesFn.
+    const deviceSimulationsFn = new nodejs.NodejsFunction(this, "DeviceSimulationsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-simulations.ts"),
+        "device simulations — create/get/start + scenario catalog",
+      ),
+      timeout: destroyTimeout,
+      bundling: bundlingWithSdk,
+    });
+
+    // The sim-host plane (/sim-hosts/*): authenticated ONLY by the dedicated
+    // SIM_HOST_TOKEN secret (README Q10), never by a user credential. Reads the
+    // desired list, presigns the demo-assets pack, serves provision bundles,
+    // takes heartbeats.
+    const simHostsFn = new nodejs.NodejsFunction(this, "SimHostsFn", {
+      ...standardFnProps(
+        path.join(entryBase, "sim-hosts.ts"),
+        "sim-host plane — desired/scenarios/bundles/heartbeat (SIM_HOST_TOKEN)",
+      ),
+      bundling: bundlingWithSdk,
+    });
+    simHostsFn.addEnvironment("SIM_HOST_TOKEN_SECRET", "xorgate/sim-host-token");
 
     // GET /get/{code} — serves the per-request install.sh as text/x-shellscript.
     // No DB writes; bakes the dist bucket URL + version into the script.
@@ -2540,6 +2596,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       "DeviceTransferInt",
       deviceTransferFn,
     );
+    const deviceSimulationsInt = new apigwv2int.HttpLambdaIntegration(
+      "DeviceSimulationsInt",
+      deviceSimulationsFn,
+    );
+    const simHostsInt = new apigwv2int.HttpLambdaIntegration("SimHostsInt", simHostsFn);
     const deviceCommandsInt = new apigwv2int.HttpLambdaIntegration(
       "DeviceCommandsInt",
       deviceCommandsFn,
@@ -2961,6 +3022,42 @@ export class XorgateCoreApiStack extends cdk.Stack {
       path: "/device-dist/latest",
       methods: [apigwv2.HttpMethod.GET],
       integration: deviceDistInt,
+    });
+
+    // Device simulator (plans/xorgate-device-simulator). Operator routes take a
+    // normal user/API-key credential; `{id}` is the device id. `/scenarios` is
+    // a literal segment, which HTTP API matches ahead of `{id}`.
+    addRoutes({
+      path: "/device-simulations",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceSimulationsInt,
+    });
+    addRoutes({
+      path: "/device-simulations/scenarios",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSimulationsInt,
+    });
+    addRoutes({
+      path: "/device-simulations/{id}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceSimulationsInt,
+    });
+    addRoutes({
+      path: "/device-simulations/{id}/start",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceSimulationsInt,
+    });
+    // The sim-host plane: SIM_HOST_TOKEN only (handler-enforced; the gateway
+    // has no authorizer). ONE proxy route for its four operations, on purpose:
+    // every route here costs two CloudFormation resources (the route and its
+    // own Lambda permission) and this stack sits at the 500-resource limit
+    // (497 on dev with this route). The handler dispatches GET desired |
+    // GET scenarios | GET bundles/{deviceId} | POST heartbeat and 404s the
+    // rest. Undocumented by classification (src/openapi/scope.ts).
+    addRoutes({
+      path: "/sim-hosts/{proxy+}",
+      methods: [apigwv2.HttpMethod.ANY],
+      integration: simHostsInt,
     });
 
     // Device registration (onboarding). The {code}/claim route is reached

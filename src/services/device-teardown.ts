@@ -3,11 +3,12 @@ import {
   KinesisVideoClient,
   ResourceNotFoundException,
 } from '@aws-sdk/client-kinesis-video';
-import { inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { db, schema } from '../db/index';
 import { deleteThing } from './iot-provisioning';
 import { deviceStoragePrefixes } from './destroy-rules';
 import { drainPrefix } from './s3-drain';
+import { deleteSimBundle } from './device-simulations';
 
 /**
  * Everything a device owns OUTSIDE the rows that cascade off `devices`: its
@@ -99,7 +100,7 @@ export async function teardownDevices(
   ]);
 
   const drained = new Map<string, boolean>();
-  const removed = { things: [] as string[], channels: [] as string[] };
+  const removed = { things: [] as string[], channels: [] as string[], simBundles: [] as string[] };
   for (const device of devices) {
     // IoT: thing, its certificates and the policy attachment. `deleteThing`
     // swallows its own errors (it was written for the claim-rollback path).
@@ -139,6 +140,33 @@ export async function teardownDevices(
     else summary.s3Pending += 1;
   }
 
+  // Simulated devices (plans/xorgate-device-simulator) own two more things: the
+  // provision bundle in Secrets Manager — the private key, which must not
+  // outlive its (now deleted) certificate — and the `device_simulations` row.
+  // The row would cascade with the device anyway; deleting it here takes the
+  // sim out of the host's desired list even if the caller's row delete never
+  // lands, so the container stops on the host's next pass.
+  const simulated = await db.query.devices.findMany({
+    where: and(inArray(schema.devices.id, ids), eq(schema.devices.simulated, true)),
+    columns: { id: true },
+  });
+  for (const { id } of simulated) {
+    try {
+      await deleteSimBundle(id);
+      removed.simBundles.push(id);
+    } catch (err) {
+      fail(`sim bundle secret ${id}`, err);
+    }
+  }
+  if (simulated.length > 0) {
+    await db.delete(schema.deviceSimulations).where(
+      inArray(
+        schema.deviceSimulations.deviceId,
+        simulated.map((d) => d.id),
+      ),
+    );
+  }
+
   // The FK-less tables. These throw: a failure here means telemetry would
   // survive its device, which is a correctness problem rather than garbage.
   await db.delete(schema.telemetryReadings).where(inArray(schema.telemetryReadings.deviceId, ids));
@@ -166,6 +194,7 @@ export async function teardownDevices(
       deviceIds: ids,
       iotThings: removed.things,
       kvsChannels: removed.channels,
+      simBundles: removed.simBundles,
       s3Drained: summary.s3Drained,
       s3Pending: summary.s3Pending,
       errors: summary.errors,
