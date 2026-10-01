@@ -2555,136 +2555,173 @@ export class XorgateCoreApiStack extends cdk.Stack {
       throttlingBurstLimit: 100,
     };
 
-    const healthInt = new apigwv2int.HttpLambdaIntegration(
+    // Every route integration goes through this helper. By default
+    // HttpLambdaIntegration adds one AWS::Lambda::Permission PER ROUTE, so each
+    // route cost two CloudFormation resources and this stack reached 497 of
+    // the hard 500-resource cap (2026-10-01, plans/xorgate-device-simulator).
+    // `scopePermissionToRoute: false` makes it one permission per function,
+    // scoped to this API (`<apiId>/*/*/*`): ~120 resources back, and a new
+    // route now costs one. Only routes declared here can reach the function,
+    // so the wider source ARN grants nothing new. Do NOT construct
+    // HttpLambdaIntegration directly: test/api-stack-budget.test.ts fails the
+    // build if you do.
+    const lambdaInt = (id: string, fn: lambda.IFunction) =>
+      new apigwv2int.HttpLambdaIntegration(id, fn, { scopePermissionToRoute: false });
+
+    // The 500 cap is a hard CloudFormation quota, and the first sign of it used
+    // to be a failed deploy. Count at synth instead: warn with headroom left,
+    // fail synth (not the deploy) past the cap. Runs after every construct is
+    // added, so the lazily-created route permissions are included.
+    const RESOURCE_CAP = 500;
+    const RESOURCE_WARN = 450;
+    this.node.addValidation({
+      validate: () => {
+        const count = this.node
+          .findAll()
+          .filter((c) => c instanceof cdk.CfnResource && cdk.Stack.of(c) === this).length;
+        if (count > RESOURCE_CAP) {
+          return [`${count} CloudFormation resources, over the hard cap of ${RESOURCE_CAP}`];
+        }
+        if (count > RESOURCE_WARN) {
+          cdk.Annotations.of(this).addWarningV2(
+            "xorgate:stack-resource-budget",
+            `${count} of ${RESOURCE_CAP} CloudFormation resources; plan a split before adding more`,
+          );
+        }
+        return [];
+      },
+    });
+
+    const healthInt = lambdaInt(
       "HealthInt",
       healthFn,
     );
-    const meInt = new apigwv2int.HttpLambdaIntegration("MeInt", meFn);
-    const organizationsInt = new apigwv2int.HttpLambdaIntegration(
+    const meInt = lambdaInt("MeInt", meFn);
+    const organizationsInt = lambdaInt(
       "OrganizationsInt",
       organizationsFn,
     );
-    const membershipsInt = new apigwv2int.HttpLambdaIntegration(
+    const membershipsInt = lambdaInt(
       "MembershipsInt",
       membershipsFn,
     );
-    const apiKeysInt = new apigwv2int.HttpLambdaIntegration(
+    const apiKeysInt = lambdaInt(
       "ApiKeysInt",
       apiKeysFn,
     );
-    const authSessionTokensInt = new apigwv2int.HttpLambdaIntegration(
+    const authSessionTokensInt = lambdaInt(
       "AuthSessionTokensInt",
       authSessionTokensFn,
     );
-    const authLiveCredentialsInt = new apigwv2int.HttpLambdaIntegration(
+    const authLiveCredentialsInt = lambdaInt(
       "AuthLiveCredentialsInt",
       authLiveCredentialsFn,
     );
-    const workspacesInt = new apigwv2int.HttpLambdaIntegration(
+    const workspacesInt = lambdaInt(
       "WorkspacesInt",
       workspacesFn,
     );
-    const deviceModelsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceModelsInt = lambdaInt(
       "DeviceModelsInt",
       deviceModelsFn,
     );
-    const devicesInt = new apigwv2int.HttpLambdaIntegration(
+    const devicesInt = lambdaInt(
       "DevicesInt",
       devicesFn,
     );
-    const deviceTransferInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceTransferInt = lambdaInt(
       "DeviceTransferInt",
       deviceTransferFn,
     );
-    const deviceSimulationsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceSimulationsInt = lambdaInt(
       "DeviceSimulationsInt",
       deviceSimulationsFn,
     );
-    const simHostsInt = new apigwv2int.HttpLambdaIntegration("SimHostsInt", simHostsFn);
-    const deviceCommandsInt = new apigwv2int.HttpLambdaIntegration(
+    const simHostsInt = lambdaInt("SimHostsInt", simHostsFn);
+    const deviceCommandsInt = lambdaInt(
       "DeviceCommandsInt",
       deviceCommandsFn,
     );
-    const searchInt = new apigwv2int.HttpLambdaIntegration(
+    const searchInt = lambdaInt(
       "SearchInt",
       searchFn,
     );
-    const deviceProvisioningInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceProvisioningInt = lambdaInt(
       "DeviceProvisioningInt",
       deviceProvisioningFn,
     );
-    const deviceRegistrationsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceRegistrationsInt = lambdaInt(
       "DeviceRegistrationsInt",
       deviceRegistrationsFn,
     );
-    const installScriptInt = new apigwv2int.HttpLambdaIntegration(
+    const installScriptInt = lambdaInt(
       "InstallScriptInt",
       installScriptFn,
     );
-    const deviceDistInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceDistInt = lambdaInt(
       "DeviceDistInt",
       deviceDistFn,
     );
-    const deviceKvsChannelsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceKvsChannelsInt = lambdaInt(
       "DeviceKvsChannelsInt",
       deviceKvsChannelsFn,
     );
-    const deviceIdentityInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceIdentityInt = lambdaInt(
       "DeviceIdentityInt",
       deviceIdentityFn,
     );
-    const telemetryHistoryInt = new apigwv2int.HttpLambdaIntegration(
+    const telemetryHistoryInt = lambdaInt(
       "TelemetryHistoryInt",
       telemetryHistoryFn,
     );
-    const deviceSessionsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceSessionsInt = lambdaInt(
       "DeviceSessionsInt",
       deviceSessionsFn,
     );
-    const iotAttachPolicyInt = new apigwv2int.HttpLambdaIntegration(
+    const iotAttachPolicyInt = lambdaInt(
       "IotAttachPolicyInt",
       iotAttachPolicyFn,
     );
-    const liveAccessInt = new apigwv2int.HttpLambdaIntegration(
+    const liveAccessInt = lambdaInt(
       "LiveAccessInt",
       liveAccessFn,
     );
-    const workflowTemplatesInt = new apigwv2int.HttpLambdaIntegration(
+    const workflowTemplatesInt = lambdaInt(
       "WorkflowTemplatesInt",
       workflowTemplatesFn,
     );
-    const workflowCatalogInt = new apigwv2int.HttpLambdaIntegration(
+    const workflowCatalogInt = lambdaInt(
       "WorkflowCatalogInt",
       workflowCatalogFn,
     );
-    const modelRegistryInt = new apigwv2int.HttpLambdaIntegration(
+    const modelRegistryInt = lambdaInt(
       "ModelRegistryInt",
       modelRegistryFn,
     );
-    const deviceWorkflowsInt = new apigwv2int.HttpLambdaIntegration(
+    const deviceWorkflowsInt = lambdaInt(
       "DeviceWorkflowsInt",
       deviceWorkflowsFn,
     );
-    const workflowRunsInt = new apigwv2int.HttpLambdaIntegration(
+    const workflowRunsInt = lambdaInt(
       "WorkflowRunsInt",
       workflowRunsFn,
     );
-    const workflowSimulationsInt = new apigwv2int.HttpLambdaIntegration(
+    const workflowSimulationsInt = lambdaInt(
       "WorkflowSimulationsInt",
       workflowSimulationsFn,
     );
-    const organizationCredentialsInt = new apigwv2int.HttpLambdaIntegration(
+    const organizationCredentialsInt = lambdaInt(
       "OrganizationCredentialsInt",
       organizationCredentialsFn,
     );
-    const datasetsInt = new apigwv2int.HttpLambdaIntegration("DatasetsInt", datasetsFn);
-    const modelsInt = new apigwv2int.HttpLambdaIntegration("ModelsInt", modelsFn);
-    const trainingJobsInt = new apigwv2int.HttpLambdaIntegration(
+    const datasetsInt = lambdaInt("DatasetsInt", datasetsFn);
+    const modelsInt = lambdaInt("ModelsInt", modelsFn);
+    const trainingJobsInt = lambdaInt(
       "TrainingJobsInt",
       trainingJobsFn,
     );
-    const docsInt = new apigwv2int.HttpLambdaIntegration("DocsInt", docsFn);
-    const webhooksInt = new apigwv2int.HttpLambdaIntegration("WebhooksInt", webhooksFn);
+    const docsInt = lambdaInt("DocsInt", docsFn);
+    const webhooksInt = lambdaInt("WebhooksInt", webhooksFn);
 
     // Inject the API base into the docs Lambda now that the api exists. The
     // public hostname wins when there is one: `servers` in the served document
