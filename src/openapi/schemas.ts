@@ -1669,6 +1669,115 @@ export function openApiSchemas(): Record<string, unknown> {
         },
       },
     },
+
+    // ---- Device SMS inbox (plans/device-sms-inbox) --------------------------
+    SmsReadCreate: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 50,
+          default: 10,
+          description:
+            'How many of the newest messages to return. Out-of-range numbers are clamped to ' +
+            '1..50; a non-number is a 400 (`VALIDATION_ERROR`).',
+        },
+      },
+    },
+    SmsMessage: {
+      type: 'object',
+      required: ['id', 'storage', 'indexes', 'from', 'fromType', 'sentAt', 'unread', 'text'],
+      properties: {
+        id: {
+          type: 'string',
+          description: 'Storage and index of each part joined by `+` (e.g. `SM:3+SM:4`). Stable within one read only.',
+        },
+        storage: { type: 'string', enum: ['SM', 'ME'], description: 'Store of the first part: SIM (`SM`) or modem (`ME`).' },
+        indexes: { type: 'array', items: { type: 'integer' } },
+        from: { type: 'string', description: 'Sender as decoded; alphanumeric senders verbatim.' },
+        fromType: { type: 'string', enum: ['international', 'national', 'alphanumeric', 'other'] },
+        sentAt: {
+          type: 'string',
+          nullable: true,
+          description: 'Service-centre timestamp with its own UTC offset, or null if undecodable.',
+          example: '2026-08-11T20:05:59-04:00',
+        },
+        unread: { type: 'boolean', description: 'Unread on the SIM. Reading does not change it.' },
+        text: { type: 'string', description: 'Decoded text; a hex string when `binary`.' },
+        binary: { type: 'boolean' },
+        incomplete: { type: 'boolean', description: 'A concatenated message with parts missing.' },
+        truncated: { type: 'boolean', description: 'Text cut at 4000 characters.' },
+      },
+    },
+    SmsReadResult: {
+      type: 'object',
+      required: ['storage', 'total', 'skipped', 'partial', 'messages'],
+      properties: {
+        storage: {
+          type: 'object',
+          description: 'Used and total slots per store that answered (`SM`, `ME`).',
+          additionalProperties: {
+            type: 'object',
+            required: ['used', 'total'],
+            properties: { used: { type: 'integer' }, total: { type: 'integer' } },
+          },
+        },
+        total: { type: 'integer', description: 'Messages on the device after joining parts, before the limit.' },
+        skipped: { type: 'integer', description: 'Stored items that were not readable messages.' },
+        partial: { type: 'boolean', description: 'The device ran out of time; fewer messages than stored.' },
+        durationMs: { type: 'integer', nullable: true },
+        messages: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/SmsMessage' },
+          description: 'Newest first, at most `limit`.',
+        },
+      },
+    },
+    SmsRead: {
+      type: 'object',
+      required: [
+        'id',
+        'deviceId',
+        'status',
+        'errorCode',
+        'errorMessage',
+        'limit',
+        'requestedBy',
+        'createdAt',
+        'completedAt',
+        'result',
+      ],
+      properties: {
+        id: { type: 'string', format: 'uuid' },
+        deviceId: { type: 'string', format: 'uuid' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'ok', 'error', 'expired'],
+          description:
+            '`pending` until the device answers (usually within a few seconds), then `ok` or ' +
+            '`error`. A read still pending after 45 s is reported as `expired`; a reply that ' +
+            'arrives later still lands.',
+        },
+        errorCode: {
+          type: 'string',
+          nullable: true,
+          description:
+            'Why it failed: the device\'s status (`no_modem`, `no_sim`, `modem_busy`, `error`), ' +
+            '`timeout` on expiry, or `publish_failed` when the command never reached the broker.',
+        },
+        errorMessage: { type: 'string', nullable: true, description: 'The device\'s own error detail, if any.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50 },
+        requestedBy: { type: 'string', description: 'User id or API key id of the principal that asked.' },
+        createdAt: { type: 'string', format: 'date-time' },
+        completedAt: { type: 'string', format: 'date-time', nullable: true },
+        result: {
+          allOf: [{ $ref: '#/components/schemas/SmsReadResult' }],
+          nullable: true,
+          description: 'Present only when `status` is `ok`.',
+        },
+      },
+    },
     // ---- Device transfer ---------------------------------------------------
 
     TransferTenancy: {

@@ -45,7 +45,14 @@ import { iotDataClient } from './iot-data';
  * and nothing consumes `command/response` yet): the outcome signal is the new
  * build in the device's next config report, mirrored to `devices.agent_version`.
  */
-export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update';
+/**
+ * `read_sms` (plans/device-sms-inbox) asks the agent to read the modem's stored
+ * SMS over its spare AT port (non-destructively) and publish the newest
+ * `args.limit` on `xorgate/devices/{id}/sms`. The only command that carries
+ * `args`, and the only one whose requestId is caller-supplied: it is the
+ * `device_sms_reads` row id the reply is matched against.
+ */
+export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update' | 'read_sms';
 
 /**
  * How long a command stays valid. Generous next to a sub-second publish, tight
@@ -61,6 +68,15 @@ export interface DeviceCommandMessage {
   command: DeviceCommandName;
   ts: number;
   expiresAt: number;
+  /** Command parameters. Omitted unless the caller passes some (only `read_sms` does). */
+  args?: Record<string, unknown>;
+}
+
+export interface PublishDeviceCommandOptions {
+  /** Parameters for the command; the device ignores them for every command but `read_sms`. */
+  args?: Record<string, unknown>;
+  /** Use this requestId instead of minting one (the caller's correlation row id). */
+  requestId?: string;
 }
 
 /**
@@ -70,14 +86,16 @@ export interface DeviceCommandMessage {
 export async function publishDeviceCommand(
   deviceId: string,
   command: DeviceCommandName,
+  options: PublishDeviceCommandOptions = {},
 ): Promise<DeviceCommandMessage> {
   const ts = Date.now();
   const message: DeviceCommandMessage = {
     v: 1,
-    requestId: randomUUID(),
+    requestId: options.requestId ?? randomUUID(),
     command,
     ts,
     expiresAt: ts + COMMAND_TTL_MS,
+    ...(options.args ? { args: options.args } : {}),
   };
   const client = await iotDataClient();
   await client.send(

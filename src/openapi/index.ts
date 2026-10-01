@@ -270,7 +270,10 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // the `simulation` config namespace, and the Device Simulations section
       // (create, scenarios, read, start). The sim host's plane is private.
       // Purely additive.
-      version: '0.11.0',
+      // 0.12.0: device SMS inbox. `POST /devices/{id}/sms-reads`, `GET
+      // .../sms-reads/latest` and `GET .../sms-reads/{readId}`, plus the
+      // `SmsRead` schema. Purely additive.
+      version: '0.12.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

@@ -780,6 +780,113 @@ export const devicesPaths = {
       },
     },
   },
+  '/devices/{id}/sms-reads': {
+    parameters: deviceIdParams,
+    post: {
+      operationId: 'createDeviceSmsRead',
+      summary: 'Read the SMS stored on a device\'s SIM and modem',
+      description:
+        'Asks the device to read the text messages its cellular modem holds (SIM and modem ' +
+        'storage) and return the newest `limit`. Reading is non-destructive: nothing is deleted ' +
+        'and unread messages stay unread. Returns `202` with a `pending` read; poll `GET ' +
+        '/devices/{id}/sms-reads/{readId}` (every second or two) until `status` is no longer ' +
+        '`pending`. A read takes a few seconds and expires after 45 s.\n\n' +
+        'Xorgate keeps only the device\'s latest successful read (served by `GET ' +
+        '/devices/{id}/sms-reads/latest`, also while the device is offline); each new ' +
+        'successful read replaces it. Any member of the organization may read, viewers included.',
+      tags: ['Devices'],
+      requestBody: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/SmsReadCreate' },
+            example: { limit: 10 },
+          },
+        },
+      },
+      responses: {
+        '202': {
+          description: 'Read requested. Poll it by id.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/SmsRead' } } },
+        },
+        '400': {
+          description: '`limit` is not a number, or the body is not a JSON object (`VALIDATION_ERROR`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            'The device is not online (`DEVICE_OFFLINE`), or its agent predates SMS reading ' +
+            '(`UNSUPPORTED_AGENT`; update the device agent).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '502': {
+          description:
+            'The command could not be delivered to the broker (`COMMAND_PUBLISH_FAILED`; ' +
+            '`details.readId` names the read, now `error`). Safe to retry.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+      },
+    },
+  },
+  '/devices/{id}/sms-reads/latest': {
+    parameters: deviceIdParams,
+    get: {
+      operationId: 'getLatestDeviceSmsRead',
+      summary: 'The device\'s stored messages (its latest successful read)',
+      description:
+        'The newest read whose `status` is `ok`, with its messages. Works whatever the device\'s ' +
+        'status, which is the point: an offline device still shows what was last fetched. 404 ' +
+        '`NO_SMS_READ` when the device has never been read.',
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'The latest successful read.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/SmsRead' } } },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': {
+          description: 'No such device (`NOT_FOUND`), or it has never been read (`NO_SMS_READ`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
+  '/devices/{id}/sms-reads/{readId}': {
+    parameters: [
+      ...deviceIdParams,
+      {
+        name: 'readId',
+        in: 'path',
+        required: true,
+        schema: { type: 'string', format: 'uuid' },
+      },
+    ],
+    get: {
+      operationId: 'getDeviceSmsRead',
+      summary: 'Get an SMS read',
+      description:
+        'One read: `pending` while the device works, then `ok` (with `result`) or `error`. A ' +
+        'read still `pending` 45 s after it was requested is returned, and stored, as `expired` ' +
+        '(`errorCode: "timeout"`). Unknown ids, ids of another device and non-uuid ids are 404.',
+      tags: ['Devices'],
+      responses: {
+        '200': {
+          description: 'The read.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/SmsRead' } } },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': { $ref: '#/components/responses/Forbidden' },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
   '/devices/{id}/reboot': {
     parameters: deviceIdParams,
     post: {

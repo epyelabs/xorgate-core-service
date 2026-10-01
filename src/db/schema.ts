@@ -1308,6 +1308,48 @@ export const devicePurges = pgTable(
   (t) => [index('device_purges_device_requested_idx').on(t.deviceId, t.requestedAt)],
 );
 
+// --- Device SMS reads (plans/device-sms-inbox, drizzle/manual/033) ---
+//
+// One row per on-demand "read the SIM's messages" request. `id` is the command
+// `requestId`; the ingest Lambda (handlers/device-sms-result.ts) stores the
+// device's reply on the row. `status`: pending | ok | error | expired.
+//
+// Retention without a schedule: storing an `ok` result deletes every OLDER row
+// of that device, so a device keeps one `ok` row (what an offline device's
+// sheet shows) plus whatever requests came after it. `result` (message text
+// and numbers) is only ever set on `ok` rows. `device_id` cascades; tenancy ids
+// carry no FK, like `device_purges`.
+export const deviceSmsReads = pgTable(
+  'device_sms_reads',
+  {
+    // uuidv7 minted in app code (utils/uuidv7.ts).
+    id: uuid('id').primaryKey(),
+    deviceId: uuid('device_id')
+      .references(() => devices.id, { onDelete: 'cascade' })
+      .notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    organizationId: uuid('organization_id').notNull(),
+    /** User id or API key id, whichever principal asked. Debugging only. */
+    requestedBy: text('requested_by').notNull(),
+    limit: integer('limit').default(10).notNull(),
+    status: text('status').default('pending').notNull(),
+    // Device status when != ok (no_modem | no_sim | modem_busy | error),
+    // 'timeout' on expiry, 'publish_failed' when the command never left.
+    errorCode: text('error_code'),
+    errorMessage: text('error_message'),
+    // contract.md §4: { storage, total, skipped, partial, durationMs, messages }.
+    result: jsonb('result'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('device_sms_reads_device_created_idx').on(t.deviceId, t.createdAt.desc()),
+    index('device_sms_reads_device_latest_ok_idx')
+      .on(t.deviceId, t.completedAt.desc())
+      .where(sql`${t.status} = 'ok'`),
+  ],
+);
+
 // --- Device simulations (plans/xorgate-device-simulator, drizzle/manual/032) ---
 //
 // 1:1 with a `simulated` device: what the sim host should do with it (desired)

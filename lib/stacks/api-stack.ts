@@ -905,7 +905,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-commands.ts"),
-        "POST /devices/{id}/reboot|power-off|refresh-state — one-shot device commands",
+        "POST /devices/{id}/reboot|power-off|refresh-state|update + sms-reads — one-shot device commands",
       ),
       // Bundles @aws-sdk/client-iot-data-plane (command publish), which isn't
       // guaranteed in the Lambda runtime SDK.
@@ -1729,6 +1729,46 @@ export class XorgateCoreApiStack extends cdk.Stack {
     deviceConfigReportFn.addPermission("AllowIotRuleInvoke", {
       principal: new iam.ServicePrincipal("iot.amazonaws.com"),
       sourceArn: deviceConfigReportRule.attrArn,
+      sourceAccount: this.account,
+      action: "lambda:InvokeFunction",
+    });
+
+    // --- Device SMS read results (plans/device-sms-inbox, Phase 2) ---
+    // The agent answers a `read_sms` command on xorgate/devices/<id>/sms; this
+    // rule writes the reply onto its device_sms_reads row and prunes the
+    // device's older reads. DB only: no publish, so no SDK bundling and no new
+    // IAM (the device policy already allows xorgate/devices/<thing>/*). No
+    // function-level DLQ on purpose: a lost reply costs the user one retry,
+    // and the rule's action errors still land in the shared telemetry DLQ.
+    // No EventBridge schedule: retention runs inside this handler.
+    const deviceSmsResultFn = new nodejs.NodejsFunction(this, "DeviceSmsResultFn", {
+      ...standardFnProps(
+        path.join(entryBase, "device-sms-result.ts"),
+        "IoT rule -> device_sms_reads (SMS read replies + retention)",
+      ),
+      timeout: cdk.Duration.seconds(20),
+    });
+
+    const deviceSmsResultRule = new iot.CfnTopicRule(this, "DeviceSmsResultRule", {
+      ruleName: isProd ? "xorgate_device_sms_result" : "xorgate_device_sms_result_dev",
+      topicRulePayload: {
+        sql: "SELECT *, topic(3) AS topicDeviceId FROM 'xorgate/devices/+/sms'",
+        awsIotSqlVersion: "2016-03-23",
+        ruleDisabled: false,
+        actions: [{ lambda: { functionArn: deviceSmsResultFn.functionArn } }],
+        errorAction: {
+          sqs: {
+            queueUrl: telemetryDlq.queueUrl,
+            roleArn: telemetryRuleRole.roleArn,
+            useBase64: false,
+          },
+        },
+      },
+    });
+
+    deviceSmsResultFn.addPermission("AllowIotRuleInvoke", {
+      principal: new iam.ServicePrincipal("iot.amazonaws.com"),
+      sourceArn: deviceSmsResultRule.attrArn,
       sourceAccount: this.account,
       action: "lambda:InvokeFunction",
     });
@@ -3051,6 +3091,24 @@ export class XorgateCoreApiStack extends cdk.Stack {
     addRoutes({
       path: "/devices/{id}/update",
       methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    // On-demand SMS reads (plans/device-sms-inbox): POST publishes `read_sms`,
+    // the web polls the row. `latest` is a literal route, which API Gateway
+    // matches ahead of `{readId}`; the handler also 404s a non-uuid readId.
+    addRoutes({
+      path: "/devices/{id}/sms-reads",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/sms-reads/latest",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: deviceCommandsInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/sms-reads/{readId}",
+      methods: [apigwv2.HttpMethod.GET],
       integration: deviceCommandsInt,
     });
 

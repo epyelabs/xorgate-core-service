@@ -10,6 +10,14 @@ import {
   type DeviceCommandName,
 } from '../services/device-command';
 import { apiHandler } from '../utils/api-handler';
+import { handleDeviceSmsReadRoutes } from './device-sms-reads';
+
+/** On-demand SMS reads (plans/device-sms-inbox): their own gates and shapes, see device-sms-reads.ts. */
+const SMS_READ_ROUTES = new Set([
+  'POST /devices/{id}/sms-reads',
+  'GET /devices/{id}/sms-reads/latest',
+  'GET /devices/{id}/sms-reads/{readId}',
+]);
 
 const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/reboot': 'reboot',
@@ -24,6 +32,10 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  *   POST /devices/{id}/power-off
  *   POST /devices/{id}/refresh-state
  *   POST /devices/{id}/update
+ * plus the SMS-read routes, dispatched to device-sms-reads.ts:
+ *   POST /devices/{id}/sms-reads
+ *   GET  /devices/{id}/sms-reads/latest
+ *   GET  /devices/{id}/sms-reads/{readId}
  *
  * Reboot/power-off/update are restricted to owner/admin, unlike the other device
  * writes which effectively allow any member. Power-off in particular is not
@@ -41,6 +53,8 @@ const restHandler = async (
 ): Promise<APIGatewayProxyResultV2> => {
   const routeKey = canonicalRouteKey(event); // e.g. "POST /devices/{id}/reboot"
   const deviceId = event.pathParameters?.id;
+
+  if (SMS_READ_ROUTES.has(routeKey)) return handleDeviceSmsReadRoutes(event, routeKey, deviceId);
 
   const command = ROUTE_COMMANDS[routeKey];
   if (!command) return methodNotAllowed(event.requestContext.http.method, 'POST');
