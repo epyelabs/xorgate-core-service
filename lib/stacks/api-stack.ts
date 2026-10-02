@@ -957,6 +957,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
       timeout: destroyTimeout,
       bundling: bundlingWithSdk,
     });
+    // Simulated devices per organization (README Q7 shipped 2; raised to 5 by the
+    // user 2026-10-02). The global cap (SIM_QUOTA_GLOBAL, default 8) and the
+    // homelab host's SIM_HOST_MAX_SIMS (8) are unchanged.
+    deviceSimulationsFn.addEnvironment("SIM_QUOTA_PER_ORG", "5");
 
     // The sim-host plane (/sim-hosts/*): authenticated ONLY by the dedicated
     // SIM_HOST_TOKEN secret (README Q10), never by a user credential. Reads the
