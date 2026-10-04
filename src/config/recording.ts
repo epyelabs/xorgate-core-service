@@ -19,6 +19,14 @@ function numEnv(key: string, def: number): number {
 }
 
 export const recordingConfig = {
+  /**
+   * True when the 1-minute OfflineSweeper schedule is deployed enabled (prod by
+   * default; `SWEEPER_SCHEDULED`). Read paths that close stale sessions on read
+   * skip that transaction then: the sweeper closes them within a tick anyway,
+   * and close-on-read exists for dev, where nothing else would. Unset reads as
+   * false, so a function without the variable keeps closing on read.
+   */
+  sweeperScheduled: process.env.SWEEPER_SCHEDULED === '1',
   /** Offline-sweeper: telemetry-staleness threshold that flips the device badge. */
   deviceOfflineStaleMs: numEnv('DEVICE_OFFLINE_STALE_MS', 60_000),
   /** Device-status: debounce an online:false that follows a recent online:true (R3). */

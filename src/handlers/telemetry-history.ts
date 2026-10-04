@@ -7,7 +7,12 @@ import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { badRequest, gzipIfAccepted, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
-import { readWindowInsights } from '../services/telemetry-overview-window';
+import { recordingConfig } from '../config/recording';
+import {
+  readWindowInsights,
+  readWindowInsightsBatch,
+  WINDOW_INSIGHTS_BATCH_MAX,
+} from '../services/telemetry-overview-window';
 import {
   boundedTotalQuery,
   capTotal,
@@ -30,6 +35,7 @@ import { apiHandler } from '../utils/api-handler';
  *   GET /devices/{id}/telemetry/recent[&metric][&limit]       — the most recent N rows
  *   GET /devices/{id}/telemetry/readings[&...]                — raw rows, paginated by ts
  *   GET /devices/{id}/telemetry/insights?from&to               — windowed distance / moving time
+ *   POST /devices/{id}/telemetry/insights/batch {windows}      — the same, for many windows at once
  *   GET /devices/{id}/telemetry/sessions[&from&to&status...]  — recorded telemetry
  *       SESSIONS (the S3 artifact index + insights), paginated; no URLs
  *
@@ -568,19 +574,71 @@ async function handleWindowInsights(
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> {
   const qs = event.queryStringParameters ?? {};
-  const fromMs = qs.from ? Date.parse(qs.from) : NaN;
-  const toMs = qs.to ? Date.parse(qs.to) : NaN;
-  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
-    return badRequest('"from" and "to" are required ISO-8601 timestamps');
-  }
-  if (toMs <= fromMs) return badRequest('"to" must be after "from"');
-  if (toMs - fromMs > WINDOW_INSIGHTS_MAX_MS) return badRequest('the window may span at most 31 days');
+  const window = parseWindow(qs.from, qs.to);
+  if (typeof window === 'string') return badRequest(window);
   try {
     await closeStaleTelemetrySessions(deviceId);
   } catch (err) {
     console.warn('telemetry/insights: close-on-read failed', { deviceId, err });
   }
-  return ok(await readWindowInsights(deviceId, { fromMs, toMs }));
+  return ok(await readWindowInsights(deviceId, window));
+}
+
+/** One `{from, to}` window, validated like the single read's query. */
+function parseWindow(from: unknown, to: unknown): { fromMs: number; toMs: number } | string {
+  const fromMs = typeof from === 'string' ? Date.parse(from) : NaN;
+  const toMs = typeof to === 'string' ? Date.parse(to) : NaN;
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs)) {
+    return '"from" and "to" are required ISO-8601 timestamps';
+  }
+  if (toMs <= fromMs) return '"to" must be after "from"';
+  if (toMs - fromMs > WINDOW_INSIGHTS_MAX_MS) return 'the window may span at most 31 days';
+  return { fromMs, toMs };
+}
+
+/**
+ * POST /devices/{id}/telemetry/insights/batch — `{ windows: [{from, to}] }`
+ * answered as `{ items: [...] }`, one windowed roll-up per window in request
+ * order. A page of media runs used to make one GET per run, and each repeated
+ * auth, the ownership check, close-on-read and the session query (~7 Data
+ * API round trips, 0.3-0.9 s); the batch does each once and reads every
+ * overview object once (services/telemetry-overview-window.ts). POST only
+ * because a page of windows does not fit a query string comfortably; it
+ * writes nothing beyond the same close-on-read.
+ */
+async function handleWindowInsightsBatch(
+  deviceId: string,
+  event: APIGatewayProxyEventV2,
+): Promise<APIGatewayProxyResultV2> {
+  let body: { windows?: unknown };
+  try {
+    const raw = event.body ?? '';
+    body = JSON.parse(event.isBase64Encoded ? Buffer.from(raw, 'base64').toString('utf8') : raw || '{}');
+  } catch {
+    return badRequest('body must be JSON');
+  }
+  const list = body?.windows;
+  if (!Array.isArray(list) || list.length === 0) return badRequest('"windows" must be a non-empty array');
+  if (list.length > WINDOW_INSIGHTS_BATCH_MAX) {
+    return badRequest(`"windows" may hold at most ${WINDOW_INSIGHTS_BATCH_MAX} entries`);
+  }
+  const windows: Array<{ fromMs: number; toMs: number }> = [];
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i] as { from?: unknown; to?: unknown } | null;
+    const parsed = parseWindow(w?.from, w?.to);
+    if (typeof parsed === 'string') return badRequest(`windows[${i}]: ${parsed}`);
+    windows.push(parsed);
+  }
+  // Same close-on-read as the single read, except where the sweeper schedule
+  // already closes stale sessions every minute (config/recording.ts).
+  if (!recordingConfig.sweeperScheduled) {
+    try {
+      await closeStaleTelemetrySessions(deviceId);
+    } catch (err) {
+      console.warn('telemetry/insights/batch: close-on-read failed', { deviceId, err });
+    }
+  }
+  return ok({ items: await readWindowInsightsBatch(deviceId, windows) });
 }
 
 /**
@@ -674,7 +732,8 @@ const restHandler = async (
   event: APIGatewayProxyEventV2,
 ): Promise<APIGatewayProxyResultV2> => {
   const method = event.requestContext.http.method;
-  if (method !== 'GET') return methodNotAllowed(method, 'GET');
+  const isBatch = requestPath(event).endsWith('/telemetry/insights/batch');
+  if (isBatch ? method !== 'POST' : method !== 'GET') return methodNotAllowed(method, isBatch ? 'POST' : 'GET');
 
   const id = event.pathParameters?.id;
   if (!id) return notFound('Device "" not found');
@@ -719,6 +778,7 @@ const restHandler = async (
   }
   if (path.endsWith('/telemetry/sessions')) return handleSessions(id, event);
   if (path.endsWith('/telemetry/insights')) return handleWindowInsights(id, event);
+  if (path.endsWith('/telemetry/insights/batch')) return handleWindowInsightsBatch(id, event);
   return handleHistory(id, event);
 };
 

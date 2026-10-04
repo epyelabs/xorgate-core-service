@@ -10,6 +10,7 @@ import { badRequest, conflict, methodNotAllowed, notFound, ok } from '../utils/r
 import { pageMeta, parseListParams, type ListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { closeStaleMediaSessions } from '../services/media-sessions';
+import { recordingConfig } from '../config/recording';
 import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
 import {
   buildSessionTimeline,
@@ -120,10 +121,15 @@ const restHandler = async (
       // schedule; both are idempotent. Best-effort: a close failure must not
       // break the listing. Fires session_completed triggers on transitions,
       // same as the sweeper (at-least-once contract).
-      try {
-        await closeStaleMediaSessions(deviceId);
-      } catch (err) {
-        console.warn('device-sessions: close-on-read failed', { deviceId, err });
+      // Skipped where the sweeper schedule runs (prod): there it closes the
+      // same sessions within a minute, and this transaction is three Data API
+      // round trips on every list (a third of a warm `?group=runs` read).
+      if (!recordingConfig.sweeperScheduled) {
+        try {
+          await closeStaleMediaSessions(deviceId);
+        } catch (err) {
+          console.warn('device-sessions: close-on-read failed', { deviceId, err });
+        }
       }
       const parsed = parseListParams(event, {
         sortable: ['startedAt', 'createdAt'],
@@ -284,8 +290,12 @@ const restHandler = async (
  * S3 round trips, so a page of sessions stays one DB query.
  */
 async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
-  const ids = rows.map((r) => r.id);
-  const rollups = ids.length
+  return attachRollups(rows, await segmentRollups(rows.map((r) => r.id)));
+}
+
+/** Segment count / bytes / duration per session, one grouped query. */
+async function segmentRollups(ids: string[]) {
+  return ids.length
     ? await db
         .select({
           sessionId: schema.mediaSegments.sessionId,
@@ -297,6 +307,12 @@ async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
         .where(inArray(schema.mediaSegments.sessionId, ids))
         .groupBy(schema.mediaSegments.sessionId)
     : [];
+}
+
+async function attachRollups(
+  rows: (typeof schema.mediaSessions.$inferSelect)[],
+  rollups: Awaited<ReturnType<typeof segmentRollups>>,
+) {
   const bySession = new Map(rollups.map((r) => [r.sessionId, r]));
   return Promise.all(
     rows.map(async (r) => {
@@ -324,14 +340,14 @@ async function withRollups(rows: (typeof schema.mediaSessions.$inferSelect)[]) {
 /**
  * GET /devices/{id}/sessions?group=runs — the run-paginated listing.
  *
- * Three statements, in this order, all scoped to one device (services/
- * session-runs.ts owns the clustering SQL and the equivalence proof):
+ * Three steps, all scoped to one device (services/session-runs.ts owns the
+ * clustering SQL and the equivalence proof). 1 and 2 run concurrently, then 3:
  *
  *   1. count the matching RUNS → `page.total` (the footer counts runs now)
  *   2. rank the runs and return the page's sessions, each tagged with its run
- *   3. load those sessions in full + their rollups, then fold
+ *   3. load those sessions in full + their rollups (concurrently), then fold
  *
- * Step 3 goes through the same `findMany` + `withRollups` path the ungrouped
+ * Step 3 goes through the same rows + rollups path the ungrouped
  * branch uses, so `runs[].sessions[]` are exactly the objects a caller already
  * knows how to read. The fold is deserialization, not clustering: step 2's rows
  * arrive pre-assigned to runs, ordered, and contiguous.
@@ -343,24 +359,23 @@ async function listRuns(
 ): Promise<APIGatewayProxyResultV2> {
   const { limit, offset, order } = parsed;
 
-  const totalRows = await db.execute<{ total: number } & Record<string, unknown>>(
-    runCountQuery(deviceId, filters),
-  );
+  // Independent reads go out together: each Data API call is a round trip
+  // (~50-100 ms from the Lambda) and the SQL itself is sub-millisecond, so
+  // the count of SEQUENTIAL calls is what this route's latency is.
+  const [totalRows, pageRows] = await Promise.all([
+    db.execute<{ total: number } & Record<string, unknown>>(runCountQuery(deviceId, filters)),
+    db.execute<RunPageRow>(runPageQuery(deviceId, filters, { limit, offset, order })),
+  ]);
   const total = Number(totalRows.rows[0]?.total ?? 0);
-
-  const pageRows = await db.execute<RunPageRow>(
-    runPageQuery(deviceId, filters, { limit, offset, order }),
-  );
   const rows = pageRows.rows ?? [];
   if (rows.length === 0) return ok({ runs: [], page: pageMeta(parsed, total) });
 
-  const sessionRows = await db.query.mediaSessions.findMany({
-    where: inArray(
-      schema.mediaSessions.id,
-      rows.map((r) => r.session_id),
-    ),
-  });
-  const sessions = await withRollups(sessionRows);
+  const ids = rows.map((r) => r.session_id);
+  const [sessionRows, rollups] = await Promise.all([
+    db.query.mediaSessions.findMany({ where: inArray(schema.mediaSessions.id, ids) }),
+    segmentRollups(ids),
+  ]);
+  const sessions = await attachRollups(sessionRows, rollups);
   const byId = new Map(sessions.map((s) => [s.id, s]));
 
   return ok({ runs: foldRunRows(rows, byId), page: pageMeta(parsed, total) });

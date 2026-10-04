@@ -3,7 +3,12 @@ import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { buildOverview, type OverviewSegmentInput, type OverviewV1 } from '../src/services/telemetry-overview';
-import { readWindowInsights, summarizeOverviewWindow, type WindowInsightsDeps } from '../src/services/telemetry-overview-window';
+import {
+  readWindowInsights,
+  readWindowInsightsBatch,
+  summarizeOverviewWindow,
+  type WindowInsightsDeps,
+} from '../src/services/telemetry-overview-window';
 
 /**
  * Windowed insights over the overview grid (the fix for the doubled run
@@ -122,5 +127,67 @@ describe('readWindowInsights', () => {
   it('no sessions: empty, zero coverage, not partial', async () => {
     const out = await readWindowInsights('dev', { fromMs: 0, toMs: 1000 }, deps([], {}));
     expect(out).toMatchObject({ sessions: [], distanceM: null, movingMs: null, telemetryMs: 0, partial: false });
+  });
+});
+
+describe('readWindowInsightsBatch', () => {
+  const row = (id: string, from: number, to: number, built: boolean, status = 'closed') => ({
+    id,
+    status,
+    startedAt: new Date(from),
+    endedAt: new Date(to),
+    overviewKey: built ? `k/${id}` : null,
+    overviewBuiltAt: built ? new Date(to) : null,
+    overviewStale: false,
+  });
+  // A fake that honours the overlap predicate and counts its calls, so the
+  // batch can be held to the single read's answers AND to its call budget.
+  const counting = (rows: ReturnType<typeof row>[], overviews: Record<string, OverviewV1 | null>) => {
+    const calls = { list: 0, get: [] as string[] };
+    const deps: WindowInsightsDeps = {
+      listSessions: async (_d, fromMs, toMs) => {
+        calls.list++;
+        return rows.filter((r) => (r.endedAt ?? r.startedAt).getTime() >= fromMs && r.startedAt.getTime() < toMs);
+      },
+      getOverview: async (key) => {
+        calls.get.push(key);
+        return overviews[key] ?? null;
+      },
+    };
+    return { deps, calls };
+  };
+
+  const d = golden;
+  const rows = [
+    row('a', d.from, d.to, true),
+    row('b', d.to + 120_000, d.to + 600_000, false, 'open'),
+    row('gone', d.to + 700_000, d.to + 800_000, true),
+  ];
+  const overviews = { 'k/a': d };
+  const windows = [
+    { fromMs: d.to - 10 * 60_000, toMs: d.to - 60_000 }, // inside a
+    { fromMs: d.to - 5 * 60_000, toMs: d.to + 200_000 }, // a's tail + b
+    { fromMs: d.to + 650_000, toMs: d.to + 900_000 }, // only the gone overview
+    { fromMs: d.to + 10_000_000, toMs: d.to + 10_060_000 }, // nothing
+  ];
+
+  it('answers each window exactly as the single read does, in order', async () => {
+    const batch = await readWindowInsightsBatch('dev', windows, counting(rows, overviews).deps);
+    const single = await Promise.all(windows.map((w) => readWindowInsights('dev', w, counting(rows, overviews).deps)));
+    expect(batch).toEqual(single);
+    expect(batch.map((b) => b.sessions.map((s) => s.id))).toEqual([['a'], ['a', 'b'], ['gone'], []]);
+  });
+
+  it('lists sessions once and reads each overview once, however many windows share it', async () => {
+    const { deps, calls } = counting(rows, overviews);
+    await readWindowInsightsBatch('dev', windows, deps);
+    expect(calls.list).toBe(1);
+    expect(calls.get.sort()).toEqual(['k/a', 'k/gone']);
+  });
+
+  it('an empty batch reads nothing', async () => {
+    const { deps, calls } = counting(rows, overviews);
+    expect(await readWindowInsightsBatch('dev', [], deps)).toEqual([]);
+    expect(calls).toEqual({ list: 0, get: [] });
   });
 });

@@ -686,6 +686,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // (safe in either direction: S3 is the record).
       // (90 = DEFAULT_RETENTION_DAYS in src/services/telemetry-partitions.ts.)
       TELEMETRY_HOT_WINDOW_DAYS: String(props.telemetryHotWindowDays ?? props.telemetryRetentionDays ?? 90),
+      // "1" when the 1-minute OfflineSweeper schedule is enabled (prod by
+      // default). Read paths that close stale sessions on read (because the
+      // dev sweeper is off and a status nobody advances is a lie) skip that
+      // transaction when the sweeper is already doing it.
+      SWEEPER_SCHEDULED: props.disableScheduledJobs ? "0" : "1",
       // Device-recorded media sessions (offline recording plan, Phase 4):
       // sweeper close window — no new segment ARRIVAL for this long -> closed.
       MEDIA_SESSION_CLOSE_AFTER_MS: recCtx("mediaSessionCloseAfterMs", String(10 * 60 * 1000)),
@@ -3254,6 +3259,14 @@ export class XorgateCoreApiStack extends cdk.Stack {
     addRoutes({
       path: "/devices/{id}/telemetry/insights",
       methods: [apigwv2.HttpMethod.GET],
+      integration: telemetryHistoryInt,
+    });
+    // The same read for a page of windows in one request (POST: the windows
+    // ride in the body). One session query and one GET per overview object
+    // for the whole page instead of per run.
+    addRoutes({
+      path: "/devices/{id}/telemetry/insights/batch",
+      methods: [apigwv2.HttpMethod.POST],
       integration: telemetryHistoryInt,
     });
 

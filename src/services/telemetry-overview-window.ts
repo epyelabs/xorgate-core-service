@@ -234,6 +234,66 @@ export async function readWindowInsights(
   deps: WindowInsightsDeps = windowInsightsDeps,
 ): Promise<WindowInsights> {
   const rows = await deps.listSessions(deviceId, window.fromMs, window.toMs);
+  return insightsFromRows(rows, window, (key) => deps.getOverview(key));
+}
+
+/** Most windows one batch read accepts (a page of media runs is 25 by default). */
+export const WINDOW_INSIGHTS_BATCH_MAX = 100;
+
+/** Overview objects read at once by a batch. */
+const OVERVIEW_FETCH_CONCURRENCY = 8;
+
+/**
+ * The batch form of `readWindowInsights`: one result per window, in order.
+ * What a page of media runs needs, and why it exists: the per-window read
+ * repeats auth, the ownership check, close-on-read and the session query
+ * for every run on the page, about seven sequential Data API round trips
+ * each. Here the device's sessions are listed ONCE over the windows' span,
+ * and each overview object is read ONCE however many windows it overlaps
+ * (adjacent runs usually share a telemetry session). The per-window numbers
+ * are exactly the single read's: the same rows, filtered by the same overlap
+ * rule, folded by the same function.
+ */
+export async function readWindowInsightsBatch(
+  deviceId: string,
+  windows: Array<{ fromMs: number; toMs: number }>,
+  deps: WindowInsightsDeps = windowInsightsDeps,
+): Promise<WindowInsights[]> {
+  if (windows.length === 0) return [];
+  const spanFrom = Math.min(...windows.map((w) => w.fromMs));
+  const spanTo = Math.max(...windows.map((w) => w.toMs));
+  const all = await deps.listSessions(deviceId, spanFrom, spanTo);
+  // The SQL predicate of `listSessions`, per window.
+  const rowsFor = (w: { fromMs: number; toMs: number }) =>
+    all.filter((r) => (r.endedAt ?? r.startedAt).getTime() >= w.fromMs && r.startedAt.getTime() < w.toMs);
+  const perWindow = windows.map(rowsFor);
+
+  // Only the overviews some window will read, each once.
+  const keys = [
+    ...new Set(
+      perWindow.flat().filter((r) => r.status === 'closed' && r.overviewKey && r.overviewBuiltAt).map((r) => r.overviewKey!),
+    ),
+  ];
+  const overviews = new Map<string, OverviewV1 | null>();
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < keys.length) {
+      const key = keys[next++];
+      overviews.set(key, await deps.getOverview(key));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(OVERVIEW_FETCH_CONCURRENCY, keys.length) }, worker));
+
+  return Promise.all(
+    windows.map((w, i) => insightsFromRows(perWindow[i], w, async (key) => overviews.get(key) ?? null)),
+  );
+}
+
+async function insightsFromRows(
+  rows: WindowSessionRow[],
+  window: { fromMs: number; toMs: number },
+  getOverview: (key: string) => Promise<OverviewV1 | null>,
+): Promise<WindowInsights> {
   const sessions: WindowInsightsSession[] = [];
   const spans: Array<[number, number]> = [];
   let distance: number | null = null;
@@ -248,7 +308,7 @@ export async function readWindowInsights(
     let summary: WindowGpsSummary | null = null;
     let source: 'overview' | 'unbuilt' = 'unbuilt';
     if (built) {
-      const overview = await deps.getOverview(row.overviewKey!);
+      const overview = await getOverview(row.overviewKey!);
       if (overview) {
         source = 'overview';
         summary = summarizeOverviewWindow(overview, window.fromMs, window.toMs);
