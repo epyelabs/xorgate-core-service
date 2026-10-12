@@ -910,7 +910,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-commands.ts"),
-        "POST /devices/{id}/reboot|power-off|refresh-state|update + sms-reads — one-shot device commands",
+        "POST /devices/{id}/reboot|power-off|refresh-state|update + sms-reads + sms/clear — one-shot device commands",
       ),
       // Bundles @aws-sdk/client-iot-data-plane (command publish), which isn't
       // guaranteed in the Lambda runtime SDK.
@@ -3118,6 +3118,13 @@ export class XorgateCoreApiStack extends cdk.Stack {
     addRoutes({
       path: "/devices/{id}/sms-reads/{readId}",
       methods: [apigwv2.HttpMethod.GET],
+      integration: deviceCommandsInt,
+    });
+    // SMS "Clear all" (plans/device-sms-clear): owner/admin, publishes
+    // `clear_sms`; the result is a `device_sms_reads` row polled like a read.
+    addRoutes({
+      path: "/devices/{id}/sms/clear",
+      methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });
 

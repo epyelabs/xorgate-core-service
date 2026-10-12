@@ -1732,6 +1732,15 @@ export function openApiSchemas(): Record<string, unknown> {
           items: { $ref: '#/components/schemas/SmsMessage' },
           description: 'Newest first, at most `limit`.',
         },
+        cleared: {
+          type: 'object',
+          description:
+            'Clears only (`action: "clear"`): how many messages each store (`SM`, `ME`) held ' +
+            'before the delete. The rest of the result is the device\'s sweep after the delete, ' +
+            'normally empty.',
+          additionalProperties: { type: 'integer', minimum: 0 },
+          example: { SM: 7, ME: 23 },
+        },
       },
     },
     SmsRead: {
@@ -1743,6 +1752,7 @@ export function openApiSchemas(): Record<string, unknown> {
         'errorCode',
         'errorMessage',
         'limit',
+        'action',
         'requestedBy',
         'createdAt',
         'completedAt',
@@ -1768,6 +1778,14 @@ export function openApiSchemas(): Record<string, unknown> {
         },
         errorMessage: { type: 'string', nullable: true, description: 'The device\'s own error detail, if any.' },
         limit: { type: 'integer', minimum: 1, maximum: 50 },
+        action: {
+          type: 'string',
+          enum: ['read', 'clear'],
+          description:
+            '`read` (`POST /devices/{id}/sms-reads`) or `clear` (`POST /devices/{id}/sms/clear`). ' +
+            'A clear is polled and stored like a read; its `result` is the device\'s state after ' +
+            'the delete, plus `cleared`.',
+        },
         requestedBy: { type: 'string', description: 'User id or API key id of the principal that asked.' },
         createdAt: { type: 'string', format: 'date-time' },
         completedAt: { type: 'string', format: 'date-time', nullable: true },

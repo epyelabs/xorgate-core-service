@@ -35,6 +35,13 @@ import { uuidParam } from '../utils/sql';
  * once). A bad payload logs and drops; a DB error throws so the async-invoke
  * retries get another go (a lost reply only costs the user a retry).
  *
+ * Clears (plans/device-sms-clear, contract.md §2 + §5) reply on the same
+ * topic with the same shape plus `action: "clear"` and `cleared` (messages per
+ * store before the delete). Nothing here branches on `action`: the row id is
+ * the correlation and the row already carries its action. `cleared` is kept
+ * inside `result` when present, so an `ok` clear's stored copy shows what it
+ * removed; the retention below then deletes the older rows (and their text).
+ *
  * PRIVACY: never log message text or sender numbers. Counts, status, ids and
  * durations only.
  */
@@ -72,6 +79,14 @@ const resultSchema = z.object({
   skipped: z.number().int().min(0).optional().default(0),
   partial: z.boolean().optional().default(false),
   messages: z.array(messageSchema).max(50).optional().default([]),
+  /**
+   * "read" | "clear"; absent means "read" (device-sms-clear contract §2).
+   * Informational only (never matched on), so an unknown value is not a reason
+   * to drop a real reply.
+   */
+  action: z.string().max(16).optional(),
+  /** Clear only: messages present in each store before the delete. */
+  cleared: z.record(z.string().max(8), z.number().int().min(0)).optional(),
 });
 
 export type DeviceSmsResult = z.infer<typeof resultSchema>;
@@ -130,6 +145,7 @@ export const handler = async (event: unknown): Promise<void> => {
               partial: reply.partial,
               durationMs: reply.durationMs ?? null,
               messages: reply.messages,
+              ...(reply.cleared ? { cleared: reply.cleared } : {}),
             },
             completedAt: new Date(),
           }
@@ -163,6 +179,8 @@ export const handler = async (event: unknown): Promise<void> => {
     deviceId,
     requestId: reply.requestId,
     status: reply.status,
+    action: reply.action ?? 'read',
+    ...(reply.cleared ? { cleared: reply.cleared } : {}),
     count: reply.messages.length,
     total: reply.total,
     partial: reply.partial,

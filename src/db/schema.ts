@@ -1310,8 +1310,9 @@ export const devicePurges = pgTable(
 
 // --- Device SMS reads (plans/device-sms-inbox, drizzle/manual/033) ---
 //
-// One row per on-demand "read the SIM's messages" request. `id` is the command
-// `requestId`; the ingest Lambda (handlers/device-sms-result.ts) stores the
+// One row per on-demand "read the SIM's messages" request, or (`action =
+// 'clear'`, plans/device-sms-clear, manual/034) per "delete them all" request,
+// whose reply is the post-clear sweep. `id` is the command `requestId`; the ingest Lambda (handlers/device-sms-result.ts) stores the
 // device's reply on the row. `status`: pending | ok | error | expired.
 //
 // Retention without a schedule: storing an `ok` result deletes every OLDER row
@@ -1332,6 +1333,9 @@ export const deviceSmsReads = pgTable(
     /** User id or API key id, whichever principal asked. Debugging only. */
     requestedBy: text('requested_by').notNull(),
     limit: integer('limit').default(10).notNull(),
+    // 'read' | 'clear' (plans/device-sms-clear, manual/034). Set at creation,
+    // never matched on by the ingest: the row id is the correlation.
+    action: text('action').default('read').notNull(),
     status: text('status').default('pending').notNull(),
     // Device status when != ok (no_modem | no_sim | modem_busy | error),
     // 'timeout' on expiry, 'publish_failed' when the command never left.

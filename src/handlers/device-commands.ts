@@ -12,9 +12,13 @@ import {
 import { apiHandler } from '../utils/api-handler';
 import { handleDeviceSmsReadRoutes } from './device-sms-reads';
 
-/** On-demand SMS reads (plans/device-sms-inbox): their own gates and shapes, see device-sms-reads.ts. */
+/**
+ * On-demand SMS reads (plans/device-sms-inbox) and clears (plans/device-sms-clear):
+ * their own gates and shapes, see device-sms-reads.ts.
+ */
 const SMS_READ_ROUTES = new Set([
   'POST /devices/{id}/sms-reads',
+  'POST /devices/{id}/sms/clear',
   'GET /devices/{id}/sms-reads/latest',
   'GET /devices/{id}/sms-reads/{readId}',
 ]);
@@ -34,6 +38,7 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  *   POST /devices/{id}/update
  * plus the SMS-read routes, dispatched to device-sms-reads.ts:
  *   POST /devices/{id}/sms-reads
+ *   POST /devices/{id}/sms/clear      (owner/admin; deletes the modem's stored SMS)
  *   GET  /devices/{id}/sms-reads/latest
  *   GET  /devices/{id}/sms-reads/{readId}
  *

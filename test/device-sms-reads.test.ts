@@ -212,8 +212,12 @@ const post = (body?: unknown) =>
 const getRead = (readId: string, deviceId = DEVICE) =>
   call('GET /devices/{id}/sms-reads/{readId}', { readId, deviceId });
 const getLatest = (deviceId = DEVICE) => call('GET /devices/{id}/sms-reads/latest', { deviceId });
+const clear = (body?: unknown) =>
+  call('POST /devices/{id}/sms/clear', { body: body === undefined ? undefined : JSON.stringify(body) });
 
-const capable = { effective: { agent: { capabilities: ['sms.read'], build: { version: 'abc' } } } };
+const capable = { effective: { agent: { capabilities: ['sms.read', 'sms.clear'], build: { version: 'abc' } } } };
+/** An agent with the inbox (v0.0.7, the fleet today) but not the clear. */
+const readOnly = { effective: { agent: { capabilities: ['sms.read'], build: { version: 'v0.0.7' } } } };
 
 let seq = 0;
 function seedRead(over: Partial<ReadRow> & { createdAt: Date }): ReadRow {
@@ -225,6 +229,7 @@ function seedRead(over: Partial<ReadRow> & { createdAt: Date }): ReadRow {
     organizationId: ORG,
     requestedBy: 'user-1',
     limit: 10,
+    action: 'read',
     status: 'pending',
     errorCode: null,
     errorMessage: null,
@@ -305,6 +310,7 @@ describe('POST /devices/{id}/sms-reads', () => {
       deviceId: DEVICE,
       status: 'pending',
       limit: 25,
+      action: 'read',
       requestedBy: 'user-1',
       errorCode: null,
       errorMessage: null,
@@ -318,7 +324,13 @@ describe('POST /devices/{id}/sms-reads', () => {
       requestId: body.id,
     });
     expect(reads).toHaveLength(1);
-    expect(reads[0]).toMatchObject({ id: body.id, workspaceId: WS, organizationId: ORG, status: 'pending' });
+    expect(reads[0]).toMatchObject({
+      id: body.id,
+      workspaceId: WS,
+      organizationId: ORG,
+      status: 'pending',
+      action: 'read',
+    });
   });
 
   it('takes the any-member gate: every role, viewer included, gets 202', async () => {
@@ -408,6 +420,119 @@ describe('POST /devices/{id}/sms-reads', () => {
     expect(parse(res).error.details.readId).toBe(reads[0].id);
     expect(reads[0]).toMatchObject({ status: 'error', errorCode: 'publish_failed' });
     expect(reads[0].completedAt).toBeInstanceOf(Date);
+  });
+});
+
+// ---- POST clear ---------------------------------------------------------------
+describe('POST /devices/{id}/sms/clear', () => {
+  it('records a pending clear, publishes clear_sms with the row id and args.limit, and answers 202', async () => {
+    const res = await clear({ limit: 5 });
+    expect(status(res)).toBe(202);
+    const body = parse(res);
+    expect(body).toMatchObject({
+      deviceId: DEVICE,
+      status: 'pending',
+      action: 'clear',
+      limit: 5,
+      requestedBy: 'user-1',
+      result: null,
+    });
+    expect(publishDeviceCommand).toHaveBeenCalledTimes(1);
+    expect(publishDeviceCommand).toHaveBeenCalledWith(DEVICE, 'clear_sms', {
+      args: { limit: 5 },
+      requestId: body.id,
+    });
+    expect(reads).toHaveLength(1);
+    expect(reads[0]).toMatchObject({ id: body.id, action: 'clear', status: 'pending', organizationId: ORG });
+  });
+
+  it('defaults the follow-up sweep limit to 10, with the read clamp rules', async () => {
+    expect(parse(await clear()).limit).toBe(10);
+    expect(parse(await clear({ limit: 500 })).limit).toBe(50);
+    expect(publishDeviceCommand).toHaveBeenLastCalledWith(DEVICE, 'clear_sms', expect.objectContaining({ args: { limit: 50 } }));
+  });
+
+  it('owner and admin get 202; member and viewer get 403 INSUFFICIENT_ROLE, while their read still works', async () => {
+    for (const role of ['owner', 'admin']) {
+      auth = { userId: `u-${role}`, apiKeyId: null, organizationId: ORG, membershipRole: role };
+      const res = await clear();
+      expect(status(res), role).toBe(202);
+      expect(parse(res).action).toBe('clear');
+    }
+    reads = [];
+    publishDeviceCommand.mockClear();
+    for (const role of ['member', 'viewer']) {
+      auth = { userId: `u-${role}`, apiKeyId: null, organizationId: ORG, membershipRole: role };
+      const res = await clear();
+      expect(status(res), role).toBe(403);
+      expect(parse(res).error.code).toBe('INSUFFICIENT_ROLE');
+      expect(reads).toHaveLength(0);
+      expect(publishDeviceCommand).not.toHaveBeenCalled();
+      // The read gate is unchanged for the same caller.
+      const read = await post();
+      expect(status(read), role).toBe(202);
+      expect(parse(read).action).toBe('read');
+      reads = [];
+      publishDeviceCommand.mockClear();
+    }
+  });
+
+  it('passes the owner/admin role list to the gate (and none for reads)', async () => {
+    await clear();
+    expect(requireOrgContext.mock.calls.at(-1)?.[1]).toEqual(['owner', 'admin']);
+    await post();
+    expect(requireOrgContext.mock.calls.at(-1)?.[1]).toBeUndefined();
+  });
+
+  it('is a 403 for a non-member and a 404 for a device outside the caller\'s workspaces', async () => {
+    auth = null;
+    expect(status(await clear())).toBe(403);
+    auth = { userId: 'user-1', apiKeyId: null, organizationId: ORG, membershipRole: 'owner' };
+    devices[DEVICE].workspaceId = 'ffffffff-0000-4000-8000-000000000001';
+    const res = await clear();
+    expect(status(res)).toBe(404);
+    expect(parse(res).error.code).toBe('NOT_FOUND');
+    expect(reads).toHaveLength(0);
+    expect(publishDeviceCommand).not.toHaveBeenCalled();
+  });
+
+  it('is a 409 DEVICE_OFFLINE when the device is not online', async () => {
+    devices[DEVICE].status = 'offline';
+    const res = await clear();
+    expect(status(res)).toBe(409);
+    expect(parse(res).error.code).toBe('DEVICE_OFFLINE');
+    expect(reads).toHaveLength(0);
+    expect(publishDeviceCommand).not.toHaveBeenCalled();
+  });
+
+  it('is a 409 UNSUPPORTED_AGENT when the agent has sms.read but not sms.clear', async () => {
+    devices[DEVICE].reportedConfig = readOnly;
+    const res = await clear();
+    expect(status(res)).toBe(409);
+    expect(parse(res).error.code).toBe('UNSUPPORTED_AGENT');
+    expect(parse(res).error.message).toMatch(/clear/);
+    expect(reads).toHaveLength(0);
+    expect(publishDeviceCommand).not.toHaveBeenCalled();
+    // ...and that agent can still be read.
+    expect(status(await post())).toBe(202);
+  });
+
+  it('checks the body before online and online before the capability', async () => {
+    devices[DEVICE].status = 'offline';
+    devices[DEVICE].reportedConfig = readOnly;
+    expect(parse(await clear({ limit: 'x' })).error.code).toBe('VALIDATION_ERROR');
+    expect(parse(await clear()).error.code).toBe('DEVICE_OFFLINE');
+    devices[DEVICE].status = 'online';
+    expect(parse(await clear()).error.code).toBe('UNSUPPORTED_AGENT');
+  });
+
+  it('marks the row error and answers 502 COMMAND_PUBLISH_FAILED when the publish fails', async () => {
+    publishDeviceCommand.mockRejectedValueOnce(new Error('iot down'));
+    const res = await clear();
+    expect(status(res)).toBe(502);
+    expect(parse(res).error.code).toBe('COMMAND_PUBLISH_FAILED');
+    expect(parse(res).error.details.readId).toBe(reads[0].id);
+    expect(reads[0]).toMatchObject({ status: 'error', errorCode: 'publish_failed', action: 'clear' });
   });
 });
 
@@ -570,6 +695,87 @@ describe('device-sms-result ingest', () => {
     await ingest(reply(failing.id, { status: 'no_modem', error: 'no modem', messages: [], total: 0 }));
     expect(reads).toHaveLength(2);
     expect(parse(await getLatest()).id).toBe(stored.id);
+  });
+
+  it('stores a clear reply with `cleared` inside result, keeping the row\'s action', async () => {
+    const row = seedRead({ createdAt: ago(3_000), action: 'clear' });
+    await ingest(
+      reply(row.id, {
+        action: 'clear',
+        cleared: { SM: 7, ME: 23 },
+        storage: { SM: { used: 0, total: 40 }, ME: { used: 0, total: 23 } },
+        total: 0,
+        messages: [],
+      }),
+    );
+    expect(reads[0]).toMatchObject({ status: 'ok', action: 'clear' });
+    expect(reads[0].result).toEqual({
+      storage: { SM: { used: 0, total: 40 }, ME: { used: 0, total: 23 } },
+      total: 0,
+      skipped: 0,
+      partial: false,
+      durationMs: 3512,
+      messages: [],
+      cleared: { SM: 7, ME: 23 },
+    });
+    expect(parse(await getRead(row.id))).toMatchObject({
+      action: 'clear',
+      status: 'ok',
+      result: { cleared: { SM: 7, ME: 23 }, messages: [] },
+    });
+  });
+
+  it('an ok clear deletes the device\'s older rows, so /latest serves the (empty) clear', async () => {
+    const oldOk = seedRead({
+      createdAt: ago(60_000),
+      status: 'ok',
+      completedAt: ago(59_000),
+      result: { total: 1, messages: [message] },
+    });
+    const target = seedRead({ createdAt: ago(5_000), action: 'clear' });
+    await ingest(reply(target.id, { action: 'clear', cleared: { SM: 1, ME: 0 }, total: 0, messages: [] }));
+    expect(reads.map((r) => r.id)).toEqual([target.id]);
+    expect(reads.map((r) => r.id)).not.toContain(oldOk.id);
+    const latest = parse(await getLatest());
+    expect(latest).toMatchObject({ id: target.id, action: 'clear', result: { total: 0, messages: [] } });
+  });
+
+  it('a failed clear stores no result and leaves the stored copy in place', async () => {
+    const stored = seedRead({ createdAt: ago(60_000), status: 'ok', completedAt: ago(59_000), result: { total: 1 } });
+    const target = seedRead({ createdAt: ago(5_000), action: 'clear' });
+    await ingest(
+      reply(target.id, {
+        action: 'clear',
+        status: 'error',
+        error: 'delete ME failed',
+        cleared: { SM: 7, ME: 23 },
+        total: 0,
+        messages: [],
+      }),
+    );
+    expect(reads.find((r) => r.id === target.id)).toMatchObject({
+      status: 'error',
+      errorCode: 'error',
+      errorMessage: 'delete ME failed',
+      result: null,
+    });
+    expect(parse(await getLatest())).toMatchObject({ id: stored.id, action: 'read' });
+  });
+
+  it('drops a clear reply whose `cleared` counts are not non-negative integers', async () => {
+    const row = seedRead({ createdAt: ago(3_000), action: 'clear' });
+    await ingest(reply(row.id, { action: 'clear', cleared: { SM: -1 } }));
+    await ingest(reply(row.id, { action: 'clear', cleared: { SM: 1.5 } }));
+    await ingest(reply(row.id, { action: 'clear', cleared: 'all' }));
+    expect(reads[0].status).toBe('pending');
+  });
+
+  it('serializes action read on reads, and a reply without action still lands', async () => {
+    const row = seedRead({ createdAt: ago(3_000) });
+    await ingest(reply(row.id)); // no `action` on the wire: a read
+    expect(reads[0].result).not.toHaveProperty('cleared');
+    expect(parse(await getRead(row.id))).toMatchObject({ action: 'read', status: 'ok' });
+    expect(parse(await getLatest())).toMatchObject({ id: row.id, action: 'read' });
   });
 
   it('drops invalid, oversized and topic-less payloads without touching the table', async () => {

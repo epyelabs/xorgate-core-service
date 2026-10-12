@@ -1,0 +1,14 @@
+-- Device SMS "Clear all" (plans/device-sms-clear, contract.md §5).
+--
+-- A `device_sms_reads` row is now either a read or a clear: `action` is
+-- `'read'` (every existing row, and every row the read POST creates) or
+-- `'clear'` (POST /devices/{id}/sms/clear, which publishes `clear_sms`). The
+-- device answers both on the same topic with the same payload shape, so the
+-- ingest Lambda matches on the row id alone and never on `action`. An `ok`
+-- clear stores its (normally empty) follow-up sweep and the existing
+-- retention deletes every older row of the device, old message text included.
+--
+-- Additive and idempotent. Apply through the RDS Data API BEFORE deploying the
+-- code: drizzle selects every column of `device_sms_reads`, so an unmigrated
+-- database 500s on every SMS route and on the ingest. One statement.
+ALTER TABLE device_sms_reads ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'read';

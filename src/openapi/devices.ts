@@ -839,8 +839,9 @@ export const devicesPaths = {
       summary: 'The device\'s stored messages (its latest successful read)',
       description:
         'The newest read whose `status` is `ok`, with its messages. Works whatever the device\'s ' +
-        'status, which is the point: an offline device still shows what was last fetched. 404 ' +
-        '`NO_SMS_READ` when the device has never been read.',
+        'status, which is the point: an offline device still shows what was last fetched. A ' +
+        'successful clear (`action: "clear"`) counts too, so after one this serves its (normally ' +
+        'empty) result until the next read. 404 `NO_SMS_READ` when the device has never been read.',
       tags: ['Devices'],
       responses: {
         '200': {
@@ -884,6 +885,64 @@ export const devicesPaths = {
         '403': { $ref: '#/components/responses/Forbidden' },
         '404': { $ref: '#/components/responses/NotFound' },
         '405': { $ref: '#/components/responses/MethodNotAllowed' },
+      },
+    },
+  },
+  '/devices/{id}/sms/clear': {
+    parameters: deviceIdParams,
+    post: {
+      operationId: 'clearDeviceSms',
+      summary: 'Delete every SMS stored on a device\'s SIM and modem (owner/admin only)',
+      description:
+        'Asks the device to delete every text message its cellular modem holds (SIM and modem ' +
+        'storage), then read the stores again. A full store makes the modem refuse new messages; ' +
+        'this empties it. **Destructive and irreversible**, so only owners and admins may clear ' +
+        '(members and viewers get `403` `INSUFFICIENT_ROLE`).\n\n' +
+        'Returns `202` with a `pending` `SmsRead` whose `action` is `clear`; poll `GET ' +
+        '/devices/{id}/sms-reads/{readId}` exactly as for a read. On `ok`, `result` is the ' +
+        'device\'s state after the delete (normally no messages, with fresh storage counts) plus ' +
+        '`cleared`, how many messages each store held before. A successful clear replaces the ' +
+        'stored copy, so `GET /devices/{id}/sms-reads/latest` serves it until the next read and ' +
+        'the previously stored message text is gone from Xorgate too. `limit` sizes that ' +
+        'follow-up read, with the same rules as a read.',
+      tags: ['Devices'],
+      requestBody: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/SmsReadCreate' },
+            example: { limit: 10 },
+          },
+        },
+      },
+      responses: {
+        '202': {
+          description: 'Clear requested. Poll it by id.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/SmsRead' } } },
+        },
+        '400': {
+          description: '`limit` is not a number, or the body is not a JSON object (`VALIDATION_ERROR`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '401': { $ref: '#/components/responses/Unauthorized' },
+        '403': {
+          description: 'Not an owner or admin of the organization (`INSUFFICIENT_ROLE`), or not a member.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '404': { $ref: '#/components/responses/NotFound' },
+        '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            'The device is not online (`DEVICE_OFFLINE`), or its agent predates clearing ' +
+            '(`UNSUPPORTED_AGENT`; update the device agent).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '502': {
+          description:
+            'The command could not be delivered to the broker (`COMMAND_PUBLISH_FAILED`; ' +
+            '`details.readId` names the clear, now `error`). Nothing was deleted. Safe to retry.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
       },
     },
   },

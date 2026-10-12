@@ -52,7 +52,14 @@ import { iotDataClient } from './iot-data';
  * `args`, and the only one whose requestId is caller-supplied: it is the
  * `device_sms_reads` row id the reply is matched against.
  */
-export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update' | 'read_sms';
+/**
+ * `clear_sms` (plans/device-sms-clear) asks the agent to DELETE every stored
+ * SMS (`AT+CMGD=0,4` on SM, then ME), then run a normal sweep and reply on the
+ * same `xorgate/devices/{id}/sms` topic with it, proving the stores are empty.
+ * Same `args.limit` (the follow-up sweep's size) and the same caller-supplied
+ * requestId (a `device_sms_reads` row with `action = 'clear'`) as `read_sms`.
+ */
+export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update' | 'read_sms' | 'clear_sms';
 
 /**
  * How long a command stays valid. Generous next to a sub-second publish, tight
@@ -68,12 +75,12 @@ export interface DeviceCommandMessage {
   command: DeviceCommandName;
   ts: number;
   expiresAt: number;
-  /** Command parameters. Omitted unless the caller passes some (only `read_sms` does). */
+  /** Command parameters. Omitted unless the caller passes some (only `read_sms` / `clear_sms` do). */
   args?: Record<string, unknown>;
 }
 
 export interface PublishDeviceCommandOptions {
-  /** Parameters for the command; the device ignores them for every command but `read_sms`. */
+  /** Parameters for the command; the device ignores them for every command but `read_sms` / `clear_sms`. */
   args?: Record<string, unknown>;
   /** Use this requestId instead of minting one (the caller's correlation row id). */
   requestId?: string;
