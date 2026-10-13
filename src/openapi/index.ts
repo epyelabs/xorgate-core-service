@@ -285,7 +285,12 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // `peripherals.obd`), the `obd_scan` / `obd_forget` device commands
       // (`POST /devices/{id}/commands/obd-scan|obd-forget`) and
       // `Device.obdScanRequestedAt`. Purely additive (P3).
-      version: '0.15.0',
+      // 0.16.0: the `vehicle` session insight (OBD-II: engine-on / idle /
+      // live-link time, rpm and coolant maxima, fuel and odometer start/end,
+      // refuel and DTC events) in `TelemetryInsights`, and a `vehicle`
+      // roll-up per session and in the totals of the windowed insights
+      // (`TelemetryWindowVehicle`). Purely additive (P4).
+      version: '0.16.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

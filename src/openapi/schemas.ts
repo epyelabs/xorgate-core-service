@@ -1101,14 +1101,17 @@ export function openApiSchemas(): Record<string, unknown> {
         'Every insight is a pure function of the recorded segments (nothing that depends on a ' +
         'geofence, an org setting or a model), which is what makes a rebuild reproducible. The ' +
         'v1 set: `duration`, `distance`, `speed`, `position`, `altitude`, `gpsQuality`, `system`, ' +
-        '`lte`, and `stops` (an event list). See the platform-concepts page on telemetry sessions ' +
-        'for each block\'s fields.',
+        '`lte`, `stops` (an event list) and, for a device whose model declares `peripherals.obd`, ' +
+        '`vehicle` (OBD-II: engine-on and idle time, rpm and coolant maxima, fuel start/end/used ' +
+        'with refuel events, odometer start/end/delta as a GPS cross-check, DTC events, live-link ' +
+        'time; present only when `obd.link` reached 2 in the session). See the platform-concepts ' +
+        'page on telemetry sessions for each block\'s fields.',
       properties: {
         computed: {
           type: 'object',
           additionalProperties: { type: 'integer' },
           description: '`{ insightId: version }` for every insight present.',
-          example: { duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1 },
+          example: { duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1, vehicle: 1 },
         },
         computedAt: { type: 'integer', description: 'Epoch ms.' },
         duration: {
@@ -1137,16 +1140,42 @@ export function openApiSchemas(): Record<string, unknown> {
         gpsQuality: { type: 'object', additionalProperties: true, example: { fixRatio: 0.98, avgSatellites: 7.6, avgHdop: 0.9 } },
         system: { type: 'object', additionalProperties: true, example: { maxCpuTempC: 71.5, throttledMs: 0 } },
         lte: { type: 'object', additionalProperties: true, example: { minRssi: -101, avgRssi: -83, resets: 0 } },
+        vehicle: {
+          type: 'object',
+          additionalProperties: true,
+          description:
+            'OBD-II summary, gated on `obd.link === 2` (ECU answering). `link.liveMs`; `engineOn.ms` ' +
+            '(`obd.rpm > 0`); `idle.ms` (engine on and `obd.speed`, else `gps.speed`, at or under ' +
+            '`movingThresholdKph`; `speedSource` says which); `rpm.max` + `maxAt`; `coolant.max` (C); ' +
+            '`fuel.startPct/endPct/usedPct` (`usedPct = max(0, start - end)`, so a session with a ' +
+            'refuel reads 0: check `refuels`); `odometer.startKm/endKm/deltaKm` (`role: cross-check`, ' +
+            'never the distance); `dtc.maxCount/endCount/milEnd/events`; `truncated` when an event ' +
+            'kind hit its 50 cap. Each sub-block is `{ value: null, reason }` when its metric was ' +
+            'never seen while live. Refuel (`fromPct`, `toPct`) and DTC (`count`) findings are in `events`.',
+          example: {
+            link: { liveMs: 598000, samples: 660, liveSamples: 600, liveValue: 2 },
+            engineOn: { ms: 598000, source: 'obd.rpm' },
+            idle: { ms: 298000, speedSource: 'obd.speed', movingThresholdKph: 2 },
+            rpm: { max: 2800, maxAt: 1791914528000, unit: 'rpm' },
+            coolant: { max: 100, unit: 'C' },
+            fuel: { startPct: 76.86, endPct: 95, usedPct: 0, refuels: 1, refuelMinPct: 5, unit: '%' },
+            odometer: { startKm: 47318.8, endKm: 47322.9, deltaKm: 4.1, unit: 'km', role: 'cross-check' },
+            dtc: { maxCount: 1, endCount: 1, milEnd: 1, events: 1 },
+            breakGapMs: 30000,
+            truncated: false,
+          },
+        },
         events: {
           type: 'array',
           description:
-            'Timestamped findings (stops in v1), bounded per kind, so a timeline can pin them and a ' +
-            'click can seek. Never a per-sample series.',
+            'Timestamped findings (`stop`; `refuel` with `fromPct`/`toPct` and `dtc` with `count` ' +
+            'from the `vehicle` insight), bounded per kind, so a timeline can pin them and a click ' +
+            'can seek. Never a per-sample series.',
           items: {
             type: 'object',
             required: ['kind', 'ts'],
             properties: {
-              kind: { type: 'string', example: 'stop' },
+              kind: { type: 'string', example: 'stop', description: '`stop`, `refuel` or `dtc` in v1; more may follow.' },
               ts: { type: 'integer', description: 'Epoch ms.' },
               endTs: { type: 'integer' },
               position: {
@@ -1166,7 +1195,7 @@ export function openApiSchemas(): Record<string, unknown> {
     TelemetryWindowInsights: {
       type: 'object',
       required: ['from', 'to', 'sessions', 'distanceM', 'movingMs', 'telemetryMs', 'partial'],
-      description: 'Distance and moving time inside a window (GET /devices/{id}/telemetry/insights).',
+      description: 'Distance, moving time and (for an OBD-II device) the vehicle roll-up inside a window (GET /devices/{id}/telemetry/insights).',
       properties: {
         from: { type: 'string', format: 'date-time' },
         to: { type: 'string', format: 'date-time' },
@@ -1190,6 +1219,11 @@ export function openApiSchemas(): Record<string, unknown> {
               distanceM: { type: 'number', nullable: true, description: 'Metres inside the window; 0 when built but nothing moved.' },
               movingMs: { type: 'integer', nullable: true },
               fixes: { type: 'integer', nullable: true, description: 'Overview points inside the window with an accepted fix.' },
+              vehicle: {
+                nullable: true,
+                allOf: [{ $ref: '#/components/schemas/TelemetryWindowVehicle' }],
+                description: 'Null when unbuilt, or when the overview has no `obd` grid with a live bucket inside the window.',
+              },
             },
           },
         },
@@ -1197,6 +1231,35 @@ export function openApiSchemas(): Record<string, unknown> {
         movingMs: { type: 'integer', nullable: true },
         telemetryMs: { type: 'integer', description: 'Milliseconds of the window covered by any session (union).' },
         partial: { type: 'boolean', description: 'At least one overlapping session has no built overview yet.' },
+        vehicle: {
+          nullable: true,
+          allOf: [{ $ref: '#/components/schemas/TelemetryWindowVehicle' }],
+          description:
+            'Roll-up over the sessions that have one: `liveMs`, `engineOnMs`, `idleMs`, `fuelUsedPct`, ' +
+            '`odometerDeltaKm`, `refuels` and `dtcEvents` are SUMMED; `rpmMax` and `coolantMax` are the MAX. ' +
+            'Fuel and odometer start/end values and the event lists are per session only (read the ' +
+            'session insight). Null when no session has one.',
+        },
+      },
+    },
+    TelemetryWindowVehicle: {
+      type: 'object',
+      required: ['liveMs', 'engineOnMs', 'idleMs', 'fuelUsedPct', 'odometerDeltaKm', 'rpmMax', 'coolantMax', 'refuels', 'dtcEvents', 'method'],
+      description:
+        'The `vehicle` insight\'s rules run over an overview\'s `obd` grid clipped to the window ' +
+        '(`method: "overview-obd"`): gated on `obd.link === 2`, legs broken at 30 s, bucket-averaged ' +
+        'so within one bucket width of the raw-sample session insight.',
+      properties: {
+        liveMs: { type: 'integer', description: 'Milliseconds with `obd.link === 2` inside the window.' },
+        engineOnMs: { type: 'integer', nullable: true, description: '`obd.rpm > 0`; null when the vehicle reports no rpm.' },
+        idleMs: { type: 'integer', nullable: true, description: 'Engine on and not moving (`obd.speed`, else `gps.speed`); null without a speed.' },
+        fuelUsedPct: { type: 'number', nullable: true, description: '`max(0, first - last)` of `obd.fuel_level` inside the window.' },
+        odometerDeltaKm: { type: 'number', nullable: true, description: '`last - first` of `obd.odometer` inside the window: a GPS cross-check, never the distance.' },
+        rpmMax: { type: 'number', nullable: true },
+        coolantMax: { type: 'number', nullable: true, description: 'Celsius.' },
+        refuels: { type: 'integer', description: 'Rises of `obd.fuel_level` over 5 points between consecutive buckets.' },
+        dtcEvents: { type: 'integer', description: '`obd.dtc_count` rises or `obd.mil` 0 to 1 transitions.' },
+        method: { type: 'string', enum: ['overview-obd'] },
       },
     },
     TelemetrySession: {

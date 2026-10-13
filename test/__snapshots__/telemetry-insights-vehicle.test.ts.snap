@@ -1,0 +1,71 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`vehicle insight > computes the synthetic bench session (snapshot) 1`] = `
+{
+  "events": [
+    {
+      "count": 1,
+      "kind": "dtc",
+      "ts": 1791914900000,
+      "value": 1,
+    },
+    {
+      "fromPct": 75.2,
+      "kind": "refuel",
+      "toPct": 95,
+      "ts": 1791914940000,
+      "unit": "%",
+      "value": 19.8,
+    },
+  ],
+  "vehicle": {
+    "breakGapMs": 30000,
+    "coolant": {
+      "max": 100,
+      "unit": "C",
+    },
+    "dtc": {
+      "endCount": 1,
+      "events": 1,
+      "maxCount": 1,
+      "milEnd": 1,
+    },
+    "engineOn": {
+      "ms": 598000,
+      "source": "obd.rpm",
+    },
+    "fuel": {
+      "endPct": 95,
+      "refuelMinPct": 5,
+      "refuels": 1,
+      "startPct": 76.86,
+      "unit": "%",
+      "usedPct": 0,
+    },
+    "idle": {
+      "movingThresholdKph": 2,
+      "ms": 298000,
+      "speedSource": "obd.speed",
+    },
+    "link": {
+      "liveMs": 598000,
+      "liveSamples": 600,
+      "liveValue": 2,
+      "samples": 660,
+    },
+    "odometer": {
+      "deltaKm": 4.1,
+      "endKm": 47322.9,
+      "role": "cross-check",
+      "startKm": 47318.8,
+      "unit": "km",
+    },
+    "rpm": {
+      "max": 2800,
+      "maxAt": 1791914528000,
+      "unit": "rpm",
+    },
+    "truncated": false,
+  },
+}
+`;

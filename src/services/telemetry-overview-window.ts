@@ -5,6 +5,7 @@ import { db, schema } from '../db/index';
 import { tsParam } from '../utils/sql';
 import { GPS_ACCEPT, haversineM, MOVING_THRESHOLD_KPH, round, type Fix } from './telemetry-insights/gps-accept';
 import { MIN_STEP_M } from './telemetry-insights/distance';
+import { feedVehicle, finishVehicle, initVehicleState } from './telemetry-insights/vehicle';
 import type { OverviewV1 } from './telemetry-overview';
 
 /**
@@ -26,6 +27,17 @@ import type { OverviewV1 } from './telemetry-overview';
  *
  * One S3 GET per overlapping built session; an open or unbuilt session is
  * reported with `source: "unbuilt"` and no numbers rather than guessed.
+ *
+ * `vehicle` (obd2-bluetooth-integration P4) runs the session `vehicle`
+ * insight's accumulator over the overview's `obd` grid clipped to the window,
+ * so a run's engine-on, idle, fuel-used and odometer-delta numbers follow the
+ * same rules as the whole-session insight (gated on `obd.link === 2`, legs
+ * broken at 30 s). Totals SUM `liveMs`, `engineOnMs`, `idleMs`,
+ * `fuelUsedPct`, `odometerDeltaKm`, `refuels` and `dtcEvents` and take the
+ * MAX of `rpmMax` and `coolantMax`; fuel start/end, odometer start/end and
+ * the event lists are per session and are not rolled up (read the session's
+ * own insight for those). `null` when no overlapping built session carries
+ * an `obd` grid with a live bucket inside the window.
  */
 
 export interface WindowGpsSummary {
@@ -41,6 +53,25 @@ export interface WindowGpsSummary {
   method: 'overview-haversine';
 }
 
+/** The vehicle (OBD-II) numbers of one session inside the window; see the module note for what rolls up. */
+export interface WindowVehicleSummary {
+  /** Milliseconds with `obd.link === 2` inside the window. */
+  liveMs: number;
+  /** Milliseconds with the engine running (`obd.rpm > 0`); null when the vehicle reports no rpm. */
+  engineOnMs: number | null;
+  /** Engine running and not moving (`obd.speed`, else `gps.speed`, at or under the moving threshold); null without a speed. */
+  idleMs: number | null;
+  /** `max(0, first - last)` of `obd.fuel_level` inside the window; null without the metric. */
+  fuelUsedPct: number | null;
+  /** `last - first` of `obd.odometer` inside the window (a GPS cross-check, never the distance); null without the metric. */
+  odometerDeltaKm: number | null;
+  rpmMax: number | null;
+  coolantMax: number | null;
+  refuels: number;
+  dtcEvents: number;
+  method: 'overview-obd';
+}
+
 export interface WindowInsightsSession {
   id: string;
   status: string;
@@ -54,6 +85,8 @@ export interface WindowInsightsSession {
   distanceM: number | null;
   movingMs: number | null;
   fixes: number | null;
+  /** Null when unbuilt, or built without a live OBD bucket inside the window. */
+  vehicle: WindowVehicleSummary | null;
 }
 
 export interface WindowInsights {
@@ -67,6 +100,8 @@ export interface WindowInsights {
   telemetryMs: number;
   /** True when at least one overlapping session has no built overview yet. */
   partial: boolean;
+  /** Roll-up over the sessions with a `vehicle` summary (sums, and max for rpm/coolant); null when none has one. */
+  vehicle: WindowVehicleSummary | null;
 }
 
 interface Pt extends Fix {
@@ -145,6 +180,89 @@ export function summarizeOverviewWindow(overview: OverviewV1, fromMs: number, to
   }
   if (fixes === 0) return null;
   return { distanceM: round(meters, 1), movingMs, fixes, from: first, to: last, method: 'overview-haversine' };
+}
+
+/**
+ * The vehicle summary of one overview object inside the window (pure): the
+ * session `vehicle` insight's accumulator fed the `obd` grid's buckets in
+ * order, with the `gps` grid's speed replayed ahead of each one for the
+ * no-`obd.speed` fallback. `null` without an `obd` grid or without a live
+ * bucket inside the window.
+ */
+export function summarizeOverviewVehicleWindow(overview: OverviewV1, fromMs: number, toMs: number): WindowVehicleSummary | null {
+  const obd = overview.groups?.obd;
+  if (!obd || !obd.values['obd.link']) return null;
+  const gps = overview.groups?.gps;
+  const gpsTs = gps?.ts ?? [];
+  const gpsSpeed = gps?.values['gps.speed'];
+  const metrics = Object.keys(obd.values);
+  const state = initVehicleState();
+  let g = 0;
+  for (let i = 0; i < obd.ts.length; i++) {
+    const ts = obd.ts[i];
+    if (ts < fromMs) continue;
+    if (ts >= toMs) break;
+    if (gpsSpeed) {
+      while (g < gpsTs.length && gpsTs[g] <= ts) {
+        const v = gpsSpeed[g];
+        if (v !== null && v !== undefined) feedVehicle(state, gpsTs[g], { 'gps.speed': v });
+        g++;
+      }
+    }
+    const values: Record<string, number | null> = {};
+    for (const m of metrics) values[m] = obd.values[m][i];
+    feedVehicle(state, ts, values);
+  }
+  const out = finishVehicle(state);
+  if (!out) return null;
+  const v = out.summary;
+  const n = <T extends { value: null }>(x: T | Record<string, unknown>, key: string): number | null =>
+    'value' in x && x.value === null ? null : ((x as Record<string, number>)[key] ?? null);
+  return {
+    liveMs: v.link.liveMs,
+    engineOnMs: n(v.engineOn, 'ms'),
+    idleMs: n(v.idle, 'ms'),
+    fuelUsedPct: n(v.fuel, 'usedPct'),
+    odometerDeltaKm: n(v.odometer, 'deltaKm'),
+    rpmMax: n(v.rpm, 'max'),
+    coolantMax: n(v.coolant, 'max'),
+    refuels: n(v.fuel, 'refuels') ?? 0,
+    dtcEvents: n(v.dtc, 'events') ?? 0,
+    method: 'overview-obd',
+  };
+}
+
+/** Fold per-session vehicle summaries: sums, and max for the two extremes. */
+export function rollUpVehicle(parts: WindowVehicleSummary[]): WindowVehicleSummary | null {
+  if (parts.length === 0) return null;
+  const sum = (pick: (p: WindowVehicleSummary) => number | null, decimals: number): number | null => {
+    let acc: number | null = null;
+    for (const p of parts) {
+      const x = pick(p);
+      if (x !== null) acc = (acc ?? 0) + x;
+    }
+    return acc === null ? null : round(acc, decimals);
+  };
+  const max = (pick: (p: WindowVehicleSummary) => number | null): number | null => {
+    let acc: number | null = null;
+    for (const p of parts) {
+      const x = pick(p);
+      if (x !== null && (acc === null || x > acc)) acc = x;
+    }
+    return acc;
+  };
+  return {
+    liveMs: sum((p) => p.liveMs, 0) ?? 0,
+    engineOnMs: sum((p) => p.engineOnMs, 0),
+    idleMs: sum((p) => p.idleMs, 0),
+    fuelUsedPct: sum((p) => p.fuelUsedPct, 2),
+    odometerDeltaKm: sum((p) => p.odometerDeltaKm, 1),
+    rpmMax: max((p) => p.rpmMax),
+    coolantMax: max((p) => p.coolantMax),
+    refuels: sum((p) => p.refuels, 0) ?? 0,
+    dtcEvents: sum((p) => p.dtcEvents, 0) ?? 0,
+    method: 'overview-obd',
+  };
 }
 
 export interface WindowSessionRow {
@@ -296,6 +414,7 @@ async function insightsFromRows(
 ): Promise<WindowInsights> {
   const sessions: WindowInsightsSession[] = [];
   const spans: Array<[number, number]> = [];
+  const vehicles: WindowVehicleSummary[] = [];
   let distance: number | null = null;
   let moving: number | null = null;
   let partial = false;
@@ -306,12 +425,15 @@ async function insightsFromRows(
     spans.push([sFrom, sTo]);
     const built = row.status === 'closed' && row.overviewKey && row.overviewBuiltAt;
     let summary: WindowGpsSummary | null = null;
+    let vehicle: WindowVehicleSummary | null = null;
     let source: 'overview' | 'unbuilt' = 'unbuilt';
     if (built) {
       const overview = await getOverview(row.overviewKey!);
       if (overview) {
         source = 'overview';
         summary = summarizeOverviewWindow(overview, window.fromMs, window.toMs);
+        vehicle = summarizeOverviewVehicleWindow(overview, window.fromMs, window.toMs);
+        if (vehicle) vehicles.push(vehicle);
       }
     }
     if (source === 'unbuilt') partial = true;
@@ -333,6 +455,7 @@ async function insightsFromRows(
       distanceM: source === 'overview' ? (summary?.distanceM ?? 0) : null,
       movingMs: source === 'overview' ? (summary?.movingMs ?? 0) : null,
       fixes: source === 'overview' ? (summary?.fixes ?? 0) : null,
+      vehicle,
     });
   }
   return {
@@ -343,5 +466,6 @@ async function insightsFromRows(
     movingMs: moving,
     telemetryMs: coveredMs(spans, window.fromMs, window.toMs),
     partial,
+    vehicle: rollUpVehicle(vehicles),
   };
 }

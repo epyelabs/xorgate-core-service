@@ -289,7 +289,7 @@ describe('registry', () => {
     expect(out.distance).toBeUndefined();
     expect(out.events).toEqual([]);
     expect(out.computedAt).toBe(T0 + 10_000_000);
-    expect(INSIGHT_VERSIONS).toEqual({ duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1 });
+    expect(INSIGHT_VERSIONS).toEqual({ duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1, vehicle: 1 });
   });
 
   it('promotes distance, duration and max speed for the index row', () => {

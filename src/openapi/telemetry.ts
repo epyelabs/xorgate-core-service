@@ -308,7 +308,9 @@ export const telemetryPaths = {
         '(`method: "overview-haversine"`). A session whose overview is not built yet (open, or ' +
         'closed within the last minute) is listed with `source: "unbuilt"` and no numbers, and ' +
         '`partial` is true. One object read per overlapping built session; the window may span ' +
-        'at most 31 days.',
+        'at most 31 days. For a device whose model declares `peripherals.obd`, each session and the ' +
+        'total also carry `vehicle` (engine-on, idle, live-link time, fuel used, odometer delta, rpm ' +
+        'and coolant maxima, refuel and DTC counts) from the same overview, clipped to the window.',
       tags: ['Telemetry'],
       parameters: [
         { name: 'from', in: 'query', required: true, schema: { type: 'string', format: 'date-time' } },
