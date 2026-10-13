@@ -59,7 +59,34 @@ import { iotDataClient } from './iot-data';
  * Same `args.limit` (the follow-up sweep's size) and the same caller-supplied
  * requestId (a `device_sms_reads` row with `action = 'clear'`) as `read_sms`.
  */
-export type DeviceCommandName = 'reboot' | 'power_off' | 'refresh' | 'update' | 'read_sms' | 'clear_sms';
+/**
+ * `obd_scan` / `obd_forget` (plans/obd2-bluetooth-integration, P3, lifecycle
+ * stages 3 and 9). Only for a device whose model declares `peripherals.obd`.
+ * `obd_scan` asks the agent's OBD helper to run one bounded Bluetooth
+ * discovery and write the candidates into its next config report as
+ * `effective.obd.scan = { ts, candidates: [{ mac, name, rssi }] }` — the
+ * REPORTED plane, already stored verbatim in `devices.reported_config`, so no
+ * ack consumer is needed (nothing consumes `command/response`, and nothing has
+ * to). The operator picks a MAC from that list and writes it with
+ * `PATCH /devices/{id}/config {obd:{adapterMac}}`; the device never pairs by
+ * name. The server rate-limits scans to one per device per 60 s
+ * (`devices.obd_scan_requested_at`), because discovery stalls the helper's
+ * polling while it runs. `obd_forget` asks the agent to drop the BlueZ bond
+ * for the configured adapter (and stop polling it); the caller clears the
+ * namespace separately with `PATCH {obd: null}` or `{obd:{adapterMac:null}}`.
+ */
+export type DeviceCommandName =
+  | 'reboot'
+  | 'power_off'
+  | 'refresh'
+  | 'update'
+  | 'read_sms'
+  | 'clear_sms'
+  | 'obd_scan'
+  | 'obd_forget';
+
+/** Server-side floor between two `obd_scan` commands to one device. */
+export const OBD_SCAN_MIN_INTERVAL_MS = 60_000;
 
 /**
  * How long a command stays valid. Generous next to a sub-second publish, tight

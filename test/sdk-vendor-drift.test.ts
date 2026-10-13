@@ -51,13 +51,14 @@ interface Pin {
 const PINS: Pin[] = [
   {
     file: 'src/config-registry/config-contract.json',
-    // 2026-10-01: the `simulation` namespace (plans/xorgate-device-simulator,
-    // Phase 3). Re-vendored into the SDK in the same change (SDK 0.11.0:
-    // vendor/config-contract.json + `npm run generate`, which now emits
-    // SimulationConfig). Previous pin, 2026-08-31: recording defaults lowered.
-    sha256: '6de0e20048034e68843d8b3959efd5fa051b6c3c908a035eee3578a937317d60',
+    // 2026-10-13: the `obd` namespace (plans/obd2-bluetooth-integration, P3
+    // backend). Re-vendored into the SDK on branch feat/obd-commands (SDK
+    // 0.15.0: vendor/config-contract.json + `npm run generate`, which now
+    // emits ObdConfig; publish is the owner's). Previous pin, 2026-10-01: the
+    // `simulation` namespace.
+    sha256: '430bfe1d2bfb7864a2d61358f2ffccdd1e80d791507c69169ece8e48cdfc6e12',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
-    pinnedAt: '2026-10-01',
+    pinnedAt: '2026-10-13',
   },
   {
     file: 'src/schemas/capabilities.ts',

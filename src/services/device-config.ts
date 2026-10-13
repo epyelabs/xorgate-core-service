@@ -7,6 +7,7 @@ import { iotDataClient } from './iot-data';
 import {
   CONFIG_NAMESPACES,
   GNSS_ANT_BIAS_DEFAULT,
+  namespaceAllowedFor,
   type DeviceConfigDocument,
   type PublishedConfigDocument,
 } from '../config-registry/index';
@@ -123,8 +124,17 @@ export function buildDeviceConfigMessage(
   // the emitted key order stable so consecutive entries in the device's
   // "cloud config applied" journal diff cleanly.
   const namespaces: Record<string, unknown> = { gnssAntBias: GNSS_ANT_BIAS_DEFAULT };
+  // The model-gated namespaces (`obd`, plans/obd2-bluetooth-integration P3)
+  // ride only on a device whose CURRENT hardware block qualifies. PATCH and
+  // the local-change mirror already refuse to store them elsewhere; this is
+  // the one path that sees the model at publish time, so it is where a value
+  // left behind by a model reassignment is kept off the wire. `simulated` is
+  // deliberately not re-checked here: nothing can store `simulation` on a real
+  // row, and a simulated device has no hardware block to assert it with.
+  const gate = { simulated: true, obd: hardware?.peripherals?.obd !== undefined };
   for (const ns of CONFIG_NAMESPACES) {
     if (!Object.prototype.hasOwnProperty.call(source, ns.key)) continue;
+    if (!namespaceAllowedFor(ns.key, gate)) continue;
     const value = source[ns.key];
     if (value === undefined) continue;
     if (value === null) {
@@ -167,6 +177,18 @@ export async function deviceHardwareBlock(
     .where(eq(schema.devices.id, deviceId))
     .limit(1);
   return deriveHardwareBlock(rows[0]?.caps);
+}
+
+/**
+ * Whether the device's CURRENT model declares `peripherals.obd`, i.e. whether
+ * the `obd` config namespace may be stored on its row (PATCH /config and the
+ * local-change mirror both ask here before `validateConfigPatch`) and whether
+ * the OBD commands (`obd_scan` / `obd_forget`) apply to it. false for a v1
+ * model, a plain v2 model, or a device that is gone.
+ */
+export async function deviceDeclaresObd(deviceId: string): Promise<boolean> {
+  const hardware = await deviceHardwareBlock(deviceId);
+  return hardware?.peripherals?.obd !== undefined;
 }
 
 /**

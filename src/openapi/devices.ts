@@ -305,7 +305,9 @@ export const devicesPaths = {
         'publishes the whole document as a retained MQTT message on `xorgate/devices/{id}/config`. ' +
         'Each present namespace is validated and replaced WHOLE, because the device replaces ' +
         'namespaces the same way and a partial namespace would silently drop the keys it omits. ' +
-        '`null` reverts a namespace to device defaults. Returns 502 when the row was written but ' +
+        '`null` reverts a namespace to device defaults. Two namespaces are gated on the device: ' +
+        '`simulation` is accepted only for a simulated device and `obd` only for a device whose ' +
+        'model declares `peripherals.obd` (400 otherwise, naming the namespace). Returns 502 when the row was written but ' +
         'the retained publish failed: the device has NOT been told yet, though it self-heals on ' +
         'its next config report.',
       tags: ['Devices'],
@@ -1011,6 +1013,67 @@ export const devicesPaths = {
         'one-shot coalesces into the run in flight.',
       tags: ['Devices'],
       responses: commandResponses,
+    },
+  },
+  '/devices/{id}/commands/obd-scan': {
+    parameters: deviceIdParams,
+    post: {
+      operationId: 'scanDeviceObdAdapters',
+      summary: 'Ask an OBD-II kit to scan for nearby Bluetooth adapters',
+      description:
+        'Publishes a one-shot `obd_scan` command over MQTT. The device runs one bounded Bluetooth ' +
+        'discovery (it never pairs with anything it finds) and writes the candidates into its next ' +
+        'config report as `effective.obd.scan = { ts, candidates: [{ mac, name, rssi }] }`. ' +
+        'Observe the outcome by re-reading `GET /devices/{id}` until `reportedConfig.effective.obd.scan.ts` ' +
+        'advances past the request (typically 10 to 20 s); there is no result row to poll and the ' +
+        'command ack is not consumed, because the answer travels on the reported config plane the ' +
+        'device already maintains. The operator then picks a MAC and writes it with ' +
+        '`PATCH /devices/{id}/config {"obd": {"adapterMac": "..."}}`. Only for a device whose model ' +
+        'declares `peripherals.obd` (`400` `NOT_OBD_DEVICE` otherwise). Rate-limited server-side to ' +
+        'one scan per device per 60 s (`429` `RATE_LIMITED`, `details.retryAfterMs`), because ' +
+        'discovery stalls the helper\'s polling while it runs. Ordinary member access, since nothing ' +
+        'on the device changes. The device must be online (409 otherwise).',
+      tags: ['Devices'],
+      responses: {
+        ...commandResponses,
+        '400': {
+          description:
+            'The device\'s model does not declare `peripherals.obd` (`NOT_OBD_DEVICE`): it has no ' +
+            'OBD reader to scan with.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+        '429': {
+          description:
+            'A scan was requested for this device inside the last 60 s (`RATE_LIMITED`; ' +
+            '`details.retryAfterMs` says how long to wait). Read the candidates it produced instead.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+      },
+    },
+  },
+  '/devices/{id}/commands/obd-forget': {
+    parameters: deviceIdParams,
+    post: {
+      operationId: 'forgetDeviceObdAdapter',
+      summary: 'Ask an OBD-II kit to forget its paired adapter',
+      description:
+        'Publishes a one-shot `obd_forget` command over MQTT. The device drops the Bluetooth bond ' +
+        'for its configured adapter and stops polling it; the next config report shows ' +
+        '`effective.obd.status` back at "not configured". The cloud-side setting is NOT cleared by ' +
+        'this call: pair it with `PATCH /devices/{id}/config {"obd": null}` (revert the whole ' +
+        'namespace) or `{"obd": {"adapterMac": null, ...}}`, otherwise the retained config re-pairs the ' +
+        'same adapter on the device\'s next settings poll. Reversible (set an adapter again), so it ' +
+        'takes the ordinary write gate (owner/admin/member). Only for a device whose model declares ' +
+        '`peripherals.obd` (`400` `NOT_OBD_DEVICE` otherwise). The device must be online (409 otherwise).',
+      tags: ['Devices'],
+      responses: {
+        ...commandResponses,
+        '400': {
+          description:
+            'The device\'s model does not declare `peripherals.obd` (`NOT_OBD_DEVICE`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
+      },
     },
   },
   '/device-dist/latest': {

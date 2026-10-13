@@ -1,13 +1,14 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
-import { publishDeviceConfig } from '../services/device-config';
+import { deviceDeclaresObd, publishDeviceConfig } from '../services/device-config';
 import {
   applyConfigPatch,
   configNamespace,
   namespaceAllowedFor,
   validateNamespaceValue,
   type DeviceConfigDocument,
+  OBD_ONLY_NAMESPACES,
 } from '../config-registry/index';
 import { legacyConfigColumns } from '../config-registry/legacy-columns';
 
@@ -415,6 +416,11 @@ async function mirrorLocalChange(
   // future PATCH edits and that the publisher serializes — an unvalidated value
   // here would poison it. The device's clamp range is deliberately wider than
   // the cloud's, so a rejection is possible and must not lose the rest.
+  // The `obd` fence needs the model (plans/obd2-bluetooth-integration, P3);
+  // read it only when a local change actually names a gated namespace.
+  const obd = Object.keys(changed).some((ns) => OBD_ONLY_NAMESPACES.includes(ns))
+    ? await deviceDeclaresObd(deviceId)
+    : false;
   const patch: Record<string, unknown> = {};
   for (const [ns, value] of Object.entries(changed)) {
     if (!configNamespace(ns)) {
@@ -425,9 +431,10 @@ async function mirrorLocalChange(
       continue;
     }
     // The same fence as PATCH /config: a real device's local `simulation`
-    // edit must never become cloud desired state (plans/xorgate-device-simulator).
-    if (!namespaceAllowedFor(ns, { simulated })) {
-      console.warn('device-config-report: simulator-only namespace on a real device, skipping', {
+    // edit must never become cloud desired state (plans/xorgate-device-simulator),
+    // and a plain device's local `obd` edit must not either.
+    if (!namespaceAllowedFor(ns, { simulated, obd })) {
+      console.warn('device-config-report: gated namespace on a device that does not qualify, skipping', {
         deviceId,
         namespace: ns,
       });

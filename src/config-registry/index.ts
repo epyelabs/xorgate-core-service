@@ -26,6 +26,7 @@ import { timeSyncNamespace, type TimeSyncConfig } from './time-sync';
 import { cellularNamespace, type CellularConfig } from './cellular';
 import { cameraMountNamespace, type CameraMountConfig } from './camera-mount';
 import { simulationNamespace, type SimulationConfig } from './simulation';
+import { obdNamespace, type ObdConfig } from './obd';
 
 export * from './types';
 export * from './gnss-ant-bias';
@@ -36,6 +37,7 @@ export * from './time-sync';
 export * from './cellular';
 export * from './camera-mount';
 export * from './simulation';
+export * from './obd';
 export * from './ui-prefs';
 
 /**
@@ -52,6 +54,7 @@ export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
   cellularNamespace,
   cameraMountNamespace,
   simulationNamespace,
+  obdNamespace,
 ];
 
 export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
@@ -89,6 +92,7 @@ export interface DeviceConfigDocument {
   cellular?: CellularConfig | null;
   cameraMount?: CameraMountConfig | null;
   simulation?: SimulationConfig | null;
+  obd?: ObdConfig | null;
 }
 
 /**
@@ -170,9 +174,51 @@ export function validateNamespaceValue(
  */
 export const SIMULATED_ONLY_NAMESPACES: readonly string[] = ['simulation'];
 
-/** False when `key` is simulator-only and the device is not simulated. */
-export function namespaceAllowedFor(key: string, opts: { simulated?: boolean }): boolean {
-  return opts.simulated === true || !SIMULATED_ONLY_NAMESPACES.includes(key);
+/**
+ * Namespaces only a device whose MODEL declares `peripherals.obd` may hold
+ * (plans/obd2-bluetooth-integration, P3). Same fence, different fact: the
+ * model's io_capabilities is what says a kit has an OBD reader, so a device
+ * on a plain model can never be handed an adapter to pair with — not by the
+ * PATCH route, not by its own local-change mirror, and (belt and braces) not
+ * by the retained publish either, which drops a stale `obd` left on the row
+ * by a model reassignment (`buildDeviceConfigMessage`).
+ */
+export const OBD_ONLY_NAMESPACES: readonly string[] = ['obd'];
+
+/**
+ * What a namespace's acceptance can depend on, resolved per device by the
+ * caller: `simulated` is `devices.simulated`; `obd` is whether the device's
+ * model declares `peripherals.obd` (`deviceHardwareBlock(...)?.peripherals?.obd`).
+ * Both default to false, i.e. a gated namespace is refused unless the caller
+ * proves the device qualifies.
+ */
+export interface NamespaceGateFacts {
+  simulated?: boolean;
+  obd?: boolean;
+}
+
+/** False when `key` is gated on a device fact the caller did not assert. */
+export function namespaceAllowedFor(key: string, opts: NamespaceGateFacts): boolean {
+  if (SIMULATED_ONLY_NAMESPACES.includes(key) && opts.simulated !== true) return false;
+  if (OBD_ONLY_NAMESPACES.includes(key) && opts.obd !== true) return false;
+  return true;
+}
+
+/** The 400 text for a gated namespace, naming the fact the device lacks. */
+export function namespaceRefusalMessage(keys: string[]): string {
+  const sim = keys.filter((k) => SIMULATED_ONLY_NAMESPACES.includes(k));
+  const obd = keys.filter((k) => OBD_ONLY_NAMESPACES.includes(k));
+  const parts: string[] = [];
+  if (sim.length > 0) {
+    parts.push(`config namespace(s) ${sim.join(', ')} apply only to simulated devices`);
+  }
+  if (obd.length > 0) {
+    parts.push(
+      `config namespace(s) ${obd.join(', ')} apply only to devices whose model declares ` +
+        'peripherals.obd (an OBD-II kit); this device\'s model does not',
+    );
+  }
+  return parts.join('; ');
 }
 
 /**
@@ -182,7 +228,7 @@ export function namespaceAllowedFor(key: string, opts: { simulated?: boolean }):
  */
 export function validateConfigPatch(
   body: unknown,
-  opts: { simulated?: boolean } = {},
+  opts: NamespaceGateFacts = {},
 ): { value: Record<string, unknown> } | { error: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { error: 'body must be a partial config document' };
@@ -197,11 +243,7 @@ export function validateConfigPatch(
     };
   }
   const refused = keys.filter((k) => !namespaceAllowedFor(k, opts));
-  if (refused.length > 0) {
-    return {
-      error: `config namespace(s) ${refused.join(', ')} apply only to simulated devices`,
-    };
-  }
+  if (refused.length > 0) return { error: namespaceRefusalMessage(refused) };
   const out: Record<string, unknown> = {};
   for (const key of keys) {
     const parsed = validateNamespaceValue(key, src[key]);

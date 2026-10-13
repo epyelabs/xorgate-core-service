@@ -527,6 +527,14 @@ export function openApiSchemas(): Record<string, unknown> {
             'Everything else about it is a normal device; only a simulated device accepts the ' +
             '`simulation` config namespace.',
         },
+        obdScanRequestedAt: {
+          type: 'string',
+          format: 'date-time',
+          nullable: true,
+          description:
+            'When the last `POST /devices/{id}/commands/obd-scan` was accepted for this device; ' +
+            'the server refuses another inside 60 s of it. null = never scanned. Machine-managed.',
+        },
         needsModel: {
           type: 'boolean',
           description:

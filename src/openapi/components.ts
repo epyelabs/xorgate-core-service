@@ -237,7 +237,10 @@ export function openApiComponents(): Record<string, unknown> {
                   format: 'uuid',
                   description: 'Replay key. The device refuses to execute the same one twice.',
                 },
-                command: { type: 'string', enum: ['reboot', 'power_off', 'refresh', 'update'] },
+                command: {
+                  type: 'string',
+                  enum: ['reboot', 'power_off', 'refresh', 'update', 'obd_scan', 'obd_forget'],
+                },
                 expiresAt: {
                   type: 'integer',
                   format: 'int64',

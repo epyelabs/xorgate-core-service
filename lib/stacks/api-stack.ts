@@ -910,7 +910,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const deviceCommandsFn = new nodejs.NodejsFunction(this, "DeviceCommandsFn", {
       ...standardFnProps(
         path.join(entryBase, "device-commands.ts"),
-        "POST /devices/{id}/reboot|power-off|refresh-state|update + sms-reads + sms/clear — one-shot device commands",
+        "POST /devices/{id}/reboot|power-off|refresh-state|update + sms-reads + sms/clear + commands/obd-scan|obd-forget — one-shot device commands",
       ),
       // Bundles @aws-sdk/client-iot-data-plane (command publish), which isn't
       // guaranteed in the Lambda runtime SDK.
@@ -3124,6 +3124,21 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // `clear_sms`; the result is a `device_sms_reads` row polled like a read.
     addRoutes({
       path: "/devices/{id}/sms/clear",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    // OBD-II adapter setup (plans/obd2-bluetooth-integration, P3): `obd_scan`
+    // (any member, 60 s per-device rate limit) and `obd_forget` (member+),
+    // both only for a device whose model declares `peripherals.obd`. The
+    // device answers on the REPORTED config plane (`effective.obd.scan`), so
+    // there is no result row to poll and no ack consumer.
+    addRoutes({
+      path: "/devices/{id}/commands/obd-scan",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: deviceCommandsInt,
+    });
+    addRoutes({
+      path: "/devices/{id}/commands/obd-forget",
       methods: [apigwv2.HttpMethod.POST],
       integration: deviceCommandsInt,
     });

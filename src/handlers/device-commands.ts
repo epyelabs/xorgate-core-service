@@ -1,14 +1,21 @@
 import { routeKey as canonicalRouteKey } from '../utils/route';
-import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, eq, inArray } from 'drizzle-orm';
+import type {
+  APIGatewayProxyEventV2,
+  APIGatewayProxyResultV2,
+  APIGatewayProxyStructuredResultV2,
+} from 'aws-lambda';
+import { and, eq, inArray, isNull, lt, or } from 'drizzle-orm';
 import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { accepted, conflict, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
 import {
+  OBD_SCAN_MIN_INTERVAL_MS,
   publishDeviceCommand,
   type DeviceCommandName,
 } from '../services/device-command';
+import { deviceDeclaresObd } from '../services/device-config';
+import type { MembershipRole } from '../types/index';
 import { apiHandler } from '../utils/api-handler';
 import { handleDeviceSmsReadRoutes } from './device-sms-reads';
 
@@ -28,7 +35,28 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
   'POST /devices/{id}/power-off': 'power_off',
   'POST /devices/{id}/refresh-state': 'refresh',
   'POST /devices/{id}/update': 'update',
+  'POST /devices/{id}/commands/obd-scan': 'obd_scan',
+  'POST /devices/{id}/commands/obd-forget': 'obd_forget',
 };
+
+/**
+ * Role gate per command. `undefined` = any member (the ordinary read gate).
+ * Reboot/power-off/update are owner/admin (see the handler comment). The OBD
+ * pair (plans/obd2-bluetooth-integration, P3): `obd_scan` is read-only on the
+ * device (a bounded Bluetooth discovery, never a pairing) so it takes the
+ * member gate like `refresh`; `obd_forget` drops a bond, a reversible write
+ * of the same class as a config save, so it takes the ordinary write gate
+ * (owner/admin/member) rather than the destructive one.
+ */
+const COMMAND_ROLES: Partial<Record<DeviceCommandName, MembershipRole[]>> = {
+  reboot: ['owner', 'admin'],
+  power_off: ['owner', 'admin'],
+  update: ['owner', 'admin'],
+  obd_forget: ['owner', 'admin', 'member'],
+};
+
+/** Commands that exist only for a device whose model declares `peripherals.obd`. */
+const OBD_COMMANDS: ReadonlySet<DeviceCommandName> = new Set(['obd_scan', 'obd_forget']);
 
 /**
  * One-shot device commands. Routes (all -> this Lambda):
@@ -36,6 +64,8 @@ const ROUTE_COMMANDS: Record<string, DeviceCommandName> = {
  *   POST /devices/{id}/power-off
  *   POST /devices/{id}/refresh-state
  *   POST /devices/{id}/update
+ *   POST /devices/{id}/commands/obd-scan     (member; OBD models only; 1 per 60 s per device)
+ *   POST /devices/{id}/commands/obd-forget   (owner/admin/member; OBD models only)
  * plus the SMS-read routes, dispatched to device-sms-reads.ts:
  *   POST /devices/{id}/sms-reads
  *   POST /devices/{id}/sms/clear      (owner/admin; deletes the modem's stored SMS)
@@ -67,10 +97,7 @@ const restHandler = async (
 
   let auth;
   try {
-    auth =
-      command === 'refresh'
-        ? await requireOrgContext(event)
-        : await requireOrgContext(event, ['owner', 'admin']);
+    auth = await requireOrgContext(event, COMMAND_ROLES[command]);
   } catch (err) {
     if (err instanceof AuthError) return authErrorResponse(err);
     throw err;
@@ -84,9 +111,22 @@ const restHandler = async (
       eq(schema.devices.id, deviceId),
       inArray(schema.devices.workspaceId, orgWorkspaceIds),
     ),
-    columns: { id: true, name: true, serial: true, status: true },
+    columns: { id: true, name: true, serial: true, status: true, obdScanRequestedAt: true },
   });
   if (!device) return notFound(`Device "${deviceId}" not found`);
+
+  // The OBD commands are meaningless on a kit without an OBD reader, and the
+  // model is what says a kit has one — the same fence as the `obd` config
+  // namespace, with the same 400. Checked before the online test so the
+  // answer for a plain device is stable whether or not it is up.
+  if (OBD_COMMANDS.has(command) && !(await deviceDeclaresObd(deviceId))) {
+    return errorResponse(
+      400,
+      'NOT_OBD_DEVICE',
+      `Device "${device.name ?? device.serial}" is on a model that does not declare ` +
+        'peripherals.obd (an OBD-II kit); OBD commands do not apply to it.',
+    );
+  }
 
   // Commands are not retained, so publishing to an offline device would drop the
   // message silently and report success. Fail loudly instead. This is a race, not
@@ -99,6 +139,44 @@ const restHandler = async (
     );
   }
 
+  // `obd_scan` is rate-limited server-side to one per device per 60 s: a
+  // discovery stalls the helper's polling while it runs, and a console that
+  // re-fires on every render would otherwise keep the vehicle card blank.
+  // One conditional UPDATE claims the slot, so two concurrent requests cannot
+  // both pass; the slot is handed back if the publish then fails.
+  const now = new Date();
+  if (command === 'obd_scan') {
+    const claimed = await db
+      .update(schema.devices)
+      .set({ obdScanRequestedAt: now })
+      .where(
+        and(
+          eq(schema.devices.id, deviceId),
+          or(
+            isNull(schema.devices.obdScanRequestedAt),
+            lt(schema.devices.obdScanRequestedAt, new Date(now.getTime() - OBD_SCAN_MIN_INTERVAL_MS)),
+          ),
+        ),
+      )
+      .returning({ id: schema.devices.id });
+    if (claimed.length === 0) {
+      const last = device.obdScanRequestedAt?.getTime() ?? now.getTime();
+      const retryAfterMs = Math.max(0, last + OBD_SCAN_MIN_INTERVAL_MS - now.getTime());
+      const res = errorResponse(
+        429,
+        'RATE_LIMITED',
+        `An OBD scan was requested for this device less than ${OBD_SCAN_MIN_INTERVAL_MS / 1000} s ago. ` +
+          'Wait for its candidates in the config report (effective.obd.scan) before scanning again.',
+        { retryAfterMs },
+      ) as APIGatewayProxyStructuredResultV2;
+      // The SDK's backoff honours Retry-After (seconds); the body carries ms.
+      return {
+        ...res,
+        headers: { ...res.headers, 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+      };
+    }
+  }
+
   try {
     const message = await publishDeviceCommand(deviceId, command);
     return accepted({
@@ -108,6 +186,18 @@ const restHandler = async (
     });
   } catch (err) {
     console.error('device command publish failed', { deviceId, command, err });
+    if (command === 'obd_scan') {
+      // The device never heard the request: release the slot so the operator
+      // can retry at once instead of waiting out a window nothing used.
+      try {
+        await db
+          .update(schema.devices)
+          .set({ obdScanRequestedAt: device.obdScanRequestedAt ?? null })
+          .where(eq(schema.devices.id, deviceId));
+      } catch (releaseErr) {
+        console.error('obd_scan slot release failed', { deviceId, releaseErr });
+      }
+    }
     return errorResponse(
       502,
       'COMMAND_PUBLISH_FAILED',

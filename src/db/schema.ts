@@ -364,6 +364,12 @@ export const devices = pgTable(
     // making "turn this device into a simulator" a cloud write any real device
     // could receive. Its `device_simulations` row carries the rest.
     simulated: boolean('simulated').default(false).notNull(),
+    // When the last `obd_scan` command was accepted for this device
+    // (plans/obd2-bluetooth-integration P3, manual/036). The server-side
+    // rate limit: a scan inside 60 s of it is a 429, enforced with one
+    // conditional UPDATE so two concurrent requests cannot both pass. NULL =
+    // never scanned.
+    obdScanRequestedAt: timestamp('obd_scan_requested_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

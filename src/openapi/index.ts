@@ -280,7 +280,12 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // `peripherals.obd` section (adapter, transport, rateHz, fields, info),
       // which declares the `obd.<field>` metric namespace the way `comm.gps`
       // declares `gps.*`. Purely additive (plans/obd2-bluetooth-integration).
-      version: '0.14.0',
+      // 0.15.0: the `obd` config namespace (adapter MAC, PIN, poll rate,
+      // fields, power source; accepted only for a model that declares
+      // `peripherals.obd`), the `obd_scan` / `obd_forget` device commands
+      // (`POST /devices/{id}/commands/obd-scan|obd-forget`) and
+      // `Device.obdScanRequestedAt`. Purely additive (P3).
+      version: '0.15.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

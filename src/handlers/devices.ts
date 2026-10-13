@@ -18,7 +18,7 @@ import {
   ok,
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
-import { publishDeviceConfig } from '../services/device-config';
+import { deviceDeclaresObd, publishDeviceConfig } from '../services/device-config';
 import {
   applyConfigPatch,
   CONFIG_NAMESPACES,
@@ -27,6 +27,7 @@ import {
   validateConfigPatch,
   validateNamespaceValue,
   type DeviceConfigDocument,
+  OBD_ONLY_NAMESPACES,
 } from '../config-registry/index';
 import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
 import { apiHandler } from '../utils/api-handler';
@@ -48,6 +49,12 @@ const LEGACY_PUT_FIELDS: { field: string; namespace: string }[] = CONFIG_NAMESPA
 
 /** Old cloud-only PUT fields, now `PATCH /devices/{id}/ui-prefs`. */
 const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
+
+/** True when a PATCH body names a model-gated namespace (so the model read is worth doing). */
+function hasObdNamespace(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  return Object.keys(body).some((k) => OBD_ONLY_NAMESPACES.includes(k));
+}
 
 async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
   if (orgWorkspaceIds.length === 0) return undefined;
@@ -163,8 +170,12 @@ const restHandler = async (
 
     // Validated against THIS device: the `simulation` namespace exists only
     // for devices created as simulated, and real hardware must never be able
-    // to receive it (plans/xorgate-device-simulator, README §3.3).
-    const parsed = validateConfigPatch(body, { simulated: device.simulated });
+    // to receive it (plans/xorgate-device-simulator, README §3.3); `obd` only
+    // for a device whose model declares `peripherals.obd`
+    // (plans/obd2-bluetooth-integration, P3). The model read is skipped unless
+    // the body actually carries a gated namespace.
+    const obd = hasObdNamespace(body) ? await deviceDeclaresObd(id) : false;
+    const parsed = validateConfigPatch(body, { simulated: device.simulated, obd });
     if ('error' in parsed) return badRequest(parsed.error);
 
     const nextConfig = applyConfigPatch(device.config, parsed.value) as DeviceConfigDocument;
