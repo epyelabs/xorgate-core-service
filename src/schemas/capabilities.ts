@@ -142,6 +142,73 @@ const imuSensorV2Schema = imuSensorSchema.extend({
   model: z.string().optional(), // bno085
 });
 
+// ---------------------------------------------------------------------------
+// v2 `peripherals` — external devices the kit attaches to (obd2 plan, D2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every field the OBD helper can decode, i.e. the closed vocabulary of
+ * `obd.<field>` metric names (obd2-bluetooth-integration plan, phase-1 brief,
+ * "Frozen contract 2"). A model's `peripherals.obd.fields` is a subset of this
+ * list; the device emits the intersection with what the vehicle actually
+ * supports (an unsupported PID is never polled and never emitted, no nulls).
+ * `link` is the health code (0 no adapter, 1 adapter only, 2 ECU answering)
+ * and is always emitted while the collector exists.
+ */
+export const OBD_FIELDS = [
+  'rpm',
+  'speed',
+  'coolant_temp',
+  'engine_load',
+  'throttle',
+  'pedal',
+  'intake_temp',
+  'ambient_temp',
+  'intake_map',
+  'baro',
+  'fuel_level',
+  'fuel_rate',
+  'module_voltage',
+  'adapter_voltage',
+  'run_time',
+  'odometer',
+  'gear',
+  'distance_since_clear',
+  'mil',
+  'dtc_count',
+  'link',
+] as const;
+export type ObdField = (typeof OBD_FIELDS)[number];
+
+/** ELM327-class adapters the helper speaks to. */
+export const OBD_ADAPTERS = ['elm327'] as const;
+/** How the adapter is reached: Bluetooth SPP (RFCOMM) or a USB serial port. */
+export const OBD_TRANSPORTS = ['bt-spp', 'usb-serial'] as const;
+
+/**
+ * An OBD-II reader attached to the kit. The adapter MAC is NOT here: it is per
+ * vehicle, so it is a device setting (the `obd` config namespace), while this
+ * section says only that an adapter is EXPECTED on every device of the model.
+ * `info` names the string items (VIN, calibration ids, ECU names, DTC codes)
+ * that travel via the config report rather than telemetry (C1: metrics are
+ * numbers only); declared but unused in v1.
+ */
+const obdPeripheralSchema = z.object({
+  adapter: z.enum(OBD_ADAPTERS),
+  transport: z.enum(OBD_TRANSPORTS),
+  rateHz: z.number().positive().optional(),
+  fields: z.array(z.enum(OBD_FIELDS)),
+  info: z.array(z.string()).optional(),
+});
+
+/**
+ * `peripherals` is generic on purpose (like `comm`/`media`/`sensors`/`system`):
+ * later entries could be `j1939`, `modbus`, `ble`, `tpms`. Only `obd` exists.
+ */
+const peripheralsCapabilitiesSchema = z.object({
+  obd: obdPeripheralSchema.optional(),
+});
+
 export const ioCapabilitiesV2Schema = z.object({
   schemaVersion: z.literal(2),
   media: z
@@ -153,6 +220,7 @@ export const ioCapabilitiesV2Schema = z.object({
   sensors: z.object({ imu: imuSensorV2Schema.optional() }).optional(),
   comm: commCapabilitiesSchema.optional(),
   system: systemV2Schema,
+  peripherals: peripheralsCapabilitiesSchema.optional(),
 });
 
 export const ioCapabilitiesSchema = z.discriminatedUnion('schemaVersion', [
@@ -162,6 +230,7 @@ export const ioCapabilitiesSchema = z.discriminatedUnion('schemaVersion', [
 
 export type IoCapabilities = z.infer<typeof ioCapabilitiesSchema>;
 export type IoCapabilitiesV2 = z.infer<typeof ioCapabilitiesV2Schema>;
+export type ObdPeripheralCapability = z.infer<typeof obdPeripheralSchema>;
 
 // ---------------------------------------------------------------------------
 // The hardware block — what a device is TOLD about its own hardware
@@ -194,7 +263,20 @@ export interface DeviceHardwareBlock {
     maxHeight?: number;
     maxFps?: number;
   }>;
+  /**
+   * External devices the model expects attached. Present ONLY when the model
+   * declares `peripherals` (absent, not null, otherwise): an agent that
+   * predates the key ignores it, and a model without it yields a block that is
+   * byte-for-byte what it was before. Field lists and rates stay on the model;
+   * the device only needs to know WHAT to drive and over which transport.
+   */
+  peripherals?: {
+    obd?: { adapter: ObdAdapter; transport: ObdTransport };
+  };
 }
+
+export type ObdAdapter = (typeof OBD_ADAPTERS)[number];
+export type ObdTransport = (typeof OBD_TRANSPORTS)[number];
 
 /**
  * Derive the device-facing hardware block from a model's `io_capabilities`.
@@ -206,6 +288,7 @@ export function deriveHardwareBlock(caps: unknown): DeviceHardwareBlock | null {
   if (!parsed.success) return null;
   const c = parsed.data;
   const imu = c.sensors?.imu;
+  const obd = c.peripherals?.obd;
   return {
     v: 2,
     platform: c.system.platform,
@@ -225,6 +308,7 @@ export function deriveHardwareBlock(caps: unknown): DeviceHardwareBlock | null {
       ...(v.maxHeight !== undefined ? { maxHeight: v.maxHeight } : {}),
       ...(v.maxFps !== undefined ? { maxFps: v.maxFps } : {}),
     })),
+    ...(obd ? { peripherals: { obd: { adapter: obd.adapter, transport: obd.transport } } } : {}),
   };
 }
 

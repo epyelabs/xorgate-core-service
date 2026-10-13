@@ -61,16 +61,15 @@ const PINS: Pin[] = [
   },
   {
     file: 'src/schemas/capabilities.ts',
-    // 2026-08-24: schemaVersion 2 (cm4-support plan) — platform facts on
-    // `system` (platform/encoder/rails/statusLed), per-video connector+sensor,
-    // sensors.imu.model. ⚠ SDK re-vendor still OUTSTANDING: mirror v2 into
-    // vendor/io-capabilities.schema.json in epyelabs/xorgate-sdk-js and
-    // regenerate there (steps 1-2 in the header); this pin was moved with the
-    // change so the suite stays green, and the SDK task is tracked in
-    // plans/cm4-support/PROGRESS.md.
-    sha256: '76101abaf26dd247563ef15ca57950b61abe3f854a6f7e5fc600c513ec93858f',
+    // 2026-10-13: v2 `peripherals.obd` (plans/obd2-bluetooth-integration, P2
+    // backend): adapter/transport enums, rateHz, the closed OBD_FIELDS
+    // vocabulary, info. Mirrored into vendor/io-capabilities.schema.json in
+    // epyelabs/xorgate-sdk-js on branch feat/obd-peripherals (SDK 0.14.0,
+    // regenerated; publish is the owner's). Previous pin, 2026-08-24:
+    // schemaVersion 2 (cm4-support plan).
+    sha256: '1683c087f80001f044761b01cc5d5530be499c18f2ffea7e77b7f64957fa0379',
     vendoredAs: 'vendor/io-capabilities.schema.json (hand-derived mirror)',
-    pinnedAt: '2026-08-24',
+    pinnedAt: '2026-10-13',
   },
 ];
 

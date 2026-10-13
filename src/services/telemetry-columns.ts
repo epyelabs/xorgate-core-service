@@ -49,6 +49,9 @@ type Caps =
         gps?: { fields?: string[] | null } | null;
       } | null;
       system?: { fields?: string[] | null } | null;
+      peripherals?: {
+        obd?: { fields?: string[] | null } | null;
+      } | null;
     }
   | null
   | undefined;
@@ -82,6 +85,17 @@ function imuColumns(caps: Caps): string[] {
   ];
 }
 
+/**
+ * OBD-II metrics (obd2-bluetooth-integration plan, D4/D8), in the model's
+ * declared order: `peripherals.obd.fields` is already the closed vocabulary the
+ * schema validates against, so every declared field is a real `obd.<field>`
+ * metric. `link` (the health code) is included: it is numeric and charts as a
+ * step line, the same way `lte.gnss_health` would.
+ */
+function obdColumns(caps: Caps): string[] {
+  return list(caps?.peripherals?.obd?.fields).map((f) => `obd.${f}`);
+}
+
 /** Chartable system metrics, in the model's declared order (see quirk 1 above). */
 function systemColumns(caps: Caps): string[] {
   return list(caps?.system?.fields)
@@ -97,12 +111,13 @@ function systemColumns(caps: Caps): string[] {
  * says so in the response, so a client can tell "the model declares nothing"
  * apart from "there is no data".
  *
- * For the Pi model this returns exactly 17 keys.
+ * For the Pi model this returns exactly 17 keys; the OBD clone of it adds the
+ * `obd.*` columns AFTER gps, so existing column positions never move.
  */
 export function historyColumnKeys(caps: unknown): string[] {
   const c = caps as Caps;
   const gps = c?.comm?.gps ? GPS_COLUMNS : [];
-  return [...imuColumns(c), ...systemColumns(c), ...gps];
+  return [...imuColumns(c), ...systemColumns(c), ...gps, ...obdColumns(c)];
 }
 
 /**

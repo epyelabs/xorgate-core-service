@@ -276,7 +276,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // 0.13.0: device SMS clear. `POST /devices/{id}/sms/clear` (owner/admin),
       // `SmsRead.action` (`read` | `clear`) and `SmsReadResult.cleared`.
       // Purely additive.
-      version: '0.13.0',
+      // 0.14.0: OBD-II peripherals. `IoCapabilities` v2 gains the optional
+      // `peripherals.obd` section (adapter, transport, rateHz, fields, info),
+      // which declares the `obd.<field>` metric namespace the way `comm.gps`
+      // declares `gps.*`. Purely additive (plans/obd2-bluetooth-integration).
+      version: '0.14.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

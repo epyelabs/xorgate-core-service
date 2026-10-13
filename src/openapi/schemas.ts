@@ -464,7 +464,9 @@ export function openApiSchemas(): Record<string, unknown> {
         'optional so partial-capability hardware is describable. `media.video[].key` is what ' +
         'becomes a video channel at provisioning time; `sensors.imu` field lists become ' +
         'the `imu.<prefix>_<field>` metrics; `comm` and `system` field lists become the `gps`, ' +
-        '`signal` and `system` metric namespaces.\n\n' +
+        '`signal` and `system` metric namespaces; a v2 `peripherals.obd.fields` list becomes the ' +
+        '`obd` namespace (an attached ELM327 OBD-II reader; the adapter address itself is a ' +
+        'per-device setting, not a model fact).\n\n' +
         'IMPORTANT: this shape is NOT enforced when you write a device model. ' +
         '`POST`/`PUT /device-models` accept any JSON object here. It IS parsed at provisioning ' +
         'time, and a document that fails to parse yields NO video stream keys, so the device is ' +

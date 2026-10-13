@@ -33,6 +33,9 @@ type Caps = {
     signal?: { fields?: string[] | null } | null;
   } | null;
   system?: { fields?: string[] | null } | null;
+  peripherals?: {
+    obd?: { fields?: string[] | null } | null;
+  } | null;
 } | null | undefined;
 
 /** Distinct capability tokens a definition requires, in a stable order. */
@@ -79,6 +82,8 @@ export function producibleMetricKeys(caps: Caps): Set<string> {
   for (const a of imu?.accel ?? imu?.axes ?? []) keys.add(`imu.accel_${a}`);
   for (const q of imu?.quaternion ?? []) keys.add(`imu.quat_${q}`);
   for (const e of imu?.euler ?? []) keys.add(`imu.euler_${e}`);
+  // peripherals.obd.fields -> obd.* (obd2-bluetooth-integration plan, D4).
+  for (const f of caps?.peripherals?.obd?.fields ?? []) keys.add(`obd.${f}`);
   return keys;
 }
 
