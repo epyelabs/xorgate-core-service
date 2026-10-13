@@ -51,12 +51,12 @@ interface Pin {
 const PINS: Pin[] = [
   {
     file: 'src/config-registry/config-contract.json',
-    // 2026-10-13: the `obd` namespace (plans/obd2-bluetooth-integration, P3
-    // backend). Re-vendored into the SDK on branch feat/obd-commands (SDK
-    // 0.15.0: vendor/config-contract.json + `npm run generate`, which now
-    // emits ObdConfig; publish is the owner's). Previous pin, 2026-10-01: the
-    // `simulation` namespace.
-    sha256: '430bfe1d2bfb7864a2d61358f2ffccdd1e80d791507c69169ece8e48cdfc6e12',
+    // 2026-10-13 (later): `obd.powerSource` description reworded to say it is
+    // the TRACKER DEVICE's feed, not the adapter's (description-only; no shape
+    // change). Re-vendored into the SDK on branch fix/obd-power-source-copy
+    // (JSDoc-only regenerate; publish is the owner's). Previous pin, earlier
+    // 2026-10-13: the `obd` namespace (P3 backend, SDK 0.15.0).
+    sha256: 'c0760e6650eca4823991a5df44db400776673ad1dc11fe3088d8508f5fcf2a2a',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
     pinnedAt: '2026-10-13',
   },
