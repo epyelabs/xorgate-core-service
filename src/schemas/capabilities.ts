@@ -154,6 +154,12 @@ const imuSensorV2Schema = imuSensorSchema.extend({
  * supports (an unsupported PID is never polled and never emitted, no nulls).
  * `link` is the health code (0 no adapter, 1 adapter only, 2 ECU answering)
  * and is always emitted while the collector exists.
+ *
+ * Torque (POST_INTEGRATION 2026-10-16, appended after `link` so existing
+ * model rows only grow at the end): `engine_torque_pct` = PID 62 actual
+ * engine torque, % of reference (A - 125); `reference_torque` = PID 63, Nm
+ * (A*256 + B); `engine_torque` = derived Nm (pct / 100 * reference), emitted
+ * only when both PIDs answered in the same poll cycle.
  */
 export const OBD_FIELDS = [
   'rpm',
@@ -177,6 +183,9 @@ export const OBD_FIELDS = [
   'mil',
   'dtc_count',
   'link',
+  'engine_torque_pct',
+  'reference_torque',
+  'engine_torque',
 ] as const;
 export type ObdField = (typeof OBD_FIELDS)[number];
 

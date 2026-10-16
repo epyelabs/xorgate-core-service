@@ -73,10 +73,21 @@ describe('peripherals.obd schema', () => {
     expect(ioCapabilitiesSchema.safeParse(CM5_OBD).success).toBe(true);
   });
 
-  it('the brief freezes 21 field names, link included', () => {
-    expect(OBD_FIELDS).toHaveLength(21);
+  it('the brief froze 21 field names, link included; torque appends three after link', () => {
+    expect(OBD_FIELDS).toHaveLength(24);
     expect(OBD_FIELDS).toContain('link');
+    expect(OBD_FIELDS.slice(20)).toEqual(['link', 'engine_torque_pct', 'reference_torque', 'engine_torque']);
     expect(new Set(OBD_FIELDS).size).toBe(OBD_FIELDS.length);
+  });
+
+  it('a pre-torque model (21 fields) and the torque model both validate', () => {
+    const pre = { ...CM5, peripherals: { obd: { ...OBD_SECTION.obd, fields: OBD_FIELDS.slice(0, 21) } } };
+    expect(ioCapabilitiesSchema.safeParse(pre).success).toBe(true);
+    const torqueOnly = {
+      ...CM5,
+      peripherals: { obd: { ...OBD_SECTION.obd, fields: ['engine_torque_pct', 'reference_torque', 'engine_torque', 'link'] } },
+    };
+    expect(ioCapabilitiesSchema.safeParse(torqueOnly).success).toBe(true);
   });
 
   it('is closed: unknown fields, adapters and transports are rejected at their path', () => {
@@ -159,7 +170,7 @@ describe('obd.* metrics from peripherals.obd.fields', () => {
     const withObd = historyColumnKeys(CM5_OBD);
     expect(withObd.slice(0, base.length)).toEqual(base);
     expect(withObd.slice(base.length)).toEqual(OBD_FIELDS.map((f) => `obd.${f}`));
-    expect(withObd.at(-1)).toBe('obd.link');
+    expect(withObd.at(-1)).toBe('obd.engine_torque');
   });
 
   it('a declared subset yields exactly that subset', () => {

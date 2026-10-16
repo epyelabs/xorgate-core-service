@@ -290,7 +290,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // refuel and DTC events) in `TelemetryInsights`, and a `vehicle`
       // roll-up per session and in the totals of the windowed insights
       // (`TelemetryWindowVehicle`). Purely additive (P4).
-      version: '0.16.0',
+      // 0.17.0: engine torque. The OBD field vocabulary (`peripherals.obd.fields`,
+      // the `obd` namespace's `fields`) gains `engine_torque_pct` (PID 62, %),
+      // `reference_torque` (PID 63, Nm) and the derived `engine_torque` (Nm),
+      // appended after `link`. Purely additive.
+      version: '0.17.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so
