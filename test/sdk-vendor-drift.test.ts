@@ -56,9 +56,12 @@ const PINS: Pin[] = [
     // change). Re-vendored into the SDK on branch fix/obd-power-source-copy
     // (JSDoc-only regenerate; publish is the owner's). Previous pin, earlier
     // 2026-10-13: the `obd` namespace (P3 backend, SDK 0.15.0).
-    sha256: 'c0760e6650eca4823991a5df44db400776673ad1dc11fe3088d8508f5fcf2a2a',
+    // 2026-10-16: OBD torque fields (engine_torque_pct, reference_torque,
+    // engine_torque) in the `obd` namespace's `fields` enum; re-vendored into
+    // the SDK on branch feat/obd-torque (0.16.0; publish is the owner's).
+    sha256: '5bb0025eae4fa53108157ce1b993933b6d4fcf65403af2136d4e0194b3fc88a0',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
-    pinnedAt: '2026-10-13',
+    pinnedAt: '2026-10-16',
   },
   {
     file: 'src/schemas/capabilities.ts',
@@ -68,9 +71,11 @@ const PINS: Pin[] = [
     // epyelabs/xorgate-sdk-js on branch feat/obd-peripherals (SDK 0.14.0,
     // regenerated; publish is the owner's). Previous pin, 2026-08-24:
     // schemaVersion 2 (cm4-support plan).
-    sha256: '1683c087f80001f044761b01cc5d5530be499c18f2ffea7e77b7f64957fa0379',
+    // 2026-10-16: OBD_FIELDS appends the three torque fields after `link`
+    // (SDK 0.16.0, branch feat/obd-torque). Previous pin 2026-10-13 (P2).
+    sha256: '32bca71a6aad30cc87dbbb623827359c6cf9fec19622c00a52dd0d56c70399fe',
     vendoredAs: 'vendor/io-capabilities.schema.json (hand-derived mirror)',
-    pinnedAt: '2026-10-13',
+    pinnedAt: '2026-10-16',
   },
 ];
 
