@@ -294,7 +294,11 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // the `obd` namespace's `fields`) gains `engine_torque_pct` (PID 62, %),
       // `reference_torque` (PID 63, Nm) and the derived `engine_torque` (Nm),
       // appended after `link`. Purely additive.
-      version: '0.17.0',
+      // 0.18.0: the `deviceStatus` session insight in `TelemetryInsights`
+      // (status-LED time per code and per health flag, worst code, LED-state
+      // intervals) over the new `system.led_state` / `system.health_flags`
+      // metrics. Purely additive (plans/include-led-status-in-telemetry P2).
+      version: '0.18.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

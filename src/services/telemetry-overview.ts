@@ -13,8 +13,9 @@ import { acceptedFix, round } from './telemetry-insights/gps-accept';
  * Free of AWS/DB imports; services/telemetry-sessions.ts does the I/O.
  *
  * STREAMING by design. Segments are fed one at a time in `seq` order; each
- * line goes to a per-group bucket grid (sum + count per (bucket, metric), so
- * the average is sum/count at the end) and to every insight computer, and is
+ * line goes to a per-group bucket grid (sum + count + max + or per (bucket,
+ * metric), so the average is sum/count at the end, or the max / OR for a
+ * metric with that rule in {@link OVERVIEW_METRIC_AGG}) and to every insight computer, and is
  * then dropped. Nothing holds the samples: a 10 Hz, 24 h session (~860 k
  * lines) needs the grids, not gigabytes.
  *
@@ -24,7 +25,7 @@ import { acceptedFix, round } from './telemetry-insights/gps-accept';
  * the group's span. Because the count is only known at the end, the grid
  * accumulates at the native period until the target is passed, then coarsens
  * itself to the 1 s rung and keeps going; `finish()` coarsens once more to the
- * final rung. Sum/count merges are exact, so the result is identical to a
+ * final rung. Sum/count/max/or merges are exact, so the result is identical to a
  * single pass at the final width.
  */
 
@@ -32,6 +33,43 @@ export const OVERVIEW_V = 1 as const;
 export const OVERVIEW_KIND = 'telemetry-overview' as const;
 export const OVERVIEW_FORMAT = 'overview.v1' as const;
 export const OVERVIEW_OBJECT_NAME = 'overview.v1.json.gz';
+
+/**
+ * Builder revision, written on every object as the additive `builder` field
+ * (the format stays `overview.v1`; consumers ignore unknown keys). Objects
+ * without the field predate the aggregation registry (every metric averaged).
+ *   2: per-metric bucket aggregation, {@link OVERVIEW_METRIC_AGG}
+ *      (include-led-status-in-telemetry P2, 2026-10-18).
+ */
+export const OVERVIEW_BUILDER_V = 2 as const;
+
+/** How a bucket folds the samples of one metric. */
+export type OverviewAgg = 'mean' | 'max' | 'or';
+
+/**
+ * Per-metric bucket aggregation (include-led-status-in-telemetry D5). A metric
+ * not listed is averaged (`mean`). Coded values must not be averaged: a bucket
+ * mixing LED codes 1 and 5 would read 3, a state that never happened, and a
+ * bitmask mean is meaningless.
+ *  - `max`: the worst code in the bucket (codes are severity-ascending).
+ *  - `or`:  the bitwise OR of every sample's flags (every bit set at least once).
+ * Mirrored by `@xorgate/react` `buildOverviewSeries` for open sessions; keep
+ * the two in step. Rebuilt objects list the non-mean rules they applied in
+ * each group's `agg`.
+ */
+export const OVERVIEW_METRIC_AGG: Readonly<Record<string, OverviewAgg>> = {
+  'system.led_state': 'max',
+  'system.health_flags': 'or',
+  // Existing coded metrics (owner decision Q5, 2026-10-18): the GNSS health
+  // code is severity-ordered, the throttled word is a bitmask.
+  'lte.gnss_health': 'max',
+  'system.throttled': 'or',
+};
+
+export const overviewMetricAgg = (
+  metric: string,
+  registry: Readonly<Record<string, OverviewAgg>> = OVERVIEW_METRIC_AGG,
+): OverviewAgg => registry[metric] ?? 'mean';
 
 /** The client's interval ladder (sdk/xorgate-react replay-telemetry.ts INTERVAL_LADDER), seconds. */
 export const BUCKET_LADDER_S: readonly number[] = [
@@ -94,6 +132,11 @@ export interface OverviewGroupV1 {
   values: Record<string, (number | null)[]>;
   /** [minLon, minLat, maxLon, maxLat] over accepted fixes; gps only, absent without one. */
   bbox?: [number, number, number, number];
+  /**
+   * Builder 2+: the metrics of this group whose buckets are NOT means, with
+   * their rule (`max` / `or`). Absent when every metric is averaged.
+   */
+  agg?: Record<string, Exclude<OverviewAgg, 'mean'>>;
 }
 
 export interface OverviewSourceV1 {
@@ -112,6 +155,8 @@ export interface OverviewSourceV1 {
 export interface OverviewV1 {
   v: typeof OVERVIEW_V;
   kind: typeof OVERVIEW_KIND;
+  /** Builder revision ({@link OVERVIEW_BUILDER_V}); absent on objects built before 2. */
+  builder?: number;
   deviceId: string;
   sessionId: string;
   rateHz: number | null;
@@ -141,6 +186,34 @@ export const nativePeriodMs = (rateHz: number | null | undefined): number =>
 interface Agg {
   sum: number;
   count: number;
+  /** Largest value seen (`max` rule). */
+  max: number;
+  /** Bitwise OR of every value (`or` rule; values truncated to unsigned 32-bit). */
+  or: number;
+}
+
+const newAgg = (value: number): Agg => ({ sum: value, count: 1, max: value, or: value >>> 0 });
+
+function addToAgg(agg: Agg, value: number): void {
+  agg.sum += value;
+  agg.count++;
+  if (value > agg.max) agg.max = value;
+  agg.or = (agg.or | (value >>> 0)) >>> 0;
+}
+
+function mergeAgg(into: Agg, from: Agg): void {
+  into.sum += from.sum;
+  into.count += from.count;
+  if (from.max > into.max) into.max = from.max;
+  into.or = (into.or | from.or) >>> 0;
+}
+
+/** The bucket's value for a metric under its rule. A single sample passes through untouched. */
+function aggValue(agg: Agg, rule: OverviewAgg): number {
+  if (agg.count === 1) return agg.sum;
+  if (rule === 'max') return agg.max;
+  if (rule === 'or') return agg.or;
+  return round(agg.sum / agg.count, AVG_DECIMALS);
 }
 
 class GroupGrid {
@@ -167,6 +240,7 @@ class GroupGrid {
     readonly group: string,
     nativeMs: number,
     private readonly target: number,
+    private readonly registry: Readonly<Record<string, OverviewAgg>> = OVERVIEW_METRIC_AGG,
   ) {
     this.bucketMs = nativeMs;
   }
@@ -199,12 +273,8 @@ class GroupGrid {
       if (!this.metrics.has(metric)) this.metrics.add(metric);
       if (leaf.unit && this.units[metric] === undefined) this.units[metric] = leaf.unit;
       const agg = bucket.get(metric);
-      if (agg) {
-        agg.sum += leaf.value;
-        agg.count++;
-      } else {
-        bucket.set(metric, { sum: leaf.value, count: 1 });
-      }
+      if (agg) addToAgg(agg, leaf.value);
+      else bucket.set(metric, newAgg(leaf.value));
     }
   }
 
@@ -220,12 +290,8 @@ class GroupGrid {
       }
       for (const [metric, agg] of bucket) {
         const t = target.get(metric);
-        if (t) {
-          t.sum += agg.sum;
-          t.count += agg.count;
-        } else {
-          target.set(metric, { sum: agg.sum, count: agg.count });
-        }
+        if (t) mergeAgg(t, agg);
+        else target.set(metric, { ...agg });
       }
     }
     this.buckets.clear();
@@ -245,16 +311,21 @@ class GroupGrid {
     const starts = [...this.buckets.keys()].sort((a, b) => a - b);
     const metrics = [...this.metrics].sort();
     const values: Record<string, (number | null)[]> = {};
-    for (const m of metrics) values[m] = new Array<number | null>(starts.length).fill(null);
+    const rules: Record<string, Exclude<OverviewAgg, 'mean'>> = {};
+    for (const m of metrics) {
+      values[m] = new Array<number | null>(starts.length).fill(null);
+      const rule = overviewMetricAgg(m, this.registry);
+      if (rule !== 'mean') rules[m] = rule;
+    }
     starts.forEach((start, i) => {
       const bucket = this.buckets.get(start)!;
-      for (const [metric, agg] of bucket) {
-        values[metric][i] = agg.count === 1 ? agg.sum : round(agg.sum / agg.count, AVG_DECIMALS);
-      }
+      for (const [metric, agg] of bucket) values[metric][i] = aggValue(agg, overviewMetricAgg(metric, this.registry));
     });
     const units: Record<string, string> = {};
     for (const m of metrics) if (this.units[m] !== undefined) units[m] = this.units[m];
-    return { bucketMs: this.bucketMs, ts: starts, units, values };
+    const out: OverviewGroupV1 = { bucketMs: this.bucketMs, ts: starts, units, values };
+    if (Object.keys(rules).length > 0) out.agg = rules;
+    return out;
   }
 }
 
@@ -280,7 +351,11 @@ export class OverviewBuilder {
     droppedSamples: 0,
   };
 
-  constructor(private readonly meta: OverviewSessionMeta) {
+  constructor(
+    private readonly meta: OverviewSessionMeta,
+    /** Tests only: an alternative aggregation registry (`{}` = the pre-builder-2 all-mean grids). */
+    private readonly metricAgg: Readonly<Record<string, OverviewAgg>> = OVERVIEW_METRIC_AGG,
+  ) {
     this.rateHz = meta.rateHz ?? null;
     this.timeSource = meta.timeSource ?? null;
     this.nativeMs = nativePeriodMs(this.rateHz);
@@ -329,7 +404,7 @@ export class OverviewBuilder {
       const fields = metrics[group];
       let grid = this.grids.get(group);
       if (!grid) {
-        grid = new GroupGrid(group, this.nativeMs, bucketTarget(group));
+        grid = new GroupGrid(group, this.nativeMs, bucketTarget(group), this.metricAgg);
         this.grids.set(group, grid);
       }
       grid.feed(ts, fields);
@@ -374,6 +449,7 @@ export class OverviewBuilder {
     return {
       v: OVERVIEW_V,
       kind: OVERVIEW_KIND,
+      builder: OVERVIEW_BUILDER_V,
       deviceId: this.meta.deviceId,
       sessionId: this.meta.sessionId,
       rateHz: this.rateHz,
@@ -393,8 +469,9 @@ export function buildOverview(
   meta: OverviewSessionMeta,
   segments: OverviewSegmentInput[],
   builtAt?: number,
+  metricAgg: Readonly<Record<string, OverviewAgg>> = OVERVIEW_METRIC_AGG,
 ): OverviewV1 {
-  const builder = new OverviewBuilder(meta);
+  const builder = new OverviewBuilder(meta, metricAgg);
   for (const seg of [...segments].sort((a, b) => a.seq - b.seq)) builder.feedSegment(seg);
   return builder.finish(builtAt);
 }

@@ -9,6 +9,7 @@ import {
   nativePeriodMs,
   OverviewBuilder,
   overviewKeyFor,
+  OVERVIEW_METRIC_AGG,
   type OverviewSegmentInput,
 } from '../src/services/telemetry-overview';
 
@@ -232,6 +233,81 @@ describe.skipIf(!existsSync(join(FIXTURE_DIR, 'expected.json')))('real dev sessi
     expect(o.insights.duration).toEqual(expected.insights.duration);
     expect(o.insights.speed).toEqual(expected.insights.speed);
     expect(o.insights.events).toHaveLength(expected.insights.eventCount);
-    expect(gzipOverview(o).length).toBe(expected.gzipBytes);
+    expect(o.builder).toBe(2);
+    // The default (mean) path is byte-identical to the reviewed build: with an
+    // empty registry and the builder-2 stamp set aside, the object is the
+    // same bytes as before the aggregation registry existed.
+    const allMean = buildOverview({ deviceId: expected.deviceId, sessionId: expected.sessionId, rateHz: expected.rateHz }, segments, expected.builtAt, {});
+    expect(gzipOverview({ ...allMean, builder: undefined }).length).toBe(expected.gzipBytes);
+    // And with the real registry, only the four listed metrics may differ.
+    const changed: string[] = [];
+    for (const [g, grid] of Object.entries(o.groups)) {
+      expect(grid.ts).toEqual(allMean.groups[g].ts);
+      for (const [m, vals] of Object.entries(grid.values)) {
+        if (JSON.stringify(vals) !== JSON.stringify(allMean.groups[g].values[m])) changed.push(m);
+      }
+    }
+    for (const m of changed) expect(Object.keys(OVERVIEW_METRIC_AGG)).toContain(m);
+    expect({ ...o.insights, computedAt: 0 }).toEqual({ ...allMean.insights, computedAt: 0 });
+  });
+});
+
+describe('per-metric bucket aggregation (include-led-status-in-telemetry D5)', () => {
+  it('buckets led_state with max and health_flags with OR, never the mean; everything else stays a mean', async () => {
+    const { OVERVIEW_METRIC_AGG, OVERVIEW_BUILDER_V } = await import('../src/services/telemetry-overview');
+    expect(OVERVIEW_METRIC_AGG).toEqual({
+      'system.led_state': 'max',
+      'system.health_flags': 'or',
+      'lte.gnss_health': 'max',
+      'system.throttled': 'or',
+    });
+    // 3600 samples at 1 Hz -> 10 s buckets (target 500). Each 10 s bucket mixes
+    // codes 1 and 5 and flags 4 and 1, so a mean would read 3 and 2.5.
+    const samples = synthetic(3600, 1000, T0, (i) => ({
+      system: {
+        cpu_temp: { value: 50 + (i % 3), unit: '°C' },
+        led_state: { value: i % 2 === 0 ? 1 : 5 },
+        health_flags: { value: i % 2 === 0 ? 4 : 1 },
+        throttled: { value: i % 2 === 0 ? 0x4 : 0x10000 },
+      },
+      lte: { gnss_health: { value: i % 2 === 0 ? 0 : 2 }, rssi: { value: i % 2 === 0 ? -80 : -90, unit: 'dBm' } },
+    }));
+    const o = buildOverview(META, [segment(0, samples)], T0 + 1);
+    expect(o.builder).toBe(OVERVIEW_BUILDER_V);
+    const sys = o.groups.system;
+    expect(sys.bucketMs).toBe(10_000);
+    expect(sys.agg).toEqual({ 'system.health_flags': 'or', 'system.led_state': 'max', 'system.throttled': 'or' });
+    expect(new Set(sys.values['system.led_state'])).toEqual(new Set([5]));
+    expect(new Set(sys.values['system.health_flags'])).toEqual(new Set([5]));
+    expect(new Set(sys.values['system.throttled'])).toEqual(new Set([0x10004]));
+    expect(o.groups.lte.agg).toEqual({ 'lte.gnss_health': 'max' });
+    expect(new Set(o.groups.lte.values['lte.gnss_health'])).toEqual(new Set([2]));
+    // Unlisted metrics in the SAME buckets keep the mean (owner constraint):
+    // cpu_temp 50,51,52 repeating -> first 10 s bucket = 509/10; rssi -80/-90 -> -85;
+    // gps.lat = i in 2 s gps buckets -> mean of 0,1 = 0.5.
+    expect(sys.values['system.cpu_temp'][0]).toBe(50.9);
+    expect(new Set(o.groups.lte.values['lte.rssi'])).toEqual(new Set([-85]));
+    expect(o.groups.gps.bucketMs).toBe(2_000);
+    expect(o.groups.gps.values['gps.lat'][0]).toBe(0.5);
+    expect(o.groups.gps.agg).toBeUndefined();
+    // The insight sees the raw samples.
+    const ds = o.insights.deviceStatus as { worstCode: number; byCodeMs: Record<string, number> };
+    expect(ds.worstCode).toBe(5);
+    expect(ds.byCodeMs['1'] + ds.byCodeMs['5']).toBe(3_599_000);
+  });
+
+  it('keeps max/or exact across the sub-second coarsening fold', () => {
+    // 10 Hz: the grid folds to 1 s once past the target, then to the final rung.
+    const samples = Array.from({ length: 6000 }, (_, i) => ({
+      ts: T0 + i * 100,
+      metrics: { system: { led_state: { value: i % 20 === 7 ? 4 : 0 }, health_flags: { value: i % 20 === 7 ? 2 : i % 20 === 9 ? 64 : 0 } } },
+    }));
+    const o = buildOverview({ ...META, rateHz: 10 }, [segment(0, samples, { rateHz: 10 })], T0 + 1);
+    const sys = o.groups.system;
+    // 600 s over a 500 target -> 2 s buckets of 20 samples, one code-4 sample each.
+    expect(sys.bucketMs).toBe(2_000);
+    expect(sys.ts).toHaveLength(300);
+    expect(new Set(sys.values['system.led_state'])).toEqual(new Set([4]));
+    expect(new Set(sys.values['system.health_flags'])).toEqual(new Set([66]));
   });
 });
