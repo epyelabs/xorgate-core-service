@@ -9,6 +9,7 @@ import { systemInsight } from './system';
 import { lteInsight } from './lte';
 import { stopsInsight } from './stops';
 import { vehicleInsight } from './vehicle';
+import { deviceStatusInsight } from './device-status';
 
 export type { InsightComputer, InsightContext, InsightEvent, InsightSample, InsightsV1 } from './types';
 
@@ -28,6 +29,7 @@ export const INSIGHT_COMPUTERS: readonly InsightComputer<any>[] = [
   lteInsight,
   stopsInsight,
   vehicleInsight,
+  deviceStatusInsight,
 ];
 
 /** Per-insight versions the registry currently produces: `{ distance: 1, ... }`. */

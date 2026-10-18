@@ -1104,14 +1104,16 @@ export function openApiSchemas(): Record<string, unknown> {
         '`lte`, `stops` (an event list) and, for a device whose model declares `peripherals.obd`, ' +
         '`vehicle` (OBD-II: engine-on and idle time, rpm and coolant maxima, fuel start/end/used ' +
         'with refuel events, odometer start/end/delta as a GPS cross-check, DTC events, live-link ' +
-        'time; present only when `obd.link` reached 2 in the session). See the platform-concepts ' +
+        'time; present only when `obd.link` reached 2 in the session) and, for a device that reports ' +
+        '`system.led_state`, `deviceStatus` (time per status-LED code and per health flag, the worst ' +
+        'code, and the contiguous LED-state intervals). See the platform-concepts ' +
         'page on telemetry sessions for each block\'s fields.',
       properties: {
         computed: {
           type: 'object',
           additionalProperties: { type: 'integer' },
           description: '`{ insightId: version }` for every insight present.',
-          example: { duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1, vehicle: 1 },
+          example: { duration: 1, distance: 1, speed: 1, position: 1, altitude: 1, gpsQuality: 1, system: 1, lte: 1, stops: 1, vehicle: 1, deviceStatus: 1 },
         },
         computedAt: { type: 'integer', description: 'Epoch ms.' },
         duration: {
@@ -1163,6 +1165,32 @@ export function openApiSchemas(): Record<string, unknown> {
             dtc: { maxCount: 1, endCount: 1, milEnd: 1, events: 1 },
             breakGapMs: 30000,
             truncated: false,
+          },
+        },
+        deviceStatus: {
+          type: 'object',
+          additionalProperties: true,
+          description:
+            'What the kit\'s status LED showed, from the 1 Hz `system.led_state` code (severity-ascending: ' +
+            '0 healthy, 1 starting, 2 gps_wait, 3 network, 4 thermal, 5 undervoltage, 6 agent_down ' +
+            'reserved) and `system.health_flags` bitmask (1 undervoltage, 2 thermal, 4 lte_down, ' +
+            '8 mqtt_down, 16 gps_no_fix, 32 gps_gate_hold, 64 dead_zone, 128 power_shed, 256 live_block). ' +
+            '`version` (1); `worstCode`; `byCodeMs` (code -> ms, every code "0".."6" present); ' +
+            '`byFlagMs` (bit value -> ms the bit was set, every known bit present); `events`, the ' +
+            'contiguous LED-state runs `{ kind: "led_state", ts, endTs, value }` with sub-2 s blips ' +
+            'folded into a neighbour, at most 500 (the longest kept, `truncated: true`). A sample ' +
+            'holds until the next one, at most 10 s. Present only when the session carries ' +
+            '`system.led_state`. These intervals live in this block, not in the top-level `events`.',
+          example: {
+            version: 1,
+            worstCode: 3,
+            byCodeMs: { '0': 3410000, '1': 6000, '2': 95000, '3': 41000, '4': 0, '5': 0, '6': 0 },
+            byFlagMs: { '1': 0, '2': 0, '4': 41000, '8': 12000, '16': 95000, '32': 0, '64': 0, '128': 0, '256': 0 },
+            events: [
+              { kind: 'led_state', ts: 1791914400000, endTs: 1791914406000, value: 1 },
+              { kind: 'led_state', ts: 1791914406000, endTs: 1791914501000, value: 2 },
+              { kind: 'led_state', ts: 1791914501000, endTs: 1791916000000, value: 0 },
+            ],
           },
         },
         events: {
