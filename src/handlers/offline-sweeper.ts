@@ -7,6 +7,7 @@ import {
   closeStaleMediaSessions,
   expireSegmentIndexRows,
 } from '../services/media-sessions';
+import { runClockStepBackfill } from '../services/clock-step-backfill';
 import {
   deleteTelemetrySession,
   reconcileTelemetryIndex,
@@ -37,7 +38,17 @@ export type SweeperJob =
   // xorgate-webhooks Phase 1: steps 5 and 6 of the tick, on demand (dev runs
   // with the schedule off, so this is how a due retry is forced there).
   | { job: 'webhooks-requeue' }
-  | { job: 'webhooks-retention' };
+  | { job: 'webhooks-retention' }
+  // plans/clock-step-correction P3: repair sessions ingested before the
+  // ingest-time clock-step correction (scripts/clock-step-backfill.ts).
+  | {
+      job: 'clock-step-backfill';
+      dryRun?: boolean;
+      sessionId?: string;
+      mediaOnly?: boolean;
+      telemetryOnly?: boolean;
+      limit?: number;
+    };
 
 const isJob = (event: unknown): event is SweeperJob =>
   typeof event === 'object' && event !== null && typeof (event as { job?: unknown }).job === 'string';
@@ -249,6 +260,16 @@ async function runJob(job: SweeperJob, deadline?: number): Promise<unknown> {
       return webhooksRequeue();
     case 'webhooks-retention':
       return expireWebhookHistory();
+    case 'clock-step-backfill':
+      return runClockStepBackfill({
+        dryRun: job.dryRun !== false,
+        sessionId: job.sessionId,
+        mediaOnly: job.mediaOnly,
+        telemetryOnly: job.telemetryOnly,
+        limit: job.limit,
+        bucket,
+        deadline,
+      });
     case 'telemetry-session-delete':
       // Operator-only (P6): objects + ingest-log rows + index rows of ONE
       // session, so a backfill pass cannot bring it back. Dev fixture cleanup.
