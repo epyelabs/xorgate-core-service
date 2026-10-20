@@ -13,6 +13,13 @@ import {
   videoSidecarSchema,
 } from '../services/media-segments';
 import { recordingConfig } from '../config/recording';
+import { nominalSegmentMs } from '../services/clock-step';
+import {
+  applyMediaClockStep,
+  planMediaSegment,
+  type MediaSegmentPlan,
+  type MediaSessionClockState,
+} from '../services/media-clock-step';
 import { evaluateSegmentUploadedTriggers } from '../services/workflow-triggers';
 import { dispatchWebhookEvents } from '../services/webhooks/emit';
 import { emitMediaSessionStarted } from '../services/webhooks/sessions';
@@ -53,6 +60,17 @@ class AlreadyIngested extends Error {}
  * ON CONFLICT DO NOTHING inside the same tx as the session upsert/rollup; a
  * duplicate delivery inserts nothing and rolls the session update back.
  *
+ * Clock-step correction (plans/clock-step-correction §4.2): a battery-less
+ * device boots on a stale fake-hwclock stamp and NTP/GPS/NITZ steps the clock
+ * forward minutes later, so the fragment open during the step reports
+ * `durationMs = step + nominal` and every earlier segment is late by the
+ * step. services/media-clock-step.ts plans the row (shift + clamp the
+ * inflated one, clamp a crash-cut one, shift a late pre-step straggler) and,
+ * for a new step, shifts the stored rows and re-derives the session bounds in
+ * this same transaction. Everything downstream of the insert (session window,
+ * `media_session.started`, `segment_uploaded`, the log line) sees the
+ * CORRECTED values. Kill switch: CLOCK_STEP_CORRECTION=0.
+ *
  * Workflow hook (destroy-kvs-recorder Phase W): each successfully ingested
  * segment fires `segment_uploaded` triggers — the near-realtime half of the
  * media trigger pair. Its batch twin, `session_completed`, fires from the
@@ -90,7 +108,7 @@ export const handler = async (
 
   const device = await db.query.devices.findFirst({
     where: eq(schema.devices.id, deviceId),
-    columns: { id: true },
+    columns: { id: true, recordingConfig: true },
   });
   if (!device) {
     console.error('media-segment-ingest: unknown device, dropping', { key, deviceId });
@@ -124,14 +142,33 @@ export const handler = async (
     return;
   }
 
-  const { session, segment, segmentEnd } = buildSegmentRows(parsedKey, key, sidecar.data);
+  const { session, segment } = buildSegmentRows(parsedKey, key, sidecar.data);
+
+  // Clock-step plan as if this delivery created the session (no correction
+  // recorded yet). Inside the transaction an EXISTING session's correction
+  // state is read under a row lock and the plan is redone with it (D10
+  // stragglers); for a new session this one stands.
+  const nominalMs = nominalSegmentMs(device.recordingConfig);
+  const planFor = (sessionState: MediaSessionClockState | null): MediaSegmentPlan =>
+    planMediaSegment({
+      startTs: segment.startTs,
+      durationMs: segment.durationMs,
+      finalized: segment.finalized ?? true,
+      nominalMs,
+      minStepMs: recordingConfig.clockStepMinMs,
+      enabled: recordingConfig.clockStepCorrection,
+      session: sessionState,
+    });
+  const freshPlan = planFor(null);
 
   // Far-future guardrail (optimize-system-process-cycle Phase 8): a broken
   // device clock must be loud, not silently absorbed. Permanent — the sidecar
-  // will say the same thing on every retry — so log and drop.
+  // will say the same thing on every retry — so log and drop. Judged on the
+  // step-CORRECTED start (what would be stored); a D10 straggler shift only
+  // moves a stale stamp toward real time, so it cannot newly trip this.
   if (
     segmentTooFarInFuture(
-      segment.startTs.getTime(),
+      freshPlan.startTs.getTime(),
       Date.now(),
       recordingConfig.mediaSegmentMaxFutureMs,
     )
@@ -140,7 +177,8 @@ export const handler = async (
       key,
       deviceId,
       sessionId,
-      startTs: segment.startTs.toISOString(),
+      startTs: freshPlan.startTs.toISOString(),
+      rawStartTs: segment.startTs.toISOString(),
       maxFutureMs: recordingConfig.mediaSegmentMaxFutureMs,
       timeSource: sidecar.data.timeSource ?? null,
     });
@@ -157,20 +195,46 @@ export const handler = async (
   const upgradeTimeSource = recordingConfig.mediaTimeSourceUpgrade && sidecarRank >= 0;
 
   let startedEventId: string | null = null;
+  let plan: MediaSegmentPlan = freshPlan;
   try {
     startedEventId = await db.transaction(async (tx) => {
       // Session row first (media_segments.session_id FK). Sequential statements
       // only — RDS Data API forbids interleaving inside a transaction. A
       // returned row means THIS delivery created the session (xorgate-webhooks
-      // P3: `media_session.started`).
+      // P3: `media_session.started`). A new session starts at the CORRECTED
+      // bounds of its first segment.
       const created = await tx
         .insert(schema.mediaSessions)
-        .values(session)
+        .values({ ...session, startedAt: freshPlan.startTs, endedAt: freshPlan.segmentEnd })
         .onConflictDoNothing()
         .returning({ id: schema.mediaSessions.id });
+      plan = freshPlan;
+      if (created.length === 0 && recordingConfig.clockStepCorrection) {
+        // D10: an existing session may already carry a correction. FOR UPDATE
+        // serialises this read against a concurrent step-applying delivery of
+        // the same session: either it committed first (its correction is
+        // visible here and this straggler is shifted on insert), or it waits
+        // for this commit and its shift UPDATE then sees this row.
+        const [state] = await tx
+          .select({
+            clockCorrectionMs: schema.mediaSessions.clockCorrectionMs,
+            clockStaleBefore: schema.mediaSessions.clockStaleBefore,
+          })
+          .from(schema.mediaSessions)
+          .where(eq(schema.mediaSessions.id, sessionId))
+          .for('update');
+        plan = planFor(state ?? null);
+      }
       const inserted = await tx
         .insert(schema.mediaSegments)
-        .values(segment)
+        .values({
+          ...segment,
+          startTs: plan.startTs,
+          durationMs: plan.durationMs,
+          meta: plan.clockStep
+            ? { ...(segment.meta as Record<string, unknown>), clockStep: plan.clockStep }
+            : segment.meta,
+        })
         .onConflictDoNothing()
         .returning({ id: schema.mediaSegments.id });
       if (inserted.length === 0) throw new AlreadyIngested(key);
@@ -182,8 +246,8 @@ export const handler = async (
       await tx
         .update(schema.mediaSessions)
         .set({
-          startedAt: sql`least(${schema.mediaSessions.startedAt}, ${tsParam(segment.startTs.toISOString())})`,
-          endedAt: sql`greatest(coalesce(${schema.mediaSessions.endedAt}, 'epoch'::timestamptz), ${tsParam(segmentEnd.toISOString())})`,
+          startedAt: sql`least(${schema.mediaSessions.startedAt}, ${tsParam(plan.startTs.toISOString())})`,
+          endedAt: sql`greatest(coalesce(${schema.mediaSessions.endedAt}, 'epoch'::timestamptz), ${tsParam(plan.segmentEnd.toISOString())})`,
           lastSegmentAt: sql`now()`,
           status: 'open',
           ...(upgradeTimeSource
@@ -194,6 +258,18 @@ export const handler = async (
             : {}),
         })
         .where(eq(schema.mediaSessions.id, sessionId));
+      // A new step (§4.2 steps 3-4): shift every row stamped before it, then
+      // re-derive started_at/ended_at from the rows (least/greatest above
+      // would keep the stale start) and record the audit columns.
+      if (plan.step) {
+        await applyMediaClockStep(tx, {
+          sessionId,
+          segmentRowId: inserted[0].id,
+          rawStartTs: plan.step.rawStartTs,
+          stepMs: plan.step.stepMs,
+          nominalMs: plan.step.nominalMs,
+        });
+      }
       // The outbox row commits with the session it announces (README D3); a
       // duplicate delivery rolled back above, so it never gets here.
       if (created.length === 0) return null;
@@ -201,7 +277,7 @@ export const handler = async (
         sessionId,
         deviceId,
         streamKey,
-        startedAt: session.startedAt,
+        startedAt: plan.startTs,
         timeSource: session.timeSource ?? null,
         codec: session.codec ?? null,
         width: session.width ?? null,
@@ -218,14 +294,33 @@ export const handler = async (
     throw err; // transient DB failure → Lambda retry / DLQ
   }
 
+  if (plan.kind !== 'none') {
+    console.log('media-segment-ingest: clock step corrected', {
+      key,
+      deviceId,
+      streamKey,
+      sessionId,
+      seq,
+      kind: plan.kind,
+      stepMs: plan.step?.stepMs ?? (plan.kind === 'straggler' ? plan.clockStep?.stepMs : 0),
+      nominalMs,
+      rawStartTs: plan.rawStartTs.toISOString(),
+      rawDurationMs: plan.rawDurationMs,
+      startTs: plan.startTs.toISOString(),
+      durationMs: plan.durationMs,
+      finalized: segment.finalized,
+      timeSource: sidecar.data.timeSource ?? null,
+    });
+  }
+
   console.log('media-segment-ingest: ingested', {
     key,
     deviceId,
     streamKey,
     sessionId,
     seq,
-    startTs: segment.startTs,
-    durationMs: segment.durationMs,
+    startTs: plan.startTs,
+    durationMs: plan.durationMs,
     sizeBytes: segment.sizeBytes,
     finalized: segment.finalized,
   });
@@ -245,8 +340,8 @@ export const handler = async (
       streamKey,
       s3Key: key,
       seq,
-      startTs: segment.startTs,
-      durationMs: segment.durationMs,
+      startTs: plan.startTs,
+      durationMs: plan.durationMs,
     });
   } catch (err) {
     console.error('media-segment-ingest: segment_uploaded trigger eval failed', { key, err });

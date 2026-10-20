@@ -162,6 +162,59 @@ describe('buildSessionTimeline', () => {
     expect(t.segments[0].anchor).toBeNull();
     expect(t.segments[0].sizeBytes).toBeNull();
   });
+
+  describe('clock-step safety cap (plans/clock-step-correction D14)', () => {
+    // Real prod rows, Tacloban 04 session 01a14919-…: seq 1 was open across a
+    // ~66 min clock step and reports durationMs = step + nominal, which is
+    // EXACTLY the delta to seq 2, so the contiguity rule bridges the step.
+    const S0 = Date.parse('2026-10-17T09:03:10.471Z');
+    const S1 = Date.parse('2026-10-17T09:04:10.471Z');
+    const S2 = Date.parse('2026-10-17T10:11:03.304Z');
+    const rows = () => [
+      seg({ seq: 0, startTs: S0, durationMs: 60000, meta: { anchor: 'boundary' } }),
+      seg({ seq: 1, startTs: S1, durationMs: 4012833, meta: { anchor: 'fstat' } }),
+      seg({ seq: 2, startTs: S2, durationMs: 59990 }),
+    ];
+
+    it('without the cap the inflated row bridges the step (behaviour unchanged)', () => {
+      const t = buildSessionTimeline(rows())!;
+      expect(t.segments.map((s) => s.effectiveDurationMs)).toEqual([60000, 4012833, 59990]);
+      expect(t.gaps).toEqual([]);
+    });
+
+    it('with maxSegmentMs 70 000 the inflated row is capped and the rest of the step becomes a gap', () => {
+      const t = buildSessionTimeline(rows(), { maxSegmentMs: 70000 })!;
+      expect(t.segments.map((s) => s.effectiveDurationMs)).toEqual([60000, 70000, 59990]);
+      expect(t.gaps).toEqual([{ fromTs: S1 + 70000, toTs: S2, reason: 'missing-segments' }]);
+      expect(t.fromTs).toBe(S0);
+      expect(t.toTs).toBe(S2 + 59990);
+    });
+
+    it('the cap never changes normal rows (deltas still win, fstat heads still bridge)', () => {
+      const normal = [
+        seg({ seq: 0, startTs: T0, durationMs: 61992, meta: { anchor: 'fstat' } }),
+        seg({ seq: 1, startTs: T0 + 61992, durationMs: 59984 }),
+        seg({ seq: 2, startTs: T0 + 61992 + 59990, durationMs: 59991 }),
+      ];
+      expect(buildSessionTimeline(normal, { maxSegmentMs: 70000 })).toEqual(buildSessionTimeline(normal));
+    });
+
+    it('a crash-cut inflated row (D5, never corrected at ingest) is capped too', () => {
+      const t = buildSessionTimeline(
+        [
+          seg({ seq: 0, startTs: S1, durationMs: 4012833, finalized: false }),
+          seg({ seq: 1, startTs: S2, durationMs: 59990 }),
+        ],
+        { maxSegmentMs: 70000 },
+      )!;
+      expect(t.segments[0].effectiveDurationMs).toBe(70000);
+      expect(t.gaps).toEqual([{ fromTs: S1 + 70000, toTs: S2, reason: 'missing-segments' }]);
+    });
+
+    it('a non-positive maxSegmentMs means no cap', () => {
+      expect(buildSessionTimeline(rows(), { maxSegmentMs: 0 })).toEqual(buildSessionTimeline(rows()));
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

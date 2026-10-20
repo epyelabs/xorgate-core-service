@@ -22,6 +22,16 @@
  * seams are absorbed client-side by the player's micro-gap jump controller
  * (spike recipe item 4). For finalized segments this is automatic: a
  * non-contiguous delta implies a hole > 2 s by construction.
+ *
+ * Clock-step safety cap (plans/clock-step-correction D14): a fragment open
+ * across a device clock step reports `durationMs = step + nominal`, which
+ * would satisfy the contiguity rule against ANY later segment and stretch a
+ * 60 s file over the whole step (the player stalls at the real end and jumps).
+ * With `maxSegmentMs` each row's durationMs is clamped to it, for the
+ * contiguity test and the effective duration alike, so such a row yields
+ * effective = the cap and a `missing-segments` gap for the remainder. Ingest
+ * corrects these rows at the source; the cap covers rows it did not (kill
+ * switch off, D5 crash-cut rows, pre-correction history).
  */
 
 export const CONTIGUITY_SLACK_MS = 2000;
@@ -64,23 +74,25 @@ export interface SessionTimeline {
 
 export function buildSessionTimeline(
   rows: ReplaySegmentInput[],
-  opts: { sessionStartedAt?: Date } = {},
+  opts: { sessionStartedAt?: Date; maxSegmentMs?: number } = {},
 ): SessionTimeline | null {
   if (rows.length === 0) return null;
 
+  const cap = opts.maxSegmentMs !== undefined && opts.maxSegmentMs > 0 ? opts.maxSegmentMs : null;
   const work = rows.map((r) => {
     const meta = (r.meta ?? {}) as Record<string, unknown>;
+    const durationMs = cap !== null ? Math.min(r.durationMs, cap) : r.durationMs;
     return {
       seg: {
         seq: r.seq,
         startTs: r.startTs.getTime(),
-        effectiveDurationMs: r.durationMs, // provisional; fixed up below
+        effectiveDurationMs: durationMs, // provisional; fixed up below
         finalized: r.finalized,
         anchor: typeof meta.anchor === 'string' ? meta.anchor : null,
         sizeBytes: r.sizeBytes,
         s3Key: r.s3Key,
       } satisfies ReplayManifestSegment,
-      durationMs: r.durationMs,
+      durationMs,
     };
   });
   // Never trust seq for ordering (README gotcha: eviction holes + reopened
