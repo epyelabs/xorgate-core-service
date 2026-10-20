@@ -48,6 +48,7 @@ export type SweeperJob =
       mediaOnly?: boolean;
       telemetryOnly?: boolean;
       limit?: number;
+      after?: string;
     };
 
 const isJob = (event: unknown): event is SweeperJob =>
@@ -267,6 +268,7 @@ async function runJob(job: SweeperJob, deadline?: number): Promise<unknown> {
         mediaOnly: job.mediaOnly,
         telemetryOnly: job.telemetryOnly,
         limit: job.limit,
+        after: job.after,
         bucket,
         deadline,
       });

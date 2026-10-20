@@ -35,10 +35,11 @@ interface Args {
   mediaOnly: boolean;
   telemetryOnly: boolean;
   limit: number;
+  maxPasses: number;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { stage: 'dev', apply: false, mediaOnly: false, telemetryOnly: false, limit: 50 };
+  const args: Args = { stage: 'dev', apply: false, mediaOnly: false, telemetryOnly: false, limit: 20, maxPasses: 50 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -52,6 +53,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === '--media-only') args.mediaOnly = true;
     else if (a === '--telemetry-only') args.telemetryOnly = true;
     else if (a === '--limit') args.limit = Number(next());
+    else if (a === '--max-passes') args.maxPasses = Number(next());
     else throw new Error(`unknown argument ${a}`);
   }
   if (args.mediaOnly && args.telemetryOnly) throw new Error('--media-only and --telemetry-only are exclusive');
@@ -136,8 +138,9 @@ export interface ClockStepBackfillResult {
   dryRun: boolean;
   media: { scanned: number; candidates: MediaClockStepCandidate[] };
   telemetry: { scanned: number; candidates: TelemetryClockStepCandidate[] };
-  /** True when `limit` cut the scan short; re-run to continue. */
+  /** True when `limit` cut the scan short; re-run with `after = nextAfter`. */
   truncated: boolean;
+  nextAfter: string | null;
 }
 
 // --- Printing ----------------------------------------------------------------
@@ -198,18 +201,28 @@ async function main(): Promise<void> {
   const lambda = new LambdaClient({ region });
   console.log(`sweeper function: ${fn} (${args.stage}, ${args.apply ? 'APPLY' : 'dry run'})`);
 
-  const out = await invoke(lambda, fn, {
-    job: 'clock-step-backfill',
-    dryRun: !args.apply,
-    sessionId: args.sessionId,
-    mediaOnly: args.mediaOnly,
-    telemetryOnly: args.telemetryOnly,
-    limit: args.limit,
-  });
-  console.log(`scanned media=${out.media.scanned} telemetry=${out.telemetry.scanned}${out.truncated ? ' (TRUNCATED by --limit, re-run)' : ''}`);
-  printMedia(out.media.candidates);
-  printTelemetry(out.telemetry.candidates);
-  const errors = [...out.media.candidates, ...out.telemetry.candidates].filter((c) => c.error).length;
+  let after: string | undefined;
+  let errors = 0;
+  for (let pass = 1; pass <= args.maxPasses; pass++) {
+    const out = await invoke(lambda, fn, {
+      job: 'clock-step-backfill',
+      dryRun: !args.apply,
+      sessionId: args.sessionId,
+      mediaOnly: args.mediaOnly,
+      telemetryOnly: args.telemetryOnly,
+      limit: args.limit,
+      after,
+    });
+    console.log(
+      `pass ${pass}: scanned media=${out.media.scanned} telemetry=${out.telemetry.scanned}` +
+        (after ? ` (after ${after})` : ''),
+    );
+    printMedia(out.media.candidates);
+    printTelemetry(out.telemetry.candidates);
+    errors += [...out.media.candidates, ...out.telemetry.candidates].filter((c) => c.error).length;
+    if (!out.truncated || !out.nextAfter || out.nextAfter === after) break;
+    after = out.nextAfter;
+  }
   if (errors > 0) {
     console.error(`${errors} session(s) failed; see the sweeper's CloudWatch log`);
     process.exit(2);

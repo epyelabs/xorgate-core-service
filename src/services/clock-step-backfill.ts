@@ -1,14 +1,21 @@
-import { sql } from 'drizzle-orm';
-import { db } from '../db/index';
+import { asc, eq, sql } from 'drizzle-orm';
+import { db, schema } from '../db/index';
 import { recordingConfig } from '../config/recording';
-import { nominalSegmentMs } from './clock-step';
+import { nominalSegmentMs, totalTelemetryShiftMs } from './clock-step';
+import { parseSegment } from './telemetry-batch';
+import {
+  applyTelemetryClockStep,
+  prepareTelemetryClockStep,
+  readSegmentObject,
+  type SegmentShift,
+} from './telemetry-clock-step';
 import {
   applyMediaClockStep,
   correctInflatedSegmentRowSql,
   planMediaSegment,
   type ExecutesSql,
 } from './media-clock-step';
-import { uuidParam } from '../utils/sql';
+import { tsParam, uuidParam } from '../utils/sql';
 
 /**
  * Clock-step backfill (plans/clock-step-correction PLAN §4.4): repair the
@@ -32,8 +39,10 @@ export interface ClockStepBackfillOptions {
   sessionId?: string;
   mediaOnly?: boolean;
   telemetryOnly?: boolean;
-  /** Candidates per call (per kind); the driver re-runs when `truncated`. */
+  /** Candidates per call (per kind); the driver re-runs with `after` while `truncated`. */
   limit?: number;
+  /** Resume cursor: ISO timestamp; media rows with start_ts / telemetry sessions with started_at AFTER it. */
+  after?: string;
   bucket: string;
   /** Epoch ms; stop starting new sessions past it. */
   deadline?: number;
@@ -83,6 +92,8 @@ export interface ClockStepBackfillResult {
   media: { scanned: number; candidates: MediaClockStepCandidate[] };
   telemetry: { scanned: number; candidates: TelemetryClockStepCandidate[] };
   truncated: boolean;
+  /** Pass back as `after` to continue a truncated scan (the last scanned stamp). */
+  nextAfter: string | null;
 }
 
 interface MediaScanRow {
@@ -112,7 +123,7 @@ function isoFromDb(v: string | Date | null): string | null {
   return Number.isNaN(d.getTime()) ? String(v) : d.toISOString();
 }
 
-function mediaScanSql(opts: { sessionId?: string; minStepMs: number; limit: number }) {
+function mediaScanSql(opts: { sessionId?: string; minStepMs: number; limit: number; after?: string }) {
   // Pre-filter on the device's configured nominal (default 60 s, like
   // nominalSegmentMs); the exact decision is re-made in JS with planMediaSegment.
   return sql`select g.id, g.session_id, g.device_id, d.name as device_name, d.recording_config,
@@ -128,6 +139,7 @@ function mediaScanSql(opts: { sessionId?: string; minStepMs: number; limit: numb
         + 1000 * coalesce((d.recording_config->'video'->>'segmentSeconds')::int, 60)
       and (g.meta is null or g.meta->'clockStep' is null)
       ${opts.sessionId ? sql`and g.session_id = ${uuidParam(opts.sessionId)}` : sql``}
+      ${opts.after ? sql`and g.start_ts > ${tsParam(opts.after)}` : sql``}
     order by g.start_ts asc, g.seq asc
     limit ${opts.limit + 1}`;
 }
@@ -171,10 +183,14 @@ export function predictMediaBounds(
   };
 }
 
-async function backfillMedia(opts: ClockStepBackfillOptions): Promise<{ scanned: number; candidates: MediaClockStepCandidate[]; truncated: boolean }> {
+async function backfillMedia(
+  opts: ClockStepBackfillOptions,
+): Promise<{ scanned: number; candidates: MediaClockStepCandidate[]; truncated: boolean; nextAfter: string | null }> {
   const limit = opts.limit ?? 50;
   const minStepMs = recordingConfig.clockStepMinMs;
-  const res = (await db.execute(mediaScanSql({ sessionId: opts.sessionId, minStepMs, limit }))) as unknown as { rows?: MediaScanRow[] };
+  const res = (await db.execute(
+    mediaScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after }),
+  )) as unknown as { rows?: MediaScanRow[] };
   const rows = res.rows ?? [];
   const truncated = rows.length > limit;
   const work = truncated ? rows.slice(0, limit) : rows;
@@ -264,19 +280,235 @@ async function backfillMedia(opts: ClockStepBackfillOptions): Promise<{ scanned:
     }
     candidates.push(candidate);
   }
-  return { scanned: work.length, candidates, truncated };
+  const last = work[work.length - 1];
+  return { scanned: work.length, candidates, truncated, nextAfter: last ? isoFromDb(last.start_ts) : null };
+}
+
+// --- Telemetry half (PLAN §4.4, routines from services/telemetry-clock-step.ts) ---
+
+interface TelemetryScanRow {
+  id: string;
+  device_id: string;
+  device_name: string | null;
+  started_at: string;
+  ended_at: string | null;
+  rate_hz: number | null;
+  sample_count: number;
+  clock_correction_ms: number | null;
+}
+
+/**
+ * Candidate telemetry sessions: never corrected, closed, and spanning far
+ * more wall-clock than their sample count can account for at their rate (a
+ * stale-boot straddle adds the whole step to the span; a recording hole does
+ * too, which only costs the S3 reads that then find no in-file step). A
+ * `sessionId` filter bypasses the heuristic so one session can always be
+ * forced.
+ */
+function telemetryScanSql(opts: { sessionId?: string; minStepMs: number; limit: number; after?: string }) {
+  const minSecs = Math.ceil(opts.minStepMs / 1000);
+  return sql`select s.id, s.device_id, d.name as device_name, s.started_at, s.ended_at, s.rate_hz,
+      s.sample_count, s.clock_correction_ms
+    from telemetry_sessions s
+    join devices d on d.id = s.device_id
+    where s.ended_at is not null
+      ${
+        opts.sessionId
+          ? sql`and s.id = ${uuidParam(opts.sessionId)}`
+          : sql`and s.clock_correction_ms is null
+      and extract(epoch from (s.ended_at - s.started_at))
+          > s.sample_count::float / greatest(coalesce(s.rate_hz, 1), 1) + ${minSecs}::int`
+      }
+      ${opts.after ? sql`and s.started_at > ${tsParam(opts.after)}` : sql``}
+    order by s.started_at asc
+    limit ${opts.limit + 1}`;
+}
+
+async function readTelemetryBounds(exec: ExecutesSql, sessionId: string): Promise<SessionBounds> {
+  const res = (await exec.execute(
+    sql`select started_at, ended_at from telemetry_sessions where id = ${uuidParam(sessionId)}`,
+  )) as unknown as { rows?: { started_at: string; ended_at: string | null }[] };
+  const row = res.rows?.[0];
+  if (!row) throw new Error(`telemetry session ${sessionId} vanished during backfill`);
+  const startedAt = isoFromDb(row.started_at) as string;
+  const endedAt = isoFromDb(row.ended_at);
+  return { startedAt, endedAt, spanMs: endedAt ? new Date(endedAt).getTime() - new Date(startedAt).getTime() : 0 };
+}
+
+/** Pure: the bounds a dry run predicts after a telemetry step of `shiftMs` (every file before it shifts, the end holds). */
+export function predictTelemetryBounds(before: SessionBounds, shiftMs: number): SessionBounds {
+  const startedAt = new Date(new Date(before.startedAt).getTime() + shiftMs).toISOString();
+  return {
+    startedAt,
+    endedAt: before.endedAt,
+    spanMs: before.endedAt ? new Date(before.endedAt).getTime() - new Date(startedAt).getTime() : 0,
+  };
+}
+
+async function backfillTelemetry(
+  opts: ClockStepBackfillOptions,
+): Promise<{ scanned: number; candidates: TelemetryClockStepCandidate[]; truncated: boolean; nextAfter: string | null }> {
+  const limit = opts.limit ?? 10;
+  const minStepMs = recordingConfig.clockStepMinMs;
+  const res = (await db.execute(
+    telemetryScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after }),
+  )) as unknown as { rows?: TelemetryScanRow[] };
+  const rows = res.rows ?? [];
+  const truncated = rows.length > limit;
+  const work = truncated ? rows.slice(0, limit) : rows;
+  const candidates: TelemetryClockStepCandidate[] = [];
+  const seg = schema.telemetrySegments;
+
+  for (const s of work) {
+    if (opts.deadline !== undefined && Date.now() > opts.deadline) break;
+    const segments = await db
+      .select({ s3Key: seg.s3Key, seq: seg.seq, bytes: seg.bytes })
+      .from(seg)
+      .where(eq(seg.sessionId, s.id))
+      .orderBy(asc(seg.seq));
+    let correctionMs: number | null = s.clock_correction_ms === null ? null : Number(s.clock_correction_ms);
+    let before: SessionBounds = {
+      startedAt: isoFromDb(s.started_at) as string,
+      endedAt: isoFromDb(s.ended_at),
+      spanMs: s.ended_at ? new Date(isoFromDb(s.ended_at) as string).getTime() - new Date(isoFromDb(s.started_at) as string).getTime() : 0,
+    };
+
+    for (const file of segments) {
+      if (opts.deadline !== undefined && Date.now() > opts.deadline) break;
+      const obj = await readSegmentObject(opts.bucket, file.s3Key);
+      if (!obj) continue; // lifecycle removed it; nothing to correct
+      const parse = (text: string, detect: boolean) =>
+        parseSegment(text, {
+          deviceId: s.device_id,
+          now: Date.now(),
+          // Backfill: every line counts (the readings UPDATE matches by exact
+          // ts, so an out-of-partition line simply matches nothing).
+          maxAgeMs: Number.MAX_SAFE_INTEGER,
+          maxFutureMs: Number.MAX_SAFE_INTEGER,
+          ...(detect ? { clockStepMinMs: minStepMs } : {}),
+        });
+      const parsed = parse(obj.text, true);
+      const base = {
+        deviceId: s.device_id,
+        deviceName: s.device_name,
+        sessionId: s.id,
+        seq: Number(file.seq),
+      };
+      if (parsed.clockSteps.length === 0) {
+        if (obj.meta?.own && correctionMs === null) {
+          // An earlier attempt rewrote the object but never committed the DB
+          // half, and the step file's own stale ts are no longer recoverable
+          // from its content: leave it to an operator rather than guess.
+          candidates.push({
+            ...base,
+            steps: obj.meta.own.steps,
+            totalShiftMs: obj.meta.own.shiftMs,
+            earlierFiles: 0,
+            before,
+            after: before,
+            applied: false,
+            error: 'object already rewritten (x-amz-meta-xg-clock-step.own) but the session was never corrected; inspect manually',
+          });
+        }
+        continue;
+      }
+      const shiftMs = totalTelemetryShiftMs(parsed.clockSteps);
+      const earlierRows = (await db.execute(
+        sql`select count(*)::int as n from telemetry_segments
+            where session_id = ${uuidParam(s.id)} and seq < ${Number(file.seq)}::int
+              and start_ts <= ${tsParam(new Date(parsed.rawFirstTs as number).toISOString())}`,
+      )) as unknown as { rows?: { n: number }[] };
+      const candidate: TelemetryClockStepCandidate = {
+        ...base,
+        steps: parsed.clockSteps,
+        totalShiftMs: shiftMs,
+        earlierFiles: Number(earlierRows.rows?.[0]?.n ?? 0),
+        before,
+        after: predictTelemetryBounds(before, shiftMs),
+        applied: false,
+      };
+      if (opts.dryRun) {
+        candidates.push(candidate);
+        before = candidate.after; // a second step file in the same session predicts from here
+        continue;
+      }
+      try {
+        // Phase 1 (S3): rewrite this object + shift the earlier files; the
+        // session state is irrelevant here (a step file is never a straggler).
+        const prepared = await prepareTelemetryClockStep({
+          bucket: opts.bucket,
+          key: file.s3Key,
+          sessionId: s.id,
+          seq: Number(file.seq),
+          text: obj.text,
+          meta: obj.meta,
+          parsed,
+          session: null,
+          reparse: (text) => parse(text, false),
+        });
+        if (!prepared) throw new Error('prepareTelemetryClockStep returned no plan for a file with steps');
+        const selfBytes = prepared.bytes ?? Number(file.bytes);
+        const self: SegmentShift = {
+          s3Key: file.s3Key,
+          firstTs: prepared.parsed.firstTs,
+          lastTs: prepared.parsed.lastTs,
+          bytes: selfBytes,
+          bytesDelta: selfBytes - Number(file.bytes),
+          staleTsGroups: prepared.parsed.staleTsGroups,
+          rewritten: prepared.rewroteSelf,
+        };
+        // Phase 2 (DB), one transaction: earlier files first (seq order), then
+        // this file, then the session roll-up + audit columns.
+        const moved = await db.transaction(async (tx) => {
+          const r = await applyTelemetryClockStep(tx, {
+            sessionId: s.id,
+            deviceId: s.device_id,
+            files: [...prepared.earlier, self],
+            shiftMs: prepared.shiftMs,
+            staleBefore: prepared.staleBefore,
+          });
+          candidate.after = await readTelemetryBounds(tx, s.id);
+          return r.readingsMoved;
+        });
+        candidate.applied = true;
+        correctionMs = (correctionMs ?? 0) + prepared.shiftMs;
+        before = candidate.after;
+        console.log('clock-step-backfill: telemetry session corrected', {
+          sessionId: s.id,
+          seq: candidate.seq,
+          steps: prepared.steps,
+          shiftMs: prepared.shiftMs,
+          earlierFiles: prepared.earlier.length,
+          readingsMoved: moved,
+          before: candidate.before,
+          after: candidate.after,
+        });
+      } catch (err) {
+        candidate.error = (err as Error).message;
+        console.error('clock-step-backfill: telemetry session failed', { sessionId: s.id, seq: candidate.seq, err });
+      }
+      candidates.push(candidate);
+    }
+  }
+  const last = work[work.length - 1];
+  return { scanned: work.length, candidates, truncated, nextAfter: last ? isoFromDb(last.started_at) : null };
 }
 
 export async function runClockStepBackfill(opts: ClockStepBackfillOptions): Promise<ClockStepBackfillResult> {
   const media = opts.telemetryOnly
-    ? { scanned: 0, candidates: [] as MediaClockStepCandidate[], truncated: false }
+    ? { scanned: 0, candidates: [] as MediaClockStepCandidate[], truncated: false, nextAfter: null as string | null }
     : await backfillMedia(opts);
-  // Telemetry half: wired in P2's follow-up commit (services/telemetry-clock-step.ts).
-  const telemetry = { scanned: 0, candidates: [] as TelemetryClockStepCandidate[], truncated: false };
+  const telemetry = opts.mediaOnly
+    ? { scanned: 0, candidates: [] as TelemetryClockStepCandidate[], truncated: false, nextAfter: null as string | null }
+    : await backfillTelemetry(opts);
+  // One cursor for both scans: the driver re-runs with the SMALLER of the two
+  // so neither kind skips rows; a kind already past it just rescans a little.
+  const cursors = [media.nextAfter, telemetry.nextAfter].filter((c): c is string => c !== null);
   return {
     dryRun: opts.dryRun,
     media: { scanned: media.scanned, candidates: media.candidates },
     telemetry: { scanned: telemetry.scanned, candidates: telemetry.candidates },
     truncated: media.truncated || telemetry.truncated,
+    nextAfter: cursors.length ? cursors.sort()[0] : null,
   };
 }
