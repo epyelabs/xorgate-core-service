@@ -140,7 +140,7 @@ export interface ClockStepBackfillResult {
   telemetry: { scanned: number; candidates: TelemetryClockStepCandidate[] };
   /** True when `limit` cut the scan short; re-run with `after = nextAfter`. */
   truncated: boolean;
-  nextAfter: string | null;
+  nextAfter: { media: string | null; telemetry: string | null };
 }
 
 // --- Printing ----------------------------------------------------------------
@@ -201,7 +201,7 @@ async function main(): Promise<void> {
   const lambda = new LambdaClient({ region });
   console.log(`sweeper function: ${fn} (${args.stage}, ${args.apply ? 'APPLY' : 'dry run'})`);
 
-  let after: string | undefined;
+  let after: { media?: string; telemetry?: string } | undefined;
   let errors = 0;
   for (let pass = 1; pass <= args.maxPasses; pass++) {
     const out = await invoke(lambda, fn, {
@@ -215,13 +215,18 @@ async function main(): Promise<void> {
     });
     console.log(
       `pass ${pass}: scanned media=${out.media.scanned} telemetry=${out.telemetry.scanned}` +
-        (after ? ` (after ${after})` : ''),
+        (after ? ` (after media=${after.media ?? '-'} telemetry=${after.telemetry ?? '-'})` : ''),
     );
     printMedia(out.media.candidates);
     printTelemetry(out.telemetry.candidates);
     errors += [...out.media.candidates, ...out.telemetry.candidates].filter((c) => c.error).length;
-    if (!out.truncated || !out.nextAfter || out.nextAfter === after) break;
-    after = out.nextAfter;
+    if (!out.truncated) break;
+    const next = {
+      media: out.nextAfter.media ?? undefined,
+      telemetry: out.nextAfter.telemetry ?? undefined,
+    };
+    if (next.media === after?.media && next.telemetry === after?.telemetry) break; // no progress
+    after = next;
   }
   if (errors > 0) {
     console.error(`${errors} session(s) failed; see the sweeper's CloudWatch log`);

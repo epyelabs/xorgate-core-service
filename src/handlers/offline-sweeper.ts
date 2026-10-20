@@ -48,7 +48,7 @@ export type SweeperJob =
       mediaOnly?: boolean;
       telemetryOnly?: boolean;
       limit?: number;
-      after?: string;
+      after?: { media?: string; telemetry?: string };
     };
 
 const isJob = (event: unknown): event is SweeperJob =>

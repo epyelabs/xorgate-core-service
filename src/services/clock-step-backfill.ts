@@ -41,8 +41,8 @@ export interface ClockStepBackfillOptions {
   telemetryOnly?: boolean;
   /** Candidates per call (per kind); the driver re-runs with `after` while `truncated`. */
   limit?: number;
-  /** Resume cursor: ISO timestamp; media rows with start_ts / telemetry sessions with started_at AFTER it. */
-  after?: string;
+  /** Resume cursors (ISO): media rows with start_ts / telemetry sessions with started_at AFTER them. */
+  after?: { media?: string; telemetry?: string };
   bucket: string;
   /** Epoch ms; stop starting new sessions past it. */
   deadline?: number;
@@ -92,8 +92,8 @@ export interface ClockStepBackfillResult {
   media: { scanned: number; candidates: MediaClockStepCandidate[] };
   telemetry: { scanned: number; candidates: TelemetryClockStepCandidate[] };
   truncated: boolean;
-  /** Pass back as `after` to continue a truncated scan (the last scanned stamp). */
-  nextAfter: string | null;
+  /** Pass back as `after` to continue a truncated scan (the last processed stamp per kind). */
+  nextAfter: { media: string | null; telemetry: string | null };
 }
 
 interface MediaScanRow {
@@ -189,7 +189,7 @@ async function backfillMedia(
   const limit = opts.limit ?? 50;
   const minStepMs = recordingConfig.clockStepMinMs;
   const res = (await db.execute(
-    mediaScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after }),
+    mediaScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after?.media }),
   )) as unknown as { rows?: MediaScanRow[] };
   const rows = res.rows ?? [];
   const truncated = rows.length > limit;
@@ -364,7 +364,7 @@ async function backfillTelemetry(
   const limit = opts.limit ?? 10;
   const minStepMs = recordingConfig.clockStepMinMs;
   const res = (await db.execute(
-    telemetryScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after }),
+    telemetryScanSql({ sessionId: opts.sessionId, minStepMs, limit, after: opts.after?.telemetry }),
   )) as unknown as { rows?: TelemetryScanRow[] };
   const rows = res.rows ?? [];
   const truncated = rows.length > limit;
@@ -527,14 +527,17 @@ export async function runClockStepBackfill(opts: ClockStepBackfillOptions): Prom
   const telemetry = opts.mediaOnly
     ? { scanned: 0, candidates: [] as TelemetryClockStepCandidate[], truncated: false, nextAfter: null as string | null }
     : await backfillTelemetry(opts);
-  // One cursor for both scans: the driver re-runs with the SMALLER of the two
-  // so neither kind skips rows; a kind already past it just rescans a little.
-  const cursors = [media.nextAfter, telemetry.nextAfter].filter((c): c is string => c !== null);
   return {
     dryRun: opts.dryRun,
     media: { scanned: media.scanned, candidates: media.candidates },
     telemetry: { scanned: telemetry.scanned, candidates: telemetry.candidates },
     truncated: media.truncated || telemetry.truncated,
-    nextAfter: cursors.length ? cursors.sort()[0] : null,
+    // A kind that is NOT truncated keeps its cursor at its last processed
+    // stamp, so the next pass rescans nothing of it (apply) or only the same
+    // tail (dry run).
+    nextAfter: {
+      media: media.truncated ? media.nextAfter : (opts.after?.media ?? media.nextAfter),
+      telemetry: telemetry.truncated ? telemetry.nextAfter : (opts.after?.telemetry ?? telemetry.nextAfter),
+    },
   };
 }
