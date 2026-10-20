@@ -769,6 +769,15 @@ export function openApiSchemas(): Record<string, unknown> {
           nullable: true,
           description: 'Server-side arrival time of the most recent segment (upload can lag recording).',
         },
+        clockCorrectionMs: {
+          type: 'integer',
+          nullable: true,
+          description:
+            'Clock-step correction: the cumulative forward shift (ms) the server applied to this ' +
+            "session's segments because the device recorded them on a stale boot clock (no RTC) " +
+            'that NTP/GPS/NITZ later stepped. startedAt/endedAt and the segment startTs values are ' +
+            'already corrected. NULL = never corrected.',
+        },
         createdAt: { type: 'string', format: 'date-time' },
         thumbnailKey: {
           type: 'string',
@@ -918,6 +927,14 @@ export function openApiSchemas(): Record<string, unknown> {
               width: { type: 'integer', nullable: true },
               height: { type: 'integer', nullable: true },
               fps: { type: 'integer', nullable: true },
+              clockCorrectionMs: {
+                type: 'integer',
+                nullable: true,
+                description:
+                  'Cumulative forward shift (ms) applied to this session for a device clock step ' +
+                  '(see `MediaSession.clockCorrectionMs`); the timeline is already corrected. NULL = ' +
+                  'never corrected; absent from servers older than 0.19.0.',
+              },
               segments: {
                 type: 'array',
                 description: 'Ordered by startTs. Segment i covers [startTs, startTs + effectiveDurationMs).',
@@ -931,7 +948,10 @@ export function openApiSchemas(): Record<string, unknown> {
                       type: 'integer',
                       description:
                         'Next-segment startTs delta when contiguous, else the recorded durationMs. ' +
-                        'Deltas beat durations (rotation timestamps are accurate; durations drift).',
+                        'Deltas beat durations (rotation timestamps are accurate; durations drift). ' +
+                        'A recorded durationMs is capped at the nominal segment length + 10 s, so a ' +
+                        'segment inflated by an uncorrected device clock step never bridges the step ' +
+                        '(the remainder becomes a missing-segments gap).',
                     },
                     finalized: {
                       type: 'boolean',
@@ -1330,6 +1350,14 @@ export function openApiSchemas(): Record<string, unknown> {
         bytes: { type: 'integer', description: 'Gzipped bytes across them.' },
         overviewBuiltAt: { type: 'string', format: 'date-time', nullable: true, description: '`null` until the overview artifact exists.' },
         overviewBytes: { type: 'integer', nullable: true, description: 'Gzipped size of the overview; `null` until built or backfilled.' },
+        clockCorrectionMs: {
+          type: 'integer',
+          nullable: true,
+          description:
+            'Clock-step correction: the cumulative forward shift (ms) the server applied to samples ' +
+            'the device stamped on a stale boot clock (no RTC) before NTP/GPS/NITZ stepped it. ' +
+            '`from`/`to` and the stored samples are already corrected. `null` = never corrected.',
+        },
         insights: {
           nullable: true,
           allOf: [{ $ref: '#/components/schemas/TelemetryInsights' }],

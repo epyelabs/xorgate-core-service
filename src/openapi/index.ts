@@ -298,7 +298,12 @@ export function buildOpenApiDocument(baseUrl: string): Record<string, unknown> {
       // (status-LED time per code and per health flag, worst code, LED-state
       // intervals) over the new `system.led_state` / `system.health_flags`
       // metrics. Purely additive (plans/include-led-status-in-telemetry P2).
-      version: '0.18.0',
+      // 0.19.0: clock-step correction. Nullable `clockCorrectionMs` on
+      // `MediaSession`, `TelemetrySession` and the replay manifest's sessions;
+      // the manifest caps a segment's recorded duration at nominal + 10 s so a
+      // clock-step-inflated row never bridges the step. Purely additive
+      // (plans/clock-step-correction P1).
+      version: '0.19.0',
       description: DESCRIPTION,
     },
     // The BARE origin. The version lives in the path keys below, not here, so

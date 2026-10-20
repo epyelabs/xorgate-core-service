@@ -11,6 +11,7 @@ import { pageMeta, parseListParams, type ListParams } from '../utils/list-params
 import { tsParam } from '../utils/sql';
 import { closeStaleMediaSessions } from '../services/media-sessions';
 import { recordingConfig } from '../config/recording';
+import { nominalSegmentMs } from '../services/clock-step';
 import { closeStaleTelemetrySessions } from '../services/telemetry-sessions';
 import {
   buildSessionTimeline,
@@ -97,7 +98,7 @@ const restHandler = async (
       eq(schema.devices.id, deviceId),
       inArray(schema.devices.workspaceId, orgWorkspaceIds),
     ),
-    columns: { id: true },
+    columns: { id: true, recordingConfig: true },
   });
   if (!device) return notFound(`Device "${deviceId}" not found`);
 
@@ -227,7 +228,13 @@ const restHandler = async (
     }
 
     case 'GET /devices/{id}/replay-manifest':
-      return replayManifest(event, deviceId);
+      return replayManifest(
+        event,
+        deviceId,
+        // D14 safety cap: no row may claim more than nominal + the step
+        // threshold, so an uncorrected clock-step row never bridges the step.
+        nominalSegmentMs(device.recordingConfig) + recordingConfig.clockStepMinMs,
+      );
 
     case 'DELETE /devices/{id}/sessions/{sessionId}': {
       const session = await loadSession();
@@ -407,6 +414,7 @@ async function listRuns(
 async function replayManifest(
   event: APIGatewayProxyEventV2,
   deviceId: string,
+  maxSegmentMs: number,
 ): Promise<APIGatewayProxyResultV2> {
   const qs = event.queryStringParameters ?? {};
   const sessionIdParam = qs.sessionId;
@@ -525,6 +533,7 @@ async function replayManifest(
       // Evicted-head detection only makes sense against the session's own
       // start; in range mode the window boundary clips segments arbitrarily.
       sessionStartedAt: rangeToMs === null ? s.startedAt : undefined,
+      maxSegmentMs,
     });
     if (!timeline) {
       // No (in-range) media. Range mode: omit the session entirely. Session
@@ -653,6 +662,9 @@ function sessionManifestShape(
     width: s.width,
     height: s.height,
     fps: s.fps,
+    // Clock-step correction (D9): the cumulative shift ingest applied to this
+    // session's stale-clock rows; null = never corrected.
+    clockCorrectionMs: s.clockCorrectionMs ?? null,
     segments,
     gaps,
   };
