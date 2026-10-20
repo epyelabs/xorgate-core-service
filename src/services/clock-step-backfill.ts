@@ -195,9 +195,17 @@ async function backfillMedia(
   const truncated = rows.length > limit;
   const work = truncated ? rows.slice(0, limit) : rows;
   const candidates: MediaClockStepCandidate[] = [];
+  // Resume cursor = the last row this pass actually PROCESSED: a deadline
+  // break must not skip the rest of the scanned page.
+  let processed = 0;
+  let cutShort = false;
 
   for (const r of work) {
-    if (opts.deadline !== undefined && Date.now() > opts.deadline) break;
+    if (opts.deadline !== undefined && Date.now() > opts.deadline) {
+      cutShort = true;
+      break;
+    }
+    processed++;
     const nominalMs = nominalSegmentMs(r.recording_config as Parameters<typeof nominalSegmentMs>[0]);
     const rawStartTs = new Date(isoFromDb(r.start_ts) as string);
     const plan = planMediaSegment({
@@ -280,8 +288,13 @@ async function backfillMedia(
     }
     candidates.push(candidate);
   }
-  const last = work[work.length - 1];
-  return { scanned: work.length, candidates, truncated, nextAfter: last ? isoFromDb(last.start_ts) : null };
+  const last = work[processed - 1];
+  return {
+    scanned: processed,
+    candidates,
+    truncated: truncated || cutShort,
+    nextAfter: last ? isoFromDb(last.start_ts) : null,
+  };
 }
 
 // --- Telemetry half (PLAN §4.4, routines from services/telemetry-clock-step.ts) ---
@@ -358,9 +371,18 @@ async function backfillTelemetry(
   const work = truncated ? rows.slice(0, limit) : rows;
   const candidates: TelemetryClockStepCandidate[] = [];
   const seg = schema.telemetrySegments;
+  let processed = 0;
+  let cutShort = false;
 
   for (const s of work) {
-    if (opts.deadline !== undefined && Date.now() > opts.deadline) break;
+    // Deadline checked between SESSIONS only: a session's files are
+    // processed together (a second step file in the same session must see
+    // the first one's correction), and one session is a few seconds of S3.
+    if (opts.deadline !== undefined && Date.now() > opts.deadline) {
+      cutShort = true;
+      break;
+    }
+    processed++;
     const segments = await db
       .select({ s3Key: seg.s3Key, seq: seg.seq, bytes: seg.bytes })
       .from(seg)
@@ -374,7 +396,6 @@ async function backfillTelemetry(
     };
 
     for (const file of segments) {
-      if (opts.deadline !== undefined && Date.now() > opts.deadline) break;
       const obj = await readSegmentObject(opts.bucket, file.s3Key);
       if (!obj) continue; // lifecycle removed it; nothing to correct
       const parse = (text: string, detect: boolean) =>
@@ -490,8 +511,13 @@ async function backfillTelemetry(
       candidates.push(candidate);
     }
   }
-  const last = work[work.length - 1];
-  return { scanned: work.length, candidates, truncated, nextAfter: last ? isoFromDb(last.started_at) : null };
+  const last = work[processed - 1];
+  return {
+    scanned: processed,
+    candidates,
+    truncated: truncated || cutShort,
+    nextAfter: last ? isoFromDb(last.started_at) : null,
+  };
 }
 
 export async function runClockStepBackfill(opts: ClockStepBackfillOptions): Promise<ClockStepBackfillResult> {
