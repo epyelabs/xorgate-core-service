@@ -700,6 +700,7 @@ async function handleSessions(
       byteCount: t.byteCount,
       overviewBuiltAt: t.overviewBuiltAt,
       overviewBytes: t.overviewBytes,
+      clockCorrectionMs: t.clockCorrectionMs,
       insights: t.insights,
     })
     .from(t)
@@ -723,6 +724,8 @@ async function handleSessions(
     bytes: Number(r.byteCount),
     overviewBuiltAt: r.overviewBuiltAt ? r.overviewBuiltAt.toISOString() : null,
     overviewBytes: r.overviewBytes,
+    // Clock-step correction (plans/clock-step-correction D9); null = never corrected.
+    clockCorrectionMs: r.clockCorrectionMs === null ? null : Number(r.clockCorrectionMs),
     insights: r.insights ?? null,
   }));
   return ok({ sessions, page: pageMeta(parsed, total) });

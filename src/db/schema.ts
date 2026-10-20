@@ -583,6 +583,13 @@ export const telemetrySessions = pgTable(
     distanceM: doublePrecision('distance_m'),
     durationMs: bigint('duration_ms', { mode: 'number' }),
     maxSpeedKph: doublePrecision('max_speed_kph'),
+    // Clock-step correction (plans/clock-step-correction, D9): cumulative
+    // forward shift applied by ingest/backfill to rows stamped by a stale
+    // boot clock; `clock_stale_before` = the raw (pre-shift) wall time below
+    // which a late-arriving segment is still stale (D10). NULL = never corrected.
+    clockCorrectionMs: bigint('clock_correction_ms', { mode: 'number' }),
+    clockStaleBefore: timestamp('clock_stale_before', { withTimezone: true }),
+    clockCorrectedAt: timestamp('clock_corrected_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -664,6 +671,13 @@ export const mediaSessions = pgTable(
     // P3, manual/030). Non-null at close time = a straggler reopened it: the
     // event says `reopened: true`.
     endedFiredAt: timestamp('ended_fired_at', { withTimezone: true }),
+    // Clock-step correction (plans/clock-step-correction, D9): cumulative
+    // forward shift applied by ingest/backfill to rows stamped by a stale
+    // boot clock; `clock_stale_before` = the raw (pre-shift) wall time below
+    // which a late-arriving segment is still stale (D10). NULL = never corrected.
+    clockCorrectionMs: bigint('clock_correction_ms', { mode: 'number' }),
+    clockStaleBefore: timestamp('clock_stale_before', { withTimezone: true }),
+    clockCorrectedAt: timestamp('clock_corrected_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => [index('media_sessions_device_stream_started_idx').on(t.deviceId, t.streamKey, t.startedAt)],
