@@ -84,4 +84,18 @@ export const recordingConfig = {
    * catch garbage, not to police clocks. 0 disables the check.
    */
   mediaSegmentMaxFutureMs: numEnv('MEDIA_SEGMENT_MAX_FUTURE_MS', 24 * 60 * 60 * 1000),
+  /**
+   * Clock-step correction (plans/clock-step-correction, D4/D13): a battery-less
+   * CM5 boots on the fake-hwclock restore stamp and NTP/GPS/NITZ steps the
+   * clock forward minutes into the boot. Ingest detects the step (a finalized
+   * video segment longer than nominal + `clockStepMinMs`; a telemetry sample
+   * whose wall-clock delta disagrees with its monotonic delta by that much)
+   * and shifts the stale rows forward. `CLOCK_STEP_CORRECTION=0` turns the
+   * ingest-time correction off (the replay-manifest safety cap stays on);
+   * `CLOCK_STEP_MIN_MS` is the detection threshold (default 10 s, the
+   * device's own stepper threshold; real segment durations never drift that
+   * far).
+   */
+  clockStepCorrection: numEnv('CLOCK_STEP_CORRECTION', 1) !== 0,
+  clockStepMinMs: numEnv('CLOCK_STEP_MIN_MS', 10_000),
 } as const;

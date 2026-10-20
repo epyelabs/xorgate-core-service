@@ -698,6 +698,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
       // (optimize-system-process-cycle Phase 1, Q6). Experiment flag, default
       // off; flip with `--context mediaTimeSourceUpgrade=1`.
       MEDIA_TIME_SOURCE_UPGRADE: recCtx("mediaTimeSourceUpgrade", "0"),
+      // Clock-step correction (plans/clock-step-correction, D13): on by
+      // default on both stages; `--context clockStepCorrection=0` is the kill
+      // switch, `--context clockStepMinMs=<ms>` the detection threshold.
+      CLOCK_STEP_CORRECTION: recCtx("clockStepCorrection", "1"),
+      CLOCK_STEP_MIN_MS: recCtx("clockStepMinMs", "10000"),
       // Far-future media-segment guardrail (optimize-system-process-cycle
       // Phase 8): drop segments stamped more than this far ahead of now
       // instead of silently absorbing a device's broken clock. 0 = off.
