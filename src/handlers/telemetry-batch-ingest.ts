@@ -3,6 +3,7 @@ import type { EventBridgeEvent } from 'aws-lambda';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index';
+import { recordingConfig } from '../config/recording';
 import {
   DEFAULT_MAX_AGE_MS,
   DEFAULT_MAX_FUTURE_MS,
@@ -10,6 +11,15 @@ import {
   parseSegment,
   parseTelemetryObjectKey,
 } from '../services/telemetry-batch';
+import {
+  applySegmentShifts,
+  applySessionClockCorrection,
+  loadSessionClockState,
+  prepareTelemetryClockStep,
+  readClockStepMeta,
+  repairReputSegment,
+  type PreparedTelemetryClockStep,
+} from '../services/telemetry-clock-step';
 import { ensureSegmentNormalized, indexSegment } from '../services/telemetry-sessions';
 import { dispatchWebhookEvents } from '../services/webhooks/emit';
 import { emitTelemetrySessionStarted } from '../services/webhooks/sessions';
@@ -61,6 +71,21 @@ class AlreadyIngested extends Error {}
  * gzip, README Q14) with a CopyObject onto itself; that re-fires this event
  * once, and the fast-path dedupe below absorbs it (and re-checks the header,
  * because a device uploader retry can re-PUT a key AFTER normalisation).
+ *
+ * Clock-step correction (plans/clock-step-correction §4.3, D6-D11), on unless
+ * CLOCK_STEP_CORRECTION=0: a file whose samples disagree with their own
+ * monotonic clock by >= CLOCK_STEP_MIN_MS straddles a boot-time clock step.
+ * BEFORE the transaction this object is rewritten with its stale lines
+ * re-stamped and every earlier file of the session is shifted whole (S3);
+ * INSIDE it the earlier files' bounds and readings move, this file inserts
+ * corrected rows, and the session gets its corrected bounds + audit columns.
+ * A late file stamped before a corrected session's step is shifted by the
+ * session's correction (D10). Our PUTs re-fire Object Created like the
+ * normalisation copy does: for an already-ingested key the fast path absorbs
+ * it (dedupe is by key, the new ETag does not matter); for THIS key, which may
+ * still be mid-transaction, the object's `xg-clock-step` metadata lets the
+ * re-fired run replay the same correction and lose the ingest-log race
+ * harmlessly (services/telemetry-clock-step.ts).
  */
 export const handler = async (
   event: EventBridgeEvent<'Object Created', S3ObjectCreatedDetail>,
@@ -98,6 +123,21 @@ export const handler = async (
     if (normalized !== 'already') {
       console.log('telemetry-batch-ingest: normalised on duplicate delivery', { key, normalized });
     }
+    // 'copied' here means the object was re-PUT un-normalised after ingest
+    // (a device retry), i.e. the device's raw stamps are back in S3 while the
+    // DB holds the corrected ones: put the object back in line (S3 only).
+    if (normalized === 'copied' && recordingConfig.clockStepCorrection) {
+      try {
+        const repaired = await repairReputSegment(bucket, key, {
+          clockStepMinMs: recordingConfig.clockStepMinMs,
+          reparse: (t, clockStepMinMs) =>
+            parseSegment(t, { deviceId, now: Date.now(), maxAgeMs: maxAgeMs(), maxFutureMs: DEFAULT_MAX_FUTURE_MS, clockStepMinMs }),
+        });
+        if (repaired !== 'none') console.log('telemetry-batch-ingest: clock step re-applied to re-PUT object', { key, repaired });
+      } catch (err) {
+        console.error('telemetry-batch-ingest: clock step repair of re-PUT object failed', { key, err });
+      }
+    }
     return;
   }
 
@@ -109,6 +149,10 @@ export const handler = async (
     console.error('telemetry-batch-ingest: unknown device, dropping', { key, deviceId });
     return;
   }
+
+  // D10 needs the session's correction state; read it BEFORE parsing.
+  const clockStepMinMs = recordingConfig.clockStepCorrection ? recordingConfig.clockStepMinMs : 0;
+  const sessionClock = clockStepMinMs > 0 ? await loadSessionClockState(sessionId) : null;
 
   // Fetch + gunzip. S3 failures throw (transient); a corrupt gzip is permanent.
   const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
@@ -122,17 +166,31 @@ export const handler = async (
     return;
   }
 
-  const parsed = parseSegment(text, {
-    deviceId,
-    now: Date.now(),
-    maxAgeMs: maxAgeMs(),
-    maxFutureMs: DEFAULT_MAX_FUTURE_MS,
-  });
+  const parseOpts = { deviceId, now: Date.now(), maxAgeMs: maxAgeMs(), maxFutureMs: DEFAULT_MAX_FUTURE_MS };
+  let parsed = parseSegment(text, { ...parseOpts, clockStepMinMs });
   if (parsed.deviceIdMismatch) {
     // The key prefix is IAM-scoped ground truth; a contradicting header means a
     // mis-built file. Refuse rather than attribute data to the wrong device.
     console.error('telemetry-batch-ingest: header deviceId mismatches key, dropping', { key });
     return;
+  }
+
+  // Clock-step phase 1 (S3, before the transaction). Throws on S3 failure:
+  // transient, and a retry replays it from the objects' metadata.
+  let clock: PreparedTelemetryClockStep | null = null;
+  if (clockStepMinMs > 0) {
+    clock = await prepareTelemetryClockStep({
+      bucket,
+      key,
+      sessionId,
+      seq: parsedKey.seq,
+      text,
+      meta: readClockStepMeta(obj.Metadata),
+      parsed,
+      session: sessionClock,
+      reparse: (t) => parseSegment(t, parseOpts),
+    });
+    if (clock) parsed = clock.parsed;
   }
 
   const skipped = parsed.skippedInvalid + parsed.skippedAge;
@@ -145,15 +203,23 @@ export const handler = async (
     firstTs: parsed.firstTs,
     lastTs: parsed.lastTs,
     samples: parsed.sampleLines,
-    bytes: objectBytes,
+    // A corrected object's stored size (this call's PUT, or the earlier
+    // attempt's object we just read), not the size the device's event carried.
+    bytes: clock ? (clock.bytes ?? gz.length) : objectBytes,
     keyStartTsMs: parsedKey.startTsMs,
   };
 
   let startedEventId: string | null = null;
+  let readingsMoved = 0;
   try {
     startedEventId = await db.transaction(async (tx) => {
       // Sequential batches — RDS Data API forbids interleaving inside a
       // transaction (no Promise.all here, per the driver's known limits).
+      // Clock-step (c): earlier files' bounds + readings first, so their
+      // stale-ts match never meets this file's freshly inserted rows.
+      if (clock && clock.earlier.length > 0) {
+        readingsMoved = await applySegmentShifts(tx, deviceId, clock.earlier);
+      }
       // A file with nothing insertable (every line outside the partition
       // window) skips the readings but is STILL indexed and logged.
       for (let i = 0; i < parsed.rows.length; i += INSERT_BATCH_ROWS) {
@@ -162,6 +228,16 @@ export const handler = async (
           .values(parsed.rows.slice(i, i + INSERT_BATCH_ROWS));
       }
       const indexed = await indexSegment(tx, indexInput);
+      // Clock-step (d): after this file is indexed with corrected bounds, the
+      // session's bounds are recomputed from its segments and audited.
+      if (clock?.kind === 'step') {
+        await applySessionClockCorrection(tx, {
+          sessionId,
+          shiftMs: clock.shiftMs,
+          staleBefore: clock.staleBefore,
+          bytesDelta: clock.earlier.reduce((sum, f) => sum + f.bytesDelta, 0),
+        });
+      }
       const logged = await tx
         .insert(schema.telemetryIngestLog)
         .values({
@@ -192,6 +268,19 @@ export const handler = async (
       return;
     }
     throw err; // transient DB failure → Lambda retry / DLQ
+  }
+
+  if (clock) {
+    console.log('telemetry-batch-ingest: clock step corrected', {
+      key,
+      kind: clock.kind,
+      steps: clock.steps,
+      shiftMs: clock.shiftMs,
+      staleBefore: clock.staleBefore,
+      filesRewritten: (clock.rewroteSelf ? 1 : 0) + clock.earlier.filter((f) => f.rewritten).length,
+      earlierFiles: clock.earlier.length,
+      readingsMoved,
+    });
   }
 
   if (parsed.rows.length === 0) {
