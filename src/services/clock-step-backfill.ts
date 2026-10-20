@@ -311,12 +311,14 @@ interface TelemetryScanRow {
 }
 
 /**
- * Candidate telemetry sessions: never corrected, closed, and spanning far
- * more wall-clock than their sample count can account for at their rate (a
- * stale-boot straddle adds the whole step to the span; a recording hole does
- * too, which only costs the S3 reads that then find no in-file step). A
- * `sessionId` filter bypasses the heuristic so one session can always be
- * forced.
+ * Candidate telemetry sessions: closed, and spanning far more wall-clock than
+ * their sample count can account for at their rate (a stale-boot straddle adds
+ * the whole step to the span; a recording hole does too, which only costs the
+ * S3 reads that then find no in-file step). A corrected session's span matches
+ * its samples again, so it drops out by itself; deliberately NOT filtered on
+ * `clock_correction_ms`, so a session whose pass was cut by the deadline after
+ * its first step file is still rescanned for a second one. A `sessionId`
+ * filter bypasses the heuristic so one session can always be forced.
  */
 function telemetryScanSql(opts: { sessionId?: string; minStepMs: number; limit: number; after?: string }) {
   const minSecs = Math.ceil(opts.minStepMs / 1000);
@@ -328,8 +330,7 @@ function telemetryScanSql(opts: { sessionId?: string; minStepMs: number; limit: 
       ${
         opts.sessionId
           ? sql`and s.id = ${uuidParam(opts.sessionId)}`
-          : sql`and s.clock_correction_ms is null
-      and extract(epoch from (s.ended_at - s.started_at))
+          : sql`and extract(epoch from (s.ended_at - s.started_at))
           > s.sample_count::float / greatest(coalesce(s.rate_hz, 1), 1) + ${minSecs}::int`
       }
       ${opts.after ? sql`and s.started_at > ${tsParam(opts.after)}` : sql``}
@@ -374,15 +375,13 @@ async function backfillTelemetry(
   let processed = 0;
   let cutShort = false;
 
-  for (const s of work) {
-    // Deadline checked between SESSIONS only: a session's files are
-    // processed together (a second step file in the same session must see
-    // the first one's correction), and one session is a few seconds of S3.
-    if (opts.deadline !== undefined && Date.now() > opts.deadline) {
+  const pastDeadline = () => opts.deadline !== undefined && Date.now() > opts.deadline;
+
+  sessions: for (const s of work) {
+    if (pastDeadline()) {
       cutShort = true;
       break;
     }
-    processed++;
     const segments = await db
       .select({ s3Key: seg.s3Key, seq: seg.seq, bytes: seg.bytes })
       .from(seg)
@@ -395,8 +394,28 @@ async function backfillTelemetry(
       spanMs: s.ended_at ? new Date(isoFromDb(s.ended_at) as string).getTime() - new Date(isoFromDb(s.started_at) as string).getTime() : 0,
     };
 
+    // S3 reads in parallel (not the Data API): a prod session can hold a few
+    // hundred one-minute files, and sequential GETs alone would blow the
+    // sweeper's 60 s budget. The deadline is re-checked per file below; a
+    // session cut mid-way is not counted as processed, so the next pass
+    // rescans it (its already-rewritten files carry no step any more).
+    const objects = new Map<string, Awaited<ReturnType<typeof readSegmentObject>>>();
+    for (let i = 0; i < segments.length; i += 8) {
+      if (pastDeadline()) {
+        cutShort = true;
+        break sessions;
+      }
+      const part = segments.slice(i, i + 8);
+      const got = await Promise.all(part.map((f) => readSegmentObject(opts.bucket, f.s3Key)));
+      part.forEach((f, j) => objects.set(f.s3Key, got[j]));
+    }
+
     for (const file of segments) {
-      const obj = await readSegmentObject(opts.bucket, file.s3Key);
+      if (pastDeadline()) {
+        cutShort = true;
+        break sessions;
+      }
+      const obj = objects.get(file.s3Key) ?? null;
       if (!obj) continue; // lifecycle removed it; nothing to correct
       const parse = (text: string, detect: boolean) =>
         parseSegment(text, {
@@ -510,6 +529,7 @@ async function backfillTelemetry(
       }
       candidates.push(candidate);
     }
+    processed++;
   }
   const last = work[processed - 1];
   return {
