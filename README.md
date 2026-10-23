@@ -116,7 +116,7 @@ from the editor over uploaded or recorded inputs through the same path.
 **One engine, consumed as a package.** The graph executor, the 28-node catalog,
 the definition/manifest/result schemas and the host seams are
 [`@xorgate/workflow-engine`](https://www.npmjs.com/package/@xorgate/workflow-engine)
-(pinned exactly in `package.json`, `0.5.1` today). This service is the engine's
+(pinned exactly in `package.json`, `0.5.2` today). This service is the engine's
 **platform shell**: it owns the REST API, the run rows, dispatch, the S3 artifact
 tree, the IoT progress plane and the AWS-backed host the engine runs on.
 Nothing engine-internal lives in this repo any more.
