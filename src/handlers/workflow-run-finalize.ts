@@ -29,7 +29,7 @@ const resultStepSchema = z.object({
   seq: z.number(),
   nodeId: z.string(),
   label: z.string(),
-  status: z.enum(['ok', 'failed', 'skipped']),
+  status: z.enum(['ok', 'failed', 'skipped', 'cancelled']),
   output: z.string().default(''),
   durationMs: z.number().default(0),
 });

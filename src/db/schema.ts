@@ -900,7 +900,7 @@ export const workflowRunSteps = pgTable(
     seq: integer('seq').notNull(), // topo order
     nodeId: text('node_id').notNull(),
     label: text('label').notNull(),
-    status: text('status').notNull(), // ok | failed | skipped
+    status: text('status').notNull(), // ok | failed | skipped | cancelled (engine >= 0.5.1: deadline/stall)
     output: text('output').default('').notNull(), // human one-liner, e.g. "37 detections"
     durationMs: integer('duration_ms').default(0).notNull(),
     detail: jsonb('detail'),

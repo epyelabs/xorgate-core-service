@@ -12,7 +12,7 @@ export interface V2StepRow {
   seq: number;
   nodeId: string;
   label: string;
-  status: 'ok' | 'failed' | 'skipped';
+  status: 'ok' | 'failed' | 'skipped' | 'cancelled';
   output: string;
   durationMs: number;
 }
