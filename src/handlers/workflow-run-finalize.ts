@@ -160,7 +160,9 @@ export const handler = async (
       error: parsed.error ?? null,
       failedNodeId: parsed.failedNodeId ?? null,
     })
-    .where(eq(schema.workflowRuns.id, run.id));
+    // Conditional like the v2 claim: a run cancelled (or watchdog-failed) since
+    // the read above keeps its terminal status.
+    .where(and(eq(schema.workflowRuns.id, run.id), eq(schema.workflowRuns.status, 'running')));
 
   await updateAttachmentStatusIfLatest(run, parsed.status);
   console.log('workflow-run-finalize: run finalized', {

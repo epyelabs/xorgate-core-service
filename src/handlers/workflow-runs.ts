@@ -1,12 +1,13 @@
 import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { and, asc, desc, eq, inArray, ne, sql, type SQL } from 'drizzle-orm';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { ECSClient, StopTaskCommand } from '@aws-sdk/client-ecs';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { AuthError, authErrorResponse, requireOrgContext } from '../middleware/auth';
+import { AuthError, assertOrgWideScope, authErrorResponse, requireOrgContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
 import { resolveWorkspaceScope } from '../services/workspace-scope';
-import { badRequest, methodNotAllowed, notFound, ok } from '../utils/responses';
+import { badRequest, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
 import { tsParam } from '../utils/sql';
 import { fireWorkflowRun } from '../services/workflow-triggers';
@@ -15,12 +16,29 @@ import { runPrefix, runTopicPrefix, simTopicPrefix } from '@xorgate/workflow-eng
 import { apiHandler } from '../utils/api-handler';
 import { artifactFileName } from '../workflows/host/result';
 import { webhookNamesByNode } from '../services/webhooks/workflow-events';
+import { iotPublishTransport } from '../workflows/host/aws';
+import {
+  CANCEL_STOP_REASON,
+  RUN_CANCELLED_ERROR,
+  RUN_CANCELLED_STATUS,
+  cancelMarkerBody,
+  cancelMarkerKey,
+  cancelledDurationMs,
+  decideStopTask,
+} from '../workflows/simulation-saves';
 
 const s3 = new S3Client({});
+const ecs = new ECSClient({});
 const BUCKET = process.env.BUCKET_NAME;
+// The shared Fargate cluster the v2 engine-runner tasks run in (cancel's StopTask).
+const ENGINE_CLUSTER = process.env.ENGINE_CLUSTER_ARN;
 const ARTIFACT_URL_EXPIRES_SECONDS = 300;
+// Bound on the best-effort IoT status publish so a slow DescribeEndpoint can
+// never hold the cancel response.
+const CANCEL_PUBLISH_TIMEOUT_MS = 2000;
 
-const RUN_STATUSES = ['running', 'succeeded', 'failed'] as const;
+// 'cancelled' (sim-cancel-save): a user stopped an in-flight simulation.
+const RUN_STATUSES = ['running', 'succeeded', 'failed', 'cancelled'] as const;
 
 // Summary select shared by the workspace list and the per-device list.
 const summaryColumns = {
@@ -118,10 +136,240 @@ function deriveTriggeredBy(trigger: string, ctx: unknown): string {
 }
 
 /**
+ * The GET /workflow-runs/{id} `run` body, or null when the run does not exist in
+ * this org. Shared with POST /workflow-runs/{id}/cancel, which answers with the
+ * same shape (and puts it in a 409's details so the client can adopt it).
+ */
+async function loadRunDetail(id: string, organizationId: string) {
+  // Detail is scoped through the template's org (every run has a template;
+  // its org equals the run's workspace org for production runs). This is
+  // what lets device-less simulation runs (null workspace/device, 0015)
+  // resolve; devices/workspaces are LEFT joins for the same reason.
+  const [row] = await db
+    .select({
+      run: schema.workflowRuns,
+      templateName: schema.workflowTemplates.name,
+      deviceName: schema.devices.name,
+      serial: schema.devices.serial,
+      workspaceName: schema.workspaces.name,
+    })
+    .from(schema.workflowRuns)
+    .innerJoin(
+      schema.workflowTemplates,
+      eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
+    )
+    .leftJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
+    .leftJoin(schema.workspaces, eq(schema.workspaces.id, schema.workflowRuns.workspaceId))
+    .where(
+      and(
+        eq(schema.workflowRuns.id, id),
+        eq(schema.workflowTemplates.organizationId, organizationId),
+      ),
+    );
+  if (!row) return null;
+  const run = row.run;
+
+  const [steps, events] = await Promise.all([
+    db
+      .select()
+      .from(schema.workflowRunSteps)
+      .where(eq(schema.workflowRunSteps.runId, id))
+      .orderBy(asc(schema.workflowRunSteps.seq)),
+    db
+      .select()
+      .from(schema.workflowEvents)
+      .where(eq(schema.workflowEvents.runId, id))
+      .orderBy(asc(schema.workflowEvents.occurredAt)),
+  ]);
+
+  // xorgate-webhooks P2: a simulation never delivers; it says where each
+  // event WOULD go (the emitting output.event node's `webhook` name).
+  const wouldDeliver = run.mode === 'simulation' ? webhookNamesByNode(run.definition) : null;
+
+  return {
+    ...toSummary({ ...run, templateName: row.templateName, deviceName: row.deviceName, serial: row.serial }),
+    workspaceName: row.workspaceName,
+    triggeredBy: deriveTriggeredBy(run.trigger, run.triggerContext),
+    definition: run.definition,
+    // ADDITIVE (simulator-output-artifacts): `seq` on steps, `payload` and
+    // `clipKey` on events, so the editor's Output panel can show the
+    // full trace order and event bodies without reading events.jsonl.
+    steps: steps.map((s) => ({
+      seq: s.seq,
+      nodeId: s.nodeId,
+      label: s.label,
+      status: s.status,
+      output: s.output,
+      durationMs: s.durationMs,
+    })),
+    events: events.map((e) => ({
+      id: e.id,
+      kind: e.kind,
+      occurredAt: e.occurredAt.toISOString(),
+      confidence: e.confidence ?? 0,
+      clip: e.clip,
+      clipKey: e.clipS3Key ?? null,
+      payloadSummary: e.payloadSummary,
+      payload: e.payload ?? null,
+      // ADDITIVE (xorgate-webhooks P2): the emitting node (engine >= 0.5.0,
+      // else null) and, on simulation runs only, the endpoint name the
+      // node routes to in production (null = the node has no `webhook`).
+      nodeId: e.nodeId ?? null,
+      ...(wouldDeliver
+        ? { wouldDeliverTo: (e.nodeId && wouldDeliver.get(e.nodeId)) || null }
+        : {}),
+    })),
+    metrics: run.metrics,
+    // v2 engine runs only (null on PoC runs): which engine produced the
+    // result and where its Data Capture / events artifacts live in S3
+    // (plus `videos`, the muxed visualization MP4s, on Fargate runs).
+    engineVersion: run.engineVersion ?? null,
+    artifacts: run.artifacts ?? null,
+    // ADDITIVE (M6): live-progress subscription hint. v2 runs (their
+    // stored snapshot is schemaVersion 2) publish the M3 topic/payload
+    // contract under this prefix — wf/run/<org>/<id> for production
+    // runs, wf/sim/<org>/<id> for simulations. Null on PoC-era rows,
+    // which never published progress. engineVersion can't gate this
+    // (finalize stamps it only at run END), the snapshot version can.
+    progress:
+      ((run.definition as { schemaVersion?: number })?.schemaVersion ?? 1) >= 2
+        ? {
+            topicPrefix:
+              run.mode === 'simulation'
+                ? simTopicPrefix(organizationId, id)
+                : runTopicPrefix(organizationId, id),
+          }
+        : null,
+    error: run.error ?? null,
+    failedNodeId: run.failedNodeId ?? null,
+  };
+}
+
+/**
+ * POST /workflow-runs/{id}/cancel (sim-cancel-save). Atomically claims a
+ * running simulation row as 'cancelled', drops a cancel marker for a future
+ * engine poll, StopTasks its Fargate task when no other run shares it (warm
+ * sessions are shared per org+template), and best-effort publishes the
+ * terminal status on the run's IoT status topic. Finalize (v1 + v2) and the
+ * watchdog only ever touch 'running' rows, so the engine's later result.json
+ * is skipped.
+ */
+async function cancelSimulationRun(
+  id: string,
+  organizationId: string,
+  userId: string | null,
+): Promise<APIGatewayProxyResultV2> {
+  const [found] = await db
+    .select({ run: schema.workflowRuns })
+    .from(schema.workflowRuns)
+    .innerJoin(schema.workflowTemplates, eq(schema.workflowTemplates.id, schema.workflowRuns.templateId))
+    .where(and(eq(schema.workflowRuns.id, id), eq(schema.workflowTemplates.organizationId, organizationId)));
+  if (!found) return notFound(`Run "${id}" not found`);
+  const run = found.run;
+  if (run.mode !== 'simulation') {
+    return errorResponse(400, 'RUN_NOT_CANCELLABLE', 'Only simulation runs can be cancelled');
+  }
+
+  const notRunning = async () =>
+    errorResponse(409, 'RUN_NOT_RUNNING', `Run "${id}" is not running`, {
+      run: await loadRunDetail(id, organizationId),
+    });
+  if (run.status !== 'running') return notRunning();
+
+  // 1. The claim: the conditional UPDATE is the only arbiter against a racing
+  // finalize / watchdog / second cancel.
+  const endedAt = new Date();
+  const claimed = await db
+    .update(schema.workflowRuns)
+    .set({
+      status: RUN_CANCELLED_STATUS,
+      endedAt,
+      durationMs: cancelledDurationMs(run.startedAt, endedAt),
+      error: RUN_CANCELLED_ERROR,
+    })
+    .where(and(eq(schema.workflowRuns.id, id), eq(schema.workflowRuns.status, 'running')))
+    .returning({ id: schema.workflowRuns.id, taskArn: schema.workflowRuns.taskArn });
+  if (claimed.length === 0) return notRunning();
+  // Re-read taskArn from the claim: dispatch may have stamped it after our read.
+  const taskArn = claimed[0].taskArn ?? run.taskArn;
+
+  // 2. Cancel marker (the seam a future engine release polls). Best-effort.
+  if (BUCKET) {
+    try {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: BUCKET,
+          Key: cancelMarkerKey(id),
+          Body: cancelMarkerBody({ runId: id, requestedAt: endedAt, requestedByUserId: userId }),
+          ContentType: 'application/json',
+        }),
+      );
+    } catch (err) {
+      console.warn('workflow-runs: cancel marker write failed', { runId: id, err });
+    }
+  }
+
+  // 3. StopTask, only when no other running row rides the same task.
+  let otherRunningOnTask = 0;
+  if (run.executionMode !== 'lambda' && taskArn) {
+    const [counted] = await db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(schema.workflowRuns)
+      .where(
+        and(
+          eq(schema.workflowRuns.status, 'running'),
+          eq(schema.workflowRuns.taskArn, taskArn),
+          ne(schema.workflowRuns.id, id),
+        ),
+      );
+    otherRunningOnTask = Number(counted?.n ?? 0);
+  }
+  const decision = decideStopTask({
+    executionMode: run.executionMode,
+    taskArn,
+    otherRunningOnTask,
+    clusterConfigured: Boolean(ENGINE_CLUSTER),
+  });
+  if (decision.stop) {
+    try {
+      await ecs.send(new StopTaskCommand({ cluster: ENGINE_CLUSTER, task: decision.taskArn, reason: CANCEL_STOP_REASON }));
+      console.log('workflow-runs: cancel stopped engine task', { runId: id, taskArn: decision.taskArn });
+    } catch (err) {
+      console.warn('workflow-runs: cancel StopTask failed', { runId: id, taskArn: decision.taskArn, err });
+    }
+  } else {
+    console.log('workflow-runs: cancel left engine running', { runId: id, reason: decision.reason });
+  }
+
+  // 4. Live view: the terminal status on wf/sim/<org>/<run>/status. The
+  // engine's simStatusPayloadSchema enumerates running|succeeded|failed, so a
+  // strict parser drops this; the run row (polled) stays the source of truth.
+  try {
+    const topic = `${simTopicPrefix(organizationId, id)}/status`;
+    const payload = JSON.stringify({
+      at: endedAt.toISOString(),
+      runId: id,
+      status: RUN_CANCELLED_STATUS,
+      error: RUN_CANCELLED_ERROR,
+      failedNodeId: null,
+    });
+    await Promise.race([
+      iotPublishTransport(topic, payload),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('publish timeout')), CANCEL_PUBLISH_TIMEOUT_MS)),
+    ]);
+  } catch (err) {
+    console.warn('workflow-runs: cancel status publish failed', { runId: id, err });
+  }
+
+  return ok({ run: await loadRunDetail(id, organizationId) });
+}
+
+/**
  * Workflow runs (executions) read API. Routes (all -> this Lambda):
  *   GET /workflow-runs                     workspace-scoped list (honors X-Workspace-Id)
  *   GET /workflow-runs/{id}                run detail (steps + events + snapshot graph)
  *   GET /devices/{id}/workflow-runs        per-device list
+ *   POST /workflow-runs/{id}/cancel        cancel an in-flight simulation (sim-cancel-save)
  * (POST /workflow-runs/{id}/rerun is added with the run-execution path in M3.)
  */
 const restHandler = async (
@@ -191,110 +439,23 @@ const restHandler = async (
     case 'GET /workflow-runs/{id}': {
       const id = event.pathParameters?.id;
       if (!id) return badRequest('run id required');
-      // Detail is scoped through the template's org (every run has a template;
-      // its org equals the run's workspace org for production runs). This is
-      // what lets device-less simulation runs (null workspace/device, 0015)
-      // resolve; devices/workspaces are LEFT joins for the same reason.
-      const [row] = await db
-        .select({
-          run: schema.workflowRuns,
-          templateName: schema.workflowTemplates.name,
-          deviceName: schema.devices.name,
-          serial: schema.devices.serial,
-          workspaceName: schema.workspaces.name,
-        })
-        .from(schema.workflowRuns)
-        .innerJoin(
-          schema.workflowTemplates,
-          eq(schema.workflowTemplates.id, schema.workflowRuns.templateId),
-        )
-        .leftJoin(schema.devices, eq(schema.devices.id, schema.workflowRuns.deviceId))
-        .leftJoin(schema.workspaces, eq(schema.workspaces.id, schema.workflowRuns.workspaceId))
-        .where(
-          and(
-            eq(schema.workflowRuns.id, id),
-            eq(schema.workflowTemplates.organizationId, auth.organizationId),
-          ),
-        );
-      if (!row) return notFound(`Run "${id}" not found`);
-      const run = row.run;
+      const detail = await loadRunDetail(id, auth.organizationId);
+      if (!detail) return notFound(`Run "${id}" not found`);
+      return ok({ run: detail });
+    }
 
-      const [steps, events] = await Promise.all([
-        db
-          .select()
-          .from(schema.workflowRunSteps)
-          .where(eq(schema.workflowRunSteps.runId, id))
-          .orderBy(asc(schema.workflowRunSteps.seq)),
-        db
-          .select()
-          .from(schema.workflowEvents)
-          .where(eq(schema.workflowEvents.runId, id))
-          .orderBy(asc(schema.workflowEvents.occurredAt)),
-      ]);
-
-      // xorgate-webhooks P2: a simulation never delivers; it says where each
-      // event WOULD go (the emitting output.event node's `webhook` name).
-      const wouldDeliver = run.mode === 'simulation' ? webhookNamesByNode(run.definition) : null;
-
-      return ok({
-        run: {
-          ...toSummary({ ...run, templateName: row.templateName, deviceName: row.deviceName, serial: row.serial }),
-          workspaceName: row.workspaceName,
-          triggeredBy: deriveTriggeredBy(run.trigger, run.triggerContext),
-          definition: run.definition,
-          // ADDITIVE (simulator-output-artifacts): `seq` on steps, `payload` and
-          // `clipKey` on events, so the editor's Output panel can show the
-          // full trace order and event bodies without reading events.jsonl.
-          steps: steps.map((s) => ({
-            seq: s.seq,
-            nodeId: s.nodeId,
-            label: s.label,
-            status: s.status,
-            output: s.output,
-            durationMs: s.durationMs,
-          })),
-          events: events.map((e) => ({
-            id: e.id,
-            kind: e.kind,
-            occurredAt: e.occurredAt.toISOString(),
-            confidence: e.confidence ?? 0,
-            clip: e.clip,
-            clipKey: e.clipS3Key ?? null,
-            payloadSummary: e.payloadSummary,
-            payload: e.payload ?? null,
-            // ADDITIVE (xorgate-webhooks P2): the emitting node (engine >= 0.5.0,
-            // else null) and, on simulation runs only, the endpoint name the
-            // node routes to in production (null = the node has no `webhook`).
-            nodeId: e.nodeId ?? null,
-            ...(wouldDeliver
-              ? { wouldDeliverTo: (e.nodeId && wouldDeliver.get(e.nodeId)) || null }
-              : {}),
-          })),
-          metrics: run.metrics,
-          // v2 engine runs only (null on PoC runs): which engine produced the
-          // result and where its Data Capture / events artifacts live in S3
-          // (plus `videos`, the muxed visualization MP4s, on Fargate runs).
-          engineVersion: run.engineVersion ?? null,
-          artifacts: run.artifacts ?? null,
-          // ADDITIVE (M6): live-progress subscription hint. v2 runs (their
-          // stored snapshot is schemaVersion 2) publish the M3 topic/payload
-          // contract under this prefix — wf/run/<org>/<id> for production
-          // runs, wf/sim/<org>/<id> for simulations. Null on PoC-era rows,
-          // which never published progress. engineVersion can't gate this
-          // (finalize stamps it only at run END), the snapshot version can.
-          progress:
-            ((run.definition as { schemaVersion?: number })?.schemaVersion ?? 1) >= 2
-              ? {
-                  topicPrefix:
-                    run.mode === 'simulation'
-                      ? simTopicPrefix(auth.organizationId, id)
-                      : runTopicPrefix(auth.organizationId, id),
-                }
-              : null,
-          error: run.error ?? null,
-          failedNodeId: run.failedNodeId ?? null,
-        },
-      });
+    case 'POST /workflow-runs/{id}/cancel': {
+      const id = event.pathParameters?.id;
+      if (!id) return badRequest('run id required');
+      // Simulations are org-wide (template-scoped, often device-less), the same
+      // gate as the simulator routes that started them.
+      try {
+        assertOrgWideScope(auth);
+      } catch (err) {
+        if (err instanceof AuthError) return authErrorResponse(err);
+        throw err;
+      }
+      return cancelSimulationRun(id, auth.organizationId, auth.userId);
     }
 
     case 'GET /devices/{id}/workflow-runs': {

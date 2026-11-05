@@ -1859,7 +1859,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowRunsFn = new nodejs.NodejsFunction(this, "WorkflowRunsFn", {
       ...standardFnProps(
         path.join(entryBase, "workflow-runs.ts"),
-        "GET /workflow-runs(+/{id}), /devices/{id}/workflow-runs, POST rerun",
+        "GET /workflow-runs(+/{id}), /devices/{id}/workflow-runs, POST rerun/cancel",
       ),
       bundling: bundlingWithSdk,
     });
@@ -1902,6 +1902,11 @@ export class XorgateCoreApiStack extends cdk.Stack {
     workflowDispatchFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     deviceWorkflowsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     workflowRunsFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
+    // POST /workflow-runs/{id}/cancel StopTasks a simulation's engine task
+    // (EngineStopTask on the shared lambdaRole covers the cluster's tasks; the
+    // bucket grant covers the cancel.json marker; IotPublishSimProgress covers
+    // the wf/sim/* status publish).
+    workflowRunsFn.addEnvironment("ENGINE_CLUSTER_ARN", recorderClusterArn);
     telemetryIngestFn.addEnvironment("WORKFLOW_QUEUE_URL", workflowRunQueue.queueUrl);
     // Phase 6.4: session_completed fires from the sweeper's close pass AND the
     // sessions list's close-on-read — both evaluate triggers via
@@ -2021,7 +2026,7 @@ export class XorgateCoreApiStack extends cdk.Stack {
     const workflowSimulationsFn = new nodejs.NodejsFunction(this, "WorkflowSimulationsFn", {
       ...standardFnProps(
         path.join(entryBase, "workflow-simulations.ts"),
-        "POST /workflow-templates/{id}/simulations(+/uploads) — simulator runs",
+        "POST /workflow-templates/{id}/simulations(+/uploads, saved runs) — simulator runs",
       ),
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
@@ -3365,6 +3370,22 @@ export class XorgateCoreApiStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowSimulationsInt,
     });
+    // Saved simulation runs per (template, user) (sim-cancel-save).
+    addRoutes({
+      path: "/workflow-templates/{id}/simulations/saved",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: workflowSimulationsInt,
+    });
+    addRoutes({
+      path: "/workflow-templates/{id}/simulations/{runId}/save",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowSimulationsInt,
+    });
+    addRoutes({
+      path: "/workflow-templates/{id}/simulations/saved/{savedId}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: workflowSimulationsInt,
+    });
 
     // Per-org connector credentials (M7).
     addRoutes({
@@ -3427,6 +3448,12 @@ export class XorgateCoreApiStack extends cdk.Stack {
     });
     addRoutes({
       path: "/workflow-runs/{id}/rerun",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: workflowRunsInt,
+    });
+    // Cancel an in-flight simulation run (sim-cancel-save).
+    addRoutes({
+      path: "/workflow-runs/{id}/cancel",
       methods: [apigwv2.HttpMethod.POST],
       integration: workflowRunsInt,
     });

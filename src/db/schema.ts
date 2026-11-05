@@ -854,7 +854,7 @@ export const workflowRuns = pgTable(
     definition: jsonb('definition').notNull(), // snapshot of the version that ran
     trigger: text('trigger').notNull(), // event | schedule | manual | simulation
     triggerContext: jsonb('trigger_context'),
-    status: text('status').default('running').notNull(), // running | succeeded | failed
+    status: text('status').default('running').notNull(), // running | succeeded | failed | cancelled
     // v1 (PoC) values: inline | fargate. v2 engine runs stamp the dispatch
     // target instead: lambda | fargate (simulation rows use these today).
     executionMode: text('execution_mode').notNull(),
@@ -934,6 +934,38 @@ export const workflowEvents = pgTable(
   (t) => [
     index('workflow_events_run_idx').on(t.runId),
     index('workflow_events_device_occurred_idx').on(t.deviceId, t.occurredAt),
+  ],
+);
+
+// A user's bookmark of a simulation run on a template (sim-cancel-save): the
+// simulator's "Saved runs" list, keyed by (template, user). One user may save
+// several runs per template, never the same run twice (a re-save renames).
+// user_id is TEXT because users.id is the Cognito sub. `bindings` is a display
+// snapshot of the run's triggerContext.bindings at save time.
+export const workflowSimulationSaves = pgTable(
+  'workflow_simulation_saves',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .references(() => organizations.id, { onDelete: 'cascade' })
+      .notNull(),
+    templateId: uuid('template_id')
+      .references(() => workflowTemplates.id, { onDelete: 'cascade' })
+      .notNull(),
+    userId: text('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    runId: uuid('run_id')
+      .references(() => workflowRuns.id, { onDelete: 'cascade' })
+      .notNull(),
+    name: text('name').notNull(),
+    bindings: jsonb('bindings'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('workflow_simulation_saves_template_user_run_idx').on(t.templateId, t.userId, t.runId),
+    index('workflow_simulation_saves_template_user_idx').on(t.templateId, t.userId),
   ],
 );
 
@@ -1221,6 +1253,7 @@ export type WorkflowTriggerState = InferSelectModel<typeof workflowTriggerState>
 export type NewWorkflowTriggerState = InferInsertModel<typeof workflowTriggerState>;
 export type WorkflowRun = InferSelectModel<typeof workflowRuns>;
 export type NewWorkflowRun = InferInsertModel<typeof workflowRuns>;
+export type WorkflowSimulationSave = InferSelectModel<typeof workflowSimulationSaves>;
 export type WorkflowRunStep = InferSelectModel<typeof workflowRunSteps>;
 export type NewWorkflowRunStep = InferInsertModel<typeof workflowRunSteps>;
 export type WorkflowEvent = InferSelectModel<typeof workflowEvents>;

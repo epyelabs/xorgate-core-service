@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { routeKey as canonicalRouteKey } from '../utils/route';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { S3Client } from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { AuthError, authErrorResponse, requireOrgWideContext } from '../middleware/auth';
 import { db, schema } from '../db/index';
-import { badRequest, created, errorResponse, methodNotAllowed, notFound } from '../utils/responses';
+import { badRequest, created, errorResponse, methodNotAllowed, notFound, ok } from '../utils/responses';
 import { dispatchV2Run, materializeHistoryInputs } from '../services/workflow-engine-v2';
 import { validateDefinitionForPublish } from '@xorgate/workflow-engine';
 import { platformCatalog } from '../workflows/catalog';
@@ -29,6 +29,13 @@ import {
 import type { ResolvedVideoSession } from '../workflows/production';
 import { findOrgSessions, resolveVideoSessions } from '../services/media-session-input';
 import { apiHandler } from '../utils/api-handler';
+import {
+  resolveSavedSimulationName,
+  saveRunRefusal,
+  saveSimulationSchema,
+  simulationBindingsSnapshot,
+  toSavedSimulation,
+} from '../workflows/simulation-saves';
 
 /**
  * Simulator API (M3, architecture §5): a simulation is a REAL run of the real
@@ -37,6 +44,13 @@ import { apiHandler } from '../utils/api-handler';
  *
  *   POST /workflow-templates/{id}/simulations          create + dispatch
  *   POST /workflow-templates/{id}/simulations/uploads  presigned POST for video/CSV
+ *
+ * Saved runs (sim-cancel-save): the caller's own bookmarks of simulation runs
+ * on this template, keyed by (template, user):
+ *
+ *   GET    /workflow-templates/{id}/simulations/saved            list (newest first)
+ *   POST   /workflow-templates/{id}/simulations/{runId}/save     save / rename (upsert)
+ *   DELETE /workflow-templates/{id}/simulations/saved/{savedId}  remove
  *
  * The draft is validated with the SAME strict publish validator (publish stays
  * the only gate that matters; the simulator surfaces the identical issues).
@@ -51,6 +65,8 @@ import { apiHandler } from '../utils/api-handler';
  */
 
 const s3 = new S3Client({});
+// Path ids are uuid columns; a malformed one would be a Postgres cast error (500).
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BUCKET = process.env.BUCKET_NAME;
 
 function safeJson(body: string | undefined): unknown {
@@ -65,6 +81,25 @@ function bindingIssuesResponse(issues: SimulationBindingIssue[]): APIGatewayProx
   return errorResponse(400, 'SIMULATION_BINDING_INVALID', 'Simulation input bindings are invalid', {
     issues,
   });
+}
+
+// The run half of a SavedSimulation (wire shape in workflows/simulation-saves.ts).
+const savedRunColumns = {
+  id: schema.workflowRuns.id,
+  status: schema.workflowRuns.status,
+  mode: schema.workflowRuns.mode,
+  startedAt: schema.workflowRuns.startedAt,
+  endedAt: schema.workflowRuns.endedAt,
+  durationMs: schema.workflowRuns.durationMs,
+  templateVersion: schema.workflowRuns.templateVersion,
+  executionMode: schema.workflowRuns.executionMode,
+  error: schema.workflowRuns.error,
+  eventCount: schema.workflowRuns.eventCount,
+};
+
+function userRequired(): APIGatewayProxyResultV2 {
+  // Saved runs belong to a person; an API key / session token has no user row.
+  return errorResponse(401, 'USER_CREDENTIAL_REQUIRED', 'Saved simulations require a signed-in user');
 }
 
 const restHandler = async (
@@ -291,8 +326,122 @@ const restHandler = async (
       });
     }
 
+    case 'GET /workflow-templates/{id}/simulations/saved': {
+      if (!auth.userId) return userRequired();
+      const rows = await db
+        .select({ save: schema.workflowSimulationSaves, run: savedRunColumns })
+        .from(schema.workflowSimulationSaves)
+        .innerJoin(schema.workflowRuns, eq(schema.workflowRuns.id, schema.workflowSimulationSaves.runId))
+        .where(
+          and(
+            eq(schema.workflowSimulationSaves.organizationId, orgId),
+            eq(schema.workflowSimulationSaves.templateId, template.id),
+            eq(schema.workflowSimulationSaves.userId, auth.userId),
+          ),
+        )
+        .orderBy(desc(schema.workflowSimulationSaves.createdAt));
+      return ok({ saved: rows.map((r) => toSavedSimulation(r.save, r.run)) });
+    }
+
+    case 'POST /workflow-templates/{id}/simulations/{runId}/save': {
+      if (!auth.userId) return userRequired();
+      const runId = event.pathParameters?.runId;
+      if (!runId) return badRequest('run id required');
+      if (!UUID_RE.test(runId)) return notFound(`Simulation run "${runId}" not found`);
+      const parsed = saveSimulationSchema.safeParse(safeJson(event.body));
+      if (!parsed.success) return badRequest(parsed.error.issues[0]?.message ?? 'Invalid body');
+
+      const run = await db.query.workflowRuns.findFirst({
+        where: and(eq(schema.workflowRuns.id, runId), eq(schema.workflowRuns.templateId, template.id)),
+      });
+      const refusal = run ? saveRunRefusal(run, template.id) : 'not_found';
+      if (!run || refusal === 'not_found') return notFound(`Simulation run "${runId}" not found`);
+      if (refusal === 'not_terminal') {
+        return errorResponse(409, 'RUN_NOT_TERMINAL', 'Only a finished simulation run can be saved', {
+          runId,
+          status: run.status,
+        });
+      }
+
+      const now = new Date();
+      const existing = await db.query.workflowSimulationSaves.findFirst({
+        where: and(
+          eq(schema.workflowSimulationSaves.templateId, template.id),
+          eq(schema.workflowSimulationSaves.userId, auth.userId),
+          eq(schema.workflowSimulationSaves.runId, run.id),
+        ),
+      });
+      let saveRow;
+      let statusCode: 200 | 201;
+      if (existing) {
+        // Re-save: rename (an omitted name keeps the current one).
+        const name = parsed.data.name?.trim() ? parsed.data.name.trim() : existing.name;
+        [saveRow] = await db
+          .update(schema.workflowSimulationSaves)
+          .set({ name, updatedAt: now })
+          .where(eq(schema.workflowSimulationSaves.id, existing.id))
+          .returning();
+        statusCode = 200;
+      } else {
+        const name = resolveSavedSimulationName(parsed.data.name, run.startedAt);
+        // ON CONFLICT covers a double-click racing the existence check.
+        [saveRow] = await db
+          .insert(schema.workflowSimulationSaves)
+          .values({
+            organizationId: orgId,
+            templateId: template.id,
+            userId: auth.userId,
+            runId: run.id,
+            name,
+            bindings: simulationBindingsSnapshot(run.triggerContext),
+          })
+          .onConflictDoUpdate({
+            target: [
+              schema.workflowSimulationSaves.templateId,
+              schema.workflowSimulationSaves.userId,
+              schema.workflowSimulationSaves.runId,
+            ],
+            set: { name, updatedAt: now },
+          })
+          .returning();
+        statusCode = 201;
+      }
+      const saved = toSavedSimulation(saveRow, {
+        id: run.id,
+        status: run.status,
+        mode: run.mode,
+        startedAt: run.startedAt,
+        endedAt: run.endedAt,
+        durationMs: run.durationMs,
+        templateVersion: run.templateVersion,
+        executionMode: run.executionMode,
+        error: run.error,
+        eventCount: run.eventCount,
+      });
+      return statusCode === 201 ? created({ saved }) : ok({ saved });
+    }
+
+    case 'DELETE /workflow-templates/{id}/simulations/saved/{savedId}': {
+      if (!auth.userId) return userRequired();
+      const savedId = event.pathParameters?.savedId;
+      if (!savedId) return badRequest('saved id required');
+      if (!UUID_RE.test(savedId)) return notFound(`Saved simulation "${savedId}" not found`);
+      const deleted = await db
+        .delete(schema.workflowSimulationSaves)
+        .where(
+          and(
+            eq(schema.workflowSimulationSaves.id, savedId),
+            eq(schema.workflowSimulationSaves.templateId, template.id),
+            eq(schema.workflowSimulationSaves.userId, auth.userId),
+          ),
+        )
+        .returning({ id: schema.workflowSimulationSaves.id });
+      if (deleted.length === 0) return notFound(`Saved simulation "${savedId}" not found`);
+      return { statusCode: 204, body: '' };
+    }
+
     default:
-      return methodNotAllowed(method, 'POST');
+      return methodNotAllowed(method, 'GET, POST, DELETE');
   }
 };
 
