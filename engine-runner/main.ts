@@ -12,7 +12,8 @@ import {
   type RunManifest,
 } from '@xorgate/workflow-engine';
 import { platformCatalog } from '../src/workflows/catalog';
-import { failureOutcome, iotAtsEndpoint, loadRunManifest, writeRunArtifacts } from '../src/workflows/host/aws';
+import { failureOutcome, iotAtsEndpoint, loadRunManifest, s3Client, writeRunArtifacts } from '../src/workflows/host/aws';
+import { watchCancelMarker } from '../src/workflows/host/cancel-watch';
 import {
   cloudHost,
   preflightRefusal,
@@ -119,15 +120,23 @@ async function executeRun(args: {
         catalog: platformCatalog,
         log: (m, level) => log(`[${level}] ${m}`),
       });
+      // POST /workflow-runs/{id}/cancel stops a single-run task outright, but
+      // leaves a warm session task alone while another run rides it; this
+      // watcher covers that job (and the window before StopTask lands) by
+      // polling <runPrefix>cancel.json and aborting the run (engine 0.5.3).
+      const cancelWatch = watchCancelMarker({ s3: s3Client(), bucket, runId: manifest.runId, log });
       try {
         result = (
           await engine.run({
             manifest,
             runId: manifest.runId,
             deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
+            signal: cancelWatch.signal,
           })
         ).result;
+        if (cancelWatch.cancelled) log(`run ${manifest.runId} stopped by cancel marker`);
       } finally {
+        cancelWatch.stop();
         // Progress errors never fail the task.
         await host.takeProgress(manifest.runId)?.flush().catch((err) => {
           console.error(`[engine-runner] progress flush failed: ${String(err)}`);
