@@ -121,7 +121,7 @@ describe('cancel watch: the polling core', () => {
 describe('cancel watch: the S3 head', () => {
   const bucket = 'core-bucket';
 
-  function s3With(outcome: 'ok' | 'notfound' | 'nokey' | '404' | 'denied') {
+  function s3With(outcome: 'ok' | 'notfound' | 'nokey' | '404' | 'denied' | '500') {
     const send = vi.fn(async (cmd: { input: { Bucket: string; Key: string } }) => {
       switch (outcome) {
         case 'ok':
@@ -134,6 +134,8 @@ describe('cancel watch: the S3 head', () => {
           throw Object.assign(new Error('404'), { name: 'UnknownError', $metadata: { httpStatusCode: 404 } });
         case 'denied':
           throw Object.assign(new Error('AccessDenied'), { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } });
+        case '500':
+          throw Object.assign(new Error('InternalError'), { name: 'InternalError', $metadata: { httpStatusCode: 500 } });
       }
       void cmd;
     });
@@ -148,13 +150,13 @@ describe('cancel watch: the S3 head', () => {
     expect(cmd.input.Key).toBe(`workflows/v2/runs/${RUN_ID}/cancel.json`);
   });
 
-  it('maps every flavour of "absent" to false', async () => {
-    for (const o of ['notfound', 'nokey', '404'] as const) {
+  it('maps every flavour of "absent" to false, 403 included (missing key without ListBucket)', async () => {
+    for (const o of ['notfound', 'nokey', '404', 'denied'] as const) {
       await expect(s3CancelMarkerHead(s3With(o), bucket, RUN_ID)()).resolves.toBe(false);
     }
   });
 
   it('rethrows any other error for the core to log', async () => {
-    await expect(s3CancelMarkerHead(s3With('denied'), bucket, RUN_ID)()).rejects.toThrow('AccessDenied');
+    await expect(s3CancelMarkerHead(s3With('500'), bucket, RUN_ID)()).rejects.toThrow('InternalError');
   });
 });

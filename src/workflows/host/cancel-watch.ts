@@ -97,7 +97,13 @@ export function createCancelWatch(opts: CancelWatchOptions): CancelWatch {
   };
 }
 
-/** HeadObject on the run's cancel marker; 404/NotFound → false. */
+/**
+ * HeadObject on the run's cancel marker; 404/NotFound → false. A 403 is also
+ * "absent": S3 answers HeadObject on a missing key with 403 when the caller
+ * lacks s3:ListBucket on the prefix (the engine task role now has it, but a
+ * role without it must not log an error every run), and a caller that could
+ * not read the prefix at all would not have loaded the manifest either.
+ */
 export function s3CancelMarkerHead(s3: S3Client, bucket: string, runId: string): CancelWatchHead {
   const Key = cancelMarkerKey(runId);
   return async () => {
@@ -106,7 +112,8 @@ export function s3CancelMarkerHead(s3: S3Client, bucket: string, runId: string):
       return true;
     } catch (err) {
       const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-      if (e?.name === 'NotFound' || e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return false;
+      const status = e?.$metadata?.httpStatusCode;
+      if (e?.name === 'NotFound' || e?.name === 'NoSuchKey' || status === 404 || status === 403) return false;
       throw err;
     }
   };
