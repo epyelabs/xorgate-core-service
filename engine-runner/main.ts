@@ -125,6 +125,9 @@ async function executeRun(args: {
       // watcher covers that job (and the window before StopTask lands) by
       // polling <runPrefix>cancel.json and aborting the run (engine 0.5.3).
       const cancelWatch = watchCancelMarker({ s3: s3Client(), bucket, runId: manifest.runId, log });
+      // A cancel that landed while the task started or the job sat in the
+      // session queue refuses the run before any node starts.
+      await cancelWatch.poll();
       try {
         result = (
           await engine.run({

@@ -88,6 +88,9 @@ export const handler = async (
   // at the next poll (engine 0.5.3 `signal`). The cancelled result.json is
   // ignored by the finalizer (the row is already `cancelled`).
   const cancelWatch = watchCancelMarker({ s3: s3Client(), bucket, runId: manifest.runId, log });
+  // A cancel that landed during the async invoke + cold start (the common
+  // "clicked Cancel right away" case) refuses the run before any node starts.
+  await cancelWatch.poll();
   let outcomeStatus: 'succeeded' | 'failed';
   try {
     const { outcome } = await engine.run({
