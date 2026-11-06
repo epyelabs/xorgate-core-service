@@ -7,7 +7,8 @@ import {
 } from '@xorgate/workflow-engine';
 import { readTelemetryWindow } from '../services/telemetry-window';
 import { platformCatalog } from '../workflows/catalog';
-import { failureOutcome, loadRunManifest, writeRunArtifacts } from '../workflows/host/aws';
+import { failureOutcome, loadRunManifest, s3Client, writeRunArtifacts } from '../workflows/host/aws';
+import { watchCancelMarker } from '../workflows/host/cancel-watch';
 import { cloudHost, preflightRefusal, writeRefusal } from '../workflows/host/cloud-host';
 
 /**
@@ -82,18 +83,28 @@ export const handler = async (
   // the graph, writes the artifact tree (result.json last) and emits the
   // terminal status. Progress is flushed here, after the run resolves.
   const engine = createEngine({ host, catalog: platformCatalog, log: (m, level) => log(`[${level}] ${m}`) });
+  // A Lambda invocation cannot be stopped from outside; POST /workflow-runs/
+  // {id}/cancel writes <runPrefix>cancel.json and this watcher aborts the run
+  // at the next poll (engine 0.5.3 `signal`). The cancelled result.json is
+  // ignored by the finalizer (the row is already `cancelled`).
+  const cancelWatch = watchCancelMarker({ s3: s3Client(), bucket, runId: manifest.runId, log });
+  // A cancel that landed during the async invoke + cold start (the common
+  // "clicked Cancel right away" case) refuses the run before any node starts.
+  await cancelWatch.poll();
   let outcomeStatus: 'succeeded' | 'failed';
   try {
     const { outcome } = await engine.run({
       manifest,
       runId: manifest.runId,
       deadlineMs: (manifest.limits.maxRuntimeSeconds ?? DEFAULT_MAX_RUNTIME_SECONDS) * 1000,
+      signal: cancelWatch.signal,
     });
     outcomeStatus = outcome.status;
     log(
-      `run complete ${JSON.stringify({ runId: manifest.runId, status: outcome.status, events: outcome.metrics.events, messages: outcome.metrics.messages })}`,
+      `run complete ${JSON.stringify({ runId: manifest.runId, status: outcome.status, cancelled: cancelWatch.cancelled, events: outcome.metrics.events, messages: outcome.metrics.messages })}`,
     );
   } finally {
+    cancelWatch.stop();
     await host.takeProgress(manifest.runId)?.flush();
   }
   return { runId: manifest.runId, status: outcomeStatus, resultKey: resultKey(manifest.runId) };

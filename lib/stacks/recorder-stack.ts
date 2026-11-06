@@ -160,7 +160,10 @@ export class XorgateCoreRecorderStack extends cdk.Stack {
         sid: 'EngineListModelRegistry',
         actions: ['s3:ListBucket'],
         resources: [bucket.bucketArn],
-        conditions: { StringLike: { 's3:prefix': ['models/*', 'org-models/*'] } },
+        // workflows/v2/runs/*: the cancel-marker watcher HeadObjects
+        // <runPrefix>cancel.json every 2 s; without ListBucket on the prefix
+        // S3 answers a missing key with 403 instead of 404.
+        conditions: { StringLike: { 's3:prefix': ['models/*', 'org-models/*', 'workflows/v2/runs/*'] } },
       }),
     );
     engineTaskRole.addToPolicy(
