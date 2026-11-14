@@ -226,6 +226,12 @@ export const devices = pgTable(
     // config report (`effective.agent.build.version`) — never written by an
     // operator. Named for what it is: the agent isn't firmware.
     agentVersion: text('agent_version'),
+    // Which device agent this device runs: 'js' | 'rust' (app-enforced; text by
+    // the enum-cast convention). Set from the registration at claim, then only
+    // PROMOTED to 'rust' by a report carrying `effective.agent.runtime: "rust"`
+    // (dual-agent registration D9: positive evidence only, never demoted).
+    // manual/041.
+    agent: text('agent').default('js').notNull(),
     status: text('status').default('provisioned').notNull(),
     // Probe-at-claim couldn't pick a model unambiguously (cm4-support D3): the
     // device carries its registration's fallback model until an operator
@@ -405,6 +411,12 @@ export const deviceRegistrations = pgTable(
     // probe-at-claim mapping. False = deviceModelId is the auto-picked
     // default, which the probe may override.
     modelPinned: boolean('model_pinned').default(false).notNull(),
+    // Which device agent the installer installs: 'js' (today's install.sh,
+    // byte for byte) or 'rust' (the Rust bootstrap). App-enforced; text by the
+    // enum-cast convention. A pending code is reused only for the SAME agent:
+    // an agent change mints a new code (dual-agent registration Q-8.2).
+    // manual/041.
+    agent: text('agent').default('js').notNull(),
     // Exactly one of the two creator columns is set. A Cognito-authenticated
     // caller sets the user; an API-key caller sets the key, because a key has no
     // `users` row to point at. Nullable since Phase 2 for that reason.
