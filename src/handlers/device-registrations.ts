@@ -12,6 +12,7 @@ import type { DeviceRegistration } from '../db/schema';
 import {
   badRequest,
   conflict,
+  errorResponse,
   methodNotAllowed,
   notFound,
   ok,
@@ -23,6 +24,13 @@ import { resolveModel } from '../services/model-probe';
 import { deriveHardwareBlock } from '../schemas/capabilities';
 import { initialConfigDocument } from '../config-registry/index';
 import { apiHandler } from '../utils/api-handler';
+import {
+  type AgentKind,
+  isAgentKind,
+  rustRegistrationEnabled,
+  rustRegistrationFlag,
+  storedAgent,
+} from '../services/device-agent';
 
 const REGISTRATION_TTL_MS = 15 * 60 * 1000;
 
@@ -43,6 +51,8 @@ interface RegistrationView {
   deviceId: string | null;
   expiresAt: string;
   installUrl: string;
+  /** Which installer `installUrl` serves (dual-agent registration D3). */
+  agent: AgentKind;
 }
 
 function toView(row: DeviceRegistration): RegistrationView {
@@ -52,6 +62,7 @@ function toView(row: DeviceRegistration): RegistrationView {
     deviceId: row.deviceId,
     expiresAt: row.expiresAt.toISOString(),
     installUrl: `${apiBaseUrl()}/get/${row.code}`,
+    agent: storedAgent(row.agent),
   };
 }
 
@@ -106,11 +117,29 @@ async function createRegistration(
   // Optional explicit model pick (cm4-support D3 override): when the operator
   // chooses a model in the Register dialog, the claim honors it and skips
   // probe-at-claim mapping (`model_pinned`).
-  let body: { deviceModelId?: string } = {};
+  let body: { deviceModelId?: string; agent?: unknown } = {};
   try {
     body = JSON.parse(event.body ?? '{}');
   } catch {
     return badRequest('Invalid JSON body');
+  }
+
+  // Which agent the code installs (dual-agent registration D3). Absent = 'js',
+  // today's installer. Rust is gated per stage (and optionally per workspace)
+  // by RUST_AGENT_REGISTRATION, which fails closed (services/device-agent.ts).
+  let agent: AgentKind = 'js';
+  if (body.agent !== undefined) {
+    if (!isAgentKind(body.agent)) {
+      return errorResponse(400, 'INVALID_AGENT', 'agent must be "js" or "rust"');
+    }
+    agent = body.agent;
+  }
+  if (agent === 'rust' && !rustRegistrationEnabled(rustRegistrationFlag(), workspaceId)) {
+    return errorResponse(
+      409,
+      'AGENT_NOT_ENABLED',
+      'Rust agent registration is not enabled on this stage for this workspace.',
+    );
   }
   let pinnedModelId: string | null = null;
   if (body.deviceModelId !== undefined) {
@@ -135,10 +164,16 @@ async function createRegistration(
     return badRequest('No device model is configured; seed a device model first');
   }
 
+  // Reuse only a pending code for the SAME agent (Q-8.2). The agent decides
+  // which script `GET /get/{code}` serves, so re-pinning it in place would
+  // silently change what an already-copied install URL does; an agent change
+  // mints a new code instead. The other agent's pending code stays valid until
+  // it expires.
   const existing = await db.query.deviceRegistrations.findFirst({
     where: and(
       eq(schema.deviceRegistrations.workspaceId, workspaceId),
       eq(schema.deviceRegistrations.status, 'pending'),
+      eq(schema.deviceRegistrations.agent, agent),
       gt(schema.deviceRegistrations.expiresAt, sql`now()`),
     ),
     orderBy: [desc(schema.deviceRegistrations.createdAt)],
@@ -165,6 +200,7 @@ async function createRegistration(
       workspaceId,
       deviceModelId: pinnedModelId ?? model.id,
       modelPinned: pinnedModelId !== null,
+      agent,
       // Exactly one of these is set. An API-key caller has no `users` row to
       // point at, so attribution moves to the key rather than being dropped.
       createdByUserId: auth.userId,
@@ -244,6 +280,8 @@ async function claimRegistration(
     dtModel?: string;
     /** Cameras libcamera saw at install time; 0/absent = unknown (fresh install has no overlays yet). */
     cameras?: number;
+    /** The installer's own idea of its agent (the Rust provisioner sends "rust"; JS sends none). */
+    agent?: unknown;
   };
   try {
     body = JSON.parse(event.body ?? '{}');
@@ -317,6 +355,19 @@ async function claimRegistration(
     });
   }
 
+  // The device runs the agent its REGISTRATION chose: that is what
+  // `GET /get/{code}` served. The claim body's `agent` is only a cross-check; a
+  // mismatch is logged and the registration's value kept.
+  const agent = storedAgent(reg.agent);
+  const claimedAgent = body.agent === undefined ? 'js' : body.agent;
+  if (claimedAgent !== agent) {
+    console.warn('claim agent mismatch; keeping the registration agent', {
+      code,
+      registrationAgent: agent,
+      claimedAgent: typeof claimedAgent === 'string' ? claimedAgent.slice(0, 16) : typeof claimedAgent,
+    });
+  }
+
   // Step 2: create the device row.
   let device;
   try {
@@ -328,6 +379,7 @@ async function claimRegistration(
         needsModel,
         serial,
         name,
+        agent,
         // status omitted: column DEFAULT 'provisioned' fires.
         // rev 1 (not the 0 default) marks "the cloud has published a document";
         // rev 0 means the topic was never written. See step 5 below.
