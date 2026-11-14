@@ -1,0 +1,25 @@
+-- Which device agent a registration installs, and a device runs
+-- (device-agent-js-to-rust plan, Phase 8 "dual-agent registration", D2).
+--
+-- `device_registrations.agent` picks the installer `GET /v1/get/{code}` serves:
+-- 'js' = today's install.sh, byte for byte; 'rust' = the thin Rust bootstrap.
+-- `devices.agent` is copied from the registration at claim, and later only ever
+-- PROMOTED to 'rust' by a config report carrying `effective.agent.runtime:
+-- "rust"` (D9: positive evidence only, never demoted). Every existing row is a
+-- JS registration / JS-provisioned device, which is exactly what the DEFAULT
+-- says. The allowed values (js | rust) are enforced in the app, like every other
+-- text-typed enum here (the aws-data-api enum-cast issue).
+--
+-- A hand-written manual migration rather than `npm run db:generate` output: the
+-- drizzle snapshot lags the schema (see 040).
+--
+-- Additive and idempotent (IF NOT EXISTS). `ADD COLUMN ... DEFAULT` is
+-- metadata-only on PostgreSQL >= 11, so it is instant on a populated table.
+--
+-- ORDER MATTERS: apply BEFORE deploying the code. The new code selects `agent`
+-- by name, so a deploy before this migration makes every device and
+-- registration route 500, including the JS `GET /v1/get/{code}`. The reverse
+-- order is safe: the old code ignores the new columns. Two statements.
+ALTER TABLE "device_registrations" ADD COLUMN IF NOT EXISTS "agent" text DEFAULT 'js' NOT NULL;
+--> statement-breakpoint
+ALTER TABLE "devices" ADD COLUMN IF NOT EXISTS "agent" text DEFAULT 'js' NOT NULL;
