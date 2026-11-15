@@ -512,6 +512,14 @@ export function openApiSchemas(): Record<string, unknown> {
           deprecated: true,
           description: 'DEPRECATED alias for agentVersion; removed once clients migrate.',
         },
+        agent: {
+          type: 'string',
+          enum: ['js', 'rust'],
+          description:
+            'Which device agent the device runs. Set from its registration at claim, then promoted ' +
+            'to `rust` (never demoted) when the device reports `effective.agent.runtime: "rust"`. ' +
+            'Compare `agentVersion` against `GET /device-dist/latest?agent=<this>`. Read-only.',
+        },
         status: {
           type: 'string',
           enum: ['provisioned', 'online', 'offline', 'decommissioned'],
@@ -682,7 +690,7 @@ export function openApiSchemas(): Record<string, unknown> {
     },
     DeviceRegistration: {
       type: 'object',
-      required: ['code', 'status', 'deviceId', 'expiresAt', 'installUrl'],
+      required: ['code', 'status', 'deviceId', 'expiresAt', 'installUrl', 'agent'],
       description:
         'A short-lived onboarding code. The operator runs `installUrl` on the device; the install ' +
         'script claims the code, which creates the device row and provisions its IoT identity.',
@@ -713,6 +721,11 @@ export function openApiSchemas(): Record<string, unknown> {
           description:
             'The one-liner target: `<api base>/get/{code}`, which serves the install script. ' +
             'That route is internal to the installer and is not part of the public API.',
+        },
+        agent: {
+          type: 'string',
+          enum: ['js', 'rust'],
+          description: 'Which device agent `installUrl` installs.',
         },
       },
     },

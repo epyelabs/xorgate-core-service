@@ -27,8 +27,11 @@ export const deviceRegistrationsPaths = {
         'the default is only a FALLBACK: the claim maps the device\'s own hardware probe to a ' +
         'model row (probe-at-claim), unless `deviceModelId` is passed here to pin the model ' +
         'explicitly (the claim then skips the probe). Passing `deviceModelId` while a pending ' +
-        'code exists re-pins that code\'s model in place. Note the success status is 200, not ' +
-        '201, even when a code is created.',
+        'code exists re-pins that code\'s model in place. `agent` picks the installer the code ' +
+        'serves (`js`, the default, or `rust`); a pending code is reused only for the SAME agent, ' +
+        'so changing the agent mints a new code. `rust` is gated per stage, and optionally per ' +
+        'workspace: while it is not enabled the request is a 409 `AGENT_NOT_ENABLED`. Note the ' +
+        'success status is 200, not 201, even when a code is created.',
       tags: ['Device Registrations'],
       requestBody: {
         required: false,
@@ -44,6 +47,16 @@ export const deviceRegistrationsPaths = {
                     'Pin the device model explicitly instead of probe-at-claim mapping. ' +
                     'Unknown ids are a 400.',
                 },
+                agent: {
+                  type: 'string',
+                  enum: ['js', 'rust'],
+                  default: 'js',
+                  description:
+                    'Which device agent the installer installs. Absent = `js`. Any other value is ' +
+                    'a 400 `INVALID_AGENT`; `rust` while this stage does not enable it for the ' +
+                    'workspace is a 409 `AGENT_NOT_ENABLED` (see `GET /device-dist/latest?agent=rust` ' +
+                    '`registrationEnabled`).',
+                },
               },
             },
           },
@@ -58,10 +71,20 @@ export const deviceRegistrationsPaths = {
             },
           },
         },
-        '400': { $ref: '#/components/responses/BadRequest' },
+        '400': {
+          description:
+            'Bad request, including an unknown `agent` (`INVALID_AGENT`) or `deviceModelId`.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
         '401': { $ref: '#/components/responses/Unauthorized' },
         '403': { $ref: '#/components/responses/Forbidden' },
         '405': { $ref: '#/components/responses/MethodNotAllowed' },
+        '409': {
+          description:
+            '`agent: "rust"` while Rust-agent registration is not enabled on this stage for this ' +
+            'workspace (`AGENT_NOT_ENABLED`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
       },
     },
   },
@@ -129,7 +152,9 @@ export const deviceRegistrationsPaths = {
       summary: 'Device install script (internal, installer only)',
       description:
         'INTERNAL. Serves the bash installer for a registration code as ' +
-        '`text/x-shellscript`, unauthenticated. Invalid, used, or expired codes still return a ' +
+        '`text/x-shellscript`, unauthenticated. The registration\'s `agent` picks it: `js` gets ' +
+        'the JS agent installer, `rust` a bootstrap that downloads, verifies and runs the Rust ' +
+        'agent\'s own provisioner. Invalid, used, or expired codes still return a ' +
         'runnable script that prints the reason and exits non-zero, so the operator sees the ' +
         'problem instead of bash silently doing nothing.',
       tags: ['Device Registrations'],
@@ -142,6 +167,11 @@ export const deviceRegistrationsPaths = {
         },
         '400': { description: 'Missing code. Body is a failing shell script.' },
         '404': { description: 'Unknown code. Body is a failing shell script.' },
+        '409': {
+          description:
+            'A `rust` code while Rust-agent registration is not enabled here. Body is a failing ' +
+            'shell script.',
+        },
         '410': { description: 'Code already used or expired. Body is a failing shell script.' },
         '500': { description: 'Server misconfiguration. Body is a failing shell script.' },
       },

@@ -19,6 +19,19 @@ const deviceIdParams = [
   { $ref: '#/components/parameters/OrganizationIdHeader' },
 ];
 
+/** The five manifest fields CI publishes (latest.json / latest-rs.json). */
+const AGENT_BUILD_SCHEMA = {
+  type: 'object',
+  required: ['version'],
+  properties: {
+    version: { type: 'string', example: 'a1b2c3d' },
+    channel: { type: 'string', nullable: true, example: 'dev' },
+    builtAt: { type: 'string', format: 'date-time', nullable: true },
+    packageVersion: { type: 'string', nullable: true, example: '0.2.0' },
+    tarball: { type: 'string', nullable: true },
+  },
+};
+
 export const devicesPaths = {
   '/devices': {
     parameters: [{ $ref: '#/components/parameters/OrganizationIdHeader' }],
@@ -1077,7 +1090,31 @@ export const devicesPaths = {
     },
   },
   '/device-dist/latest': {
-    parameters: [{ $ref: '#/components/parameters/OrganizationIdHeader' }],
+    parameters: [
+      { $ref: '#/components/parameters/OrganizationIdHeader' },
+      {
+        name: 'agent',
+        in: 'query',
+        required: false,
+        schema: { type: 'string', enum: ['js', 'rust'] },
+        description:
+          'Select one agent\'s channel. WITH it the response is self-describing ' +
+          '(`{agent, latest | null, registrationEnabled}`, always 200 for a readable or missing ' +
+          'manifest). WITHOUT it the response is the historical `{latest}` for the JS agent, ' +
+          'with 404 when unpublished. A backend that predates this parameter ignores it and ' +
+          'answers in the historical shape, which carries no `agent`: read that as "this API ' +
+          'does not support the Rust agent".',
+      },
+      {
+        name: 'X-Workspace-Id',
+        in: 'header',
+        required: false,
+        schema: { type: 'string', format: 'uuid' },
+        description:
+          'With `?agent=`: the workspace `registrationEnabled` is evaluated for. Without it, ' +
+          'Rust registration counts as enabled only when the stage enables it everywhere.',
+      },
+    ],
     get: {
       operationId: 'getLatestAgentBuild',
       summary: 'The newest published device-agent build',
@@ -1087,36 +1124,59 @@ export const devicesPaths = {
         'per-device. Compare `version` against a device\'s reported build (`agentVersion`) by ' +
         'STRING EQUALITY only: shas do not order, and a dev sha and a prod release tag are not ' +
         'comparable. 404 means CI has not published a manifest for this stage yet, which is ' +
-        '"latest unknown" rather than an error.',
+        '"latest unknown" rather than an error. Pass `?agent=js|rust` for one agent\'s channel ' +
+        '(the Rust agent has its own manifest); compare a device against the channel of its ' +
+        'own `agent`.',
       tags: ['Devices'],
       responses: {
         '200': {
-          description: 'The latest published build.',
+          description:
+            'The latest published build. Without `agent`: `{latest}` (the JS agent). With `agent`: ' +
+            '`{agent, latest | null, registrationEnabled}`.',
           content: {
             'application/json': {
               schema: {
-                type: 'object',
-                required: ['latest'],
-                properties: {
-                  latest: {
+                oneOf: [
+                  {
                     type: 'object',
-                    required: ['version'],
+                    title: 'LatestAgentBuild',
+                    required: ['latest'],
+                    properties: { latest: AGENT_BUILD_SCHEMA },
+                  },
+                  {
+                    type: 'object',
+                    title: 'AgentChannel',
+                    required: ['agent', 'latest', 'registrationEnabled'],
                     properties: {
-                      version: { type: 'string', example: 'a1b2c3d' },
-                      channel: { type: 'string', nullable: true, example: 'dev' },
-                      builtAt: { type: 'string', format: 'date-time', nullable: true },
-                      packageVersion: { type: 'string', nullable: true, example: '0.2.0' },
-                      tarball: { type: 'string', nullable: true },
+                      agent: { type: 'string', enum: ['js', 'rust'] },
+                      latest: {
+                        ...AGENT_BUILD_SCHEMA,
+                        nullable: true,
+                        description: 'null = no manifest is published for this agent on this stage.',
+                      },
+                      registrationEnabled: {
+                        type: 'boolean',
+                        description:
+                          'Whether `POST /device-registrations` accepts this agent here. Always ' +
+                          'true for `js`; for `rust`, the stage flag evaluated for `X-Workspace-Id`.',
+                      },
                     },
                   },
-                },
+                ],
               },
             },
           },
         },
+        '400': {
+          description: 'An `agent` other than `js` or `rust` (`INVALID_AGENT`).',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
         '401': { $ref: '#/components/responses/Unauthorized' },
         '403': { $ref: '#/components/responses/Forbidden' },
-        '404': { $ref: '#/components/responses/NotFound' },
+        '404': {
+          description: 'Without `agent` only: no manifest is published for this stage yet.',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
         '405': { $ref: '#/components/responses/MethodNotAllowed' },
         '500': {
           description: 'This stage has no distribution bucket configured (`DIST_BUCKET_UNCONFIGURED`).',
