@@ -103,7 +103,7 @@ done
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-fetch() { curl -fsSL --retry 3 --retry-delay 2 "$1" -o "$2"; }
+fetch() { curl -fsSL --proto =https --retry 3 --retry-delay 2 "$1" -o "$2"; }
 
 # 1. Resolve the build. "latest" is resolved through latest-rs.json to the
 #    IMMUTABLE versioned tarball it names: the latest alias and its sidecar are

@@ -32,8 +32,8 @@ import { INSTALL_SCRIPT_PLACEHOLDERS } from '../src/assets/install-script';
  */
 
 const GOLDEN = readFileSync(join(__dirname, 'fixtures/install-script/rust-prod.golden.sh'), 'utf8');
-const GOLDEN_SHA256 = '23aab2ab6da4730328a305be2e55a8d1aac3ef8f907917cb16baffd2f61bbcfd';
-const TEMPLATE_FILE_SHA256 = 'e8fb23d269240c19e7e1b433e58b6c262a1b3d6c2a130e4e8f095ed92f9697c1';
+const GOLDEN_SHA256 = '9084ff6cf02093c515841a079966910dd154b117a059a7f038c8d01f38f0525f';
+const TEMPLATE_FILE_SHA256 = '759fe1fa5cdb906f2d527b71cbe88cd564f7a8f3cad1d3480b37ac931395ead8';
 
 const PROD = {
   regCode: 'abcdefghijkmnpq2',
@@ -195,7 +195,7 @@ beforeEach(() => {
   writeExec(
     join(stubs, 'curl'),
     `#!/bin/bash\nurl=""; out=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;;\n` +
-      `  --retry|--retry-delay) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done\n` +
+      `  --retry|--retry-delay|--proto) echo "$1 $2" >> "${work}/curl.flags"; shift 2;; -*) shift;; *) url="$1"; shift;; esac; done\n` +
       `echo "$url" >> "${work}/curl.log"\n` +
       `f="${bucket}/\${url#${BUCKET_URL}/}"\n[ -f "$f" ] || exit 22\ncp "$f" "$out"\n`,
   );
@@ -230,6 +230,9 @@ describe('Rust bootstrap behaviour', () => {
     expect(a).toHaveLength(10);
     // The temp dir survives the exec (the provisioner owns its cleanup).
     expect(existsSync(join(work, 'tarball.seen'))).toBe(true);
+    // Every fetch is https-only, redirects included (review N6).
+    const flags = readFileSync(join(work, 'curl.flags'), 'utf8').trim().split('\n');
+    expect(flags.filter((f) => f === '--proto =https')).toHaveLength(r.urls.length);
   });
 
   it('the sed fallback resolves the manifest when python3 is absent', () => {
