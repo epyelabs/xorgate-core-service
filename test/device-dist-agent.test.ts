@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 process.env.DEVICE_DIST_BUCKET = 'dist-bucket';
+let scopedWorkspace: string | null = null;
 
 let objects: Record<string, string>;
 let s3Error: { name: string } | null;
@@ -50,7 +51,7 @@ vi.mock('../src/middleware/auth', async () => {
       apiKeyId: null,
       organizationId: 'org-1',
       membershipRole: 'member',
-      allowedWorkspaceId: null,
+      allowedWorkspaceId: scopedWorkspace,
     }),
   };
 });
@@ -81,6 +82,7 @@ beforeEach(() => {
   objects = { 'latest.json': JS_MANIFEST, 'latest-rs.json': RS_MANIFEST };
   s3Error = null;
   gets.length = 0;
+  scopedWorkspace = null;
   process.env.RUST_AGENT_REGISTRATION = 'on';
 });
 afterEach(() => {
@@ -223,6 +225,29 @@ describe('GET /device-dist/latest?agent=: self-describing channel', () => {
   it('allow:<ws> naming a workspace outside the caller\'s organization → false', async () => {
     process.env.RUST_AGENT_REGISTRATION = `allow:${WS_FOREIGN}`;
     const body = JSON.parse((await get({ agent: 'rust' }, { 'x-workspace-id': WS_FOREIGN })).body as string);
+    expect(body.registrationEnabled).toBe(false);
+  });
+
+  it('N2: a credential scoped to an allow-listed workspace, no header → true, as create would accept', async () => {
+    process.env.RUST_AGENT_REGISTRATION = `allow:${WS}`;
+    scopedWorkspace = WS;
+    const body = JSON.parse((await get({ agent: 'rust' })).body as string);
+    expect(body.registrationEnabled).toBe(true);
+  });
+
+  it('N2: today the real org-wide gate refuses a scoped credential before the flag is read', async () => {
+    const { assertOrgWideScope } = await vi.importActual<typeof import('../src/middleware/auth')>(
+      '../src/middleware/auth',
+    );
+    expect(() =>
+      assertOrgWideScope({ allowedWorkspaceId: WS } as Parameters<typeof assertOrgWideScope>[0]),
+    ).toThrow(expect.objectContaining({ statusCode: 403, code: 'WORKSPACE_SCOPED' }));
+  });
+
+  it('N2: a credential scoped to a workspace NOT on the allow-list → false', async () => {
+    process.env.RUST_AGENT_REGISTRATION = `allow:${WS_FOREIGN}`;
+    scopedWorkspace = WS;
+    const body = JSON.parse((await get({ agent: 'rust' })).body as string);
     expect(body.registrationEnabled).toBe(false);
   });
 

@@ -172,15 +172,25 @@ const restHandler = async (
 
 /**
  * `registrationEnabled` for Rust: the stage flag, evaluated for the caller's
- * `X-Workspace-Id`. The General tab sends none (an org-wide call), and only
- * `on` enables that case. An allow-list counts the header only when the
- * workspace really belongs to the caller's organization, so this cannot be used
- * to probe which workspace ids are allow-listed.
+ * workspace, resolved EXACTLY as `POST /device-registrations` resolves it
+ * (the `X-Workspace-Id` header, else the workspace a scoped credential names),
+ * so the two can never disagree (WP-B review N2). The General tab sends no
+ * header (an org-wide call), and only `on` enables that case. An allow-list
+ * counts a workspace only when it really belongs to the caller's organization,
+ * so this cannot be used to probe which workspace ids are allow-listed.
+ *
+ * Today `requireOrgWideContext` refuses a workspace-scoped token on this route
+ * (403 WORKSPACE_SCOPED) before this runs, so the credential fallback is
+ * defensive: it keeps the rule identical if that gate ever loosens.
  */
 async function rustEnabledFor(event: APIGatewayProxyEventV2, auth: OrgAuthContext): Promise<boolean> {
   const flag = rustRegistrationFlag();
   if (flag.mode !== 'allow') return rustRegistrationEnabled(flag, null);
-  const workspaceId = event.headers?.['x-workspace-id'] ?? event.headers?.['X-Workspace-Id'];
+  const workspaceId =
+    event.headers?.['x-workspace-id'] ??
+    event.headers?.['X-Workspace-Id'] ??
+    auth.allowedWorkspaceId ??
+    undefined;
   if (!workspaceId) return false;
   const visible = await resolveWorkspaceScope(auth);
   if (!visible.includes(workspaceId)) return false;
