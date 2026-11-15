@@ -1013,6 +1013,23 @@ export class XorgateCoreApiStack extends cdk.Stack {
     );
     deviceDistFn.addEnvironment("DEVICE_DIST_BUCKET", distBucket.bucketName);
     distBucket.grantRead(deviceDistFn, "latest.json");
+    // `?agent=rust` reads the Rust agent's manifest (dual-agent registration D3).
+    distBucket.grantRead(deviceDistFn, "latest-rs.json");
+
+    // Rust-agent registration gate (dual-agent registration D5): `on` | `off` |
+    // `allow:<workspaceId>,...`, parsed fail-closed by src/services/device-agent.ts
+    // (unset or malformed = off). The SAME value goes on every Lambda that
+    // gates Rust: create-registration (409 AGENT_NOT_ENABLED), the
+    // `GET /get/{code}` render, and device-dist's `registrationEnabled`.
+    // test/rust-agent-flag-cdk.test.ts pins both this map and the loop.
+    // Flipping PROD is this one line plus a PROD deploy (the user's).
+    const RUST_AGENT_REGISTRATION: Record<"dev" | "prod", string> = {
+      dev: "on",
+      prod: "off",
+    };
+    for (const fn of [deviceRegistrationsFn, installScriptFn, deviceDistFn]) {
+      fn.addEnvironment("RUST_AGENT_REGISTRATION", RUST_AGENT_REGISTRATION[isProd ? "prod" : "dev"]);
+    }
 
     // GET /devices/{id}/kvs-channels (P3) — returns the device's KVS signaling
     // channels so the browser can run a WebRTC VIEWER. Reads Postgres only (no KVS
