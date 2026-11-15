@@ -227,12 +227,18 @@ export const handler = async (event: unknown): Promise<void> => {
   // untouched rather than nulling it, so a mixed-version fleet never loses a
   // version it already knew.
   const agentVersion = reportedAgentVersion(report);
+  // Which agent (dual-agent registration D9): POSITIVE evidence only. A report
+  // saying `effective.agent.runtime: "rust"` promotes the column to 'rust';
+  // anything else (no marker: every JS build and every pre-marker Rust build)
+  // leaves it untouched. The mirror never demotes.
+  const promoteToRust = reportedAgentRuntime(report) === 'rust';
   const updated = await db
     .update(schema.devices)
     .set({
       reportedConfig: report,
       reportedAt: new Date(),
       ...(agentVersion === null ? {} : { agentVersion }),
+      ...(promoteToRust ? { agent: 'rust' } : {}),
     })
     .where(
       and(
@@ -332,6 +338,17 @@ export function reportedAgentVersion(report: DeviceConfigReport): string | null 
   const trimmed = version.trim();
   if (trimmed.length === 0 || trimmed.length > 64) return null;
   return trimmed;
+}
+
+/**
+ * The agent runtime a report declares, or null. Only the exact string 'rust'
+ * counts (the Rust agent's D85 marker); the JS agent sends no marker at all,
+ * and a value this backend does not know is treated as absent.
+ */
+export function reportedAgentRuntime(report: DeviceConfigReport): 'rust' | null {
+  const agent = report.effective?.agent;
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return null;
+  return (agent as { runtime?: unknown }).runtime === 'rust' ? 'rust' : null;
 }
 
 /** Structural equality for two config documents (key order is not meaningful). */

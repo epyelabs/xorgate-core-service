@@ -483,3 +483,50 @@ describe('device-config-report: origin=local mirroring', () => {
     expect(publishDeviceConfig).not.toHaveBeenCalled();
   });
 });
+
+describe('device-config-report: agent mirror (dual-agent registration D9, positive-only)', () => {
+  const written = () => set.mock.calls[0][0] as Record<string, unknown>;
+
+  it('effective.agent.runtime "rust" promotes devices.agent to rust', async () => {
+    await handler(
+      report({ effective: { agent: { mode: 'real', runtime: 'rust', build: { version: 'abc1234' } } } }),
+    );
+    expect(written().agent).toBe('rust');
+    expect(written().agentVersion).toBe('abc1234');
+  });
+
+  it('no marker (every JS build, every pre-marker Rust build) leaves the column untouched', async () => {
+    await handler(report({ effective: { agent: { mode: 'real', build: { version: '9bd55b9' } } } }));
+    expect(written()).not.toHaveProperty('agent');
+  });
+
+  it.each([
+    ['js'],
+    ['JS'],
+    ['Rust'],
+    [' rust'],
+    [''],
+    [null],
+    [1],
+    [{ kind: 'rust' }],
+  ])('runtime %j never writes the column (never demotes, never guesses)', async (runtime) => {
+    await handler(report({ effective: { agent: { mode: 'real', runtime } } }));
+    expect(written()).not.toHaveProperty('agent');
+  });
+
+  it.each([[undefined], [null], ['rust'], [['rust']]])(
+    'a malformed effective.agent (%j) writes nothing',
+    async (agent) => {
+      await handler(report({ effective: { agent } }));
+      expect(written()).not.toHaveProperty('agent');
+    },
+  );
+
+  it('the marker rides the same guarded update (a stale report changes nothing)', async () => {
+    returning = async () => [];
+    await handler(report({ effective: { agent: { runtime: 'rust' } } }));
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(set).toHaveBeenCalledTimes(1);
+    expect(where).toHaveBeenCalledTimes(1);
+  });
+});
