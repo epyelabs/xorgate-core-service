@@ -491,7 +491,7 @@ export function openApiSchemas(): Record<string, unknown> {
     },
     Device: {
       type: 'object',
-      required: ['id', 'workspaceId', 'deviceModelId', 'serial', 'status'],
+      required: ['id', 'workspaceId', 'deviceModelId', 'serial', 'status', 'agent'],
       properties: {
         id: { type: 'string', format: 'uuid' },
         workspaceId: { type: 'string', format: 'uuid' },
