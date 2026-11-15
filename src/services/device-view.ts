@@ -1,5 +1,6 @@
 import { schema } from '../db/index';
 import { publicConfigDocument, type DeviceConfigDocument } from '../config-registry/index';
+import { type AgentKind, storedAgent } from './device-agent';
 
 /**
  * The single projection of a `devices` row onto the wire.
@@ -11,7 +12,10 @@ import { publicConfigDocument, type DeviceConfigDocument } from '../config-regis
  */
 export type DeviceRow = typeof schema.devices.$inferSelect;
 
-export type DeviceView = DeviceRow & { firmwareVersion: string | null };
+export type DeviceView = Omit<DeviceRow, 'agent'> & {
+  agent: AgentKind;
+  firmwareVersion: string | null;
+};
 
 /**
  * Cleared config namespaces (`null`, settings_sync_hardening finding 2) are
@@ -25,6 +29,10 @@ export function deviceResponse(row: DeviceRow): DeviceView {
   return {
     ...row,
     config: publicConfigDocument(row.config) as DeviceConfigDocument,
+    // Which device agent this device runs (dual-agent registration D2/D9). The
+    // column is NOT NULL DEFAULT 'js'; normalized so a client only ever sees
+    // 'js' or 'rust', and every route that returns a device carries it.
+    agent: storedAgent(row.agent),
     // TODO(agent-version-alias): drop `firmwareVersion` once the renamed
     // frontend is deployed (device_update_management, Phase 4). Its zod device
     // schema is strict — `firmwareVersion: z.string().nullable()` with no
