@@ -5,6 +5,12 @@ import {
   INSTALL_SCRIPT_PLACEHOLDERS,
   renderInstallScript,
 } from '../assets/install-script';
+import { renderRustBootstrap } from '../assets/install-script-rs';
+import {
+  rustRegistrationEnabled,
+  rustRegistrationFlag,
+  storedAgent,
+} from '../services/device-agent';
 import { apiHandler } from '../utils/api-handler';
 
 const SHELL_HEADERS = {
@@ -74,7 +80,17 @@ const restHandler = async (
   }
   const distVersion = process.env.DEVICE_DIST_VERSION ?? 'latest';
 
-  const body = renderInstallScript({
+  // Which installer (dual-agent registration D2). 'js' and every legacy row get
+  // today's install.sh, untouched. 'rust' gets the Rust bootstrap, but only
+  // while this stage's flag allows Rust for the code's workspace: a code minted
+  // while the flag was on and fetched after it flipped off is refused here.
+  const agent = storedAgent(row.agent);
+  if (agent === 'rust' && !rustRegistrationEnabled(rustRegistrationFlag(), row.workspaceId)) {
+    return shellError(409, 'Rust registration is not enabled here; generate a JS code in the web app');
+  }
+  const render = agent === 'rust' ? renderRustBootstrap : renderInstallScript;
+
+  const body = render({
     regCode: row.code,
     apiBase: apiBaseUrl(),
     distBucketUrl: distBucketUrl.replace(/\/$/, ''),
