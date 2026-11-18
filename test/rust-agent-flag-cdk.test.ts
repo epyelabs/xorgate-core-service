@@ -18,13 +18,13 @@ import { describe, expect, it } from 'vitest';
 const source = readFileSync(join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts'), 'utf8');
 
 describe('RUST_AGENT_REGISTRATION in the API stack', () => {
-  it('is on in dev and off in prod', () => {
+  it('is on in dev and allow-listed to Test Org in prod', () => {
     const map = source.match(
       /const RUST_AGENT_REGISTRATION: Record<"dev" \| "prod", string> = \{\s*dev: "([^"]*)",\s*prod: "([^"]*)",\s*\};/,
     );
     expect(map, 'the per-stage RUST_AGENT_REGISTRATION map is missing or reshaped').not.toBeNull();
     expect(map![1]).toBe('on');
-    expect(map![2]).toBe('off');
+    expect(map![2]).toBe('allow:a512ada9-036d-44f0-b135-81f21619a3c8');
   });
 
   it('is set on exactly the three gating Lambdas, from the map', () => {
