@@ -1023,10 +1023,10 @@ export class XorgateCoreApiStack extends cdk.Stack {
     // `GET /get/{code}` render, and device-dist's `registrationEnabled`.
     // test/rust-agent-flag-cdk.test.ts pins both this map and the loop.
     // Flipping PROD is this one line plus a PROD deploy (the user's).
-    // PROD is allow-listed to Test Org only (Phase 8 DA21 + W3, user 2026-11-18); "on" at U9.
+    // PROD went "on" for every workspace at U9 (user 2026-11-19, after Rust v0.1.1 on both benches).
     const RUST_AGENT_REGISTRATION: Record<"dev" | "prod", string> = {
       dev: "on",
-      prod: "allow:a512ada9-036d-44f0-b135-81f21619a3c8",
+      prod: "on",
     };
     for (const fn of [deviceRegistrationsFn, installScriptFn, deviceDistFn]) {
       fn.addEnvironment("RUST_AGENT_REGISTRATION", RUST_AGENT_REGISTRATION[isProd ? "prod" : "dev"]);

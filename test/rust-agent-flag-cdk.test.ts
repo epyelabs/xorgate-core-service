@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 /**
  * F4 (Phase 8 fix-check, binding): all THREE Lambdas that gate the Rust agent
- * carry RUST_AGENT_REGISTRATION, DEV = `on` and PROD = `off`.
+ * carry RUST_AGENT_REGISTRATION, `on` in both stages since U9 (2026-11-19).
  *
  * The registrations, install-script and device-dist Lambdas are separate
  * functions. One forgotten variable fails closed (the parser reads unset as
@@ -18,13 +18,13 @@ import { describe, expect, it } from 'vitest';
 const source = readFileSync(join(__dirname, '..', 'lib', 'stacks', 'api-stack.ts'), 'utf8');
 
 describe('RUST_AGENT_REGISTRATION in the API stack', () => {
-  it('is on in dev and allow-listed to Test Org in prod', () => {
+  it('is on in dev and on in prod', () => {
     const map = source.match(
       /const RUST_AGENT_REGISTRATION: Record<"dev" \| "prod", string> = \{\s*dev: "([^"]*)",\s*prod: "([^"]*)",\s*\};/,
     );
     expect(map, 'the per-stage RUST_AGENT_REGISTRATION map is missing or reshaped').not.toBeNull();
     expect(map![1]).toBe('on');
-    expect(map![2]).toBe('allow:a512ada9-036d-44f0-b135-81f21619a3c8');
+    expect(map![2]).toBe('on');
   });
 
   it('is set on exactly the three gating Lambdas, from the map', () => {
