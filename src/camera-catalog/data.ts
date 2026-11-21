@@ -16,6 +16,12 @@ import {
  * with ⚠️. Do not add an entry, an option or a value that has not been seen.
  * Labels, option descriptions and notes are prose for the console.
  *
+ * "READ, NOT EXERCISED" beside an option value means: the value is what the
+ * overlay's own help text (`dtoverlay -h`) lists, but no bench has booted a
+ * line carrying it. Every option DEFAULT has been booted. The non-default
+ * values stay selectable (they are the overlay's documented vocabulary); the
+ * first board that needs one is its test.
+ *
  * Adding a sensor: one entry here, bump `CAMERA_CATALOG_VERSION`,
  * `npm run contract:generate`, update the pin in `test/camera-catalog.test.ts`,
  * a bench run, an agent release.
@@ -26,14 +32,20 @@ import {
  */
 
 /** Content version of the catalog. Bump on every change to this file's data. */
-export const CAMERA_CATALOG_VERSION = 2;
+export const CAMERA_CATALOG_VERSION = 3;
 
 /**
  * First Rust agent version that compiles a catalog in.
  *
- * ⚠️ UNCONFIRMED. The agent is at v0.1.1 and release tags are the owner's;
- * 0.2.0 is the working number from the plan's touch map. Set it to the real
- * tag before any console logic compares a device's build against `minAgent`.
+ * It is the `minAgent` of EVERY sensor, the IMX290 included, on purpose: an
+ * agent older than the first catalog-aware build cannot apply any managed
+ * sensor choice (it does not know the namespace), so a console that disables
+ * the picker below this version is right for the IMX290 too. Such a device
+ * keeps running its IMX290 exactly as today, unmanaged.
+ *
+ * ⚠️ WORKING VALUE. The agent is at v0.1.1 and release tags are the owner's;
+ * 0.2.0 is the working number from the plan's touch map and stays until the
+ * first catalog-aware build is tagged.
  */
 const FIRST_CATALOG_AGENT_VERSION = '0.2.0';
 
@@ -75,6 +87,8 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
             'some use 74.25 MHz. The sensor cannot report it.',
           param: 'clock-frequency',
           unit: 'Hz',
+          // 37.125 MHz: every bench and fielded device.
+          // 74.25 MHz: READ, NOT EXERCISED (no such board has been on a bench).
           values: [37125000, 74250000],
           default: 37125000,
         },
@@ -105,7 +119,7 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
     // Streaming on bench 2 (CM5, CAM1) with no agent change, 2026-11-21.
     {
       id: 'imx219',
-      label: 'Sony IMX219 (Camera Module 2)',
+      label: 'Sony IMX219',
       tier: 'supported',
       minAgent: FIRST_CATALOG_AGENT_VERSION,
       // No token = 180: device tree `00 00 00 b4`, both flips on (measured).
@@ -151,6 +165,8 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
             'receiver beside it: Camera Module 3 can radiate at a harmonic near GPS L1.',
           param: 'link-frequency',
           unit: 'Hz',
+          // 450 MHz: the CM4 bench.
+          // 447 and 453 MHz: READ, NOT EXERCISED.
           values: [450000000, 447000000, 453000000],
           default: 450000000,
         },
@@ -220,6 +236,8 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
             'use 445.5 MHz only if the board vendor says so.',
           param: 'link-frequency',
           unit: 'Hz',
+          // 594 MHz: bench 2 (`Using a link rate of 1188 Mbps`).
+          // 445.5 MHz: READ, NOT EXERCISED.
           values: [594000000, 445500000],
           default: 594000000,
         },
@@ -245,9 +263,10 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       ],
       info: {
         nativeAspect: '4:3', // 2592x1944 active (listed as 2624x1944)
-        // 2592x1944@30 in the driver source; libcamera negotiates 29.99 at
-        // most, which is why 1080p30 is in `unsupportedPresets`.
-        fullModeMaxFps: 30,
+        // Measured on bench 2: the full mode tops out at 29.99 (the driver
+        // source says 2592x1944@30), which is why `framerate=30/1` is never
+        // negotiated and 1080p30 is in `unsupportedPresets`.
+        fullModeMaxFps: 29.99,
         // Measured: 720p uses the binned 1312x972 mode (full width, 75.9% of
         // the height), 1080p the full mode (98.8% of the width, 75% of the
         // height). So both sizes show practically the same view.

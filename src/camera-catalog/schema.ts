@@ -21,7 +21,38 @@ import { VIDEO_PRESET_NAMES } from '../config-registry/recording';
  * decide what is safe to write.
  */
 
-/** Artifact FORMAT version: bump only on a breaking shape change. */
+/**
+ * Artifact FORMAT version. The compatibility rule every consumer (this
+ * backend, the console, the Rust agent, the SDK if it ever vendors the file)
+ * is held to:
+ *
+ * NOT breaking, `schemaVersion` stays:
+ *   - a new key, at any level;
+ *   - a new member of a closed vocabulary: `tier`, `identity`, an OS release
+ *     (`requires.os`, a package target's `os`), a package `arch`, a
+ *     `nativeAspect`;
+ *   - a new entry: a sensor, a planned sensor, a package set, an option, an
+ *     unsupported preset, or one more value of an existing option.
+ *
+ * So a consumer MUST:
+ *   - ignore keys it does not know (never reject the file for one);
+ *   - treat an enum member it does not know as "not usable by this build":
+ *     the sensor (or package target) that carries it is shown as unavailable
+ *     or skipped, never guessed at and never a parse failure of the whole
+ *     catalog;
+ *   - reject an option VALUE it does not list. A value added to an existing
+ *     option later is unknown to an agent built before it; that agent must
+ *     refuse the choice ("update the agent") and leave `config.txt` alone,
+ *     not write a parameter it has never seen.
+ *
+ * Breaking, bump `schemaVersion` (and every consumer refuses a version it
+ * does not know): removing or renaming a key, changing a key's type or
+ * meaning, changing what an absent/`null` value means, or making a list that
+ * was total (e.g. "every preset not listed is supported") partial.
+ *
+ * `catalogVersion` is the other number: it moves with every content change
+ * and says nothing about the shape.
+ */
 export const CAMERA_CATALOG_SCHEMA_VERSION = 1 as const;
 
 /**
@@ -29,9 +60,9 @@ export const CAMERA_CATALOG_SCHEMA_VERSION = 1 as const;
  *
  * `none` is how a port is declared EMPTY in the `cameraSensors` namespace
  * (Phase 2). It is a value of that namespace, not a sensor: it has no overlay,
- * no options and nothing to detect. The namespace schema adds it beside the
- * catalog's selectable ids; the catalog refuses an entry by that name so the
- * two can never collide.
+ * no options and nothing to detect. The namespace schema accepts it itself,
+ * before the catalog is asked (see `sensor-choice.ts`); the catalog refuses an
+ * entry by that name so the two can never collide.
  */
 export const CAMERA_SENSOR_NONE = 'none' as const;
 export const RESERVED_SENSOR_IDS: readonly string[] = [CAMERA_SENSOR_NONE];
@@ -40,9 +71,15 @@ export const RESERVED_SENSOR_IDS: readonly string[] = [CAMERA_SENSOR_NONE];
 export const LINE_OWNER_PARAMS: readonly string[] = ['cam0', 'cam1', 'rotation'];
 
 // ── character sets ──────────────────────────────────────────────────────────
-// An id is a wire value (it is stored in `devices.config` and typed into
-// `xorgate-rs set`), so lower-case alphanumerics only.
-const SENSOR_ID_RE = /^[a-z][a-z0-9]{1,31}$/;
+/**
+ * The shape of a sensor id. An id is a wire value (it is stored in
+ * `devices.config` and typed into `xorgate-rs set`), so lower-case
+ * alphanumerics only. Exported for the `cameraSensors` namespace, which types
+ * `sensor` as a string of this shape and leaves "is it in the catalog" to
+ * `validateSensorChoice` (see `sensor-choice.ts`).
+ */
+export const CAMERA_SENSOR_ID_RE = /^[a-z][a-z0-9]{1,31}$/;
+const SENSOR_ID_RE = CAMERA_SENSOR_ID_RE;
 // The name of an `overlays/<name>.dtbo` file.
 const OVERLAY_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // The name of one overlay parameter (`link-frequency`, `4lane`).
@@ -58,10 +95,47 @@ const SOURCE_PROP_RE = /^[a-z][a-z0-9-]{0,31}=[A-Za-z0-9._-]{1,32}$/;
 const KERNEL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 const PACKAGE_SET_ID_RE = /^[a-z][a-z0-9-]{1,47}$/;
-// Debian policy 5.6.1 (package name) and 5.6.12 (version).
-const DEB_NAME_RE = /^[a-z0-9][a-z0-9+.-]+$/;
-const DEB_VERSION_RE = /^[0-9][A-Za-z0-9.+~:-]*$/;
+// Debian policy 5.6.1 (package name) and 5.6.12 (version), with a length cap.
+const DEB_NAME_RE = /^[a-z0-9][a-z0-9+.-]{1,127}$/;
+const DEB_VERSION_RE = /^[0-9][A-Za-z0-9.+~:-]{0,63}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Hosts a package may be fetched from. A closed list: a device will download
+ * and install, as root, whatever a package URL names, so a new source is a
+ * decision, not a typo away. (The fetch follows the host's own redirect to
+ * its asset store; the pinned sha256 is what authenticates the bytes.)
+ */
+export const CAMERA_PACKAGE_HOSTS: readonly string[] = ['github.com'];
+const PACKAGE_URL_MAX = 300;
+// https, a bare host, then path segments of a closed character set. No port,
+// no user info, no query, no fragment, no percent-escapes: nothing in it needs
+// quoting in a shell, a log line or an apt source.
+const PACKAGE_URL_RE = /^https:\/\/([a-z0-9][a-z0-9.-]{0,252})((?:\/[A-Za-z0-9._+~-]+)+)$/;
+const PACKAGE_BYTES_MAX = 268_435_456; // 256 MiB: far above any libcamera build
+const CATALOG_VERSION_MAX = 1_000_000;
+/** An overlay integer parameter is one device-tree cell. */
+const DT_CELL_MAX = 0xffff_ffff;
+
+/**
+ * `config.txt` ignores a line longer than this. The longest `dtoverlay=` line
+ * a sensor can render is checked against it when the catalog is built.
+ */
+export const CONFIG_TXT_LINE_MAX = 98;
+
+/** Option keys that would shadow an object's own machinery in a consumer. */
+function isReservedPropertyName(key: string): boolean {
+  return key === 'prototype' || key in Object.prototype;
+}
+
+// Prose shown to an operator (label, note, reason…): any text, bounded, with
+// no control characters (a newline or an escape sequence in a label ends up in
+// a terminal, a log line or a 400 body).
+const NO_CONTROL_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028\u2029]*$/;
+const prose = (max: number) =>
+  z.string().min(1).max(max).regex(NO_CONTROL_RE, 'must not contain control characters');
+const labelText = prose(80);
+const sentenceText = prose(400);
 
 function unique(values: readonly string[]): boolean {
   return new Set(values).size === values.length;
@@ -140,22 +214,31 @@ const overlaySchema = z
 const optionSchema = z
   .object({
     /** Key in the namespace document: `options.<key>`. A wire name. */
-    key: z.string().regex(OPTION_KEY_RE),
+    key: z
+      .string()
+      .regex(OPTION_KEY_RE)
+      .refine((k) => !isReservedPropertyName(k), 'is a reserved property name'),
     /** Human label for the console's field. */
-    label: z.string().min(1),
+    label: labelText,
     /** One sentence saying when a user would change it. */
-    description: z.string().min(1),
+    description: sentenceText,
     /** The overlay parameter it sets: `<param>=<value>` on the line. */
     param: z.string().regex(OVERLAY_PARAM_RE),
     /** Unit of the values, for display (`Hz`), or null. */
-    unit: z.string().min(1).nullable(),
-    /** The closed set of accepted values. Integers: they are written verbatim. */
-    values: z.array(z.number().int().nonnegative().safe()).min(1),
+    unit: prose(16).nullable(),
+    /**
+     * The closed set of accepted values. Integers, written verbatim, each one
+     * device-tree cell.
+     *
+     * A value added here later is unknown to agents built before it: they
+     * reject a choice that carries it (see the compatibility rule at the top).
+     */
+    values: z.array(z.number().int().nonnegative().max(DT_CELL_MAX)).min(1),
     /**
      * The OVERLAY's own default, i.e. what a line without the parameter means.
      * So "option absent" and "option set to `default`" declare the same thing.
      */
-    default: z.number().int().nonnegative().safe(),
+    default: z.number().int().nonnegative().max(DT_CELL_MAX),
   })
   .strict();
 
@@ -206,7 +289,7 @@ const unsupportedPresetSchema = z
   .object({
     preset: z.enum(VIDEO_PRESET_NAMES),
     /** One or two sentences for the operator: why, and what to pick instead. */
-    reason: z.string().min(1),
+    reason: sentenceText,
   })
   .strict();
 
@@ -214,7 +297,7 @@ export const cameraSensorSchema = z
   .object({
     /** Wire id: the value of `cameraSensors.cameras.<key>.sensor`. Never renamed. */
     id: z.string().regex(SENSOR_ID_RE),
-    label: z.string().min(1),
+    label: labelText,
     tier: selectableTierSchema,
     /** First Rust agent version whose compiled-in catalog knows this sensor. */
     minAgent: z.string().regex(SEMVER_RE),
@@ -240,7 +323,7 @@ export const cameraSensorSchema = z
     unsupportedPresets: z.array(unsupportedPresetSchema),
     info: infoSchema,
     /** Plain sentences an operator should read before choosing this sensor. */
-    notes: z.array(z.string().min(1)),
+    notes: z.array(sentenceText),
   })
   .strict();
 
@@ -252,7 +335,7 @@ export type CameraUnsupportedPreset = z.infer<typeof unsupportedPresetSchema>;
  * A sensor the platform intends to support and does not yet.
  *
  * Kept OUT of `sensors` on purpose: everything that iterates `sensors` (the
- * namespace's enum, the agent's lookups, the console's select) is then
+ * namespace's validation, the agent's lookups, the console's select) is then
  * selectable by construction, and no consumer needs an "is this one real?"
  * check. The console shows these as "not yet available". A planned entry
  * carries no overlay facts because none has been seen working.
@@ -260,10 +343,10 @@ export type CameraUnsupportedPreset = z.infer<typeof unsupportedPresetSchema>;
 export const plannedSensorSchema = z
   .object({
     id: z.string().regex(SENSOR_ID_RE),
-    label: z.string().min(1),
+    label: labelText,
     tier: z.literal(PLANNED_TIER),
     requires: z.object({ os: z.array(cameraOsReleaseSchema).min(1) }).strict(),
-    notes: z.array(z.string().min(1)),
+    notes: z.array(sentenceText),
   })
   .strict();
 
@@ -271,22 +354,50 @@ export type PlannedCameraSensor = z.infer<typeof plannedSensorSchema>;
 
 // ── package sets ────────────────────────────────────────────────────────────
 
+/**
+ * Where a `.deb` is fetched from. Held to a closed shape because a device
+ * hands it to a downloader and prints it in logs:
+ * `https://<allowed host>/<segments>/<name>_<version>_<arch>.deb`.
+ */
+const packageUrlSchema = z.string().superRefine((url, ctx) => {
+  const fail = (message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+  if (url.length > PACKAGE_URL_MAX) {
+    fail(`must be at most ${PACKAGE_URL_MAX} characters`);
+    return;
+  }
+  const match = PACKAGE_URL_RE.exec(url);
+  if (!match) {
+    fail(
+      'must be an https URL of the form https://host/path/file.deb, using only letters, ' +
+        'digits and . _ + ~ - (no port, user, query, fragment, space or quoting)',
+    );
+    return;
+  }
+  const [, host, path] = match;
+  if (!CAMERA_PACKAGE_HOSTS.includes(host)) {
+    fail(`host "${host}" is not an allowed package host (${CAMERA_PACKAGE_HOSTS.join(', ')})`);
+  }
+  if (path.split('/').some((segment) => segment === '.' || segment === '..')) {
+    fail('must not contain "." or ".." path segments');
+  }
+  if (!url.endsWith('.deb')) fail('must name a .deb file');
+});
+
 const packageFileSchema = z
   .object({
     /** dpkg package name: what `dpkg-query -W` is asked about. */
     name: z.string().regex(DEB_NAME_RE),
     /** Exact dpkg version that counts as "installed". */
     version: z.string().regex(DEB_VERSION_RE),
-    /** Where the `.deb` is fetched from. https only. */
-    url: z
-      .string()
-      .url()
-      .refine((u) => u.startsWith('https://'), 'must be an https URL')
-      .refine((u) => u.endsWith('.deb'), 'must name a .deb file'),
+    /**
+     * Where the `.deb` is fetched from. Its file name must be
+     * `<name>_<version>_<arch>.deb` (checked against the fields beside it).
+     */
+    url: packageUrlSchema,
     /** sha256 of the file, lower-case hex. The download is refused on a mismatch. */
     sha256: z.string().regex(SHA256_RE),
     /** Size of the file in bytes. */
-    bytes: z.number().int().positive(),
+    bytes: z.number().int().positive().max(PACKAGE_BYTES_MAX),
   })
   .strict();
 
@@ -308,13 +419,13 @@ const packageTargetSchema = z
 export const cameraPackageSetSchema = z
   .object({
     id: z.string().regex(PACKAGE_SET_ID_RE),
-    label: z.string().min(1),
+    label: labelText,
     /**
      * True = `apt-mark hold` every package after install. Without it a newer
      * stock version replaces the packages on the next upgrade.
      */
     aptHold: z.boolean(),
-    notes: z.array(z.string().min(1)),
+    notes: z.array(sentenceText),
     /** One entry per OS release and architecture the set exists for. */
     targets: z.array(packageTargetSchema).min(1),
   })
@@ -332,8 +443,8 @@ const catalogShape = z
      * CONTENT version: bumped on every change to the entries. It is the "vN"
      * a device prints when it is handed a sensor its build does not know.
      */
-    catalogVersion: z.number().int().positive(),
-    generatedBy: z.string().min(1),
+    catalogVersion: z.number().int().positive().max(CATALOG_VERSION_MAX),
+    generatedBy: prose(120),
     sensors: z.array(cameraSensorSchema).min(1),
     planned: z.array(plannedSensorSchema),
     packageSets: z.array(cameraPackageSetSchema),
@@ -423,6 +534,28 @@ function crossCheck(catalog: CatalogShape, ctx: z.RefinementCtx): void {
       }
     });
 
+    // The longest line this sensor can ever be written as: the port token,
+    // an explicit rotation, every fixed parameter and every option at its
+    // longest value. `config.txt` silently ignores an over-long line, which
+    // on a device would read as "the camera vanished after a settings change".
+    const longestLine = [
+      `dtoverlay=${sensor.overlay.name}`,
+      'cam0',
+      ...sensor.overlay.fixedParams,
+      'rotation=180',
+      ...sensor.options.map((option) => {
+        const widest = Math.max(0, ...option.values.map((v) => String(v).length));
+        return `${option.param}=${'9'.repeat(widest)}`;
+      }),
+    ].join(',');
+    if (longestLine.length > CONFIG_TXT_LINE_MAX) {
+      issue(
+        [...at, 'overlay'],
+        `sensor "${sensor.id}": its longest config.txt line would be ${longestLine.length} ` +
+          `characters, over the ${CONFIG_TXT_LINE_MAX} that config.txt accepts`,
+      );
+    }
+
     const propNames = sensor.source.props.map((p) => p.split('=')[0]);
     if (!unique(propNames)) issue([...at, 'source', 'props'], 'properties must be unique');
     if (propNames.includes('camera-name')) {
@@ -482,6 +615,16 @@ function crossCheck(catalog: CatalogShape, ctx: z.RefinementCtx): void {
       if (!unique(target.packages.map((p) => p.name))) {
         issue([...at, 'targets', t, 'packages'], 'package names must be unique');
       }
+      target.packages.forEach((pkg, n) => {
+        // Debian file naming; the epoch (`1:`) is not part of a file name.
+        const expected = `${pkg.name}_${pkg.version.replace(/^\d+:/, '')}_${target.arch}.deb`;
+        if (pkg.url.slice(pkg.url.lastIndexOf('/') + 1) !== expected) {
+          issue(
+            [...at, 'targets', t, 'packages', n, 'url'],
+            `the file name must be "${expected}" (<name>_<version>_<arch>.deb of this entry)`,
+          );
+        }
+      });
     });
   });
 }

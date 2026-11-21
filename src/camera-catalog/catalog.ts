@@ -1,5 +1,6 @@
 import { VIDEO_PRESET_NAMES } from '../config-registry/recording';
 import { CAMERA_CATALOG_SOURCE } from './data';
+import { shown } from './message';
 import {
   cameraCatalogSchema,
   type CameraCatalog,
@@ -24,7 +25,28 @@ import {
  *
  * `test/camera-catalog.test.ts` regenerates it in memory and diffs it against
  * the committed copy, so editing `data.ts` without regenerating fails CI.
+ *
+ * NOTE FOR EVERY CONSUMER of the file (console, Rust agent, a later SDK
+ * vendor). The compatibility rule is stated in full beside
+ * `CAMERA_CATALOG_SCHEMA_VERSION` in `schema.ts`; in short:
+ *   - ignore keys you do not know;
+ *   - an enum member you do not know (`tier`, `identity`, an OS release, a
+ *     package `arch`, a `nativeAspect`) means "this entry is not usable by
+ *     this build", never a parse failure of the catalog;
+ *   - reject an option value you do not list (a value added later is unknown
+ *     to an older agent);
+ *   - refuse a `schemaVersion` you do not know. Everything else is additive
+ *     and keeps `schemaVersion` at its number.
  */
+
+/** Freeze a value and everything under it. */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 /**
  * Validate a catalog and return it in CANONICAL key order.
@@ -36,6 +58,12 @@ import {
  *
  * Throws on an invalid catalog, naming the entry: a bad catalog must never be
  * emitted, and must fail the build rather than a device.
+ *
+ * The result is deeply FROZEN. `CAMERA_CATALOG` is one object shared by every
+ * importer in the process; a consumer that pushed to one of its lists would
+ * change what the next request validates against. A write throws instead (all
+ * of this code runs in strict mode). The input is never frozen: zod builds
+ * the output from fresh objects.
  */
 export function buildCameraCatalog(source: unknown = CAMERA_CATALOG_SOURCE): CameraCatalog {
   const parsed = cameraCatalogSchema.safeParse(source);
@@ -45,7 +73,7 @@ export function buildCameraCatalog(source: unknown = CAMERA_CATALOG_SOURCE): Cam
     );
     throw new Error(`camera catalog is invalid:\n${lines.join('\n')}`);
   }
-  return parsed.data;
+  return deepFreeze(parsed.data);
 }
 
 /** Stable serialization: two-space JSON plus one trailing newline. */
@@ -57,11 +85,16 @@ export function serializeCameraCatalog(catalog: CameraCatalog = buildCameraCatal
 export const CAMERA_CATALOG: CameraCatalog = buildCameraCatalog();
 
 /**
- * Ids a device may be told to use, in catalog order. This is the set the
- * `cameraSensors` namespace builds its enum from (plus the reserved `none`).
- * Planned sensors are not in it.
+ * Ids a device may be told to use, in catalog order. Planned sensors are not
+ * in it, nor is the reserved `none`. It is NOT published as an enum in
+ * `config-contract.json` (see the ruling at the top of `sensor-choice.ts`).
  */
-export const SELECTABLE_SENSOR_IDS: readonly string[] = CAMERA_CATALOG.sensors.map((s) => s.id);
+export const SELECTABLE_SENSOR_IDS: readonly string[] = Object.freeze(
+  CAMERA_CATALOG.sensors.map((s) => s.id),
+);
+
+// The lookups below take whatever they are given: an id that is not a string
+// (unvalidated input) finds nothing, it never throws.
 
 /** A selectable sensor by id. Undefined for a planned or unknown id. */
 export function cameraSensor(id: string): CameraSensor | undefined {
@@ -89,6 +122,7 @@ export function cameraSensorByLibcameraName(name: string): CameraSensor | undefi
  * (`/base/soc/i2c0mux/i2c@0/imx708@1a`).
  */
 export function cameraSensorByDtNode(node: string): CameraSensor | undefined {
+  if (typeof node !== 'string') return undefined;
   const last = node.split('/').pop() ?? '';
   const name = last.split('@')[0];
   if (!name) return undefined;
@@ -107,22 +141,21 @@ export type CameraPresetSupport = { supported: true } | { supported: false; reas
  * Supported unless the sensor's entry lists it under `unsupportedPresets`; the
  * reason then is the catalog's own sentence, ready to show an operator.
  *
- * Fails CLOSED on what it cannot judge: a sensor that is not selectable
- * (unknown, planned, or the reserved `none`) and a name that is not a preset
- * both answer "not supported", with a reason saying which. A caller with a
- * port that has no declared sensor has nothing to ask here.
+ * Fails CLOSED on what it cannot judge, and never throws: a sensor that is
+ * not selectable (unknown, planned, the reserved `none`, or not a string at
+ * all) and a name that is not a preset both answer "not supported", with a
+ * reason saying which. Both arguments may be unvalidated input. A caller with
+ * a port that has no declared sensor has nothing to ask here.
  */
-export function cameraPresetSupport(sensorId: string, preset: string): CameraPresetSupport {
-  // Echoed names are cut short: either may be unvalidated input.
-  const clip = (text: string) => (text.length > 60 ? `${text.slice(0, 57)}...` : text);
-  const sensor = cameraSensor(sensorId);
+export function cameraPresetSupport(sensorId: unknown, preset: unknown): CameraPresetSupport {
+  const sensor = typeof sensorId === 'string' ? cameraSensor(sensorId) : undefined;
   if (!sensor) {
-    return { supported: false, reason: `"${clip(sensorId)}" is not a selectable camera sensor` };
+    return { supported: false, reason: `${shown(sensorId)} is not a selectable camera sensor` };
   }
-  if (!(VIDEO_PRESET_NAMES as readonly string[]).includes(preset)) {
+  if (typeof preset !== 'string' || !(VIDEO_PRESET_NAMES as readonly string[]).includes(preset)) {
     return {
       supported: false,
-      reason: `"${clip(preset)}" is not a video preset (presets: ${VIDEO_PRESET_NAMES.join(', ')})`,
+      reason: `${shown(preset)} is not a video preset (presets: ${VIDEO_PRESET_NAMES.join(', ')})`,
     };
   }
   const entry = sensor.unsupportedPresets.find((u) => u.preset === preset);

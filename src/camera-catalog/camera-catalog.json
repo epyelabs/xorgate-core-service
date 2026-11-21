@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "catalogVersion": 2,
+  "catalogVersion": 3,
   "generatedBy": "backend/xorgate-core-service: npm run contract:generate",
   "sensors": [
     {
@@ -63,7 +63,7 @@
     },
     {
       "id": "imx219",
-      "label": "Sony IMX219 (Camera Module 2)",
+      "label": "Sony IMX219",
       "tier": "supported",
       "minAgent": "0.2.0",
       "overlay": {
@@ -219,7 +219,7 @@
       ],
       "info": {
         "nativeAspect": "4:3",
-        "fullModeMaxFps": 30,
+        "fullModeMaxFps": 29.99,
         "sensorWidthPercent": {
           "p720": 100,
           "p1080": 98.8

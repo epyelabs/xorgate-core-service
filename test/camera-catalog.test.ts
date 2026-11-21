@@ -5,7 +5,9 @@ import { describe, expect, it } from 'vitest';
 import {
   CAMERA_CATALOG,
   CAMERA_CATALOG_VERSION,
+  CAMERA_PACKAGE_HOSTS,
   CAMERA_SENSOR_NONE,
+  CONFIG_TXT_LINE_MAX,
   SELECTABLE_SENSOR_IDS,
   buildCameraCatalog,
   cameraCatalogSchema,
@@ -34,8 +36,8 @@ const ARTIFACT = join(__dirname, '..', 'src', 'camera-catalog', 'camera-catalog.
  *   3. set the version and the artifact's sha256 here.
  */
 const PINNED = {
-  catalogVersion: 2,
-  sha256: 'feac4f6802f5e2208d84cbe405c9e723b4fede899620d3f64b1ca615f9367574',
+  catalogVersion: 3,
+  sha256: '812ce3d6c2c4d1de6209c0ec118a9ecbac998b5cf23e5ccf27bd4fbb8c4aafb3',
 };
 
 /** A deep copy with every object's keys in reverse order (arrays keep theirs). */
@@ -131,6 +133,34 @@ describe('camera-catalog.json', () => {
   });
 });
 
+describe('the shared catalog object', () => {
+  it('is deeply frozen: a consumer cannot change what the next caller validates against', () => {
+    const anyCatalog = CAMERA_CATALOG as any;
+    const before = serializeCameraCatalog(CAMERA_CATALOG);
+    expect(() => anyCatalog.sensors.push({ id: 'evil' })).toThrow(TypeError);
+    expect(() => anyCatalog.sensors[0].options[0].values.push(1)).toThrow(TypeError);
+    expect(() => (anyCatalog.sensors[0].overlay.defaultRotation = 180)).toThrow(TypeError);
+    expect(() => (anyCatalog.sensors[3].unsupportedPresets.length = 0)).toThrow(TypeError);
+    expect(() => anyCatalog.packageSets[0].targets[0].packages.pop()).toThrow(TypeError);
+    expect(() => (anyCatalog.catalogVersion = 99)).toThrow(TypeError);
+    expect(() => (SELECTABLE_SENSOR_IDS as any).push('evil')).toThrow(TypeError);
+    expect(() => (cameraSensor('imx290') as any).libcameraNames.push('imx708')).toThrow(TypeError);
+    // Nothing moved, and validation still answers from the original data.
+    expect(serializeCameraCatalog(CAMERA_CATALOG)).toBe(before);
+    expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
+    expect(cameraSensor('evil')).toBeUndefined();
+    expect(cameraPresetSupport('imx335', '1080p30-4mbps').supported).toBe(false);
+  });
+
+  it('freezes what it builds, not what it was given', () => {
+    const built = buildCameraCatalog(CAMERA_CATALOG_SOURCE);
+    expect(Object.isFrozen(built)).toBe(true);
+    expect(Object.isFrozen(built.sensors[0].options[0].values)).toBe(true);
+    expect(Object.isFrozen(CAMERA_CATALOG_SOURCE)).toBe(false);
+    expect(Object.isFrozen(CAMERA_CATALOG_SOURCE.sensors)).toBe(false);
+  });
+});
+
 describe('catalog entries (the measured facts, PROGRESS.md)', () => {
   it('lists the v1 sensors in order, and imx662 only as planned', () => {
     expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
@@ -180,6 +210,7 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(s.overlay).toMatchObject({ name: 'imx219', defaultRotation: 180, canFlip: true });
     expect(s.identity).toBe('chip-id');
     expect(s.options).toEqual([]);
+    expect(s.label).toBe('Sony IMX219');
     expect(s.info.sensorWidthPercent).toEqual({ p720: 58.5, p1080: 58.5 });
     expect(s.info.sensorHeightPercent).toEqual({ p720: 43.8, p1080: 43.8 });
     expect(s.unsupportedPresets).toEqual([]);
@@ -223,6 +254,9 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(s.libcameraNames).toEqual(['imx335']);
     expect(s.dtNodeNames).toEqual(['imx335']);
     expect(s.info.nativeAspect).toBe('4:3');
+    // The measured ceiling of the full mode, the same number its reason quotes.
+    expect(s.info.fullModeMaxFps).toBe(29.99);
+    expect(s.unsupportedPresets[0].reason).toContain('29.99');
     expect(s.info.sensorWidthPercent).toEqual({ p720: 100, p1080: 98.8 });
     expect(s.info.sensorHeightPercent).toEqual({ p720: 75.9, p1080: 75 });
     expect(s.notes.join(' ')).toContain('Mount the camera the right way up');
@@ -356,6 +390,60 @@ describe('cameraPresetSupport', () => {
     expect(both).toMatchObject({ supported: false });
     expect('reason' in both && both.reason.length).toBeLessThan(120);
   });
+
+  it('holds on unvalidated input: fails closed, never throws', () => {
+    const cyclic: any = {};
+    cyclic.self = cyclic;
+    const junk: unknown[] = [
+      null,
+      undefined,
+      0,
+      NaN,
+      true,
+      [],
+      ['imx335'],
+      {},
+      { id: 'imx335' },
+      cyclic,
+      Symbol('imx335'),
+      10n,
+      () => 'imx335',
+      Object.create(null),
+    ];
+    for (const value of junk) {
+      for (const [id, preset] of [
+        [value, '720p15-1mbps'],
+        ['imx290', value],
+        [value, value],
+      ]) {
+        let out: ReturnType<typeof cameraPresetSupport> | undefined;
+        expect(() => (out = cameraPresetSupport(id, preset))).not.toThrow();
+        expect(out?.supported).toBe(false);
+        expect(out && 'reason' in out && out.reason.length).toBeGreaterThan(0);
+      }
+    }
+    // An array or an object that prints like an id is still not an id.
+    expect(cameraPresetSupport(['imx290'], '720p15-1mbps')).toEqual({
+      supported: false,
+      reason: '["imx290"] is not a selectable camera sensor',
+    });
+    expect(cameraPresetSupport('imx290', ['720p15-1mbps'])).toMatchObject({ supported: false });
+    // Inherited names are not ids or presets.
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(cameraPresetSupport(name, '720p15-1mbps').supported).toBe(false);
+      expect(cameraPresetSupport('imx290', name).supported).toBe(false);
+    }
+    // The lookups share the rule.
+    for (const value of junk) {
+      expect(() => cameraSensor(value as any)).not.toThrow();
+      expect(cameraSensor(value as any)).toBeUndefined();
+      expect(cameraSensorByDtNode(value as any)).toBeUndefined();
+      expect(cameraSensorByOverlay(value as any)).toBeUndefined();
+      expect(cameraSensorByLibcameraName(value as any)).toBeUndefined();
+      expect(plannedCameraSensor(value as any)).toBeUndefined();
+      expect(cameraPackageSet(value as any)).toBeUndefined();
+    }
+  });
 });
 
 describe('catalog schema (what an entry may not be)', () => {
@@ -476,12 +564,17 @@ describe('catalog schema (what an entry may not be)', () => {
     expect(refusal((c) => (pkg(c).url = pkg(c).url.replace('https://', 'http://')))).toMatch(
       /https/,
     );
-    expect(refusal((c) => (pkg(c).url = 'https://example.com/install.sh'))).toMatch(/\.deb/);
+    expect(refusal((c) => (pkg(c).url = 'https://github.com/x/install.sh'))).toMatch(/\.deb/);
     expect(refusal((c) => (pkg(c).sha256 = pkg(c).sha256.toUpperCase()))).not.toBe('');
     expect(refusal((c) => (pkg(c).sha256 = 'abc'))).not.toBe('');
     expect(refusal((c) => (pkg(c).version = ''))).not.toBe('');
     expect(refusal((c) => (pkg(c).name = 'lib camera; rm -rf /'))).not.toBe('');
     expect(refusal((c) => (pkg(c).bytes = 0))).not.toBe('');
+    // Bounds: nothing absurd, nothing that is not an exact integer.
+    expect(refusal((c) => (pkg(c).bytes = 2 ** 40))).toMatch(/bytes/);
+    expect(refusal((c) => (pkg(c).bytes = 1.5))).toMatch(/bytes/);
+    expect(refusal((c) => (pkg(c).name = `lib${'x'.repeat(200)}`))).toMatch(/name/);
+    expect(refusal((c) => (pkg(c).version = `1.${'0'.repeat(100)}`))).toMatch(/version/);
     expect(refusal((c) => (c.packageSets[0].targets = []))).not.toBe('');
     expect(
       refusal((c) => c.packageSets[0].targets.push(c.packageSets[0].targets[0])),
@@ -508,6 +601,158 @@ describe('catalog schema (what an entry may not be)', () => {
       ),
     ).toMatch(/a preset may be listed once/);
     expect(refusal((c) => delete c.sensors[0].unsupportedPresets)).toMatch(/unsupportedPresets/);
+  });
+
+  it('holds a package URL to https://<allowed host>/<plain path>/<name>_<version>_<arch>.deb', () => {
+    const pkg = (c: any) => c.packageSets[0].targets[0].packages[0];
+    const good: string = pkg(CAMERA_CATALOG_SOURCE).url;
+    const file = good.slice(good.lastIndexOf('/') + 1);
+    const withUrl = (url: unknown) => refusal((c) => (pkg(c).url = url));
+    const urlIssue = /packageSets\.0\.targets\.0\.packages\.0\.url/;
+
+    expect(CAMERA_PACKAGE_HOSTS).toEqual(['github.com']);
+    expect(withUrl(good)).toBe('');
+
+    // Anything that would need quoting in a shell, a log line or an apt source.
+    const hostile = [
+      `https://github.com/$(reboot)/${file}`,
+      `https://github.com/a\nb/${file}`,
+      `https://github.com/a b/${file}`,
+      `https://github.com/a"b/${file}`,
+      `https://github.com/a'b/${file}`,
+      `https://github.com/a;b/${file}`,
+      `https://github.com/a\`id\`/${file}`,
+      `https://github.com/a%20b/${file}`,
+      `https://github.com/a\\b/${file}`,
+      `https://user:pass@github.com/a/${file}`,
+      `https://github.com:8443/a/${file}`,
+      `https://github.com/a/${file}?x=.deb`,
+      `https://github.com/a/x?x=${file}`,
+      `https://github.com/a/${file}#frag`,
+      `https://github.com/a//${file}`,
+      `https://github.com/${file}/`,
+      `https://github.com`,
+      `https://github.com/`,
+      `https:///a/${file}`,
+      ` ${good}`,
+      `${good}\n`,
+      `${good} `,
+      `HTTPS://github.com/a/${file}`,
+      `https://GitHub.com/a/${file}`,
+      `ftp://github.com/a/${file}`,
+      `file:///a/${file}`,
+      `//github.com/a/${file}`,
+      `github.com/a/${file}`,
+      '',
+      7,
+      null,
+    ];
+    for (const url of hostile) expect(withUrl(url), JSON.stringify(url)).toMatch(urlIssue);
+
+    // A length cap, and it is the cap that answers (not the pattern).
+    const long = `https://github.com/${'a'.repeat(5000)}/${file}`;
+    expect(withUrl(long)).toMatch(/at most 300 characters/);
+
+    // Well-formed, but not somewhere a device may install from.
+    for (const host of ['example.com', 'github.com.evil.example', 'evilgithub.com', 'raw.github.com']) {
+      expect(withUrl(`https://${host}/a/${file}`), host).toMatch(/is not an allowed package host/);
+    }
+    expect(withUrl(`https://github.com/a/../${file}`)).toMatch(/path segments/);
+    expect(withUrl(`https://github.com/./a/${file}`)).toMatch(/path segments/);
+
+    // The file name is derived from the fields a device verifies against.
+    expect(withUrl('https://github.com/a/libcamera0.5_0.5.2+rpt20250909-2_arm64.deb')).toMatch(
+      /the file name must be "libcamera0\.5_0\.5\.2\+rpt20250909-1_arm64\.deb"/,
+    );
+    expect(withUrl('https://github.com/a/other_0.5.2+rpt20250909-1_arm64.deb')).toMatch(
+      /the file name must be/,
+    );
+    expect(withUrl('https://github.com/a/libcamera0.5_0.5.2+rpt20250909-1_armhf.deb')).toMatch(
+      /the file name must be/,
+    );
+    expect(refusal((c) => (pkg(c).version = '0.5.3'))).toMatch(/the file name must be/);
+    expect(refusal((c) => (pkg(c).name = 'libcamera0.6'))).toMatch(/the file name must be/);
+    // An epoch is part of the version, never of the file name.
+    expect(refusal((c) => (pkg(c).version = `1:${pkg(c).version}`))).toBe('');
+  });
+
+  it('refuses a sensor whose longest overlay line would not fit in config.txt', () => {
+    expect(CONFIG_TXT_LINE_MAX).toBe(98);
+    // Every entry as written fits with room to spare.
+    for (const s of CAMERA_CATALOG.sensors) {
+      const line = [
+        `dtoverlay=${s.overlay.name}`,
+        'cam0',
+        ...s.overlay.fixedParams,
+        'rotation=180',
+        ...s.options.map((o) => `${o.param}=${Math.max(...o.values)}`),
+      ].join(',');
+      expect(line.length, line).toBeLessThanOrEqual(CONFIG_TXT_LINE_MAX);
+    }
+    const tooLong = refusal((c) =>
+      c.sensors[2].overlay.fixedParams.push('a'.repeat(30), 'b'.repeat(30)),
+    );
+    expect(tooLong).toMatch(
+      /sensors\.2\.overlay: sensor "imx708": its longest config\.txt line would be \d+ characters, over the 98/,
+    );
+    // Exactly at the limit is fine; one wider option value tips it over.
+    expect(refusal((c) => c.sensors[1].overlay.fixedParams.push('a'.repeat(32)))).toBe('');
+    expect(
+      refusal((c) => {
+        c.sensors[0].overlay.fixedParams.push('a'.repeat(32), 'b'.repeat(5));
+      }),
+    ).toBe('');
+    expect(
+      refusal((c) => {
+        c.sensors[0].overlay.fixedParams.push('a'.repeat(32), 'b'.repeat(5));
+        c.sensors[0].options[0].values.push(4294967295);
+      }),
+    ).toMatch(/sensor "imx290": its longest config\.txt line/);
+  });
+
+  it('bounds numbers to what their consumers can hold', () => {
+    // An overlay integer is one device-tree cell.
+    expect(refusal((c) => c.sensors[0].options[0].values.push(4294967295))).toBe('');
+    expect(refusal((c) => c.sensors[0].options[0].values.push(4294967296))).toMatch(/values/);
+    expect(refusal((c) => c.sensors[0].options[0].values.push(-1))).toMatch(/values/);
+    expect(refusal((c) => (c.sensors[0].options[0].default = 2 ** 53))).toMatch(/default/);
+    for (const v of [0, -1, 1.5, 1_000_001, 2 ** 53, '3', null]) {
+      expect(refusal((c) => (c.catalogVersion = v)), String(v)).toMatch(/catalogVersion/);
+    }
+    expect(refusal((c) => (c.catalogVersion = 1_000_000))).toBe('');
+  });
+
+  it('refuses control characters and unbounded prose in every free-text field', () => {
+    const fields: Array<[string, (c: any, text: string) => void]> = [
+      ['sensor label', (c, t) => (c.sensors[0].label = t)],
+      ['sensor note', (c, t) => (c.sensors[0].notes[0] = t)],
+      ['option label', (c, t) => (c.sensors[0].options[0].label = t)],
+      ['option description', (c, t) => (c.sensors[0].options[0].description = t)],
+      ['option unit', (c, t) => (c.sensors[0].options[0].unit = t)],
+      ['preset reason', (c, t) => (c.sensors[3].unsupportedPresets[0].reason = t)],
+      ['planned label', (c, t) => (c.planned[0].label = t)],
+      ['planned note', (c, t) => (c.planned[0].notes[0] = t)],
+      ['package set label', (c, t) => (c.packageSets[0].label = t)],
+      ['package set note', (c, t) => (c.packageSets[0].notes[0] = t)],
+      ['generatedBy', (c, t) => (c.generatedBy = t)],
+    ];
+    for (const [name, set] of fields) {
+      for (const bad of ['a\nb', 'a\tb', 'a\u0000b', 'a\u001b[31mb', 'a\u007fb', 'a\u0085b', 'a\u2028b', '']) {
+        expect(refusal((c) => set(c, bad)), `${name} ${JSON.stringify(bad)}`).not.toBe('');
+      }
+      expect(refusal((c) => set(c, 'x'.repeat(5000))), `${name} long`).not.toBe('');
+      // Ordinary prose, punctuation and non-ASCII letters are fine.
+      expect(refusal((c) => set(c, "Caméra 3: it's ok".slice(0, 16))), name).toBe('');
+    }
+  });
+
+  it('refuses an option key that would shadow an object\'s own machinery', () => {
+    for (const key of ['constructor', 'toString', '__proto__', 'prototype', 'hasOwnProperty', 'valueOf']) {
+      expect(refusal((c) => (c.sensors[0].options[0].key = key)), key).toMatch(
+        /sensors\.0\.options\.0\.key/,
+      );
+    }
+    expect(refusal((c) => (c.sensors[0].options[0].key = 'clockHz'))).toBe('');
   });
 
   it('names the entry when a bad catalog is built', () => {

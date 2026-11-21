@@ -1,19 +1,51 @@
 import { SELECTABLE_SENSOR_IDS, cameraSensor, plannedCameraSensor } from './catalog';
+import { shown } from './message';
 import type { CameraSensor } from './schema';
 
 /**
  * Validation of one sensor choice against the catalog: the `{ sensor, options }`
  * pair a port of the `cameraSensors` namespace will hold (Phase 2).
  *
- * This is the catalog-dependent half of that namespace's validation, kept here
- * so it can be built and tested before the namespace exists. NOT handled here,
- * on purpose, and left to the namespace schema:
- *   - the reserved `sensor: "none"` (a port declared empty). It is not a
- *     catalog sensor; the namespace accepts it before asking this function.
- *   - the stream-key map around the pair, and the gate on agent kind/version.
+ * ── RULING FOR PHASE 2 (plan owner, 2026-11-21): how the namespace uses this ──
  *
- * Every message is written for the operator who sent the value: it names the
- * offending path, says what was sent, and lists what would be accepted.
+ * 1. The sensor ids do NOT go into `config-contract.json` as an enum. The
+ *    contract must not change with every sensor (the SDK vendors it by hash,
+ *    and the console and the agent pin it); the catalog is the artifact that
+ *    moves. So the namespace's zod schema types `sensor` as a CONSTRAINED
+ *    STRING (`CAMERA_SENSOR_ID_RE` from `schema.ts`, or the literal `none`)
+ *    and `options` as a bounded record of string to number, and its
+ *    `superRefine` calls `validateSensorChoice` per camera to check the id
+ *    and the options against the catalog.
+ *
+ * 2. `validateSensorChoice` returns STRUCTURED issues: `{ path, message }`
+ *    with `path` relative to the pair (`['sensor']`, `['options', 'x']`, or
+ *    `[]` for the pair itself). In a `superRefine` that is
+ *
+ *        const checked = validateSensorChoice(entry);
+ *        if ('issues' in checked) for (const issue of checked.issues) {
+ *          ctx.addIssue({
+ *            code: z.ZodIssueCode.custom,
+ *            path: ['cameras', key, ...issue.path],
+ *            message: issue.message,
+ *          });
+ *        }
+ *
+ *    and the registry's own formatter then prints
+ *    `cameraSensors.cameras.cam0.sensor: …` once. Messages never start with a
+ *    path of their own, so nothing is doubled. `formatSensorChoiceIssue` is
+ *    only for callers outside a schema.
+ *
+ * 3. The reserved `sensor: "none"` (a port declared EMPTY) is NOT a catalog
+ *    sensor. The namespace schema accepts `{ "sensor": "none" }` BEFORE this
+ *    function is called, and `none` carries NO options: `{ "sensor": "none",
+ *    "options": … }` is refused by the namespace, whatever `options` holds.
+ *    Asked about `none`, this function answers "not a known camera sensor".
+ *
+ * 4. Also left to the namespace: the stream-key map around the pair, and the
+ *    gate on agent kind and version.
+ *
+ * Every message is written for the operator who sent the value: it says what
+ * was sent and lists what would be accepted.
  */
 
 export interface SensorChoice {
@@ -22,7 +54,18 @@ export interface SensorChoice {
   options?: Record<string, number>;
 }
 
-export type SensorChoiceResult = { value: SensorChoice } | { error: string };
+export interface SensorChoiceIssue {
+  /**
+   * Where, relative to the pair: `[]`, `['sensor']`, `['options']` or
+   * `['options', <a catalog option key>]`. Never a key taken from the input,
+   * so a path is always short and safe to print.
+   */
+  path: string[];
+  /** What is wrong and what would be accepted. Carries no path of its own. */
+  message: string;
+}
+
+export type SensorChoiceResult = { value: SensorChoice } | { issues: SensorChoiceIssue[] };
 
 const CHOICE_KEYS = ['sensor', 'options'];
 
@@ -35,25 +78,13 @@ function own(object: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-/** Cut a sent string short, so a blob cannot flood a 400 or a log line. */
-function clip(text: string): string {
-  return text.length > 60 ? `${text.slice(0, 57)}...` : text;
-}
-
-/** A sent value, as JSON, for a message. */
-function shown(value: unknown): string {
-  // JSON has no NaN/Infinity (they print as "null", which would mislead).
-  if (typeof value === 'number' && !Number.isFinite(value)) return String(value);
-  try {
-    return clip(JSON.stringify(value) ?? String(value));
-  } catch {
-    return clip(String(value));
-  }
-}
-
 function optionKeys(sensor: CameraSensor): string {
   return sensor.options.map((o) => o.key).join(', ');
 }
+
+const fail = (path: string[], message: string): SensorChoiceResult => ({
+  issues: [{ path, message }],
+});
 
 /**
  * Validate `{ sensor, options? }`.
@@ -62,96 +93,116 @@ function optionKeys(sensor: CameraSensor): string {
  * option keys, each set to one of its listed values. `options` may be absent
  * or `{}`. An option left out means the overlay's default.
  *
- * The returned value is canonical: `options` is dropped when empty and its
- * keys follow the catalog's order, so two equivalent choices store and compare
- * the same.
+ * The returned value is normalized, not minimal: an empty `options` is
+ * dropped and the keys follow the catalog's order, but an option explicitly
+ * set to its default is KEPT (it is a statement by the operator). So
+ * `{sensor}` and `{sensor, options: {<key>: <default>}}` are both valid, mean
+ * the same line, and do not compare equal as stored. To compare two choices
+ * (stored against reported, say), compare `resolveSensorOptions` of each.
  *
- * `label` prefixes each path, like `validateNamespaceValue`'s
- * (`cameraSensors.cameras.cam0`).
+ * On failure, `issues` has at least one entry. The pair itself and the sensor
+ * are judged first and stop at the first problem; every problem in `options`
+ * is then reported, unknown keys first.
  */
-export function validateSensorChoice(input: unknown, label = 'camera'): SensorChoiceResult {
+export function validateSensorChoice(input: unknown): SensorChoiceResult {
   if (!isPlainObject(input)) {
-    return { error: `${label}: must be an object like {"sensor": "${SELECTABLE_SENSOR_IDS[0]}"}` };
+    return fail([], `must be an object like {"sensor": "${SELECTABLE_SENSOR_IDS[0]}"}`);
   }
   const extra = Object.keys(input).filter((k) => !CHOICE_KEYS.includes(k));
   if (extra.length > 0) {
-    return {
-      error: `${label}.${clip(extra[0])}: unknown key (a camera takes only "sensor" and "options")`,
-    };
+    return fail(
+      [],
+      `unknown key ${shown(extra[0])} (a camera takes only "sensor" and "options")`,
+    );
   }
 
   const known = SELECTABLE_SENSOR_IDS.join(', ');
   const id = own(input, 'sensor') ? input.sensor : undefined;
   if (typeof id !== 'string' || id === '') {
-    return { error: `${label}.sensor: required, one of: ${known}` };
+    return fail(['sensor'], `required, one of: ${known}`);
   }
   const sensor = cameraSensor(id);
   if (!sensor) {
     const planned = plannedCameraSensor(id);
     if (planned) {
       const needs = planned.requires.os.join(' or ');
-      return {
-        error:
-          `${label}.sensor: "${id}" (${planned.label}) is planned and cannot be selected yet ` +
+      return fail(
+        ['sensor'],
+        `"${id}" (${planned.label}) is planned and cannot be selected yet ` +
           `(it needs a device image on Debian ${needs}); available: ${known}`,
-      };
+      );
     }
-    return {
-      error: `${label}.sensor: ${shown(id)} is not a known camera sensor (known: ${known})`,
-    };
+    return fail(['sensor'], `${shown(id)} is not a known camera sensor (known: ${known})`);
   }
 
   if (!own(input, 'options') || input.options === undefined) return { value: { sensor: id } };
   const sent = input.options;
   if (!isPlainObject(sent)) {
-    const hint =
+    return fail(
+      ['options'],
       sensor.options.length > 0
         ? `must be an object of option values, e.g. {"${sensor.options[0].key}": ${sensor.options[0].values[0]}}`
-        : `must be an object; ${id} takes no options, so leave it out`;
-    return { error: `${label}.options: ${hint}` };
-  }
-  for (const key of Object.keys(sent)) {
-    if (!sensor.options.some((o) => o.key === key)) {
-      const accepted =
-        sensor.options.length > 0
-          ? `its options: ${optionKeys(sensor)}`
-          : 'it takes no options, so remove "options"';
-      const name = clip(key);
-      return { error: `${label}.options.${name}: ${id} has no option "${name}" (${accepted})` };
-    }
+        : `must be an object; ${id} takes no options, so leave it out`,
+    );
   }
 
+  const issues: SensorChoiceIssue[] = [];
+  for (const key of Object.keys(sent)) {
+    if (sensor.options.some((o) => o.key === key)) continue;
+    const accepted =
+      sensor.options.length > 0
+        ? `its options: ${optionKeys(sensor)}`
+        : 'it takes no options, so remove "options"';
+    issues.push({ path: ['options'], message: `${id} has no option ${shown(key)} (${accepted})` });
+  }
   const options: Record<string, number> = {};
   for (const option of sensor.options) {
     if (!own(sent, option.key)) continue;
     const value = sent[option.key];
     if (typeof value !== 'number' || !option.values.includes(value)) {
       const unit = option.unit ? ` ${option.unit}` : '';
-      return {
-        error:
-          `${label}.options.${option.key}: must be one of ${option.values.join(', ')}${unit} ` +
-          `(got ${shown(value)})`,
-      };
+      issues.push({
+        path: ['options', option.key],
+        message: `must be one of ${option.values.join(', ')}${unit} (got ${shown(value)})`,
+      });
+      continue;
     }
     options[option.key] = value;
   }
+  if (issues.length > 0) return { issues };
   return Object.keys(options).length > 0
     ? { value: { sensor: id, options } }
     : { value: { sensor: id } };
 }
 
 /**
- * Every option of a VALID choice with its value: what was set, else the
- * overlay default. For display ("clock frequency: 37125000 Hz (default)") and
- * for comparing a stored choice with what a device reports. Returns null for a
- * sensor that is not selectable.
+ * One issue as a line of text, for a caller that is not a zod schema:
+ * `<label>.<path>: <message>`, the registry's own style
+ * (`cameraSensors.cameras.cam0.sensor: …`).
  */
-export function resolveSensorOptions(choice: SensorChoice): Record<string, number> | null {
-  const sensor = cameraSensor(choice.sensor);
+export function formatSensorChoiceIssue(issue: SensorChoiceIssue, label = 'camera'): string {
+  return `${[label, ...issue.path].join('.')}: ${issue.message}`;
+}
+
+/**
+ * Every option of a choice with its value: what was set, else the overlay
+ * default. For display ("clock frequency: 37125000 Hz (default)") and for
+ * COMPARING two choices: `{sensor}` and `{sensor, options: {<key>: <default>}}`
+ * resolve to the same map.
+ *
+ * Takes anything. A choice that `validateSensorChoice` would refuse (not an
+ * object, a sensor that is not selectable, an option or value the sensor does
+ * not list) resolves to `null`; it never throws and never fills in a default
+ * for a value it could not accept.
+ */
+export function resolveSensorOptions(choice: unknown): Record<string, number> | null {
+  const checked = validateSensorChoice(choice);
+  if (!('value' in checked)) return null;
+  const sensor = cameraSensor(checked.value.sensor);
   if (!sensor) return null;
   const out: Record<string, number> = {};
   for (const option of sensor.options) {
-    out[option.key] = choice.options?.[option.key] ?? option.default;
+    out[option.key] = checked.value.options?.[option.key] ?? option.default;
   }
   return out;
 }

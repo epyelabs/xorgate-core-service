@@ -28,6 +28,10 @@
  * `--repo` or `--out-root` (see `src/contract-artifacts/targets.ts` for the
  * resolution rules and the reason).
  *
+ * A destination has to be the repo it is named for, and if any destination is
+ * refused nothing at all is written. Exit codes: 0 done, 1 `--check` found
+ * drift, 2 bad command line, 3 refused / failed / nothing to do.
+ *
  * Each package has its own test asserting its copy is in sync —
  * `test/config-contract.test.ts` and `test/camera-catalog.test.ts` here do the
  * regenerate-and-diff that catches "edited the source, forgot to regenerate".
@@ -36,6 +40,7 @@ import { resolve } from 'node:path';
 import { serializeCameraCatalog } from '../src/camera-catalog';
 import { serializeConfigContract } from '../src/config-registry/contract';
 import {
+  EXIT,
   GENERATE_USAGE,
   applyTargets,
   describeCheckout,
@@ -43,6 +48,7 @@ import {
   isFailure,
   parseGenerateArgs,
   planTargets,
+  summarize,
 } from '../src/contract-artifacts/targets';
 
 const backendRoot = resolve(__dirname, '..');
@@ -51,14 +57,18 @@ function main(): void {
   const options = parseGenerateArgs(process.argv.slice(2), process.env, backendRoot);
   if ('error' in options) {
     console.error(`${options.error}\n\n${GENERATE_USAGE}`);
-    process.exitCode = 2;
+    process.exitCode = EXIT.usage;
     return;
   }
   if (options.help) {
     console.log(GENERATE_USAGE);
     return;
   }
+  // Say where a redirected run goes, resolved, before anything is touched.
+  if (options.outRoot !== null) console.log(`out root: ${options.outRoot}`);
 
+  // Decide every destination before the first write: one refused destination
+  // stops the whole run (`applyTargets`).
   const plan = planTargets(describeCheckout(backendRoot), options);
   const results = applyTargets(
     plan,
@@ -66,15 +76,21 @@ function main(): void {
       'config-contract': serializeConfigContract(),
       'camera-catalog': serializeCameraCatalog(),
     },
-    { check: options.check },
+    {
+      check: options.check,
+      // Printed as each copy is done, so a run that dies half-way has already
+      // said what it wrote.
+      onResult: (result) => {
+        const line = formatResult(result);
+        if (isFailure(result.status)) console.error(line);
+        else if (result.status === 'skipped') console.warn(line);
+        else console.log(line);
+      },
+    },
   );
-  for (const result of results) {
-    const line = formatResult(result);
-    if (isFailure(result.status)) console.error(line);
-    else if (result.status === 'skipped') console.warn(line);
-    else console.log(line);
-  }
-  if (results.some((r) => isFailure(r.status))) process.exitCode = 1;
+  const { code, message } = summarize(results);
+  if (message) console.error(message);
+  process.exitCode = code;
 }
 
 main();
