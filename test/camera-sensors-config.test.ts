@@ -234,6 +234,17 @@ describe('cameraSensors: refused values, each naming the port and what is allowe
     expect(parse(cams(many))).toHaveProperty('error');
   });
 
+  it('a "__proto__" port is refused, never silently dropped', () => {
+    // The name passes the stream-key pattern, and a parser that assigns
+    // `out[key] = value` would turn it into a prototype: the entry would vanish
+    // and the request be accepted without it.
+    const body = JSON.parse(
+      '{"cameras":{"__proto__":{"sensor":"imx708"},"cam0":{"sensor":"imx219"}}}',
+    );
+    expect(errorOf(body)).toBe('cameraSensors.cameras.__proto__: must be a stream key');
+    expect(({} as { sensor?: unknown }).sensor).toBeUndefined();
+  });
+
   it('the empty object ({} is never an erase: null is), and things that are not a document', () => {
     expect(errorOf({})).toContain('send null to revert');
     for (const v of ['imx290', 7, true, [], [{ cameras: {} }], { cameras: null }, { cameras: [] }]) {

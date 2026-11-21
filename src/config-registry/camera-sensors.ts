@@ -147,8 +147,20 @@ export function checkCameraSensorMap(
   return issues.length > 0 ? { issues } : { value };
 }
 
+/**
+ * A port key: a stream key, and never `__proto__`. That name passes the stream
+ * key pattern, and zod's record parser assigns its output with `out[key] = …`,
+ * which for `__proto__` sets a prototype instead of a key: the entry would
+ * vanish and the request would be ACCEPTED with that port silently dropped.
+ * Refused at the key, where it is still a key.
+ */
+const portKeySchema = z
+  .string()
+  .regex(STREAM_KEY_RE, 'must be a stream key')
+  .refine((key) => key !== '__proto__', { message: 'must be a stream key' });
+
 const portMapShape = z
-  .record(z.string().regex(STREAM_KEY_RE, 'must be a stream key'), cameraSensorEntrySchema)
+  .record(portKeySchema, cameraSensorEntrySchema)
   .refine((m) => Object.keys(m).length <= CAMERAS_MAX_KEYS, {
     message: `at most ${CAMERAS_MAX_KEYS} cameras`,
   });
