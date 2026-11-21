@@ -1,14 +1,26 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { db, schema } from '../db/index';
-import { deviceDeclaresObd, publishDeviceConfig } from '../services/device-config';
+import {
+  deviceDeclaresObd,
+  deviceHardwareBlock,
+  publishDeviceConfig,
+} from '../services/device-config';
 import {
   applyConfigPatch,
   configNamespace,
   namespaceAllowedFor,
+  namespaceDeviceError,
   validateNamespaceValue,
   type DeviceConfigDocument,
+  type NamespaceGateFacts,
   OBD_ONLY_NAMESPACES,
+  CAMERA_SENSORS_KEY,
+  CAMERA_SENSORS_MIN_AGENT,
+  CAMERA_SENSORS_ONLY_NAMESPACES,
+  cameraSensorsEligibility,
+  declaredCameraPorts,
+  reportDisprovesCameraSensors,
 } from '../config-registry/index';
 import { legacyConfigColumns } from '../config-registry/legacy-columns';
 
@@ -251,6 +263,8 @@ export const handler = async (event: unknown): Promise<void> => {
       config: schema.devices.config,
       configRev: schema.devices.configRev,
       simulated: schema.devices.simulated,
+      // AFTER this write, so a report that just promoted the device reads 'rust'.
+      agent: schema.devices.agent,
     });
 
   if (updated.length === 0) {
@@ -265,7 +279,9 @@ export const handler = async (event: unknown): Promise<void> => {
     return;
   }
 
-  const { config, configRev, simulated } = updated[0];
+  const { simulated, agent } = updated[0];
+  let config = updated[0].config as DeviceConfigDocument;
+  let configRev = updated[0].configRev;
   console.log('device-config-report: stored', {
     deviceId,
     origin: report.origin,
@@ -277,9 +293,18 @@ export const handler = async (event: unknown): Promise<void> => {
   });
 
   if (report.origin === 'local') {
-    await mirrorLocalChange(deviceId, report, config as DeviceConfigDocument, configRev, simulated);
-    return;
+    // The device row as the gates need it: this report IS its last report now.
+    const device = { agent, simulated, reportedConfig: report, agentVersion };
+    ({ config, configRev } = await mirrorLocalChange(deviceId, report, config, configRev, device));
   }
+
+  // An agent that has just PROVED it cannot act on `cameraSensors` must not
+  // keep holding it (plans/support-other-camera-models, version skew). Runs
+  // after the local merge so a local edit in the same report is not discarded
+  // by the rev this bumps.
+  if (await withdrawCameraSensors(deviceId, report, config, configRev, agentVersion)) return;
+
+  if (report.origin === 'local') return;
 
   if (report.rev >= configRev) {
     // Converged. Forget any republish run we were counting for this device.
@@ -388,9 +413,12 @@ async function mirrorLocalChange(
   report: DeviceConfigReport,
   config: DeviceConfigDocument,
   configRev: number,
-  simulated: boolean,
-): Promise<void> {
+  device: { agent: unknown; simulated: boolean; reportedConfig: unknown; agentVersion: unknown },
+): Promise<{ config: DeviceConfigDocument; configRev: number }> {
   const changed = report.changed ?? {};
+  const { simulated } = device;
+  // What the row holds when this returns: unchanged unless the merge wrote.
+  const unchanged = { config, configRev };
 
   // The conflict check comes FIRST, before looking at what changed: a local
   // report describes the world as of the rev the device had applied, so once
@@ -418,14 +446,14 @@ async function mirrorLocalChange(
         console.error('device-config-report: republish failed', { deviceId, configRev, err });
       }
     }
-    return;
+    return unchanged;
   }
 
   if (Object.keys(changed).length === 0) {
     // A local report with nothing to merge: an agent that predates `changed`,
     // or an edit reverted before the report went out. Storing it was the job.
     console.log('device-config-report: local report carried no changes', { deviceId });
-    return;
+    return unchanged;
   }
 
   // Validate before storing. `effective` is mirrored opaquely because it only
@@ -438,6 +466,18 @@ async function mirrorLocalChange(
   const obd = Object.keys(changed).some((ns) => OBD_ONLY_NAMESPACES.includes(ns))
     ? await deviceDeclaresObd(deviceId)
     : false;
+  const facts: NamespaceGateFacts = { simulated, obd };
+  // The `cameraSensors` fence (plans/support-other-camera-models): the same
+  // facts PATCH /config asks for. This report is the device's last report, so
+  // "never reported" cannot apply here: a local edit is folded back only from a
+  // Rust agent that advertises `camera.sensors`. The model's ports bound the
+  // keys; the model is read only when the change names the namespace.
+  if (Object.keys(changed).some((ns) => CAMERA_SENSORS_ONLY_NAMESPACES.includes(ns))) {
+    facts.cameraSensors = cameraSensorsEligibility(device);
+    if (facts.cameraSensors.allowed) {
+      facts.cameraPorts = declaredCameraPorts(await deviceHardwareBlock(deviceId));
+    }
+  }
   const patch: Record<string, unknown> = {};
   for (const [ns, value] of Object.entries(changed)) {
     if (!configNamespace(ns)) {
@@ -450,7 +490,7 @@ async function mirrorLocalChange(
     // The same fence as PATCH /config: a real device's local `simulation`
     // edit must never become cloud desired state (plans/xorgate-device-simulator),
     // and a plain device's local `obd` edit must not either.
-    if (!namespaceAllowedFor(ns, { simulated, obd })) {
+    if (!namespaceAllowedFor(ns, facts)) {
       console.warn('device-config-report: gated namespace on a device that does not qualify, skipping', {
         deviceId,
         namespace: ns,
@@ -466,9 +506,18 @@ async function mirrorLocalChange(
       });
       continue;
     }
+    const deviceError = namespaceDeviceError(ns, parsed.value, facts);
+    if (deviceError) {
+      console.warn('device-config-report: local change rejected by the registry, skipping', {
+        deviceId,
+        namespace: ns,
+        error: deviceError,
+      });
+      continue;
+    }
     patch[ns] = parsed.value;
   }
-  if (Object.keys(patch).length === 0) return;
+  if (Object.keys(patch).length === 0) return unchanged;
 
   const nextConfig = applyConfigPatch(config, patch) as DeviceConfigDocument;
   if (sameDocument(nextConfig, config)) {
@@ -478,7 +527,7 @@ async function mirrorLocalChange(
       deviceId,
       namespaces: Object.keys(patch),
     });
-    return;
+    return unchanged;
   }
 
   const now = new Date();
@@ -502,7 +551,7 @@ async function mirrorLocalChange(
       configRev,
       namespaces: Object.keys(patch),
     });
-    return;
+    return unchanged;
   }
 
   const row = updated[0];
@@ -526,4 +575,89 @@ async function mirrorLocalChange(
       err,
     });
   }
+  return { config: row.config as DeviceConfigDocument, configRev: row.configRev };
+}
+
+/**
+ * Withdraw a stored `cameraSensors` from a device whose agent has just proved
+ * it cannot act on it (plans/support-other-camera-models, Phase 2).
+ *
+ * How a device gets here: the namespace may be stored while a device has NEVER
+ * reported (that is when a registration's sensor choice is seeded, at claim).
+ * If the agent that then connects predates the namespace it ignores the key,
+ * sends no status entry for it, and every reader would show the setting as
+ * applied. The same happens when a capable device is downgraded or reverted to
+ * the JS agent. So on a report that carries a capability list WITHOUT
+ * `camera.sensors`, the key is removed from the desired document, the rev is
+ * bumped and the retained message republished, which leaves cloud, retained
+ * message and device agreeing: the ports are unmanaged, exactly like a device
+ * fielded before the namespace existed. Nothing is re-applied by itself when
+ * the agent is later updated; an operator saves the choice again, and the
+ * PATCH is then accepted.
+ *
+ * Only POSITIVE evidence removes anything (`reportDisprovesCameraSensors`): a
+ * report with no `agent` block proves nothing and leaves the row alone.
+ *
+ * Costs nothing for a device that does not hold the key, which is every JS
+ * device and every device fielded before the namespace: one `hasOwnProperty`.
+ *
+ * Returns true when it wrote (the caller's own republish logic is then moot).
+ */
+async function withdrawCameraSensors(
+  deviceId: string,
+  report: DeviceConfigReport,
+  config: DeviceConfigDocument,
+  configRev: number,
+  agentVersion: string | null,
+): Promise<boolean> {
+  if (!config || !Object.prototype.hasOwnProperty.call(config, CAMERA_SENSORS_KEY)) return false;
+  if (!reportDisprovesCameraSensors(report)) return false;
+
+  const { [CAMERA_SENSORS_KEY]: withdrawn, ...nextConfig } = config;
+  const now = new Date();
+  const updated = await db
+    .update(schema.devices)
+    .set({
+      config: nextConfig,
+      configRev: sql`${schema.devices.configRev} + 1`,
+      configUpdatedAt: now,
+      updatedAt: now,
+      ...legacyConfigColumns(nextConfig),
+    })
+    // Optimistic guard, as in the local merge: a cloud write that landed since
+    // the read wins, and the device's next report tries again.
+    .where(and(eq(schema.devices.id, deviceId), eq(schema.devices.configRev, configRev)))
+    .returning({ config: schema.devices.config, configRev: schema.devices.configRev });
+
+  if (updated.length === 0) {
+    console.warn('device-config-report: cameraSensors withdrawal lost a race with a cloud write', {
+      deviceId,
+      configRev,
+    });
+    return false;
+  }
+
+  const row = updated[0];
+  console.warn(
+    'device-config-report: cameraSensors withdrawn, the reporting agent does not support it',
+    {
+      deviceId,
+      agentVersion,
+      needsAgent: CAMERA_SENSORS_MIN_AGENT,
+      withdrawn,
+      configRev: row.configRev,
+    },
+  );
+  try {
+    await publishDeviceConfig(deviceId, row.config as DeviceConfigDocument, row.configRev);
+  } catch (err) {
+    // The row is written; the device now reports a rev behind `config_rev`,
+    // which re-triggers the republish through the ordinary self-heal branch.
+    console.error('device-config-report: republish after cameraSensors withdrawal failed', {
+      deviceId,
+      configRev: row.configRev,
+      err,
+    });
+  }
+  return true;
 }
