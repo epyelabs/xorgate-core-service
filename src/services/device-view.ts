@@ -1,5 +1,11 @@
 import { schema } from '../db/index';
-import { publicConfigDocument, type DeviceConfigDocument } from '../config-registry/index';
+import {
+  CAMERA_SENSORS_KEY,
+  cameraSensorsEligibility,
+  publicConfigDocument,
+  type ConfigDocument,
+  type DeviceConfigDocument,
+} from '../config-registry/index';
 import { type AgentKind, storedAgent } from './device-agent';
 
 /**
@@ -18,6 +24,27 @@ export type DeviceView = Omit<DeviceRow, 'agent'> & {
 };
 
 /**
+ * The config document as served for THIS device.
+ *
+ * On top of stripping cleared namespaces: `cameraSensors` is served only for a
+ * device that may hold it (`cameraSensorsEligibility`). Every client reads a
+ * namespace that is present, on a device level on rev, with no status entry, as
+ * "applied"; an agent that cannot act on the namespace sends no status entry
+ * for it. Nothing stores the key on such a device (PATCH and the local-change
+ * mirror refuse it, and the report mirror withdraws a registration's seed the
+ * moment an agent proves it cannot act on it), so this only covers the instant
+ * between a report landing and that withdrawal, and a withdrawal that lost a
+ * race. A device that never held the key is untouched: same object, same keys.
+ */
+function servedConfigDocument(row: DeviceRow): ConfigDocument {
+  const doc = publicConfigDocument(row.config);
+  if (!Object.prototype.hasOwnProperty.call(doc, CAMERA_SENSORS_KEY)) return doc;
+  if (cameraSensorsEligibility(row).allowed) return doc;
+  const { [CAMERA_SENSORS_KEY]: _hidden, ...rest } = doc;
+  return rest;
+}
+
+/**
  * Cleared config namespaces (`null`, settings_sync_hardening finding 2) are
  * stripped, so every client keeps seeing the two states the OpenAPI contract
  * documents: a namespace is either configured or absent. The marker exists so
@@ -28,7 +55,7 @@ export type DeviceView = Omit<DeviceRow, 'agent'> & {
 export function deviceResponse(row: DeviceRow): DeviceView {
   return {
     ...row,
-    config: publicConfigDocument(row.config) as DeviceConfigDocument,
+    config: servedConfigDocument(row) as DeviceConfigDocument,
     // Which device agent this device runs (dual-agent registration D2/D9). The
     // column is NOT NULL DEFAULT 'js'; normalized so a client only ever sees
     // 'js' or 'rust', and every route that returns a device carries it.

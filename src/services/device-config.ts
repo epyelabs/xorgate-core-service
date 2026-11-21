@@ -5,9 +5,12 @@ import { deriveHardwareBlock, type DeviceHardwareBlock } from '../schemas/capabi
 import { deviceScope, ensureThingScopeAttributes, type DeviceScope } from './device-scope';
 import { iotDataClient } from './iot-data';
 import {
+  CAMERA_SENSORS_KEY,
   CONFIG_NAMESPACES,
   GNSS_ANT_BIAS_DEFAULT,
+  cameraSensorsEligibility,
   namespaceAllowedFor,
+  type CameraSensorsEligibility,
   type DeviceConfigDocument,
   type PublishedConfigDocument,
 } from '../config-registry/index';
@@ -118,6 +121,7 @@ export function buildDeviceConfigMessage(
   now: number = Date.now(),
   scope?: DeviceScope | null,
   hardware?: DeviceHardwareBlock | null,
+  facts: PublishGateFacts = {},
 ): DeviceConfigMessage {
   const source = (doc ?? {}) as Record<string, unknown>;
   // Registry order is the wire order, and gnssAntBias is first in both — keep
@@ -131,7 +135,18 @@ export function buildDeviceConfigMessage(
   // left behind by a model reassignment is kept off the wire. `simulated` is
   // deliberately not re-checked here: nothing can store `simulation` on a real
   // row, and a simulated device has no hardware block to assert it with.
-  const gate = { simulated: true, obd: hardware?.peripherals?.obd !== undefined };
+  //
+  // `cameraSensors` (plans/support-other-camera-models) rides only for a device
+  // the caller PROVED eligible: a real device on the Rust agent that has never
+  // reported or reports the `camera.sensors` capability. Absent facts = not
+  // published. That is what keeps a JS device's message byte-identical whatever
+  // its row holds, and keeps the key away from a Rust agent that would ignore
+  // it and then be read as having applied it.
+  const gate = {
+    simulated: true,
+    obd: hardware?.peripherals?.obd !== undefined,
+    cameraSensors: facts.cameraSensors,
+  };
   for (const ns of CONFIG_NAMESPACES) {
     if (!Object.prototype.hasOwnProperty.call(source, ns.key)) continue;
     if (!namespaceAllowedFor(ns.key, gate)) continue;
@@ -159,6 +174,15 @@ export function buildDeviceConfigMessage(
 }
 
 /**
+ * The per-device facts the publisher cannot read off the document or the
+ * hardware block. Everything is optional and defaults to "not proven".
+ */
+export interface PublishGateFacts {
+  /** `cameraSensorsEligibility(deviceRow)`; absent = the namespace is not published. */
+  cameraSensors?: CameraSensorsEligibility;
+}
+
+/**
  * The device's hardware block, derived from its model row at publish time (so
  * the message always reflects the CURRENT model — including after a model edit
  * or a device-model reassignment). null when the device is gone or its model
@@ -177,6 +201,37 @@ export async function deviceHardwareBlock(
     .where(eq(schema.devices.id, deviceId))
     .limit(1);
   return deriveHardwareBlock(rows[0]?.caps);
+}
+
+/**
+ * The hardware block AND the device-gate facts, in one read, for a publish of
+ * a document that holds a device-gated namespace (`cameraSensors`). A device
+ * that is gone gets no block and no facts, so the namespace is not published.
+ */
+export async function devicePublishFacts(
+  deviceId: string,
+): Promise<{ hardware: DeviceHardwareBlock | null; facts: PublishGateFacts }> {
+  const rows = await db
+    .select({
+      caps: schema.deviceModels.ioCapabilities,
+      agent: schema.devices.agent,
+      simulated: schema.devices.simulated,
+      reportedConfig: schema.devices.reportedConfig,
+      agentVersion: schema.devices.agentVersion,
+    })
+    .from(schema.devices)
+    .innerJoin(
+      schema.deviceModels,
+      eq(schema.devices.deviceModelId, schema.deviceModels.id),
+    )
+    .where(eq(schema.devices.id, deviceId))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return { hardware: null, facts: {} };
+  return {
+    hardware: deriveHardwareBlock(row.caps),
+    facts: { cameraSensors: cameraSensorsEligibility(row) },
+  };
 }
 
 /**
@@ -288,8 +343,18 @@ async function publishRetainedConfig(
   rev: number,
   scope: DeviceScope | null,
 ): Promise<void> {
-  const hardware = await deviceHardwareBlock(deviceId);
-  const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope, hardware);
+  // The device-gated namespace needs the row (agent, simulated, last report).
+  // Read it ONLY for a document that actually holds the key: every other
+  // publish (every JS device, every device fielded before the namespace) runs
+  // the one model read it always ran, unchanged.
+  const holdsCameraSensors =
+    doc !== null &&
+    doc !== undefined &&
+    Object.prototype.hasOwnProperty.call(doc, CAMERA_SENSORS_KEY);
+  const { hardware, facts } = holdsCameraSensors
+    ? await devicePublishFacts(deviceId)
+    : { hardware: await deviceHardwareBlock(deviceId), facts: {} };
+  const message = buildDeviceConfigMessage(doc, rev, Date.now(), scope, hardware, facts);
   const client = await iotDataClient();
   await client.send(
     new PublishCommand({

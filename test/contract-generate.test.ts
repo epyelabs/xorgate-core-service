@@ -634,8 +634,10 @@ describe('the config contract', () => {
     // The generator work must never move the contract. This is the same hash
     // `test/sdk-vendor-drift.test.ts` pins for the committed file; when a
     // registry change legitimately moves the contract, both move together.
+    // 2026-11-21: moved by the `cameraSensors` namespace (Phase 2), from
+    // 5bb0025e…88a0.
     expect(createHash('sha256').update(CONTENTS['config-contract']).digest('hex')).toBe(
-      '5bb0025eae4fa53108157ce1b993933b6d4fcf65403af2136d4e0194b3fc88a0',
+      'cb100aaa3d6aff25c7ad1ad91c887f275616ec3a62036eb16fa1c8c19a3d0959',
     );
   });
 });

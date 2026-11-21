@@ -7,6 +7,7 @@ import { resolveWorkspaceScope } from '../services/workspace-scope';
 import { publishDeviceCommand, type DeviceCommandName } from '../services/device-command';
 import { accepted, errorResponse, notFound, ok } from '../utils/responses';
 import { uuidv7 } from '../utils/uuidv7';
+import { hasAgentCapability } from '../services/device-agent';
 
 /**
  * `/devices/{id}/sms-reads` (plans/device-sms-inbox, Phase 2; the wire shapes
@@ -101,16 +102,9 @@ export function supportsSmsRead(reportedConfig: unknown): boolean {
   return hasAgentCapability(reportedConfig, SMS_READ_CAPABILITY);
 }
 
-/** True when `effective.agent.capabilities` is an array that includes `capability`. */
-export function hasAgentCapability(reportedConfig: unknown, capability: string): boolean {
-  if (!reportedConfig || typeof reportedConfig !== 'object') return false;
-  const effective = (reportedConfig as { effective?: unknown }).effective;
-  if (!effective || typeof effective !== 'object') return false;
-  const agent = (effective as { agent?: unknown }).agent;
-  if (!agent || typeof agent !== 'object') return false;
-  const capabilities = (agent as { capabilities?: unknown }).capabilities;
-  return Array.isArray(capabilities) && capabilities.includes(capability);
-}
+// Lives in services/device-agent.ts (the config registry gates a namespace on a
+// capability too); re-exported so this module's importers keep working.
+export { hasAgentCapability };
 
 /**
  * `{ limit? }` -> the clamped limit, or an error. Absent / null = the default;
