@@ -46,8 +46,10 @@ const OBD: DeviceHardwareBlock = {
 };
 
 describe('obd namespace — schema', () => {
-  it('is registered last, after simulation, and is the only model-gated namespace', () => {
-    expect(CONFIG_NAMESPACE_KEYS.at(-1)).toBe('obd');
+  it('is registered after simulation, and is the only model-gated namespace', () => {
+    // It was the last namespace until `cameraSensors` was appended after it
+    // (plans/support-other-camera-models); its own position did not move.
+    expect(CONFIG_NAMESPACE_KEYS.indexOf('obd')).toBe(8);
     expect(CONFIG_NAMESPACE_KEYS.indexOf('obd')).toBeGreaterThan(CONFIG_NAMESPACE_KEYS.indexOf('simulation'));
     expect(OBD_ONLY_NAMESPACES).toEqual(['obd']);
   });

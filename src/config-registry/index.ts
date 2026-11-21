@@ -18,6 +18,7 @@
  * thermal-shed keys shipped present in 2 of 5 places.
  */
 import type { ConfigNamespaceSpec } from './types';
+import { clip } from '../camera-catalog/message';
 import { gnssAntBiasNamespace } from './gnss-ant-bias';
 import { imuMountNamespace, type ImuMountConfig } from './imu-mount';
 import { recordingNamespace, type RecordingConfig } from './recording';
@@ -27,6 +28,14 @@ import { cellularNamespace, type CellularConfig } from './cellular';
 import { cameraMountNamespace, type CameraMountConfig } from './camera-mount';
 import { simulationNamespace, type SimulationConfig } from './simulation';
 import { obdNamespace, type ObdConfig } from './obd';
+import {
+  CAMERA_SENSORS_KEY,
+  CAMERA_SENSORS_UNPROVEN,
+  cameraSensorsNamespace,
+  cameraSensorsPortError,
+  type CameraSensorsConfig,
+  type CameraSensorsEligibility,
+} from './camera-sensors';
 
 export * from './types';
 export * from './gnss-ant-bias';
@@ -38,6 +47,7 @@ export * from './cellular';
 export * from './camera-mount';
 export * from './simulation';
 export * from './obd';
+export * from './camera-sensors';
 export * from './ui-prefs';
 
 /**
@@ -55,6 +65,9 @@ export const CONFIG_NAMESPACES: readonly ConfigNamespaceSpec[] = [
   cameraMountNamespace,
   simulationNamespace,
   obdNamespace,
+  // Appended LAST (plans/support-other-camera-models): a new key at the end
+  // leaves the published order of every existing key as it was.
+  cameraSensorsNamespace,
 ];
 
 export const CONFIG_NAMESPACE_KEYS = CONFIG_NAMESPACES.map((n) => n.key);
@@ -93,6 +106,7 @@ export interface DeviceConfigDocument {
   cameraMount?: CameraMountConfig | null;
   simulation?: SimulationConfig | null;
   obd?: ObdConfig | null;
+  cameraSensors?: CameraSensorsConfig | null;
 }
 
 /**
@@ -121,6 +135,15 @@ export function publicConfigDocument(
 
 /** Loose view of the same document, for generic namespace-keyed manipulation. */
 export type ConfigDocument = Record<string, unknown>;
+
+/**
+ * An issue path as text. A path segment can be a KEY THE CALLER SENT (a stream
+ * key that failed its pattern, say), so each one is cut at 64 characters: a
+ * 200 KB key must not come back as a 200 KB 400 body.
+ */
+export function issuePathText(path: readonly (string | number)[]): string {
+  return path.map((segment) => clip(String(segment), 67)).join('.');
+}
 
 /**
  * Validate one namespace value.
@@ -160,7 +183,7 @@ export function validateNamespaceValue(
   const parsed = spec.schema.safeParse(value);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    const path = issue?.path.length ? `${label}.${issue.path.join('.')}` : label;
+    const path = issue?.path.length ? `${label}.${issuePathText(issue.path)}` : label;
     return { error: `${path}: ${issue?.message ?? 'invalid'}` };
   }
   return { value: parsed.data };
@@ -186,28 +209,54 @@ export const SIMULATED_ONLY_NAMESPACES: readonly string[] = ['simulation'];
 export const OBD_ONLY_NAMESPACES: readonly string[] = ['obd'];
 
 /**
+ * Namespaces only a real device running a capable Rust agent may hold
+ * (plans/support-other-camera-models, Phase 2). The fact is per device and is
+ * resolved by `cameraSensorsEligibility` (`camera-sensors.ts`): agent kind,
+ * not simulated, and never reported or reporting the `camera.sensors`
+ * capability. Asked at PATCH, at the local-change mirror and at the retained
+ * publish, like the two fences above.
+ */
+export const CAMERA_SENSORS_ONLY_NAMESPACES: readonly string[] = [CAMERA_SENSORS_KEY];
+
+/**
  * What a namespace's acceptance can depend on, resolved per device by the
  * caller: `simulated` is `devices.simulated`; `obd` is whether the device's
- * model declares `peripherals.obd` (`deviceHardwareBlock(...)?.peripherals?.obd`).
- * Both default to false, i.e. a gated namespace is refused unless the caller
+ * model declares `peripherals.obd` (`deviceHardwareBlock(...)?.peripherals?.obd`);
+ * `cameraSensors` is `cameraSensorsEligibility(deviceRow)`.
+ * All default to "no", i.e. a gated namespace is refused unless the caller
  * proves the device qualifies.
+ *
+ * `cameraPorts` is not a gate but a bound on an accepted `cameraSensors`
+ * value: the camera stream keys the device's model declares
+ * (`declaredCameraPorts(hardware)`). null/absent = unknown, and then every
+ * `cameraSensors` value but the cleared marker is REFUSED (fails closed).
  */
 export interface NamespaceGateFacts {
   simulated?: boolean;
   obd?: boolean;
+  cameraSensors?: CameraSensorsEligibility;
+  cameraPorts?: readonly string[] | null;
 }
 
 /** False when `key` is gated on a device fact the caller did not assert. */
 export function namespaceAllowedFor(key: string, opts: NamespaceGateFacts): boolean {
   if (SIMULATED_ONLY_NAMESPACES.includes(key) && opts.simulated !== true) return false;
   if (OBD_ONLY_NAMESPACES.includes(key) && opts.obd !== true) return false;
+  if (CAMERA_SENSORS_ONLY_NAMESPACES.includes(key) && opts.cameraSensors?.allowed !== true) {
+    return false;
+  }
   return true;
 }
 
-/** The 400 text for a gated namespace, naming the fact the device lacks. */
-export function namespaceRefusalMessage(keys: string[]): string {
+/**
+ * The 400 text for a gated namespace, naming the fact the device lacks. `opts`
+ * are the same facts `namespaceAllowedFor` was asked with: the `cameraSensors`
+ * refusal carries its own sentence (which agent, which version).
+ */
+export function namespaceRefusalMessage(keys: string[], opts: NamespaceGateFacts = {}): string {
   const sim = keys.filter((k) => SIMULATED_ONLY_NAMESPACES.includes(k));
   const obd = keys.filter((k) => OBD_ONLY_NAMESPACES.includes(k));
+  const cam = keys.filter((k) => CAMERA_SENSORS_ONLY_NAMESPACES.includes(k));
   const parts: string[] = [];
   if (sim.length > 0) {
     parts.push(`config namespace(s) ${sim.join(', ')} apply only to simulated devices`);
@@ -218,7 +267,26 @@ export function namespaceRefusalMessage(keys: string[]): string {
         'peripherals.obd (an OBD-II kit); this device\'s model does not',
     );
   }
+  if (cam.length > 0) {
+    const facts = opts.cameraSensors;
+    parts.push((facts && !facts.allowed ? facts : CAMERA_SENSORS_UNPROVEN).message);
+  }
   return parts.join('; ');
+}
+
+/**
+ * The per-device bounds on a namespace value that has passed its schema.
+ * Returns the error text, or null. Today: a `cameraSensors` key must be a
+ * camera port the device's model declares.
+ */
+export function namespaceDeviceError(
+  key: string,
+  value: unknown,
+  opts: NamespaceGateFacts,
+  label = key,
+): string | null {
+  if (key === CAMERA_SENSORS_KEY) return cameraSensorsPortError(value, opts.cameraPorts, label);
+  return null;
 }
 
 /**
@@ -243,11 +311,13 @@ export function validateConfigPatch(
     };
   }
   const refused = keys.filter((k) => !namespaceAllowedFor(k, opts));
-  if (refused.length > 0) return { error: namespaceRefusalMessage(refused) };
+  if (refused.length > 0) return { error: namespaceRefusalMessage(refused, opts) };
   const out: Record<string, unknown> = {};
   for (const key of keys) {
     const parsed = validateNamespaceValue(key, src[key]);
     if ('error' in parsed) return parsed;
+    const deviceError = namespaceDeviceError(key, parsed.value, opts);
+    if (deviceError) return { error: deviceError };
     out[key] = parsed.value;
   }
   return { value: out };

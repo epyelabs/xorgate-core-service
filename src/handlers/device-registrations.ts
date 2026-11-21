@@ -21,8 +21,19 @@ import { generateRegistrationCode } from '../utils/registration-code';
 import { provisionDevice, deleteThing } from '../services/iot-provisioning';
 import { publishDeviceConfig } from '../services/device-config';
 import { resolveModel } from '../services/model-probe';
-import { deriveHardwareBlock } from '../schemas/capabilities';
-import { initialConfigDocument } from '../config-registry/index';
+import { deriveHardwareBlock, type DeviceHardwareBlock } from '../schemas/capabilities';
+import {
+  CAMERA_SENSORS_CAPABILITY,
+  CAMERA_SENSORS_KEY,
+  cameraSensorMapSchema,
+  checkCameraSensorMap,
+  initialConfigDocument,
+  issuePathText,
+  type CameraSensorEntry,
+  type CameraSensorsConfig,
+  type ConfigDocument,
+} from '../config-registry/index';
+import { CAMERA_SENSOR_NONE, cameraSensor } from '../camera-catalog';
 import { apiHandler } from '../utils/api-handler';
 import {
   type AgentKind,
@@ -53,17 +64,70 @@ interface RegistrationView {
   installUrl: string;
   /** Which installer `installUrl` serves (dual-agent registration D3). */
   agent: AgentKind;
+  /**
+   * The per-port camera sensor choice the claim will seed
+   * (plans/support-other-camera-models); null = none made, the claim uses the
+   * model's sensor defaults. Present on RUST registrations only: a JS
+   * registration's view has exactly the keys it always had.
+   */
+  cameras?: RegistrationCameras | null;
 }
 
+/** `device_registrations.cameras`: the `cameras` map of the `cameraSensors` namespace. */
+type RegistrationCameras = Record<string, CameraSensorEntry>;
+
 function toView(row: DeviceRegistration): RegistrationView {
+  const agent = storedAgent(row.agent);
   return {
     code: row.code,
     status: row.status,
     deviceId: row.deviceId,
     expiresAt: row.expiresAt.toISOString(),
     installUrl: `${apiBaseUrl()}/get/${row.code}`,
-    agent: storedAgent(row.agent),
+    agent,
+    ...(agent === 'rust' ? { cameras: row.cameras ?? null } : {}),
   };
+}
+
+/** Key-order-insensitive equality for two stored camera choices. */
+function sameCameras(a: RegistrationCameras | null, b: RegistrationCameras | null): boolean {
+  const canon = (v: unknown): unknown =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(
+          Object.entries(v as Record<string, unknown>)
+            .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))
+            .map(([k, w]) => [k, canon(w)]),
+        )
+      : v;
+  return JSON.stringify(canon(a)) === JSON.stringify(canon(b));
+}
+
+/**
+ * Validate the `cameras` field of a registration body: the per-port map of the
+ * `cameraSensors` namespace, judged by the namespace's own schema (shape, then
+ * the catalog). `null` and `{}` both mean "no choice".
+ *
+ * Ports are NOT checked against a model here: the model may still be decided
+ * by the probe at claim, and the claim drops entries for ports the resolved
+ * model does not declare.
+ */
+function parseRegistrationCameras(
+  input: unknown,
+): { value: RegistrationCameras | null } | { error: string } {
+  if (input === null) return { value: null };
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    return {
+      error:
+        'cameras: must be an object keyed by stream key, like {"cam0": {"sensor": "imx290"}}, or null',
+    };
+  }
+  const parsed = cameraSensorMapSchema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path.length ? `cameras.${issuePathText(issue.path)}` : 'cameras';
+    return { error: `${path}: ${issue?.message ?? 'invalid'}` };
+  }
+  return { value: Object.keys(parsed.data).length > 0 ? parsed.data : null };
 }
 
 // Router: POST /device-registrations, GET /device-registrations/{code},
@@ -117,7 +181,7 @@ async function createRegistration(
   // Optional explicit model pick (cm4-support D3 override): when the operator
   // chooses a model in the Register dialog, the claim honors it and skips
   // probe-at-claim mapping (`model_pinned`).
-  let body: { deviceModelId?: string; agent?: unknown } = {};
+  let body: { deviceModelId?: string; agent?: unknown; cameras?: unknown } = {};
   try {
     body = JSON.parse(event.body ?? '{}');
   } catch {
@@ -140,6 +204,25 @@ async function createRegistration(
       'AGENT_NOT_ENABLED',
       'Rust agent registration is not enabled on this stage for this workspace.',
     );
+  }
+  // The per-port camera sensor choice (plans/support-other-camera-models). Only
+  // the Rust agent manages camera sensors, so the field exists only for a Rust
+  // registration: on a JS one it is refused rather than stored and ignored.
+  // `undefined` = the request does not speak about cameras (a reused code keeps
+  // what it has); `null` = clear the choice.
+  let cameras: RegistrationCameras | null | undefined;
+  if (body.cameras !== undefined) {
+    if (agent !== 'rust') {
+      return errorResponse(
+        400,
+        'INVALID_CAMERAS',
+        'cameras applies only to Rust agent registrations (agent: "rust"); the JS agent does ' +
+          'not manage camera sensors',
+      );
+    }
+    const parsed = parseRegistrationCameras(body.cameras);
+    if ('error' in parsed) return errorResponse(400, 'INVALID_CAMERAS', parsed.error);
+    cameras = parsed.value;
   }
   let pinnedModelId: string | null = null;
   if (body.deviceModelId !== undefined) {
@@ -180,11 +263,28 @@ async function createRegistration(
   });
   if (existing) {
     // Idempotent reuse — but an operator changing the model pick in the dialog
-    // must not be silently ignored on the reused row.
+    // must not be silently ignored on the reused row. Same for the camera
+    // choice: it is re-pinned in place, never a reason to mint a new code.
+    const repin: {
+      deviceModelId?: string;
+      modelPinned?: boolean;
+      cameras?: RegistrationCameras | null;
+    } = {};
     if (pinnedModelId && (existing.deviceModelId !== pinnedModelId || !existing.modelPinned)) {
+      repin.deviceModelId = pinnedModelId;
+      repin.modelPinned = true;
+    }
+    // DELIBERATE (review N4): a request that does not send `cameras` KEEPS the
+    // choice already on the reused code, it does not reset it to the model
+    // defaults (`null` does that). A code is shared by the workspace for its 15
+    // minutes, so the last re-pin wins, exactly as for the model pick above.
+    if (cameras !== undefined && !sameCameras(existing.cameras ?? null, cameras)) {
+      repin.cameras = cameras;
+    }
+    if (Object.keys(repin).length > 0) {
       const [repinned] = await db
         .update(schema.deviceRegistrations)
-        .set({ deviceModelId: pinnedModelId, modelPinned: true })
+        .set(repin)
         .where(eq(schema.deviceRegistrations.id, existing.id))
         .returning();
       return ok(toView(repinned!));
@@ -201,6 +301,9 @@ async function createRegistration(
       deviceModelId: pinnedModelId ?? model.id,
       modelPinned: pinnedModelId !== null,
       agent,
+      // Only when a choice was made: a JS registration, and a Rust one with no
+      // choice, insert exactly the columns they always did (NULL by default).
+      ...(cameras ? { cameras } : {}),
       // Exactly one of these is set. An API-key caller has no `users` row to
       // point at, so attribution moves to the key rather than being dropped.
       createdByUserId: auth.userId,
@@ -282,6 +385,12 @@ async function claimRegistration(
     cameras?: number;
     /** The installer's own idea of its agent (the Rust provisioner sends "rust"; JS sends none). */
     agent?: unknown;
+    /**
+     * What the installer and the agent it installs can act on, as capability
+     * strings (the vocabulary of `effective.agent.capabilities`). Optional;
+     * see `installerCapabilities`. Read for Rust registrations only.
+     */
+    capabilities?: unknown;
   };
   try {
     body = JSON.parse(event.body ?? '{}');
@@ -334,6 +443,12 @@ async function claimRegistration(
   const regModel = await db.query.deviceModels.findFirst({
     where: eq(schema.deviceModels.id, reg.deviceModelId),
   });
+  // The agent the REGISTRATION chose (see the cross-check below). Read here
+  // because the camera choice, a Rust-only carry, feeds the model resolution.
+  const agent = storedAgent(reg.agent);
+  const chosenCameras: RegistrationCameras | null =
+    agent === 'rust' ? (reg.cameras ?? null) : null;
+
   let resolvedModel = regModel;
   let needsModel = false;
   if (regModel && !reg.modelPinned) {
@@ -341,6 +456,11 @@ async function claimRegistration(
     const res = resolveModel(catalog, regModel, {
       dtModel: body.dtModel,
       cameras: body.cameras,
+      // A fresh OS has no camera overlay yet, so the probe says 0. The number
+      // of sensors the operator declared then stands in as the count
+      // (plans/support-other-camera-models). Absent for a JS registration and
+      // for a Rust one with no choice: the resolution is then what it was.
+      ...(chosenCameras ? { declaredCameras: declaredSensorCount(chosenCameras) } : {}),
     });
     resolvedModel = res.model;
     needsModel = res.needsModel;
@@ -358,7 +478,6 @@ async function claimRegistration(
   // The device runs the agent its REGISTRATION chose: that is what
   // `GET /get/{code}` served. The claim body's `agent` is only a cross-check; a
   // mismatch is logged and the registration's value kept.
-  const agent = storedAgent(reg.agent);
   const claimedAgent = body.agent === undefined ? 'js' : body.agent;
   if (claimedAgent !== agent) {
     console.warn('claim agent mismatch; keeping the registration agent', {
@@ -367,6 +486,33 @@ async function claimRegistration(
       claimedAgent: typeof claimedAgent === 'string' ? claimedAgent.slice(0, 16) : typeof claimedAgent,
     });
   }
+
+  // The camera sensors this device starts with (plans/support-other-camera-models):
+  // RUST registrations only. Per camera port of the resolved model, the
+  // registration's choice, else the model's own sensor. A JS claim seeds nothing
+  // and its document, its retained message and its response are exactly what
+  // they were (a `capabilities` field on a JS claim is not read).
+  //
+  // …and only when the claim REQUEST proves an installer that acts on it: the
+  // Rust provisioner of agent 0.2.0+ sends `capabilities: ["camera.sensors"]`.
+  // An installer that does not (every v0.1.1 one) gets NO seed and NO echo: its
+  // device document, retained message and response are what they were before
+  // the namespace existed, and the registration's choice is simply not applied
+  // (it stays on the registration row). Seeding for an agent that then reports
+  // without the capability would make the report mirror's withdrawal the
+  // normal path of every registration; it is meant to be the safety net.
+  const hardware = deriveHardwareBlock(resolvedModel?.ioCapabilities);
+  const seeds =
+    agent === 'rust' && installerCapabilities(body.capabilities).includes(CAMERA_SENSORS_CAPABILITY);
+  const cameraSensors = seeds ? seedCameraSensors(hardware, chosenCameras, { code }) : null;
+  if (agent === 'rust' && !seeds && chosenCameras) {
+    console.warn('claim: camera choice not applied, the installer did not declare camera.sensors', {
+      code,
+      ports: Object.keys(chosenCameras),
+    });
+  }
+  const initialConfig: ConfigDocument = initialConfigDocument();
+  if (cameraSensors) initialConfig[CAMERA_SENSORS_KEY] = cameraSensors;
 
   // Step 2: create the device row.
   let device;
@@ -383,7 +529,7 @@ async function claimRegistration(
         // status omitted: column DEFAULT 'provisioned' fires.
         // rev 1 (not the 0 default) marks "the cloud has published a document";
         // rev 0 means the topic was never written. See step 5 below.
-        config: initialConfigDocument(),
+        config: initialConfig,
         configRev: 1,
         configUpdatedAt: new Date(),
       })
@@ -425,6 +571,12 @@ async function claimRegistration(
   // `{v:1, rev:1, gnssAntBias:false, …}` marker, not a values freeze.
   // Best-effort: a publish failure must never fail a claim that has already
   // created the row, the thing and the cert — the next save republishes.
+  //
+  // A capable Rust claim's document carries the seeded `cameraSensors`. The
+  // publisher emits it because this device has never reported
+  // (`cameraSensorsEligibility`); if the agent that connects turns out not to
+  // support it after all, the report mirror withdraws it and republishes
+  // without it.
   try {
     await publishDeviceConfig(device!.id, device!.config, device!.configRev);
   } catch (err) {
@@ -465,8 +617,103 @@ async function claimRegistration(
     modelId: resolvedModel?.id ?? reg.deviceModelId,
     modelName: resolvedModel?.name ?? null,
     needsModel,
-    hardware: deriveHardwareBlock(resolvedModel?.ioCapabilities),
+    hardware,
+    // RUST claims that declared `camera.sensors` and got a seed only
+    // (plans/support-other-camera-models): exactly what was stored in
+    // `devices.config.cameraSensors`. The Rust installer renders the camera
+    // lines of config.txt from it. Absent on every JS claim, on a Rust claim
+    // from an installer that did not declare the capability, and on one whose
+    // model declares no camera port.
+    ...(cameraSensors ? { [CAMERA_SENSORS_KEY]: cameraSensors } : {}),
   });
+}
+
+/** Bounds on the claim body's `capabilities`: a list beyond them is not read at all. */
+const CLAIM_CAPABILITIES_MAX = 32;
+const CLAIM_CAPABILITY_MAX_CHARS = 64;
+
+/**
+ * The capability strings a claim body declares, or none.
+ *
+ * TOLERANT, never a 4xx: the claim is called by installers already in the
+ * field, and an old one sends no such field. Anything that is not an array, or
+ * an array of more than `CLAIM_CAPABILITIES_MAX` items, reads as "declares
+ * nothing". Inside an accepted list, an item that is not a string or is longer
+ * than `CLAIM_CAPABILITY_MAX_CHARS` is skipped, and a string this backend does
+ * not know is simply never looked for.
+ */
+function installerCapabilities(input: unknown): string[] {
+  if (!Array.isArray(input) || input.length > CLAIM_CAPABILITIES_MAX) return [];
+  return input.filter(
+    (item): item is string => typeof item === 'string' && item.length <= CLAIM_CAPABILITY_MAX_CHARS,
+  );
+}
+
+/** How many ports of a choice declare a sensor (`none` = an empty port, not counted). */
+function declaredSensorCount(cameras: RegistrationCameras): number {
+  return Object.values(cameras).filter(
+    (c) => c && typeof c === 'object' && c.sensor !== CAMERA_SENSOR_NONE,
+  ).length;
+}
+
+/**
+ * The `cameraSensors` document a new Rust device starts with, or null when
+ * there is nothing to manage.
+ *
+ * Per camera port the resolved model declares, in model order:
+ *   1. the registration's choice for that port, if it still passes the catalog
+ *      (it was validated when stored; a catalog change since is possible);
+ *   2. else the model's own `sensor`, if the catalog can select it;
+ *   3. else the port is left out, i.e. UNMANAGED (a model naming a sensor the
+ *      catalog does not know keeps today's behaviour for that port).
+ *
+ * A choice for a port the model does not declare is DROPPED, with a log line:
+ * the model may have been resolved by the probe after the choice was made.
+ * With no hardware block (a schemaVersion-1 model) there are no declared ports,
+ * so nothing is seeded.
+ */
+function seedCameraSensors(
+  hardware: DeviceHardwareBlock | null,
+  chosen: RegistrationCameras | null,
+  log: { code: string },
+): CameraSensorsConfig | null {
+  const ports = hardware?.video ?? [];
+  const declared = new Set(ports.map((p) => p.key));
+  const dropped = Object.keys(chosen ?? {}).filter((key) => !declared.has(key));
+  if (dropped.length > 0) {
+    console.warn('claim: camera choice dropped for ports the resolved model does not declare', {
+      code: log.code,
+      dropped,
+      modelPorts: [...declared],
+    });
+  }
+
+  const cameras: Record<string, CameraSensorEntry> = {};
+  for (const port of ports) {
+    const choice = chosen?.[port.key];
+    if (choice) {
+      const checked = checkCameraSensorMap({ [port.key]: choice });
+      if ('value' in checked) {
+        cameras[port.key] = checked.value[port.key];
+        continue;
+      }
+      console.warn('claim: stored camera choice no longer valid, using the model default', {
+        code: log.code,
+        port: port.key,
+        issues: checked.issues.map((i) => i.message),
+      });
+    }
+    if (cameraSensor(port.sensor)) {
+      cameras[port.key] = { sensor: port.sensor };
+    } else {
+      console.warn('claim: model sensor is not in the camera catalog, port left unmanaged', {
+        code: log.code,
+        port: port.key,
+        sensor: port.sensor,
+      });
+    }
+  }
+  return Object.keys(cameras).length > 0 ? { cameras } : null;
 }
 
 async function revertClaim(registrationId: string): Promise<void> {

@@ -18,7 +18,11 @@ import {
   ok,
 } from '../utils/responses';
 import { pageMeta, parseListParams } from '../utils/list-params';
-import { deviceDeclaresObd, publishDeviceConfig } from '../services/device-config';
+import {
+  deviceDeclaresObd,
+  deviceHardwareBlock,
+  publishDeviceConfig,
+} from '../services/device-config';
 import {
   applyConfigPatch,
   CONFIG_NAMESPACES,
@@ -27,7 +31,11 @@ import {
   validateConfigPatch,
   validateNamespaceValue,
   type DeviceConfigDocument,
+  type NamespaceGateFacts,
   OBD_ONLY_NAMESPACES,
+  CAMERA_SENSORS_ONLY_NAMESPACES,
+  cameraSensorsEligibility,
+  declaredCameraPorts,
 } from '../config-registry/index';
 import { legacyConfigColumns, legacyUiPrefColumns } from '../config-registry/legacy-columns';
 import { apiHandler } from '../utils/api-handler';
@@ -54,6 +62,12 @@ const LEGACY_UI_PREF_FIELDS = ['activeStreamsViewType', 'imuView'] as const;
 function hasObdNamespace(body: unknown): boolean {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
   return Object.keys(body).some((k) => OBD_ONLY_NAMESPACES.includes(k));
+}
+
+/** True when a PATCH body names the device-gated camera namespace. */
+function hasCameraSensorsNamespace(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  return Object.keys(body).some((k) => CAMERA_SENSORS_ONLY_NAMESPACES.includes(k));
 }
 
 async function findDevice(id: string, orgWorkspaceIds: string[]): Promise<DeviceRow | undefined> {
@@ -175,7 +189,19 @@ const restHandler = async (
     // (plans/obd2-bluetooth-integration, P3). The model read is skipped unless
     // the body actually carries a gated namespace.
     const obd = hasObdNamespace(body) ? await deviceDeclaresObd(id) : false;
-    const parsed = validateConfigPatch(body, { simulated: device.simulated, obd });
+    const facts: NamespaceGateFacts = { simulated: device.simulated, obd };
+    // `cameraSensors` (plans/support-other-camera-models): only a real device
+    // on a Rust agent that has never reported or reports `camera.sensors`. A
+    // device that does not qualify gets a 400 naming the agent version needed,
+    // never a stored value its agent would ignore. For one that does, the
+    // model's camera ports bound the keys (read only then).
+    if (hasCameraSensorsNamespace(body)) {
+      facts.cameraSensors = cameraSensorsEligibility(device);
+      if (facts.cameraSensors.allowed) {
+        facts.cameraPorts = declaredCameraPorts(await deviceHardwareBlock(id));
+      }
+    }
+    const parsed = validateConfigPatch(body, facts);
     if ('error' in parsed) return badRequest(parsed.error);
 
     const nextConfig = applyConfigPatch(device.config, parsed.value) as DeviceConfigDocument;

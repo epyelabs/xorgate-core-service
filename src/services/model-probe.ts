@@ -18,6 +18,12 @@ import {
  * - Platform must match. Camera count narrows FURTHER only when the probe saw
  *   at least one camera: on a fresh install the sensors' overlays aren't in
  *   config.txt yet, so a 0/absent count means "unknown", not "zero cameras".
+ * - When the probe saw none, the number of cameras the OPERATOR declared on
+ *   the registration stands in as the count (`declaredCameras`,
+ *   plans/support-other-camera-models). That is the fresh-OS case exactly: the
+ *   probe runs before any overlay line is written, so it can only say 0, while
+ *   the Register dialog already knows how many sensors were picked. A count
+ *   the probe measured always wins over a declared one.
  * - Exactly one candidate → assigned, done. Anything else (unknown platform,
  *   no candidate, two SKUs the probe can't separate) → the claim keeps
  *   `fallback` (the registration's model) and flags the device `needs_model`
@@ -28,6 +34,12 @@ export interface ClaimProbe {
   dtModel?: string | null;
   /** Number of cameras libcamera enumerated at install time; 0/absent = unknown. */
   cameras?: number | null;
+  /**
+   * Number of camera ports the registration declares a sensor on (`none` not
+   * counted). Used as the count only when `cameras` is 0/absent. 0/absent =
+   * nothing declared, i.e. still unknown.
+   */
+  declaredCameras?: number | null;
 }
 
 export interface ModelResolution {
@@ -49,6 +61,11 @@ function modelPlatform(model: DeviceModel): Platform | null {
   return parsed.success ? parsed.data.system.platform : null;
 }
 
+/** A camera count as a whole positive number; anything else is 0 = unknown. */
+function positiveCount(n: number | null | undefined): number {
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
 export function resolveModel(
   catalog: DeviceModel[],
   fallback: DeviceModel,
@@ -65,7 +82,12 @@ export function resolveModel(
   }
 
   let candidates = catalog.filter((m) => modelPlatform(m) === platform);
-  const cameras = probe.cameras ?? 0;
+  // The measured count is used exactly as before; only "the probe saw none"
+  // falls through to what the registration declares.
+  const probed = probe.cameras ?? 0;
+  const measured = probed > 0;
+  const cameras = measured ? probed : positiveCount(probe.declaredCameras);
+  const countSource = measured ? '' : ' declared';
   if (cameras > 0 && candidates.length > 1) {
     const narrowed = candidates.filter((m) => videoCount(m) === cameras);
     // A camera count matching nothing is treated as non-narrowing rather than
@@ -77,7 +99,7 @@ export function resolveModel(
     return {
       model: candidates[0],
       needsModel: false,
-      reason: `probe matched ${candidates[0].sku} (platform=${platform}${cameras > 0 ? `, cameras=${cameras}` : ''})`,
+      reason: `probe matched ${candidates[0].sku} (platform=${platform}${cameras > 0 ? `, cameras=${cameras}${countSource}` : ''})`,
       platform,
     };
   }

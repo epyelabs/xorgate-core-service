@@ -80,3 +80,22 @@ export function rustRegistrationEnabled(
   if (!workspaceId) return false;
   return flag.workspaceIds.has(workspaceId.trim().toLowerCase());
 }
+
+/**
+ * True when a device's last config report (`devices.reported_config`)
+ * advertises `capability`: `effective.agent.capabilities` is an array that
+ * includes it. False for a device that has never reported, for a report with
+ * no `agent` block, and for anything that is not the expected shape.
+ *
+ * The one reader of that list. Commands gate on it (`sms.read`, …) and so does
+ * the `cameraSensors` config namespace (`camera.sensors`).
+ */
+export function hasAgentCapability(reportedConfig: unknown, capability: string): boolean {
+  if (!reportedConfig || typeof reportedConfig !== 'object') return false;
+  const effective = (reportedConfig as { effective?: unknown }).effective;
+  if (!effective || typeof effective !== 'object') return false;
+  const agent = (effective as { agent?: unknown }).agent;
+  if (!agent || typeof agent !== 'object') return false;
+  const capabilities = (agent as { capabilities?: unknown }).capabilities;
+  return Array.isArray(capabilities) && capabilities.includes(capability);
+}

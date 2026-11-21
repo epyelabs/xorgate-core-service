@@ -59,9 +59,16 @@ const PINS: Pin[] = [
     // 2026-10-16: OBD torque fields (engine_torque_pct, reference_torque,
     // engine_torque) in the `obd` namespace's `fields` enum; re-vendored into
     // the SDK on branch feat/obd-torque (0.16.0; publish is the owner's).
-    sha256: '5bb0025eae4fa53108157ce1b993933b6d4fcf65403af2136d4e0194b3fc88a0',
+    // 2026-11-21: the `cameraSensors` namespace appended last
+    // (plans/support-other-camera-models, Phase 2 backend): additive, no
+    // existing namespace changed. ⚠️ NOT YET re-vendored into the SDK: that is
+    // Phase 3 of the plan (vendor copy + `NAMESPACE_TYPES` + regenerate; the
+    // publish is the owner's). Until then the SDK's generated config types
+    // simply do not know the namespace. Previous pin 2026-10-16
+    // (5bb0025e…88a0, SDK 0.16.0).
+    sha256: 'cb100aaa3d6aff25c7ad1ad91c887f275616ec3a62036eb16fa1c8c19a3d0959',
     vendoredAs: 'vendor/config-contract.json (verbatim copy)',
-    pinnedAt: '2026-10-16',
+    pinnedAt: '2026-11-21',
   },
   {
     file: 'src/schemas/capabilities.ts',

@@ -10,7 +10,11 @@ import { UI_PREFS_DEFAULTS, uiPrefsSchema } from './ui-prefs';
  * three packages:
  *   backend  src/config-registry/config-contract.json  (source of truth)
  *   web      src/lib/config-contract.json              (imported by the UI)
- *   device   test/config-contract.json                 (contract test only)
+ *   device   fixtures/config-contract.json             (Rust agent, contract test only)
+ *
+ * The frozen JS agent's `test/config-contract.json` is no longer written by the
+ * generator (plans/support-other-camera-models): it stays as the contract that
+ * agent was built against.
  *
  * There is no runtime coupling between the packages — the artifact plus one
  * test per package is what keeps them honest, which is exactly what nothing did
