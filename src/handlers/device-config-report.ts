@@ -583,11 +583,13 @@ async function mirrorLocalChange(
  * it cannot act on it (plans/support-other-camera-models, Phase 2).
  *
  * How a device gets here: the namespace may be stored while a device has NEVER
- * reported (that is when a registration's sensor choice is seeded, at claim).
- * If the agent that then connects predates the namespace it ignores the key,
- * sends no status entry for it, and every reader would show the setting as
- * applied. The same happens when a capable device is downgraded or reverted to
- * the JS agent. So on a report that carries a capability list WITHOUT
+ * reported (a claim that declared `camera.sensors` seeds it, and a PATCH is
+ * accepted in that window). If the agent that then connects predates the
+ * namespace it ignores the key, sends no status entry for it, and every reader
+ * would show the setting as applied. The same happens when a capable device is
+ * downgraded or reverted to the JS agent. This is the SAFETY NET, not the
+ * normal path: a claim seeds only for an installer that declared the
+ * capability (`handlers/device-registrations.ts`). So on a report that carries a capability list WITHOUT
  * `camera.sensors`, the key is removed from the desired document, the rev is
  * bumped and the retained message republished, which leaves cloud, retained
  * message and device agreeing: the ports are unmanaged, exactly like a device
@@ -600,6 +602,12 @@ async function mirrorLocalChange(
  *
  * Costs nothing for a device that does not hold the key, which is every JS
  * device and every device fielded before the namespace: one `hasOwnProperty`.
+ *
+ * DELIBERATE (review N2): `PATCH /devices/{id}/config` writes the document it
+ * read without a rev guard, so a PATCH of ANOTHER namespace that read the row
+ * just before this ran can store the key back. It stays unpublished and
+ * unserved (both ask the gate), and the cloud-origin report that PATCH causes
+ * withdraws it again within seconds.
  *
  * Returns true when it wrote (the caller's own republish logic is then moot).
  */
@@ -624,9 +632,18 @@ async function withdrawCameraSensors(
       updatedAt: now,
       ...legacyConfigColumns(nextConfig),
     })
-    // Optimistic guard, as in the local merge: a cloud write that landed since
-    // the read wins, and the device's next report tries again.
-    .where(and(eq(schema.devices.id, deviceId), eq(schema.devices.configRev, configRev)))
+    .where(
+      and(
+        eq(schema.devices.id, deviceId),
+        // Optimistic guard, as in the local merge: a cloud write that landed
+        // since the read wins, and the device's next report tries again.
+        // Without it this would write a stale snapshot over that write.
+        eq(schema.devices.configRev, configRev),
+        // And the stored report is still THIS one: a newer report stored since
+        // (one that may advertise the capability) is the one to judge by.
+        sql`(${schema.devices.reportedConfig}->>'ts')::bigint = ${String(report.ts)}::bigint`,
+      ),
+    )
     .returning({ config: schema.devices.config, configRev: schema.devices.configRev });
 
   if (updated.length === 0) {

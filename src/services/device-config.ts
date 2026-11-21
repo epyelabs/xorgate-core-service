@@ -142,6 +142,10 @@ export function buildDeviceConfigMessage(
   // published. That is what keeps a JS device's message byte-identical whatever
   // its row holds, and keeps the key away from a Rust agent that would ignore
   // it and then be read as having applied it.
+  // DELIBERATE (review N5): the value is published AS STORED. A port key that a
+  // later model reassignment or model edit removed from the hardware block is
+  // not pruned here; the agent reports a key it cannot map, and the operator
+  // clears or re-saves the namespace.
   const gate = {
     simulated: true,
     obd: hardware?.peripherals?.obd !== undefined,
