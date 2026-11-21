@@ -1,3 +1,4 @@
+import { VIDEO_PRESET_NAMES } from '../config-registry/recording';
 import { CAMERA_CATALOG_SOURCE } from './data';
 import {
   cameraCatalogSchema,
@@ -96,4 +97,34 @@ export function cameraSensorByDtNode(node: string): CameraSensor | undefined {
 
 export function cameraPackageSet(id: string): CameraPackageSet | undefined {
   return CAMERA_CATALOG.packageSets.find((p) => p.id === id);
+}
+
+export type CameraPresetSupport = { supported: true } | { supported: false; reason: string };
+
+/**
+ * Can `preset` (a `recording.video.preset` name) run on the sensor `sensorId`?
+ *
+ * Supported unless the sensor's entry lists it under `unsupportedPresets`; the
+ * reason then is the catalog's own sentence, ready to show an operator.
+ *
+ * Fails CLOSED on what it cannot judge: a sensor that is not selectable
+ * (unknown, planned, or the reserved `none`) and a name that is not a preset
+ * both answer "not supported", with a reason saying which. A caller with a
+ * port that has no declared sensor has nothing to ask here.
+ */
+export function cameraPresetSupport(sensorId: string, preset: string): CameraPresetSupport {
+  // Echoed names are cut short: either may be unvalidated input.
+  const clip = (text: string) => (text.length > 60 ? `${text.slice(0, 57)}...` : text);
+  const sensor = cameraSensor(sensorId);
+  if (!sensor) {
+    return { supported: false, reason: `"${clip(sensorId)}" is not a selectable camera sensor` };
+  }
+  if (!(VIDEO_PRESET_NAMES as readonly string[]).includes(preset)) {
+    return {
+      supported: false,
+      reason: `"${clip(preset)}" is not a video preset (presets: ${VIDEO_PRESET_NAMES.join(', ')})`,
+    };
+  }
+  const entry = sensor.unsupportedPresets.find((u) => u.preset === preset);
+  return entry ? { supported: false, reason: entry.reason } : { supported: true };
 }

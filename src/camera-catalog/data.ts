@@ -26,7 +26,7 @@ import {
  */
 
 /** Content version of the catalog. Bump on every change to this file's data. */
-export const CAMERA_CATALOG_VERSION = 1;
+export const CAMERA_CATALOG_VERSION = 2;
 
 /**
  * First Rust agent version that compiles a catalog in.
@@ -36,29 +36,6 @@ export const CAMERA_CATALOG_VERSION = 1;
  * tag before any console logic compares a device's build against `minAgent`.
  */
 const FIRST_CATALOG_AGENT_VERSION = '0.2.0';
-
-/**
- * The one fixed lens position the IMX708 is driven to, in dioptres
- * (0.0 = infinity, 1.0 = about 1 m, which is where libcamera leaves the lens
- * when nothing is set).
- *
- * ⚠️ UNCONFIRMED CANDIDATE. 0.5 is the first bench session's proposal with
- * low-to-moderate confidence: that scene had nothing beyond 0.5 m, so far
- * focus could not be judged. A second session the same day
- * (evidence/2026-11-21-cm4-imx708-focus) found surfaces at 3-4 m sharpest at
- * 0.9-1.0 and recommends 0.75, also with low-to-moderate confidence; nothing
- * beyond about 4 m was in view, so infinity is still extrapolated. The value
- * here stays the candidate this entry was specified with until the plan owner
- * picks one. This constant is the single place to change it (then bump
- * `CAMERA_CATALOG_VERSION` and regenerate).
- */
-const IMX708_LENS_POSITION_DIOPTRES = 0.5;
-
-/** `lens-position=0.5`; a whole number keeps one decimal (`0.0`) for a float property. */
-function lensPositionProp(dioptres: number): string {
-  const text = Number.isInteger(dioptres) ? dioptres.toFixed(1) : String(dioptres);
-  return `lens-position=${text}`;
-}
 
 const ARDUCAM_RELEASES =
   'https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download';
@@ -108,12 +85,14 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       identity: 'none',
       source: { props: [] },
       requires: { os: ['bookworm'], packageSet: null },
+      unsupportedPresets: [], // today's baseline: every preset runs on it
       info: {
         nativeAspect: '16:9', // 1920x1080
         fullModeMaxFps: null, // not recorded
         // Not measured. (Inferred from the driver: a 720p request gets the
         // sensor's own 1280x720 mode.)
         sensorWidthPercent: { p720: null, p1080: null },
+        sensorHeightPercent: { p720: null, p1080: null },
       },
       notes: [
         'The device cannot tell whether an IMX290 is really attached: this driver lists a ' +
@@ -137,12 +116,14 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       identity: 'chip-id', // `chip id mismatch: 219!=…`, no camera listed
       source: { props: [] },
       requires: { os: ['bookworm'], packageSet: null },
+      unsupportedPresets: [], // all five started at the capture front end (bench 2)
       info: {
         nativeAspect: '4:3', // 3280x2464
         fullModeMaxFps: 21, // 3280x2464@21 (driver source)
         // Measured: all five presets use the 1920x1080 centre crop,
         // (688,700)/1920x1080 of 3280x2464.
         sensorWidthPercent: { p720: 58.5, p1080: 58.5 },
+        sensorHeightPercent: { p720: 43.8, p1080: 43.8 },
       },
       notes: [
         'The 720p and 1080p presets both show the centre 58.5% of the sensor width: a ' +
@@ -178,19 +159,27 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       libcameraNames: ['imx708', 'imx708_wide', 'imx708_noir', 'imx708_wide_noir'],
       dtNodeNames: ['imx708'], // …/i2c@0/imx708@1a
       identity: 'chip-id', // `chip id mismatch: 708!=…`, no camera listed
-      source: { props: [lensPositionProp(IMX708_LENS_POSITION_DIOPTRES)] },
+      // No lens position is set in v1 (plan owner's ruling, 2026-11-21): the
+      // agent passes nothing and the lens stays where libcamera puts it, 1.0
+      // dioptre, about 1 m (measured). The two bench sessions proposed 0.5 and
+      // then 0.75, each with low-to-moderate confidence and nothing beyond
+      // about 4 m in view (evidence/2026-11-21-cm4-imx708-focus). A value
+      // chosen later goes here as `lens-position=<dioptres>`.
+      source: { props: [] },
       requires: { os: ['bookworm'], packageSet: null },
+      unsupportedPresets: [], // all five started at the capture front end (CM4)
       info: {
         nativeAspect: '16:9', // 4608x2592
         fullModeMaxFps: 14, // 4608x2592@14 (driver source)
-        // Measured: 720p uses the 1536x864 crop mode, 1080p the full-view
-        // 2304x1296 binned mode.
+        // Measured: 720p uses the 1536x864 crop mode (the centre 3072x1728 of
+        // the array), 1080p the full-view 2304x1296 binned mode.
         sensorWidthPercent: { p720: 66.7, p1080: 100 },
+        sensorHeightPercent: { p720: 66.7, p1080: 100 },
       },
       notes: [
         'The 720p presets show the centre 66.7% of the sensor width; the 1080p presets ' +
           'show the full width. The view changes with the preset.',
-        'Focus is fixed at one lens position. There is no autofocus setting.',
+        "Focus stays at the lens's default position. There is no autofocus setting.",
       ],
     },
 
@@ -199,11 +188,10 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
     // two packages add one, install over stock and leave the other port's
     // IMX219 working (bench 2, evidence/2026-11-21-bench2-arducam-libcamera).
     //
-    // ⚠️ THIN EVIDENCE. The bench unit was electrically silent until the
-    // afternoon of 2026-11-21. It then bound, listed and delivered frames on
-    // bench 2 with those packages (evidence/2026-11-21-bench2-imx335-live);
-    // that session's report was not yet written when this entry was, so the
-    // facts below marked "live" were read from its raw files.
+    // With those packages it runs through the unmodified agent beside the
+    // IMX219: bound on 18 of 18 boots in both line orders, both captures up
+    // for 10 minutes (bench 2, evidence/2026-11-21-bench2-imx335-live). One
+    // unit, one afternoon: it was electrically silent until then.
     {
       id: 'imx335',
       label: 'Sony IMX335 (Arducam)',
@@ -212,15 +200,15 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       overlay: {
         name: 'imx335',
         fixedParams: [],
-        // ⚠️ BEING MEASURED (the bench session is still open). The overlay's
-        // help text says 0; the overlay binary carries `rotation = <0xb4>`
-        // (180) on the sensor node, and the live device tree of a line with
-        // no token read `00 00 00 b4`. So 180.
-        // It decides NOTHING: the sensor has a vertical flip only, so
-        // libcamera applies no flip and `rotation=` changes no pixels
-        // (`canFlip: false`). No consumer may derive an orientation from this
-        // value for this sensor.
+        // Measured: a line with no token gives device tree `00 00 00 b4`
+        // (180). The overlay's help text ("default 0") is wrong.
+        // It decides NOTHING for the picture, see `canFlip`. No consumer may
+        // derive an orientation from this value for this sensor.
         defaultRotation: 180,
+        // Measured: `rotation=0`, `rotation=180` and no token give the same
+        // picture. The sensor has a vertical flip only (no horizontal-flip
+        // control exists), so a 180° turn at the sensor is impossible and
+        // libcamera applies none.
         canFlip: false,
       },
       options: [
@@ -236,7 +224,7 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
           default: 594000000,
         },
       ],
-      // Live: `0 : imx335 [2624x1944 12-bit RGGB] (…/i2c@88000/imx335@1a)`.
+      // `0 : imx335 [2624x1944 12-bit RGGB] (…/i2c@88000/imx335@1a)`.
       libcameraNames: ['imx335'],
       dtNodeNames: ['imx335'],
       // The probe expects 0x00 at register 0x3912. Another chip can pass: on
@@ -244,17 +232,33 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       identity: 'weak',
       source: { props: [] },
       requires: { os: ['bookworm'], packageSet: 'arducam-libcamera' },
+      // Measured, 5 of 5 attempts: `framerate=30/1` cannot be negotiated on
+      // the full mode (`streaming stopped, reason not-negotiated`), the
+      // process exits at once. The other four presets start and hold rate.
+      unsupportedPresets: [
+        {
+          preset: '1080p30-4mbps',
+          reason:
+            "The IMX335's full-resolution mode tops out at 29.99 frames per second, so a " +
+            '30 fps 1080p stream cannot start. Use 1080p15-2mbps or a 720p preset.',
+        },
+      ],
       info: {
         nativeAspect: '4:3', // 2592x1944 active (listed as 2624x1944)
-        fullModeMaxFps: 30, // 2592x1944@30 (driver source)
-        // Not measured yet. (Inferred: 16:9 uses the full width and 75% of
-        // the height.)
-        sensorWidthPercent: { p720: null, p1080: null },
+        // 2592x1944@30 in the driver source; libcamera negotiates 29.99 at
+        // most, which is why 1080p30 is in `unsupportedPresets`.
+        fullModeMaxFps: 30,
+        // Measured: 720p uses the binned 1312x972 mode (full width, 75.9% of
+        // the height), 1080p the full mode (98.8% of the width, 75% of the
+        // height). So both sizes show practically the same view.
+        sensorWidthPercent: { p720: 100, p1080: 98.8 },
+        sensorHeightPercent: { p720: 75.9, p1080: 75 },
       },
       notes: [
         "Needs Arducam's libcamera packages. Until they are installed the port reports " +
           'that its requirements are missing.',
-        'This sensor cannot be rotated: the camera mounting setting has no effect on it.',
+        'This sensor cannot be rotated: the camera mounting setting has no effect on it. ' +
+          'Mount the camera the right way up; turning the picture in software is not offered.',
       ],
     },
   ],

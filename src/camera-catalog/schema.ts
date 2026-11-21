@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { VIDEO_PRESET_NAMES } from '../config-registry/recording';
 
 /**
  * Shape of the camera sensor catalog (plans/support-other-camera-models,
@@ -167,6 +168,13 @@ const requiresSchema = z
   })
   .strict();
 
+const presetSharesSchema = z
+  .object({
+    p720: z.number().positive().max(100).nullable(),
+    p1080: z.number().positive().max(100).nullable(),
+  })
+  .strict();
+
 /**
  * Informational facts for the console and the docs. Nothing validates or
  * renders a pipeline from these; a `null` means "not measured", never "zero".
@@ -181,12 +189,24 @@ const infoSchema = z
      * Share of the sensor's WIDTH the picture shows, per preset family, in
      * percent. Below 100 the preset shows a centre crop (a narrower view).
      */
-    sensorWidthPercent: z
-      .object({
-        p720: z.number().positive().max(100).nullable(),
-        p1080: z.number().positive().max(100).nullable(),
-      })
-      .strict(),
+    sensorWidthPercent: presetSharesSchema,
+    /** The same for the sensor's HEIGHT. A 4:3 sensor never gives 100 at 16:9. */
+    sensorHeightPercent: presetSharesSchema,
+  })
+  .strict();
+
+/**
+ * A video preset that cannot run on a sensor.
+ *
+ * `preset` is one of the `recording.video.preset` names: the closed list in
+ * `config-registry/recording.ts` is the only vocabulary, so a preset renamed
+ * or removed there fails the catalog instead of leaving a dead entry here.
+ */
+const unsupportedPresetSchema = z
+  .object({
+    preset: z.enum(VIDEO_PRESET_NAMES),
+    /** One or two sentences for the operator: why, and what to pick instead. */
+    reason: z.string().min(1),
   })
   .strict();
 
@@ -213,6 +233,11 @@ export const cameraSensorSchema = z
       })
       .strict(),
     requires: requiresSchema,
+    /**
+     * Video presets that cannot run on this sensor, each with the reason.
+     * Empty = every preset runs. A preset not listed is supported.
+     */
+    unsupportedPresets: z.array(unsupportedPresetSchema),
     info: infoSchema,
     /** Plain sentences an operator should read before choosing this sensor. */
     notes: z.array(z.string().min(1)),
@@ -221,6 +246,7 @@ export const cameraSensorSchema = z
 
 export type CameraSensor = z.infer<typeof cameraSensorSchema>;
 export type CameraSensorOption = z.infer<typeof optionSchema>;
+export type CameraUnsupportedPreset = z.infer<typeof unsupportedPresetSchema>;
 
 /**
  * A sensor the platform intends to support and does not yet.
@@ -401,6 +427,10 @@ function crossCheck(catalog: CatalogShape, ctx: z.RefinementCtx): void {
     if (!unique(propNames)) issue([...at, 'source', 'props'], 'properties must be unique');
     if (propNames.includes('camera-name')) {
       issue([...at, 'source', 'props'], '"camera-name" is set by the agent per port');
+    }
+
+    if (!unique(sensor.unsupportedPresets.map((u) => u.preset))) {
+      issue([...at, 'unsupportedPresets'], 'a preset may be listed once');
     }
 
     if (!unique(sensor.requires.os)) issue([...at, 'requires', 'os'], 'releases must be unique');

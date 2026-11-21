@@ -10,6 +10,7 @@ import {
   buildCameraCatalog,
   cameraCatalogSchema,
   cameraPackageSet,
+  cameraPresetSupport,
   cameraSensor,
   cameraSensorByDtNode,
   cameraSensorByLibcameraName,
@@ -18,6 +19,7 @@ import {
   serializeCameraCatalog,
 } from '../src/camera-catalog';
 import { CAMERA_CATALOG_SOURCE } from '../src/camera-catalog/data';
+import { VIDEO_PRESET_NAMES } from '../src/config-registry/recording';
 
 const ARTIFACT = join(__dirname, '..', 'src', 'camera-catalog', 'camera-catalog.json');
 
@@ -32,8 +34,8 @@ const ARTIFACT = join(__dirname, '..', 'src', 'camera-catalog', 'camera-catalog.
  *   3. set the version and the artifact's sha256 here.
  */
 const PINNED = {
-  catalogVersion: 1,
-  sha256: '6832c4bbcb298e04785afee7cbe79bd40dab8b7625c98c7c6a77702025516d57',
+  catalogVersion: 2,
+  sha256: 'feac4f6802f5e2208d84cbe405c9e723b4fede899620d3f64b1ca615f9367574',
 };
 
 /** A deep copy with every object's keys in reverse order (arrays keep theirs). */
@@ -104,6 +106,7 @@ describe('camera-catalog.json', () => {
       'identity',
       'source',
       'requires',
+      'unsupportedPresets',
       'info',
       'notes',
     ]);
@@ -178,10 +181,12 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(s.identity).toBe('chip-id');
     expect(s.options).toEqual([]);
     expect(s.info.sensorWidthPercent).toEqual({ p720: 58.5, p1080: 58.5 });
+    expect(s.info.sensorHeightPercent).toEqual({ p720: 43.8, p1080: 43.8 });
+    expect(s.unsupportedPresets).toEqual([]);
     expect(s.tier).toBe('supported');
   });
 
-  it('imx708: four libcamera names, link frequency, one fixed lens position', () => {
+  it('imx708: four libcamera names, link frequency, no lens position set', () => {
     const s = cameraSensor('imx708')!;
     expect(s.overlay).toMatchObject({ name: 'imx708', defaultRotation: 180, canFlip: true });
     expect(s.identity).toBe('chip-id');
@@ -193,10 +198,12 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
       default: 450000000,
     });
     expect(s.info.sensorWidthPercent).toEqual({ p720: 66.7, p1080: 100 });
-    // Exactly one property, and it is the lens position (the value is a
-    // candidate still being measured; this pins the shape, not the number).
-    expect(s.source.props).toHaveLength(1);
-    expect(s.source.props[0]).toMatch(/^lens-position=\d+\.\d+$/);
+    // v1 sets nothing on the source: the lens stays at libcamera's default,
+    // and the note must not promise a fixed value.
+    expect(s.source.props).toEqual([]);
+    expect(s.notes.join(' ')).toContain("Focus stays at the lens's default position");
+    expect(s.notes.join(' ')).not.toMatch(/fixed/i);
+    expect(s.unsupportedPresets).toEqual([]);
   });
 
   it('imx335: needs packages, weak identity, cannot flip', () => {
@@ -211,6 +218,25 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
       default: 594000000,
     });
     expect(s.requires).toEqual({ os: ['bookworm'], packageSet: 'arducam-libcamera' });
+    // Measured on bench 2: no token = device tree 180, and no rotation is possible.
+    expect(s.overlay.defaultRotation).toBe(180);
+    expect(s.libcameraNames).toEqual(['imx335']);
+    expect(s.dtNodeNames).toEqual(['imx335']);
+    expect(s.info.nativeAspect).toBe('4:3');
+    expect(s.info.sensorWidthPercent).toEqual({ p720: 100, p1080: 98.8 });
+    expect(s.info.sensorHeightPercent).toEqual({ p720: 75.9, p1080: 75 });
+    expect(s.notes.join(' ')).toContain('Mount the camera the right way up');
+  });
+
+  it('imx335 cannot run 1080p30; every other sensor runs all five presets', () => {
+    const limited = CAMERA_CATALOG.sensors.filter((s) => s.unsupportedPresets.length > 0);
+    expect(limited.map((s) => s.id)).toEqual(['imx335']);
+    expect(limited[0].unsupportedPresets.map((u) => u.preset)).toEqual(['1080p30-4mbps']);
+    expect(limited[0].unsupportedPresets[0].reason).toMatch(/29\.99 frames per second/);
+    // Every listed preset is one of the registry's, by reference.
+    for (const s of CAMERA_CATALOG.sensors) {
+      for (const u of s.unsupportedPresets) expect(VIDEO_PRESET_NAMES).toContain(u.preset);
+    }
   });
 
   it('only a sensor that needs nothing but the stock image is tier "supported"', () => {
@@ -284,6 +310,54 @@ describe('catalog lookups', () => {
   });
 });
 
+describe('cameraPresetSupport', () => {
+  it('answers for every sensor and every preset, from the catalog', () => {
+    for (const sensor of CAMERA_CATALOG.sensors) {
+      for (const preset of VIDEO_PRESET_NAMES) {
+        const listed = sensor.unsupportedPresets.find((u) => u.preset === preset);
+        expect(cameraPresetSupport(sensor.id, preset), `${sensor.id} ${preset}`).toEqual(
+          listed ? { supported: false, reason: listed.reason } : { supported: true },
+        );
+      }
+    }
+  });
+
+  it('says why 1080p30 cannot run on the imx335, and what to use instead', () => {
+    expect(cameraPresetSupport('imx335', '1080p30-4mbps')).toEqual({
+      supported: false,
+      reason:
+        "The IMX335's full-resolution mode tops out at 29.99 frames per second, so a " +
+        '30 fps 1080p stream cannot start. Use 1080p15-2mbps or a 720p preset.',
+    });
+    for (const preset of ['1080p15-2mbps', '720p30-2mbps', '720p15-2mbps', '720p15-1mbps']) {
+      expect(cameraPresetSupport('imx335', preset), preset).toEqual({ supported: true });
+    }
+    for (const id of ['imx290', 'imx219', 'imx708']) {
+      expect(cameraPresetSupport(id, '1080p30-4mbps'), id).toEqual({ supported: true });
+    }
+  });
+
+  it('fails closed on a sensor that is not selectable or a name that is not a preset', () => {
+    for (const id of ['imx662', 'none', 'imx477', '', 'IMX335']) {
+      expect(cameraPresetSupport(id, '720p15-1mbps'), id).toEqual({
+        supported: false,
+        reason: `"${id}" is not a selectable camera sensor`,
+      });
+    }
+    expect(cameraPresetSupport('imx290', '1080p60-8mbps')).toEqual({
+      supported: false,
+      reason:
+        '"1080p60-8mbps" is not a video preset (presets: 1080p30-4mbps, 1080p15-2mbps, ' +
+        '720p30-2mbps, 720p15-2mbps, 720p15-1mbps)',
+    });
+    expect(cameraPresetSupport('imx290', '')).toMatchObject({ supported: false });
+    // The unknown sensor is reported first, and a long name is not echoed whole.
+    const both = cameraPresetSupport('x'.repeat(5000), 'nope');
+    expect(both).toMatchObject({ supported: false });
+    expect('reason' in both && both.reason.length).toBeLessThan(120);
+  });
+});
+
 describe('catalog schema (what an entry may not be)', () => {
   it('accepts the catalog as written', () => {
     expect(cameraCatalogSchema.safeParse(CAMERA_CATALOG_SOURCE).success).toBe(true);
@@ -340,9 +414,12 @@ describe('catalog schema (what an entry may not be)', () => {
       expect(refusal((c) => c.sensors[2].source.props.push(bad)), bad).not.toBe('');
     }
     expect(refusal((c) => c.sensors[2].source.props.push('camera-name=x'))).toMatch(/camera-name/);
-    expect(refusal((c) => c.sensors[2].source.props.push('lens-position=1.0'))).toMatch(
-      /properties must be unique/,
-    );
+    // A well-formed property is accepted (the field stays usable) ...
+    expect(refusal((c) => c.sensors[2].source.props.push('lens-position=0.5'))).toBe('');
+    // ... once.
+    expect(
+      refusal((c) => c.sensors[2].source.props.push('lens-position=0.5', 'lens-position=1.0')),
+    ).toMatch(/properties must be unique/);
   });
 
   it('refuses an option whose default is not one of its values, or with no values', () => {
@@ -409,6 +486,28 @@ describe('catalog schema (what an entry may not be)', () => {
     expect(
       refusal((c) => c.packageSets[0].targets.push(c.packageSets[0].targets[0])),
     ).toMatch(/one target per OS release and architecture/);
+  });
+
+  it('takes unsupported presets only from the recording preset list, once each, with a reason', () => {
+    const add = (entry: unknown) => (c: any) => c.sensors[0].unsupportedPresets.push(entry);
+    for (const preset of VIDEO_PRESET_NAMES) {
+      expect(refusal(add({ preset, reason: 'because' })), preset).toBe('');
+    }
+    for (const preset of ['1080p60-8mbps', '1080p30', '1080P30-4MBPS', '', 30, null]) {
+      expect(refusal(add({ preset, reason: 'because' })), String(preset)).toMatch(
+        /sensors\.0\.unsupportedPresets\.0\.preset/,
+      );
+    }
+    expect(refusal(add({ preset: '720p30-2mbps', reason: '' }))).toMatch(/reason/);
+    expect(refusal(add({ preset: '720p30-2mbps' }))).toMatch(/reason/);
+    expect(refusal(add({ preset: '720p30-2mbps', reason: 'x', since: '0.2.0' }))).not.toBe('');
+    expect(refusal(add('720p30-2mbps'))).not.toBe('');
+    expect(
+      refusal((c) =>
+        c.sensors[3].unsupportedPresets.push({ preset: '1080p30-4mbps', reason: 'again' }),
+      ),
+    ).toMatch(/a preset may be listed once/);
+    expect(refusal((c) => delete c.sensors[0].unsupportedPresets)).toMatch(/unsupportedPresets/);
   });
 
   it('names the entry when a bad catalog is built', () => {

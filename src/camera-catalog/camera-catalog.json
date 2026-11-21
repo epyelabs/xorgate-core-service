@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "catalogVersion": 1,
+  "catalogVersion": 2,
   "generatedBy": "backend/xorgate-core-service: npm run contract:generate",
   "sensors": [
     {
@@ -44,10 +44,15 @@
         ],
         "packageSet": null
       },
+      "unsupportedPresets": [],
       "info": {
         "nativeAspect": "16:9",
         "fullModeMaxFps": null,
         "sensorWidthPercent": {
+          "p720": null,
+          "p1080": null
+        },
+        "sensorHeightPercent": {
           "p720": null,
           "p1080": null
         }
@@ -84,12 +89,17 @@
         ],
         "packageSet": null
       },
+      "unsupportedPresets": [],
       "info": {
         "nativeAspect": "4:3",
         "fullModeMaxFps": 21,
         "sensorWidthPercent": {
           "p720": 58.5,
           "p1080": 58.5
+        },
+        "sensorHeightPercent": {
+          "p720": 43.8,
+          "p1080": 43.8
         }
       },
       "notes": [
@@ -134,9 +144,7 @@
       ],
       "identity": "chip-id",
       "source": {
-        "props": [
-          "lens-position=0.5"
-        ]
+        "props": []
       },
       "requires": {
         "os": [
@@ -144,17 +152,22 @@
         ],
         "packageSet": null
       },
+      "unsupportedPresets": [],
       "info": {
         "nativeAspect": "16:9",
         "fullModeMaxFps": 14,
         "sensorWidthPercent": {
           "p720": 66.7,
           "p1080": 100
+        },
+        "sensorHeightPercent": {
+          "p720": 66.7,
+          "p1080": 100
         }
       },
       "notes": [
         "The 720p presets show the centre 66.7% of the sensor width; the 1080p presets show the full width. The view changes with the preset.",
-        "Focus is fixed at one lens position. There is no autofocus setting."
+        "Focus stays at the lens's default position. There is no autofocus setting."
       ]
     },
     {
@@ -198,17 +211,27 @@
         ],
         "packageSet": "arducam-libcamera"
       },
+      "unsupportedPresets": [
+        {
+          "preset": "1080p30-4mbps",
+          "reason": "The IMX335's full-resolution mode tops out at 29.99 frames per second, so a 30 fps 1080p stream cannot start. Use 1080p15-2mbps or a 720p preset."
+        }
+      ],
       "info": {
         "nativeAspect": "4:3",
         "fullModeMaxFps": 30,
         "sensorWidthPercent": {
-          "p720": null,
-          "p1080": null
+          "p720": 100,
+          "p1080": 98.8
+        },
+        "sensorHeightPercent": {
+          "p720": 75.9,
+          "p1080": 75
         }
       },
       "notes": [
         "Needs Arducam's libcamera packages. Until they are installed the port reports that its requirements are missing.",
-        "This sensor cannot be rotated: the camera mounting setting has no effect on it."
+        "This sensor cannot be rotated: the camera mounting setting has no effect on it. Mount the camera the right way up; turning the picture in software is not offered."
       ]
     }
   ],
