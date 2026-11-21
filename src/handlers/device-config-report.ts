@@ -644,7 +644,9 @@ async function withdrawCameraSensors(
       deviceId,
       agentVersion,
       needsAgent: CAMERA_SENSORS_MIN_AGENT,
-      withdrawn,
+      // As text: the console formatter cuts nested objects off at depth 2, and
+      // this line is the only record of what the operator had chosen.
+      withdrawn: JSON.stringify(withdrawn),
       configRev: row.configRev,
     },
   );

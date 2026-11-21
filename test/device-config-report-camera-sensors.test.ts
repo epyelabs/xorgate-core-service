@@ -115,7 +115,12 @@ describe('version skew: a seeded cameraSensors meets an agent that cannot act on
     expect(publishDeviceConfig).toHaveBeenCalledWith(DEVICE, {}, 2);
     expect(warn).toHaveBeenCalledWith(
       'device-config-report: cameraSensors withdrawn, the reporting agent does not support it',
-      expect.objectContaining({ agentVersion: 'v0.1.1', needsAgent: '0.2.0', withdrawn: SEED }),
+      expect.objectContaining({
+        agentVersion: 'v0.1.1',
+        needsAgent: '0.2.0',
+        // The whole choice, as text, so the log line keeps every level of it.
+        withdrawn: JSON.stringify(SEED),
+      }),
     );
   });
 
