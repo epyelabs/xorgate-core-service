@@ -7,7 +7,7 @@ import {
   CAMERA_SENSOR_NONE,
   validateSensorChoice,
 } from '../camera-catalog';
-import { shown } from '../camera-catalog/message';
+import { clip, shown } from '../camera-catalog/message';
 import { hasAgentCapability, storedAgent } from '../services/device-agent';
 
 /**
@@ -259,6 +259,9 @@ export const cameraSensorsNamespace: ConfigNamespaceSpec<CameraSensorsConfig> = 
  */
 export const CAMERA_SENSORS_CAPABILITY = 'camera.sensors';
 
+/** What a refusal names when the catalog lists no sensor at all. */
+const CAMERA_SENSORS_MIN_AGENT_FALLBACK = '0.2.0';
+
 function semverLess(a: string, b: string): boolean {
   const pa = a.split('.').map(Number);
   const pb = b.split('.').map(Number);
@@ -269,13 +272,27 @@ function semverLess(a: string, b: string): boolean {
 }
 
 /**
+ * The lowest `minAgent` of a list of catalog sensors.
+ *
+ * Never throws: an EMPTY list answers the fallback. This runs while the module
+ * loads, in every Lambda that imports the registry, so a catalog with no
+ * selectable sensor must not stop them from starting. With no sensor to select
+ * there is no version to name anyway, and the answer is only ever message text.
+ */
+export function lowestMinAgent(sensors: readonly { minAgent: string }[]): string {
+  let lowest: string | null = null;
+  for (const { minAgent } of sensors) {
+    if (lowest === null || semverLess(minAgent, lowest)) lowest = minAgent;
+  }
+  return lowest ?? CAMERA_SENSORS_MIN_AGENT_FALLBACK;
+}
+
+/**
  * The first Rust agent version that knows the namespace: the lowest `minAgent`
  * in the catalog (an agent that knows any catalog sensor knows the namespace).
  * It is what a refusal tells the operator to update to.
  */
-export const CAMERA_SENSORS_MIN_AGENT: string = CAMERA_CATALOG.sensors
-  .map((s) => s.minAgent)
-  .reduce((lowest, v) => (semverLess(v, lowest) ? v : lowest));
+export const CAMERA_SENSORS_MIN_AGENT: string = lowestMinAgent(CAMERA_CATALOG.sensors);
 
 /** The row fields the gate reads. Any `devices` row satisfies it. */
 export interface CameraSensorsDeviceFacts {
@@ -373,6 +390,13 @@ export const CAMERA_SENSORS_UNPROVEN: CameraSensorsRefused = {
  * Stricter than "does not advertise it". A report with no `agent` block at all
  * (the agent builds one only when it knows its mode) proves nothing, and the
  * caller of this function REMOVES a stored value on a true.
+ *
+ * DELIBERATE (review N3): that leaves a "stored but hidden" state. A Rust row
+ * whose last report has no capability list is not eligible (PATCH 400, not
+ * published, not served) and not withdrawn either; the value is served again
+ * when a capable report lands. Shipped agents always send the list with the
+ * `agent` block, so it is not reachable today, and deleting on mere absence
+ * would be the worse error.
  */
 export function reportDisprovesCameraSensors(report: unknown): boolean {
   if (!report || typeof report !== 'object') return false;
@@ -391,7 +415,8 @@ export function reportDisprovesCameraSensors(report: unknown): boolean {
 /**
  * The camera stream keys a device's hardware block declares, in model order.
  * `null` when there is no block (a schemaVersion-1 model, or a model that does
- * not parse): the ports are then UNKNOWN and callers skip the port check.
+ * not parse): the ports are then UNKNOWN and `cameraSensorsPortError` refuses
+ * every value but the cleared marker.
  */
 export function declaredCameraPorts(
   hardware: { video: { key: string }[] } | null | undefined,
@@ -400,24 +425,40 @@ export function declaredCameraPorts(
   return hardware.video.map((v) => v.key);
 }
 
+/** The refusal for a device whose model declares no camera ports at all. */
+export const CAMERA_SENSORS_NO_PORTS_MESSAGE =
+  "this device's model declares no camera ports, so camera sensors cannot be set per port";
+
+/** A key as it may appear in a message: cut at 64 characters. */
+function shortKey(key: string): string {
+  return clip(key, 67);
+}
+
 /**
- * Refuse a stream key the device's model does not declare.
+ * Bound a value by the device's camera ports: every key must be a stream key
+ * the device's model declares.
  *
- * `ports` null/undefined = the model's ports are unknown (see
- * `declaredCameraPorts`): nothing is checked here and the key's shape is all
- * the cloud verifies; the agent, which knows its own hardware block, reports
- * the namespace `rejected` for a key it cannot map to a connector.
+ * FAILS CLOSED when the ports are unknown (`ports` null/undefined: no v2
+ * hardware block, see `declaredCameraPorts`, or a caller that supplied none):
+ * the value is refused whole. Without a port list the only check left on a key
+ * is the stream-key pattern, which `constructor` and `toString` pass, and the
+ * value goes to an agent that edits the boot config as root. A device on such
+ * a model has no per-port hardware description for the agent to act on anyway.
+ *
+ * `null` (the cleared marker) is always accepted: clearing writes no key, and
+ * it is the way out for a value left behind by a model reassignment.
  *
  * Returns the error text, or null. `value` is a namespace value that has
- * already passed the schema (or `null`, the cleared marker).
+ * already passed the schema (or `null`).
  */
 export function cameraSensorsPortError(
   value: unknown,
   ports: readonly string[] | null | undefined,
   label: string = CAMERA_SENSORS_KEY,
 ): string | null {
-  if (!ports) return null;
-  if (!value || typeof value !== 'object') return null;
+  if (value === null || value === undefined) return null;
+  if (!ports) return `${label}: ${CAMERA_SENSORS_NO_PORTS_MESSAGE}`;
+  if (typeof value !== 'object') return null;
   const cameras = (value as { cameras?: unknown }).cameras;
   if (!cameras || typeof cameras !== 'object') return null;
   for (const key of Object.keys(cameras)) {
@@ -426,7 +467,10 @@ export function cameraSensorsPortError(
       ports.length > 0
         ? `its camera ports: ${ports.join(', ')}`
         : 'its model declares no camera ports';
-    return `${label}.cameras.${key}: this device's model has no camera port ${shown(key)} (${allowed})`;
+    return (
+      `${label}.cameras.${shortKey(key)}: this device's model has no camera port ` +
+      `${shown(key)} (${allowed})`
+    );
   }
   return null;
 }

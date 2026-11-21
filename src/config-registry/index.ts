@@ -18,6 +18,7 @@
  * thermal-shed keys shipped present in 2 of 5 places.
  */
 import type { ConfigNamespaceSpec } from './types';
+import { clip } from '../camera-catalog/message';
 import { gnssAntBiasNamespace } from './gnss-ant-bias';
 import { imuMountNamespace, type ImuMountConfig } from './imu-mount';
 import { recordingNamespace, type RecordingConfig } from './recording';
@@ -136,6 +137,15 @@ export function publicConfigDocument(
 export type ConfigDocument = Record<string, unknown>;
 
 /**
+ * An issue path as text. A path segment can be a KEY THE CALLER SENT (a stream
+ * key that failed its pattern, say), so each one is cut at 64 characters: a
+ * 200 KB key must not come back as a 200 KB 400 body.
+ */
+export function issuePathText(path: readonly (string | number)[]): string {
+  return path.map((segment) => clip(String(segment), 67)).join('.');
+}
+
+/**
  * Validate one namespace value.
  *
  * - `null`      → revert to device defaults (stored as an explicit cleared
@@ -173,7 +183,7 @@ export function validateNamespaceValue(
   const parsed = spec.schema.safeParse(value);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    const path = issue?.path.length ? `${label}.${issue.path.join('.')}` : label;
+    const path = issue?.path.length ? `${label}.${issuePathText(issue.path)}` : label;
     return { error: `${path}: ${issue?.message ?? 'invalid'}` };
   }
   return { value: parsed.data };
@@ -218,7 +228,8 @@ export const CAMERA_SENSORS_ONLY_NAMESPACES: readonly string[] = [CAMERA_SENSORS
  *
  * `cameraPorts` is not a gate but a bound on an accepted `cameraSensors`
  * value: the camera stream keys the device's model declares
- * (`declaredCameraPorts(hardware)`). null/absent = unknown, nothing checked.
+ * (`declaredCameraPorts(hardware)`). null/absent = unknown, and then every
+ * `cameraSensors` value but the cleared marker is REFUSED (fails closed).
  */
 export interface NamespaceGateFacts {
   simulated?: boolean;

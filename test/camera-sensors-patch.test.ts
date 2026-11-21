@@ -221,11 +221,51 @@ describe('PATCH /devices/{id}/config { cameraSensors }: accepted devices', () =>
     expect(r.body.error.message).toContain('has no camera port "cam1" (its camera ports: cam0)');
   });
 
-  it('a model with no hardware block: ports unknown, the catalog is all that is checked', async () => {
-    device = base({});
+  it.each([['cam0'], ['cam3'], ['constructor'], ['toString'], ['CAM0'], ['cam-0']])(
+    'a model with no hardware block: ports unknown, key %s → 400, nothing written',
+    async (key) => {
+      device = base({});
+      deviceHardwareBlock.mockResolvedValueOnce(null);
+      const r = await patch({ cameraSensors: { cameras: { [key]: { sensor: 'imx219' } } } });
+      expect(r.status).toBe(400);
+      expect(r.body.error.message).toBe(
+        "cameraSensors: this device's model declares no camera ports, so camera sensors cannot " +
+          'be set per port',
+      );
+      expect(writes).toHaveLength(0);
+      expect(publishDeviceConfig).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([['constructor'], ['toString'], ['hasOwnProperty'], ['CAM0'], ['cam-0']])(
+    'a model WITH ports refuses the key %s by name',
+    async (key) => {
+      device = base({});
+      const r = await patch({ cameraSensors: { cameras: { [key]: { sensor: 'imx219' } } } });
+      expect(r.status).toBe(400);
+      expect(r.body.error.message).toBe(
+        `cameraSensors.cameras.${key}: this device's model has no camera port "${key}" ` +
+          '(its camera ports: cam0, cam1)',
+      );
+      expect(writes).toHaveLength(0);
+    },
+  );
+
+  it('a model with no hardware block can still be CLEARED (null)', async () => {
+    device = base({ config: { gnssAntBias: true, ...BODY } });
     deviceHardwareBlock.mockResolvedValueOnce(null);
-    const r = await patch({ cameraSensors: { cameras: { cam3: { sensor: 'imx219' } } } });
+    const r = await patch({ cameraSensors: null });
     expect(r.status).toBe(200);
+    expect(writes[0].config).toEqual({ gnssAntBias: true, cameraSensors: null });
+  });
+
+  it('a 200 KB port key comes back as a short 400', async () => {
+    device = base({});
+    const r = await patch({ cameraSensors: { cameras: { ['x'.repeat(200_000)]: { sensor: 'imx219' } } } });
+    expect(r.status).toBe(400);
+    expect(r.body.error.message).toBe(
+      `cameraSensors.cameras.${'x'.repeat(64)}...: must be a stream key`,
+    );
   });
 
   it('an invalid value → 400 naming the port and what is allowed', async () => {

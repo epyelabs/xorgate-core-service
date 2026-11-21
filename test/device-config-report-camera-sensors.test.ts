@@ -302,11 +302,32 @@ describe('a local change of cameraSensors (xorgate-rs set) folding back', () => 
     expect(sets[1].config).toEqual({ timeSync: { offlineSources: false } });
   });
 
-  it('with no hardware block the ports are unknown and only the catalog is checked', async () => {
+  it.each([['cam0'], ['constructor'], ['toString'], ['CAM0'], ['cam-0']])(
+    'with no hardware block the ports are unknown and the local change (%s) is refused',
+    async (key) => {
+      deviceHardwareBlock.mockResolvedValueOnce(null);
+      queue = [[row({}, 7)]];
+      await handler(local({ cameraSensors: { cameras: { [key]: { sensor: 'imx219' } } } }));
+      // The report is stored; the desired document is not touched.
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(publishDeviceConfig).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        'device-config-report: local change rejected by the registry, skipping',
+        expect.objectContaining({
+          namespace: 'cameraSensors',
+          error:
+            "cameraSensors: this device's model declares no camera ports, so camera sensors " +
+            'cannot be set per port',
+        }),
+      );
+    },
+  );
+
+  it('with no hardware block a local removal (null) still folds back', async () => {
     deviceHardwareBlock.mockResolvedValueOnce(null);
-    queue = [[row({}, 7)], [{ config: {}, configRev: 8 }]];
-    await handler(local({ cameraSensors: { cameras: { cam5: { sensor: 'imx219' } } } }));
-    expect(sets[1].config).toEqual({ cameraSensors: { cameras: { cam5: { sensor: 'imx219' } } } });
+    queue = [[row({ cameraSensors: NEXT }, 7)], [{ config: {}, configRev: 8 }]];
+    await handler(local({ cameraSensors: null }));
+    expect(sets[1].config).toEqual({ cameraSensors: null });
   });
 
   it.each([

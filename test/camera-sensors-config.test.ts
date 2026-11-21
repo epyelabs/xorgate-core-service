@@ -12,6 +12,7 @@ import {
   cameraSensorsPortError,
   configNamespace,
   declaredCameraPorts,
+  lowestMinAgent,
   namespaceAllowedFor,
   reportDisprovesCameraSensors,
   validateConfigPatch,
@@ -291,9 +292,54 @@ describe('cameraSensors: a key must be a camera port the model declares', () => 
     expect(cameraSensorsPortError(null, ports)).toBeNull();
   });
 
-  it('checks nothing when the ports are unknown (no hardware block)', () => {
-    expect(cameraSensorsPortError(cams({ cam7: { sensor: 'imx290' } }), null)).toBeNull();
-    expect(cameraSensorsPortError(cams({ cam7: { sensor: 'imx290' } }), undefined)).toBeNull();
+  const NO_PORTS =
+    "cameraSensors: this device's model declares no camera ports, so camera sensors cannot be " +
+    'set per port';
+
+  it('FAILS CLOSED when the ports are unknown (no hardware block): the value is refused', () => {
+    // Without a port list the stream-key pattern would be the only check on a
+    // key, and it admits names no camera port has.
+    for (const key of ['cam0', 'cam7', 'constructor', 'toString', 'hasOwnProperty', 'CAM0', 'Cam-0', 'cam_0']) {
+      const value = cams({ [key]: { sensor: 'imx708' } });
+      // The value itself is well-formed: the schema alone would store it.
+      expect(parse(value), key).toEqual({ value });
+      expect(cameraSensorsPortError(value, null), key).toBe(NO_PORTS);
+      expect(cameraSensorsPortError(value, undefined), key).toBe(NO_PORTS);
+    }
+    // Even an empty map: there is nothing this device could be told per port.
+    expect(cameraSensorsPortError(cams({}), null)).toBe(NO_PORTS);
+  });
+
+  it('the cleared marker is accepted even then (the way out for a stale value)', () => {
+    expect(cameraSensorsPortError(null, null)).toBeNull();
+    expect(cameraSensorsPortError(null, undefined)).toBeNull();
+  });
+
+  it('with known ports, a key that merely LOOKS like a stream key is refused by name', () => {
+    for (const key of ['constructor', 'toString', 'hasOwnProperty', 'CAM0', 'Cam-0', 'cam-1']) {
+      expect(cameraSensorsPortError(cams({ [key]: { sensor: 'imx708' } }), ports), key).toBe(
+        `cameraSensors.cameras.${key}: this device's model has no camera port "${key}" ` +
+          '(its camera ports: cam0, cam1)',
+      );
+    }
+  });
+
+  it('cuts an echoed key at 64 characters, in the path and in the sentence', () => {
+    const long = 'k'.repeat(32);
+    const huge = 'x'.repeat(200_000);
+    // A key that passes the pattern but is no port: the path is cut…
+    const e = cameraSensorsPortError(cams({ [long]: { sensor: 'imx708' } }), ports)!;
+    expect(e).toContain(`cameraSensors.cameras.${long}:`);
+    // …and one that fails the pattern (too long to be a stream key) comes back
+    // as a short 400, not as its own 200 KB.
+    const refused = errorOf(cams({ [huge]: { sensor: 'imx708' } }));
+    expect(refused).toBe(`cameraSensors.cameras.${'x'.repeat(64)}...: must be a stream key`);
+    expect(refused.length).toBeLessThan(120);
+    // A huge sensor value and a huge option key are cut the same way.
+    expect(errorOf(cams({ cam0: { sensor: huge } })).length).toBeLessThan(200);
+    expect(
+      errorOf(cams({ cam0: { sensor: 'imx290', options: { [huge]: 1 } } })).length,
+    ).toBeLessThan(200);
   });
 
   it('validateConfigPatch applies it through the gate facts', () => {
@@ -304,11 +350,26 @@ describe('cameraSensors: a key must be a camera port the model declares', () => 
         'cameraSensors.cameras.cam2: this device\'s model has no camera port "cam2" ' +
         '(its camera ports: cam0, cam1)',
     });
-    // Unknown ports: the shape and the catalog are all the cloud checks.
+    // Unknown ports (no hardware block, or a caller that supplied none): refused.
     expect(validateConfigPatch(body, { cameraSensors: allowed, cameraPorts: null })).toEqual({
-      value: body,
+      error: NO_PORTS,
     });
-    expect(validateConfigPatch(body, { cameraSensors: allowed })).toEqual({ value: body });
+    expect(validateConfigPatch(body, { cameraSensors: allowed })).toEqual({ error: NO_PORTS });
+    expect(
+      validateConfigPatch(
+        { cameraSensors: cams({ constructor: { sensor: 'imx708' } }) },
+        { cameraSensors: allowed, cameraPorts: null },
+      ),
+    ).toEqual({ error: NO_PORTS });
+    // The declared ports accept exactly themselves.
+    const good = { cameraSensors: cams({ cam0: { sensor: 'imx708' }, cam1: { sensor: 'none' } }) };
+    expect(validateConfigPatch(good, { cameraSensors: allowed, cameraPorts: ports })).toEqual({
+      value: good,
+    });
+    // Clearing needs no port list.
+    expect(
+      validateConfigPatch({ cameraSensors: null }, { cameraSensors: allowed, cameraPorts: null }),
+    ).toEqual({ value: { cameraSensors: null } });
   });
 });
 
@@ -353,6 +414,17 @@ describe('cameraSensors: who may hold it (cameraSensorsEligibility)', () => {
     expect(CAMERA_SENSORS_MIN_AGENT).toBe('0.2.0');
     expect(CAMERA_CATALOG.sensors.every((s) => s.minAgent === '0.2.0')).toBe(true);
     expect(CAMERA_SENSORS_ONLY_NAMESPACES).toEqual(['cameraSensors']);
+  });
+
+  it('the version is the lowest minAgent, and an EMPTY catalog does not throw', () => {
+    expect(lowestMinAgent([{ minAgent: '0.3.0' }, { minAgent: '0.2.10' }, { minAgent: '0.2.9' }])).toBe(
+      '0.2.9',
+    );
+    expect(lowestMinAgent([{ minAgent: '1.0.0' }])).toBe('1.0.0');
+    // This runs at module load in every Lambda that imports the registry.
+    expect(() => lowestMinAgent([])).not.toThrow();
+    expect(lowestMinAgent([])).toBe('0.2.0');
+    expect(lowestMinAgent(CAMERA_CATALOG.sensors)).toBe(CAMERA_SENSORS_MIN_AGENT);
   });
 
   it('a JS device: refused, reported or not', () => {
@@ -471,6 +543,7 @@ describe('cameraSensors: PATCH validation (validateConfigPatch)', () => {
   const facts = (device: Parameters<typeof cameraSensorsEligibility>[0]) => ({
     simulated: device.simulated === true,
     cameraSensors: cameraSensorsEligibility(device),
+    cameraPorts: ['cam0', 'cam1'],
   });
 
   it('JS device: a 400 text, never a silent drop', () => {
