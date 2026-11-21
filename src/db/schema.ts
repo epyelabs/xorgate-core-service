@@ -417,6 +417,17 @@ export const deviceRegistrations = pgTable(
     // an agent change mints a new code (dual-agent registration Q-8.2).
     // manual/041.
     agent: text('agent').default('js').notNull(),
+    // The per-port camera sensor choice made in the Register dialog
+    // (plans/support-other-camera-models): `{ "cam0": { "sensor": "imx708" }, … }`,
+    // the `cameras` map of the `cameraSensors` config namespace. Rust
+    // registrations only; NULL = no choice (the claim seeds from the model's
+    // sensor defaults). Re-pinned in place like the model pick. manual/042.
+    // ⚠️ Nullable with NO default, and the migration must be applied BEFORE this
+    // code is deployed: every registration query selects it by name.
+    cameras: jsonb('cameras').$type<Record<
+      string,
+      { sensor: string; options?: Record<string, number> }
+    > | null>(),
     // Exactly one of the two creator columns is set. A Cognito-authenticated
     // caller sets the user; an API-key caller sets the key, because a key has no
     // `users` row to point at. Nullable since Phase 2 for that reason.

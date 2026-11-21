@@ -30,7 +30,9 @@ export const deviceRegistrationsPaths = {
         'code exists re-pins that code\'s model in place. `agent` picks the installer the code ' +
         'serves (`js`, the default, or `rust`); a pending code is reused only for the SAME agent, ' +
         'so changing the agent mints a new code. `rust` is gated per stage, and optionally per ' +
-        'workspace: while it is not enabled the request is a 409 `AGENT_NOT_ENABLED`. Note the ' +
+        'workspace: while it is not enabled the request is a 409 `AGENT_NOT_ENABLED`. `cameras` ' +
+        '(Rust registrations only) carries the camera sensor chosen per port; like the model ' +
+        'pick it is re-pinned in place on a pending code. Note the ' +
         'success status is 200, not 201, even when a code is created.',
       tags: ['Device Registrations'],
       requestBody: {
@@ -57,6 +59,19 @@ export const deviceRegistrationsPaths = {
                     'workspace is a 409 `AGENT_NOT_ENABLED` (see `GET /device-dist/latest?agent=rust` ' +
                     '`registrationEnabled`).',
                 },
+                cameras: {
+                  allOf: [{ $ref: '#/components/schemas/DeviceRegistrationCameras' }],
+                  nullable: true,
+                  description:
+                    'Rust registrations only (`agent: "rust"`): the camera sensor on each port, ' +
+                    'which the claim stores as the new device\'s `cameraSensors` config ' +
+                    'namespace. A port left out starts on the device model\'s own sensor. ' +
+                    'Absent = leave a reused pending code\'s choice as it is; `null` or `{}` = ' +
+                    'clear it. Passing it while a pending code exists re-pins that code\'s ' +
+                    'choice in place. On a JS registration, and for a sensor or option the ' +
+                    'camera catalog does not list, it is a 400 `INVALID_CAMERAS`. A key the ' +
+                    'model resolved at claim does not declare is dropped at claim.',
+                },
               },
             },
           },
@@ -73,7 +88,8 @@ export const deviceRegistrationsPaths = {
         },
         '400': {
           description:
-            'Bad request, including an unknown `agent` (`INVALID_AGENT`) or `deviceModelId`.',
+            'Bad request, including an unknown `agent` (`INVALID_AGENT`) or `deviceModelId`, ' +
+            'and a `cameras` value that is not valid or not allowed (`INVALID_CAMERAS`).',
           content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
         },
         '401': { $ref: '#/components/responses/Unauthorized' },
@@ -131,7 +147,12 @@ export const deviceRegistrationsPaths = {
         'picks the device model unless the registration pinned one; an ambiguous probe keeps ' +
         'the registration\'s model and flags the device `needsModel`. The response embeds the ' +
         'resolved model\'s device-facing `hardware` block (null for schemaVersion-1 models), ' +
-        'which the installer writes to /etc/xorgate/hardware.json. Not part of the public API ' +
+        'which the installer writes to /etc/xorgate/hardware.json. For a Rust registration the ' +
+        'claim also seeds the device\'s `cameraSensors` config namespace (per camera port of ' +
+        'the resolved model: the registration\'s `cameras` choice, else the model\'s sensor) ' +
+        'and returns it as `cameraSensors`; a JS claim stores and returns nothing new. When the ' +
+        'probe reports 0 cameras, the number of sensors the registration declares stands in ' +
+        'as the count. Not part of the public API ' +
         'surface: treat the installer as the only client.',
       tags: ['Device Registrations'],
       security: [],

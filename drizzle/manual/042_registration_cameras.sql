@@ -1,0 +1,28 @@
+-- The camera sensor choice a device registration carries to its claim
+-- (plans/support-other-camera-models, Phase 2 "the choice").
+--
+-- `device_registrations.cameras` holds the per-port sensor choice made in the
+-- Register dialog for a RUST-agent registration: the `cameras` map of the
+-- `cameraSensors` config namespace, e.g.
+--   {"cam0": {"sensor": "imx708"}, "cam1": {"sensor": "none"}}
+-- The claim drops entries for ports the resolved model does not declare, seeds
+-- `devices.config.cameraSensors` from what is left (else from the model's
+-- sensor defaults) and echoes it to the installer. NULL = no choice was made,
+-- which is every existing row and every JS registration, now and later.
+--
+-- Nothing is added to `devices`: the namespace lives in `devices.config`
+-- (jsonb), like `cameraMount`.
+--
+-- A hand-written manual migration rather than `npm run db:generate` output: the
+-- drizzle snapshot lags the schema (see 040, 041).
+--
+-- Additive and idempotent (IF NOT EXISTS). A nullable column with no default is
+-- metadata-only on PostgreSQL, so it is instant on a populated table.
+--
+-- ORDER MATTERS: apply BEFORE deploying the code. The new code selects
+-- `cameras` by name in every registration query, so a deploy before this
+-- migration makes every registration route 500: creating a code, polling it,
+-- the claim, and the installer download `GET /v1/get/{code}`, for JS
+-- registrations as much as Rust ones. The reverse order is safe: the old code
+-- ignores the new column. One statement.
+ALTER TABLE "device_registrations" ADD COLUMN IF NOT EXISTS "cameras" jsonb;

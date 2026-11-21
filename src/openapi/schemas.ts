@@ -688,6 +688,32 @@ export function openApiSchemas(): Record<string, unknown> {
         createdAt: { type: 'string', format: 'date-time' },
       },
     },
+    DeviceRegistrationCameras: {
+      type: 'object',
+      description:
+        'A camera sensor per port, keyed by stream key (`cam0`, `cam1`): the `cameras` map of ' +
+        'the `cameraSensors` config namespace (see `CameraSensorsConfig`), validated by the ' +
+        'same rules. `sensor` is an id of the camera catalog or "none" for an empty port; ' +
+        '`options` are that sensor\'s per-board overlay parameters.',
+      additionalProperties: {
+        type: 'object',
+        required: ['sensor'],
+        additionalProperties: false,
+        properties: {
+          sensor: {
+            type: 'string',
+            description: 'A camera catalog sensor id, or "none" for a port with no camera.',
+          },
+          options: {
+            type: 'object',
+            additionalProperties: { type: 'number' },
+            description:
+              'Option values by the keys the catalog lists for the sensor. Not allowed with "none".',
+          },
+        },
+      },
+      example: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'none' } },
+    },
     DeviceRegistration: {
       type: 'object',
       required: ['code', 'status', 'deviceId', 'expiresAt', 'installUrl', 'agent'],
@@ -726,6 +752,15 @@ export function openApiSchemas(): Record<string, unknown> {
           type: 'string',
           enum: ['js', 'rust'],
           description: 'Which device agent `installUrl` installs.',
+        },
+        cameras: {
+          allOf: [{ $ref: '#/components/schemas/DeviceRegistrationCameras' }],
+          nullable: true,
+          description:
+            'Present on `rust` registrations only; a `js` registration has no such key. The ' +
+            'camera sensor chosen per port, which the claim stores as the new device\'s ' +
+            '`cameraSensors` config namespace. null = no choice was made: the device starts ' +
+            'on its model\'s own sensors.',
         },
       },
     },
