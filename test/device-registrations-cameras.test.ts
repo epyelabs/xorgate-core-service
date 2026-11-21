@@ -12,9 +12,11 @@ import { resolveModel } from '../src/services/model-probe';
  * (plans/support-other-camera-models, Phase 2):
  *
  *   POST /device-registrations   `cameras` on the body, the view, the re-pin
- *   POST …/{code}/claim          drop undeclared ports, seed `cameraSensors`
+ *   POST …/{code}/claim          for an installer that declares `camera.sensors`:
+ *                                drop undeclared ports, seed `cameraSensors`
  *                                from the choice else the model default, echo
- *                                it, count hint for the model probe
+ *                                it; for any other installer: nothing new;
+ *                                count hint for the model probe
  *
  * and, as important, what must NOT change: a JS registration and a JS claim
  * store, publish and answer exactly what they did before.
@@ -227,7 +229,13 @@ async function create(body?: unknown) {
   return { status: res.statusCode, body: JSON.parse(res.body as string), raw: res.body as string };
 }
 
-async function claim(reg: Row, body: unknown = { serial: 's1', agent: reg.agent === 'rust' ? 'rust' : undefined }) {
+/** The body the 0.2.0 Rust provisioner sends: it declares what it can act on. */
+const CAPABLE = { serial: 's1', agent: 'rust', capabilities: ['camera.sensors'] };
+
+async function claim(
+  reg: Row,
+  body: unknown = reg.agent === 'rust' ? CAPABLE : { serial: 's1' },
+) {
   claimReturns = { id: 'reg-x', code: 'c0de', workspaceId: WS, status: 'claimed', ...reg };
   const res = (await handler(claimEvent(body))) as Res;
   return { status: res.statusCode, body: JSON.parse(res.body as string), raw: res.body as string };
@@ -474,7 +482,7 @@ describe('POST /device-registrations: the one deliberate change for a JS caller'
   });
 });
 
-describe('POST /device-registrations/{code}/claim: Rust seeding', () => {
+describe('POST /device-registrations/{code}/claim: Rust seeding (an installer that declares camera.sensors)', () => {
   const rustReg = (extra: Row = {}): Row => ({
     agent: 'rust',
     deviceModelId: CM5_DUAL.id,
@@ -566,6 +574,148 @@ describe('POST /device-registrations/{code}/claim: Rust seeding', () => {
   });
 });
 
+describe('POST /device-registrations/{code}/claim: a Rust installer that does NOT declare camera.sensors', () => {
+  // Every v0.1.1 provisioner. Seeding for it would store a value its agent
+  // ignores and the report mirror then has to delete: the withdrawal would be
+  // the normal path of every registration instead of the safety net.
+  //
+  // The two tests that pin the response and the stored document, and every
+  // "treated as not declared" case, also pass unmodified against the tree
+  // before the namespace (b59d7d4): the literal below is that tree's output.
+  const rustReg = (extra: Row = {}): Row => ({
+    agent: 'rust',
+    deviceModelId: CM5_DUAL.id,
+    modelPinned: true,
+    cameras: null,
+    ...extra,
+  });
+  const OLD_INSTALLER = { serial: 's1', hostname: 'pi', agent: 'rust' };
+
+  /** The response of this claim as `b59d7d4` serialized it, field by field. */
+  const BEFORE = JSON.stringify({
+    deviceId: 'device-1',
+    thingName: 'dev-1',
+    dataEndpoint: 'ats.example',
+    certPem: 'CERT',
+    privateKey: 'KEY',
+    caUrl: 'ca',
+    name: 'pi',
+    region: 'us-east-1',
+    credentialEndpoint: 'cred.example',
+    roleAlias: 'Alias',
+    channels: [{ streamKey: 'cam0', channelName: 'dev-1-cam0' }],
+    uploadBucket: process.env.BUCKET_NAME ?? null,
+    modelId: CM5_DUAL.id,
+    modelName: 'CM5 dual',
+    needsModel: false,
+    hardware: {
+      v: 2,
+      platform: 'rpi-cm5',
+      encoder: 'sw-h264',
+      rails: false,
+      statusLed: null,
+      imu: null,
+      video: [
+        { key: 'cam0', connector: 'csi0', sensor: 'imx290', codec: 'h264' },
+        { key: 'cam1', connector: 'csi1', sensor: 'imx290', codec: 'h264' },
+      ],
+    },
+  });
+
+  it('no seed, no echo: the response is byte-for-byte the b59d7d4 one', async () => {
+    const r = await claim(rustReg(), OLD_INSTALLER);
+    expect(r.status).toBe(200);
+    expect(r.raw).toBe(BEFORE);
+    expect(Object.keys(r.body)).toEqual(JS_CLAIM_KEYS);
+  });
+
+  it('stores an empty document and publishes it, as before the namespace existed', async () => {
+    await claim(rustReg(), OLD_INSTALLER);
+    expect(deviceInserts[0].config).toEqual({});
+    expect(deviceInserts[0].agent).toBe('rust');
+    expect(publishDeviceConfig).toHaveBeenCalledWith('device-1', {}, 1);
+    expect(Object.keys(deviceInserts[0]).sort()).toEqual(
+      [
+        'agent',
+        'config',
+        'configRev',
+        'configUpdatedAt',
+        'deviceModelId',
+        'name',
+        'needsModel',
+        'serial',
+        'workspaceId',
+      ].sort(),
+    );
+  });
+
+  it('a choice on the registration is NOT applied, and the same bytes come back', async () => {
+    const r = await claim(
+      rustReg({ cameras: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'none' } } }),
+      OLD_INSTALLER,
+    );
+    expect(r.raw).toBe(BEFORE);
+    expect(deviceInserts[0].config).toEqual({});
+    expect(warn).toHaveBeenCalledWith(
+      'claim: camera choice not applied, the installer did not declare camera.sensors',
+      expect.objectContaining({ ports: ['cam0', 'cam1'] }),
+    );
+    // The choice is not erased from the registration row by the claim.
+    expect(regUpdates.every((u) => !('cameras' in u))).toBe(true);
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['null', null],
+    ['an empty list', []],
+    ['only strings this backend does not know', ['sms.read', 'obd.scan', 'camera.sensor', 'CAMERA.SENSORS']],
+    ['a bare string', 'camera.sensors'],
+    ['an object', { 'camera.sensors': true }],
+    ['an object posing as a list', { length: 1, 0: 'camera.sensors' }],
+    ['a number', 1],
+    ['true', true],
+    ['the string nested in a list', [['camera.sensors']]],
+    ['the string as an object item', [{ name: 'camera.sensors' }]],
+    ['the string padded', [' camera.sensors ']],
+    ['a list longer than 32 that does contain it', [...Array.from({ length: 32 }, (_, i) => `x.${i}`), 'camera.sensors']],
+    ['a 200 KB item', ['x'.repeat(200_000)]],
+  ])('capabilities %s → treated as not declared: 200, no seed, the same bytes', async (_name, capabilities) => {
+    const r = await claim(rustReg(), { ...OLD_INSTALLER, capabilities });
+    expect(r.status).toBe(200);
+    expect(r.raw).toBe(BEFORE);
+    expect(deviceInserts[0].config).toEqual({});
+  });
+
+  it.each([
+    ['alone', ['camera.sensors']],
+    ['among strings this backend does not know', ['sms.read', 'future.thing', 'camera.sensors']],
+    ['beside items that are not strings or are too long', [1, null, {}, 'y'.repeat(65), 'camera.sensors']],
+    ['in a list of exactly 32', [...Array.from({ length: 31 }, (_, i) => `x.${i}`), 'camera.sensors']],
+    ['twice', ['camera.sensors', 'camera.sensors']],
+  ])('capabilities with camera.sensors %s → seeded and echoed', async (_name, capabilities) => {
+    const r = await claim(rustReg(), { ...OLD_INSTALLER, capabilities });
+    expect(r.status).toBe(200);
+    const expected = { cameras: { cam0: { sensor: 'imx290' }, cam1: { sensor: 'imx290' } } };
+    expect(r.body.cameraSensors).toEqual(expected);
+    expect(deviceInserts[0].config).toEqual({ cameraSensors: expected });
+    // Everything before the new key is the old response.
+    const { cameraSensors: _added, ...rest } = r.body;
+    expect(JSON.stringify(rest)).toBe(BEFORE);
+  });
+
+  it('the count hint still uses the choice, with or without the capability', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(
+      rustReg({ modelPinned: false, cameras: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'imx219' } } }),
+      { serial: 's1', agent: 'rust', dtModel: CM5_DT, cameras: 0 },
+    );
+    expect(r.body.modelId).toBe(CM5_DUAL.id);
+    expect(r.body.needsModel).toBe(false);
+    expect('cameraSensors' in r.body).toBe(false);
+    expect(deviceInserts[0].config).toEqual({});
+  });
+});
+
 describe('POST /device-registrations/{code}/claim: the camera count hint', () => {
   const unpinned = (extra: Row = {}): Row => ({
     agent: 'rust',
@@ -579,7 +729,7 @@ describe('POST /device-registrations/{code}/claim: the camera count hint', () =>
     models = [CM5_SINGLE, CM5_DUAL];
     const r = await claim(
       unpinned({ cameras: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'imx219' } } }),
-      { serial: 's1', agent: 'rust', dtModel: CM5_DT, cameras: 0 },
+      { ...CAPABLE, dtModel: CM5_DT, cameras: 0 },
     );
     expect(r.body.modelId).toBe(CM5_DUAL.id);
     expect(r.body.needsModel).toBe(false);
@@ -589,7 +739,7 @@ describe('POST /device-registrations/{code}/claim: the camera count hint', () =>
     models = [CM5_SINGLE, CM5_DUAL];
     const r = await claim(
       unpinned({ cameras: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'none' } } }),
-      { serial: 's1', agent: 'rust', dtModel: CM5_DT },
+      { ...CAPABLE, dtModel: CM5_DT },
     );
     expect(r.body.modelId).toBe(CM5_SINGLE.id);
     expect(r.body.needsModel).toBe(false);
@@ -695,6 +845,19 @@ describe('POST /device-registrations/{code}/claim: JS is unchanged', () => {
         },
       }),
     );
+  });
+
+  it('a JS claim that sends capabilities is ignored, not refused: the same bytes', async () => {
+    const plain = await claim(jsReg(), { serial: 's1', hostname: 'pi' });
+    deviceInserts = [];
+    const withCaps = await claim(jsReg(), {
+      serial: 's1',
+      hostname: 'pi',
+      capabilities: ['camera.sensors'],
+    });
+    expect(withCaps.status).toBe(200);
+    expect(withCaps.raw).toBe(plain.raw);
+    expect(deviceInserts[0].config).toEqual({});
   });
 
   it('a JS registration row holding a cameras value seeds nothing and hints nothing', async () => {

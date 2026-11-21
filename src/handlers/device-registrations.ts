@@ -23,10 +23,12 @@ import { publishDeviceConfig } from '../services/device-config';
 import { resolveModel } from '../services/model-probe';
 import { deriveHardwareBlock, type DeviceHardwareBlock } from '../schemas/capabilities';
 import {
+  CAMERA_SENSORS_CAPABILITY,
   CAMERA_SENSORS_KEY,
   cameraSensorMapSchema,
   checkCameraSensorMap,
   initialConfigDocument,
+  issuePathText,
   type CameraSensorEntry,
   type CameraSensorsConfig,
   type ConfigDocument,
@@ -122,7 +124,7 @@ function parseRegistrationCameras(
   const parsed = cameraSensorMapSchema.safeParse(input);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    const path = issue?.path.length ? `cameras.${issue.path.join('.')}` : 'cameras';
+    const path = issue?.path.length ? `cameras.${issuePathText(issue.path)}` : 'cameras';
     return { error: `${path}: ${issue?.message ?? 'invalid'}` };
   }
   return { value: Object.keys(parsed.data).length > 0 ? parsed.data : null };
@@ -272,6 +274,10 @@ async function createRegistration(
       repin.deviceModelId = pinnedModelId;
       repin.modelPinned = true;
     }
+    // DELIBERATE (review N4): a request that does not send `cameras` KEEPS the
+    // choice already on the reused code, it does not reset it to the model
+    // defaults (`null` does that). A code is shared by the workspace for its 15
+    // minutes, so the last re-pin wins, exactly as for the model pick above.
     if (cameras !== undefined && !sameCameras(existing.cameras ?? null, cameras)) {
       repin.cameras = cameras;
     }
@@ -379,6 +385,12 @@ async function claimRegistration(
     cameras?: number;
     /** The installer's own idea of its agent (the Rust provisioner sends "rust"; JS sends none). */
     agent?: unknown;
+    /**
+     * What the installer and the agent it installs can act on, as capability
+     * strings (the vocabulary of `effective.agent.capabilities`). Optional;
+     * see `installerCapabilities`. Read for Rust registrations only.
+     */
+    capabilities?: unknown;
   };
   try {
     body = JSON.parse(event.body ?? '{}');
@@ -476,13 +488,29 @@ async function claimRegistration(
   }
 
   // The camera sensors this device starts with (plans/support-other-camera-models):
-  // RUST registrations only. Every new Rust device is managed from day one: per
-  // camera port of the resolved model, the registration's choice, else the
-  // model's own sensor. A JS claim seeds nothing and its document, its retained
-  // message and its response are exactly what they were.
+  // RUST registrations only. Per camera port of the resolved model, the
+  // registration's choice, else the model's own sensor. A JS claim seeds nothing
+  // and its document, its retained message and its response are exactly what
+  // they were (a `capabilities` field on a JS claim is not read).
+  //
+  // …and only when the claim REQUEST proves an installer that acts on it: the
+  // Rust provisioner of agent 0.2.0+ sends `capabilities: ["camera.sensors"]`.
+  // An installer that does not (every v0.1.1 one) gets NO seed and NO echo: its
+  // device document, retained message and response are what they were before
+  // the namespace existed, and the registration's choice is simply not applied
+  // (it stays on the registration row). Seeding for an agent that then reports
+  // without the capability would make the report mirror's withdrawal the
+  // normal path of every registration; it is meant to be the safety net.
   const hardware = deriveHardwareBlock(resolvedModel?.ioCapabilities);
-  const cameraSensors =
-    agent === 'rust' ? seedCameraSensors(hardware, chosenCameras, { code }) : null;
+  const seeds =
+    agent === 'rust' && installerCapabilities(body.capabilities).includes(CAMERA_SENSORS_CAPABILITY);
+  const cameraSensors = seeds ? seedCameraSensors(hardware, chosenCameras, { code }) : null;
+  if (agent === 'rust' && !seeds && chosenCameras) {
+    console.warn('claim: camera choice not applied, the installer did not declare camera.sensors', {
+      code,
+      ports: Object.keys(chosenCameras),
+    });
+  }
   const initialConfig: ConfigDocument = initialConfigDocument();
   if (cameraSensors) initialConfig[CAMERA_SENSORS_KEY] = cameraSensors;
 
@@ -544,10 +572,11 @@ async function claimRegistration(
   // Best-effort: a publish failure must never fail a claim that has already
   // created the row, the thing and the cert — the next save republishes.
   //
-  // A Rust claim's document may carry the seeded `cameraSensors`. The publisher
-  // emits it because this device has never reported (`cameraSensorsEligibility`);
-  // if the agent that connects turns out not to support it, the report mirror
-  // withdraws it and republishes without it.
+  // A capable Rust claim's document carries the seeded `cameraSensors`. The
+  // publisher emits it because this device has never reported
+  // (`cameraSensorsEligibility`); if the agent that connects turns out not to
+  // support it after all, the report mirror withdraws it and republishes
+  // without it.
   try {
     await publishDeviceConfig(device!.id, device!.config, device!.configRev);
   } catch (err) {
@@ -589,12 +618,35 @@ async function claimRegistration(
     modelName: resolvedModel?.name ?? null,
     needsModel,
     hardware,
-    // RUST claims with a seeded choice only (plans/support-other-camera-models):
-    // exactly what was stored in `devices.config.cameraSensors`. The Rust
-    // installer renders the camera lines of config.txt from it. Absent on every
-    // JS claim, and on a Rust claim whose model declares no camera port.
+    // RUST claims that declared `camera.sensors` and got a seed only
+    // (plans/support-other-camera-models): exactly what was stored in
+    // `devices.config.cameraSensors`. The Rust installer renders the camera
+    // lines of config.txt from it. Absent on every JS claim, on a Rust claim
+    // from an installer that did not declare the capability, and on one whose
+    // model declares no camera port.
     ...(cameraSensors ? { [CAMERA_SENSORS_KEY]: cameraSensors } : {}),
   });
+}
+
+/** Bounds on the claim body's `capabilities`: a list beyond them is not read at all. */
+const CLAIM_CAPABILITIES_MAX = 32;
+const CLAIM_CAPABILITY_MAX_CHARS = 64;
+
+/**
+ * The capability strings a claim body declares, or none.
+ *
+ * TOLERANT, never a 4xx: the claim is called by installers already in the
+ * field, and an old one sends no such field. Anything that is not an array, or
+ * an array of more than `CLAIM_CAPABILITIES_MAX` items, reads as "declares
+ * nothing". Inside an accepted list, an item that is not a string or is longer
+ * than `CLAIM_CAPABILITY_MAX_CHARS` is skipped, and a string this backend does
+ * not know is simply never looked for.
+ */
+function installerCapabilities(input: unknown): string[] {
+  if (!Array.isArray(input) || input.length > CLAIM_CAPABILITIES_MAX) return [];
+  return input.filter(
+    (item): item is string => typeof item === 'string' && item.length <= CLAIM_CAPABILITY_MAX_CHARS,
+  );
 }
 
 /** How many ports of a choice declare a sensor (`none` = an empty port, not counted). */

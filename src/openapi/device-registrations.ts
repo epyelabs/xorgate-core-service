@@ -70,7 +70,10 @@ export const deviceRegistrationsPaths = {
                     'clear it. Passing it while a pending code exists re-pins that code\'s ' +
                     'choice in place. On a JS registration, and for a sensor or option the ' +
                     'camera catalog does not list, it is a 400 `INVALID_CAMERAS`. A key the ' +
-                    'model resolved at claim does not declare is dropped at claim.',
+                    'model resolved at claim does not declare is dropped at claim. The choice ' +
+                    'is applied only when the installer that claims the code declares the ' +
+                    '`camera.sensors` capability (Rust agent 0.2.0 or newer); an older ' +
+                    'installer leaves the device on its model\'s sensors, unmanaged.',
                 },
               },
             },
@@ -147,10 +150,15 @@ export const deviceRegistrationsPaths = {
         'picks the device model unless the registration pinned one; an ambiguous probe keeps ' +
         'the registration\'s model and flags the device `needsModel`. The response embeds the ' +
         'resolved model\'s device-facing `hardware` block (null for schemaVersion-1 models), ' +
-        'which the installer writes to /etc/xorgate/hardware.json. For a Rust registration the ' +
-        'claim also seeds the device\'s `cameraSensors` config namespace (per camera port of ' +
-        'the resolved model: the registration\'s `cameras` choice, else the model\'s sensor) ' +
-        'and returns it as `cameraSensors`; a JS claim stores and returns nothing new. When the ' +
+        'which the installer writes to /etc/xorgate/hardware.json. The body may also carry ' +
+        '`capabilities`, a list of capability strings the installer and the agent it installs ' +
+        'can act on (at most 32 items of at most 64 characters; anything else, and any string ' +
+        'the backend does not know, is ignored and is never an error). For a Rust registration ' +
+        'whose claim lists `camera.sensors`, the claim seeds the device\'s `cameraSensors` ' +
+        'config namespace (per camera port of the resolved model: the registration\'s `cameras` ' +
+        'choice, else the model\'s sensor) and returns it as `cameraSensors`. Without that ' +
+        'string nothing is seeded or returned and the registration\'s `cameras` choice is not ' +
+        'applied; a JS claim never stores or returns anything new. When the ' +
         'probe reports 0 cameras, the number of sensors the registration declares stands in ' +
         'as the count. Not part of the public API ' +
         'surface: treat the installer as the only client.',

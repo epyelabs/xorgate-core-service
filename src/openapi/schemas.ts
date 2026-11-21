@@ -759,8 +759,10 @@ export function openApiSchemas(): Record<string, unknown> {
           description:
             'Present on `rust` registrations only; a `js` registration has no such key. The ' +
             'camera sensor chosen per port, which the claim stores as the new device\'s ' +
-            '`cameraSensors` config namespace. null = no choice was made: the device starts ' +
-            'on its model\'s own sensors.',
+            '`cameraSensors` config namespace when the installer declares the ' +
+            '`camera.sensors` capability. null = no choice was made: the device starts ' +
+            'on its model\'s own sensors. The claim does not change this field, so it shows ' +
+            'what was chosen, not what was applied.',
         },
       },
     },
