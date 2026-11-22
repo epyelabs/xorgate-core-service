@@ -159,7 +159,8 @@ export const deviceRegistrationsPaths = {
         'choice, else the model\'s sensor) and returns it as `cameraSensors`. Without that ' +
         'string nothing is seeded or returned and the registration\'s `cameras` choice is not ' +
         'applied; a JS claim never stores or returns anything new. When the ' +
-        'probe reports 0 cameras, the number of sensors the registration declares stands in ' +
+        'probe reports fewer cameras than the registration declares sensors for (0 on a fresh ' +
+        'OS, or a sensor whose packages are not installed yet), the declared number is used ' +
         'as the count. Not part of the public API ' +
         'surface: treat the installer as the only client.',
       tags: ['Device Registrations'],

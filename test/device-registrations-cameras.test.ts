@@ -754,11 +754,91 @@ describe('POST /device-registrations/{code}/claim: the camera count hint', () =>
     expect(r.body.modelId).toBe(CM5_DUAL.id); // the registration's fallback
   });
 
-  it('a count the probe measured wins over the declared one', async () => {
+  // The declared count is a LOWER BOUND on a measured one. Seen on hardware: a
+  // CM5 with an IMX335 and an IMX708 claims with `cameras: 1`, because the
+  // installer counts before its package step and stock libcamera does not list
+  // the IMX335 yet. Until this rule the measured 1 won, and the device got the
+  // one-camera SKU with needs_model false and lost its second port.
+  it('declared 2, measured 1: the two-camera model, both ports kept', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const cameras = { cam0: { sensor: 'imx335' }, cam1: { sensor: 'imx708' } };
+    const r = await claim(unpinned({ cameras }), { ...CAPABLE, dtModel: CM5_DT, cameras: 1 });
+    expect(r.body.modelId).toBe(CM5_DUAL.id);
+    expect(r.body.needsModel).toBe(false);
+    expect(deviceInserts[0].deviceModelId).toBe(CM5_DUAL.id);
+    // Nothing is dropped: the model has both declared ports.
+    expect(r.body.cameraSensors).toEqual({ cameras });
+    expect(warn).not.toHaveBeenCalledWith(
+      'claim: camera choice dropped for ports the resolved model does not declare',
+      expect.anything(),
+    );
+    expect(log).toHaveBeenCalledWith(
+      'claim model resolution',
+      expect.objectContaining({
+        cameras: 1,
+        sku: 'CM5-2',
+        needsModel: false,
+        reason: 'probe matched CM5-2 (platform=rpi-cm5, cameras=2 declared, probe saw 1)',
+      }),
+    );
+  });
+
+  it('the same from an installer that declares no capability (the count hint needs none)', async () => {
     models = [CM5_SINGLE, CM5_DUAL];
     const r = await claim(
-      unpinned({ cameras: { cam0: { sensor: 'imx708' }, cam1: { sensor: 'imx219' } } }),
+      unpinned({ cameras: { cam0: { sensor: 'imx335' }, cam1: { sensor: 'imx708' } } }),
       { serial: 's1', agent: 'rust', dtModel: CM5_DT, cameras: 1 },
+    );
+    expect(r.body.modelId).toBe(CM5_DUAL.id);
+    expect(r.body.needsModel).toBe(false);
+  });
+
+  it('nothing declared, measured 1: the one-camera model, as before', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(unpinned(), { ...CAPABLE, dtModel: CM5_DT, cameras: 1 });
+    expect(r.body.modelId).toBe(CM5_SINGLE.id);
+    expect(r.body.needsModel).toBe(false);
+    expect(log).toHaveBeenCalledWith(
+      'claim model resolution',
+      expect.objectContaining({ reason: 'probe matched CM5-1 (platform=rpi-cm5, cameras=1)' }),
+    );
+  });
+
+  it('declared {cam0: none, cam1: imx708} counts 1: a measured 1 is not raised', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(
+      unpinned({ cameras: { cam0: { sensor: 'none' }, cam1: { sensor: 'imx708' } } }),
+      { ...CAPABLE, dtModel: CM5_DT, cameras: 1 },
+    );
+    // One real sensor declared, one camera seen: the count is 1, measured.
+    expect(r.body.modelId).toBe(CM5_SINGLE.id);
+    expect(log).toHaveBeenCalledWith(
+      'claim model resolution',
+      expect.objectContaining({ reason: 'probe matched CM5-1 (platform=rpi-cm5, cameras=1)' }),
+    );
+  });
+
+  it('declared {cam0: none, cam1: imx708}, measured 2: the measured count stands', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(
+      unpinned({ cameras: { cam0: { sensor: 'none' }, cam1: { sensor: 'imx708' } } }),
+      { ...CAPABLE, dtModel: CM5_DT, cameras: 2 },
+    );
+    expect(r.body.modelId).toBe(CM5_DUAL.id);
+    expect(r.body.cameraSensors).toEqual({
+      cameras: { cam0: { sensor: 'none' }, cam1: { sensor: 'imx708' } },
+    });
+  });
+
+  it('a pinned model is not touched by any count', async () => {
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(
+      unpinned({
+        modelPinned: true,
+        deviceModelId: CM5_SINGLE.id,
+        cameras: { cam0: { sensor: 'imx335' }, cam1: { sensor: 'imx708' } },
+      }),
+      { ...CAPABLE, dtModel: CM5_DT, cameras: 1 },
     );
     expect(r.body.modelId).toBe(CM5_SINGLE.id);
   });
@@ -779,10 +859,39 @@ describe('POST /device-registrations/{code}/claim: the camera count hint', () =>
     expect(pick({ dtModel: CM5_DT }).needsModel).toBe(true);
     // A declared count matching no model is non-narrowing, like a probed one.
     expect(pick({ dtModel: CM5_DT, declaredCameras: 5 }).needsModel).toBe(true);
-    // Measured counts: the text and the result are what they were.
+    // A measured count that is at least the declared one: the text and the
+    // result are what they were.
     expect(pick({ dtModel: CM5_DT, cameras: 2, declaredCameras: 1 })).toMatchObject({
       model: CM5_DUAL,
       reason: 'probe matched CM5-2 (platform=rpi-cm5, cameras=2)',
+    });
+    expect(pick({ dtModel: CM5_DT, cameras: 2, declaredCameras: 2 }).reason).toBe(
+      'probe matched CM5-2 (platform=rpi-cm5, cameras=2)',
+    );
+    expect(pick({ dtModel: CM5_DT, cameras: 1, declaredCameras: 1 })).toMatchObject({
+      model: CM5_SINGLE,
+      reason: 'probe matched CM5-1 (platform=rpi-cm5, cameras=1)',
+    });
+    // Nothing declared: the measured count alone, exactly as before.
+    for (const declaredCameras of [undefined, null, 0]) {
+      expect(pick({ dtModel: CM5_DT, cameras: 1, declaredCameras })).toMatchObject({
+        model: CM5_SINGLE,
+        needsModel: false,
+        reason: 'probe matched CM5-1 (platform=rpi-cm5, cameras=1)',
+      });
+    }
+    // The lower bound: more declared than measured uses the declared count.
+    expect(pick({ dtModel: CM5_DT, cameras: 1, declaredCameras: 2 })).toMatchObject({
+      model: CM5_DUAL,
+      needsModel: false,
+      reason: 'probe matched CM5-2 (platform=rpi-cm5, cameras=2 declared, probe saw 1)',
+    });
+    // More declared than any model has: non-narrowing, so the operator is
+    // asked. It never falls back to narrowing on the smaller measured count.
+    expect(pick({ dtModel: CM5_DT, cameras: 1, declaredCameras: 3 })).toMatchObject({
+      model: CM5_DUAL, // the fallback
+      needsModel: true,
+      reason: 'ambiguous: 2 rpi-cm5 models match',
     });
     // One model on the platform: resolved by platform, no count in the reason.
     expect(pick({ dtModel: CM4_DT, declaredCameras: 2 })).toMatchObject({
@@ -858,6 +967,19 @@ describe('POST /device-registrations/{code}/claim: JS is unchanged', () => {
     expect(withCaps.status).toBe(200);
     expect(withCaps.raw).toBe(plain.raw);
     expect(deviceInserts[0].config).toEqual({});
+  });
+
+  it('a JS claim narrows on the measured count alone, whatever its row holds', async () => {
+    // No lower bound for JS: the declared count is never passed for it.
+    models = [CM5_SINGLE, CM5_DUAL];
+    const r = await claim(
+      jsReg({ modelPinned: false, cameras: { cam0: { sensor: 'imx335' }, cam1: { sensor: 'imx708' } } }),
+      { serial: 's1', dtModel: CM5_DT, cameras: 1 },
+    );
+    expect(r.body.modelId).toBe(CM5_SINGLE.id);
+    expect(r.body.needsModel).toBe(false);
+    const plain = await claim(jsReg({ modelPinned: false }), { serial: 's1', dtModel: CM5_DT, cameras: 1 });
+    expect(plain.raw).toBe(r.raw);
   });
 
   it('a JS registration row holding a cameras value seeds nothing and hints nothing', async () => {
