@@ -22,8 +22,16 @@ import {
  *   the registration stands in as the count (`declaredCameras`,
  *   plans/support-other-camera-models). That is the fresh-OS case exactly: the
  *   probe runs before any overlay line is written, so it can only say 0, while
- *   the Register dialog already knows how many sensors were picked. A count
- *   the probe measured always wins over a declared one.
+ *   the Register dialog already knows how many sensors were picked.
+ * - The declared count is also a LOWER BOUND on a count the probe did measure:
+ *   when the registration declares more sensors than the probe saw, the
+ *   declared count is used. The installer counts cameras BEFORE its package
+ *   step, so a sensor that needs extra OS packages (the IMX335 on stock
+ *   libcamera) is not listed yet: a two-camera device then reports 1, and
+ *   narrowing on that 1 would assign a one-camera SKU with `needs_model`
+ *   false, mint one channel, and drop the declared sensor of the port that
+ *   SKU lacks. A measured count that is at least the declared one is used as
+ *   measured, exactly as before.
  * - Exactly one candidate → assigned, done. Anything else (unknown platform,
  *   no candidate, two SKUs the probe can't separate) → the claim keeps
  *   `fallback` (the registration's model) and flags the device `needs_model`
@@ -36,8 +44,9 @@ export interface ClaimProbe {
   cameras?: number | null;
   /**
    * Number of camera ports the registration declares a sensor on (`none` not
-   * counted). Used as the count only when `cameras` is 0/absent. 0/absent =
-   * nothing declared, i.e. still unknown.
+   * counted). Used as the count when `cameras` is 0/absent, and when it is
+   * LARGER than `cameras` (the device cannot see every declared camera at
+   * claim time). 0/absent = nothing declared: the measured count stands alone.
    */
   declaredCameras?: number | null;
 }
@@ -82,12 +91,15 @@ export function resolveModel(
   }
 
   let candidates = catalog.filter((m) => modelPlatform(m) === platform);
-  // The measured count is used exactly as before; only "the probe saw none"
-  // falls through to what the registration declares.
+  // With nothing declared the measured count is used exactly as before. A
+  // declared count replaces it when the probe saw none, and when the probe saw
+  // FEWER cameras than the registration declares (the lower bound above).
   const probed = probe.cameras ?? 0;
   const measured = probed > 0;
-  const cameras = measured ? probed : positiveCount(probe.declaredCameras);
-  const countSource = measured ? '' : ' declared';
+  const declared = positiveCount(probe.declaredCameras);
+  const useDeclared = !measured || declared > probed;
+  const cameras = useDeclared ? declared : probed;
+  const countSource = !useDeclared ? '' : measured ? ` declared, probe saw ${probed}` : ' declared';
   if (cameras > 0 && candidates.length > 1) {
     const narrowed = candidates.filter((m) => videoCount(m) === cameras);
     // A camera count matching nothing is treated as non-narrowing rather than

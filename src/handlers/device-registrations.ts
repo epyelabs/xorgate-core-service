@@ -456,8 +456,10 @@ async function claimRegistration(
     const res = resolveModel(catalog, regModel, {
       dtModel: body.dtModel,
       cameras: body.cameras,
-      // A fresh OS has no camera overlay yet, so the probe says 0. The number
-      // of sensors the operator declared then stands in as the count
+      // A fresh OS has no camera overlay yet, so the probe says 0, and a sensor
+      // that needs extra OS packages is not counted until they are installed.
+      // The number of sensors the operator declared stands in for a count of
+      // 0 and is a lower bound on a measured one
       // (plans/support-other-camera-models). Absent for a JS registration and
       // for a Rust one with no choice: the resolution is then what it was.
       ...(chosenCameras ? { declaredCameras: declaredSensorCount(chosenCameras) } : {}),
