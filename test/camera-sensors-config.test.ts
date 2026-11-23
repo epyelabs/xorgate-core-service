@@ -760,8 +760,8 @@ describe('cameraSensors: the config contract', () => {
       readFileSync(join(__dirname, '..', 'src/config-registry/config-contract.json'), 'utf8'),
     );
     expect(committed.namespaces.cameraSensors).toEqual(JSON.parse(JSON.stringify(entry)));
-    // The catalog artifact is pinned by content in camera-catalog.test.ts; a
-    // new NAMESPACE must not have touched it.
-    expect(CAMERA_CATALOG.catalogVersion).toBe(3);
+    // The catalog artifact is pinned by content in camera-catalog.test.ts, and
+    // a catalog change (version 4 added Trixie) must not move the contract.
+    expect(CAMERA_CATALOG.catalogVersion).toBe(4);
   });
 });

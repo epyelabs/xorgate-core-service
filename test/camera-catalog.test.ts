@@ -36,9 +36,12 @@ const ARTIFACT = join(__dirname, '..', 'src', 'camera-catalog', 'camera-catalog.
  *   3. set the version and the artifact's sha256 here.
  */
 const PINNED = {
-  catalogVersion: 3,
-  sha256: '812ce3d6c2c4d1de6209c0ec118a9ecbac998b5cf23e5ccf27bd4fbb8c4aafb3',
+  catalogVersion: 4,
+  sha256: 'd65cde662c5f0b0eeb541c5e79e9559060285af795bc224c916214145b833ffc',
 };
+
+/** Catalog 3 (backend e4a6a28), the last Bookworm-only catalog. */
+const CATALOG_V3_SHA256 = '812ce3d6c2c4d1de6209c0ec118a9ecbac998b5cf23e5ccf27bd4fbb8c4aafb3';
 
 /** A deep copy with every object's keys in reverse order (arrays keep theirs). */
 function reverseKeys(value: unknown): unknown {
@@ -166,9 +169,36 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
     expect(CAMERA_CATALOG.planned.map((s) => s.id)).toEqual(['imx662']);
     expect(cameraSensor('imx662')).toBeUndefined();
-    expect(plannedCameraSensor('imx662')).toMatchObject({
+    // Dropped 2026-11-23 (the one board tried never answered on I2C); what was
+    // learned is in its notes, the only free field a planned entry has.
+    expect(plannedCameraSensor('imx662')).toEqual({
+      id: 'imx662',
+      label: 'Sony IMX662',
       tier: 'planned',
       requires: { os: ['trixie'] },
+      notes: [
+        'Not available. The one board tried did not answer on its I2C bus, so nothing ' +
+          'about this sensor has been verified.',
+        'It would need Debian Trixie with kernel 6.18.60 or later. Its overlay is imx662; ' +
+          'the device-tree node is starvis2, and the default rotation is 180 (read in the ' +
+          'device tree).',
+      ],
+    });
+  });
+
+  it('every sensor needs only the first catalog-aware agent (0.2.0)', () => {
+    // Nothing in catalog 4 needs a newer agent: it adds an OS release and a
+    // package target, which the released 0.2.0 parser already reads.
+    for (const s of CAMERA_CATALOG.sensors) expect(s.minAgent, s.id).toBe('0.2.0');
+  });
+
+  it('the four sensors run on Bookworm and on Trixie', () => {
+    const os = Object.fromEntries(CAMERA_CATALOG.sensors.map((s) => [s.id, s.requires.os]));
+    expect(os).toEqual({
+      imx290: ['bookworm', 'trixie'],
+      imx219: ['bookworm', 'trixie'],
+      imx708: ['bookworm', 'trixie'],
+      imx335: ['bookworm', 'trixie'],
     });
   });
 
@@ -195,7 +225,7 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(s.tier).toBe('supported');
     expect(s.identity).toBe('none');
     expect(s.source.props).toEqual([]);
-    expect(s.requires).toEqual({ os: ['bookworm'], packageSet: null });
+    expect(s.requires).toEqual({ os: ['bookworm', 'trixie'], packageSet: null });
     expect(s.options).toHaveLength(1);
     expect(s.options[0]).toMatchObject({
       key: 'clockFrequency',
@@ -248,7 +278,7 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
       values: [594000000, 445500000],
       default: 594000000,
     });
-    expect(s.requires).toEqual({ os: ['bookworm'], packageSet: 'arducam-libcamera' });
+    expect(s.requires).toEqual({ os: ['bookworm', 'trixie'], packageSet: 'arducam-libcamera' });
     // Measured on bench 2: no token = device tree 180, and no rotation is possible.
     expect(s.overlay.defaultRotation).toBe(180);
     expect(s.libcameraNames).toEqual(['imx335']);
@@ -283,7 +313,7 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     const set = cameraPackageSet('arducam-libcamera')!;
     expect(set.aptHold).toBe(true);
     expect(set.notes.join(' ')).toMatch(/apt hold/);
-    expect(set.targets).toHaveLength(1);
+    expect(set.targets.map((t) => `${t.os}/${t.arch}`)).toEqual(['bookworm/arm64', 'trixie/arm64']);
     const [target] = set.targets;
     expect(target).toMatchObject({ os: 'bookworm', arch: 'arm64' });
     const base =
@@ -308,6 +338,54 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     for (const p of target.packages) {
       expect(p.url.endsWith(`/${p.name}_${p.version}_${target.arch}.deb`), p.name).toBe(true);
     }
+  });
+
+  it('the Arducam set has a Trixie target: its own pair, libcamera0.8 not libcamera0.5', () => {
+    const trixie = cameraPackageSet('arducam-libcamera')!.targets.find((t) => t.os === 'trixie')!;
+    expect(trixie).toBeDefined();
+    expect(trixie.arch).toBe('arm64');
+    // Same host and release path as the Bookworm pair: a device accepts only
+    // an exact catalog URL on github.com.
+    const base =
+      'https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-v0.0.5/';
+    expect(trixie.packages).toEqual([
+      {
+        name: 'libcamera0.8',
+        version: '0.8.0+rpt20261106-2',
+        url: `${base}libcamera0.8_0.8.0+rpt20261106-2_arm64.deb`,
+        sha256: '8f591a09c3faf866821eb421c4f601a1ff9029ff36baa8aeb32de3467b7728eb',
+        bytes: 591404,
+      },
+      {
+        name: 'libcamera-ipa',
+        version: '0.8.0+rpt20261106-2',
+        url: `${base}libcamera-ipa_0.8.0+rpt20261106-2_arm64.deb`,
+        sha256: '5145f1961c195f1bf782e7f1233afb605c1afe97ceae79888ec5557ddfd26ccc',
+        bytes: 659076,
+      },
+    ]);
+    for (const p of trixie.packages) {
+      expect(p.url.endsWith(`/${p.name}_${p.version}_${trixie.arch}.deb`), p.name).toBe(true);
+    }
+  });
+
+  it('catalog 4 is catalog 3 plus Trixie: every other value is byte-identical', () => {
+    // Undo exactly the catalog-4 additions on the emitted artifact, re-emit it
+    // the generator's way, and the bytes must be catalog 3's. So nothing that
+    // a Bookworm device (or a console) read in catalog 3 changed.
+    const v4 = JSON.parse(readFileSync(ARTIFACT, 'utf8'));
+    const back = JSON.parse(JSON.stringify(v4));
+    back.catalogVersion = 3;
+    for (const s of back.sensors) s.requires.os = s.requires.os.filter((o: string) => o !== 'trixie');
+    // The one revised value: the planned imx662's notes (what the bench
+    // learned); its id, label, tier and OS are catalog 3's.
+    expect(back.planned.map((p: any) => p.id)).toEqual(['imx662']);
+    back.planned[0].notes = ['Not available yet. It needs a device image built on Debian Trixie.'];
+    const set = back.packageSets[0];
+    expect(set.notes.pop()).toMatch(/^On Debian Trixie the pair is libcamera0\.8/);
+    expect(set.targets.pop().os).toBe('trixie');
+    const text = `${JSON.stringify(back, null, 2)}\n`;
+    expect(createHash('sha256').update(text).digest('hex')).toBe(CATALOG_V3_SHA256);
   });
 
   it('every option default is one of its listed values', () => {
@@ -340,6 +418,7 @@ describe('catalog lookups', () => {
     expect(cameraSensorByOverlay('imx662')).toBeUndefined();
     expect(cameraSensorByLibcameraName('imx662')).toBeUndefined();
     expect(cameraSensorByDtNode('imx662@1a')).toBeUndefined();
+    expect(cameraSensorByDtNode('starvis2@1a')).toBeUndefined();
     expect(cameraPackageSet('nope')).toBeUndefined();
   });
 });
@@ -553,8 +632,9 @@ describe('catalog schema (what an entry may not be)', () => {
       }),
     ).toMatch(/not required by any sensor/);
     // A sensor may not claim an OS its package set has no files for.
+    expect(refusal((c) => c.packageSets[0].targets.pop())).toMatch(/has no files for trixie/);
     expect(refusal((c) => c.sensors[3].requires.os.push('trixie'))).toMatch(
-      /has no files for trixie/,
+      /releases must be unique/,
     );
     expect(refusal((c) => (c.sensors[0].tier = 'planned'))).not.toBe('');
   });

@@ -32,7 +32,7 @@ import {
  */
 
 /** Content version of the catalog. Bump on every change to this file's data. */
-export const CAMERA_CATALOG_VERSION = 3;
+export const CAMERA_CATALOG_VERSION = 4;
 
 /**
  * First Rust agent version that compiles a catalog in.
@@ -98,7 +98,9 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       // The probe does no I2C at all: a camera is listed whatever is attached.
       identity: 'none',
       source: { props: [] },
-      requires: { os: ['bookworm'], packageSet: null },
+      // Trixie: overlay name, `clock-frequency` and rotation default READ
+      // unchanged in the 6.18.60 kernel package; ⚠️ not yet on a Trixie bench.
+      requires: { os: ['bookworm', 'trixie'], packageSet: null },
       unsupportedPresets: [], // today's baseline: every preset runs on it
       info: {
         nativeAspect: '16:9', // 1920x1080
@@ -129,7 +131,9 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       dtNodeNames: ['imx219'], // …/i2c@70000/imx219@10
       identity: 'chip-id', // `chip id mismatch: 219!=…`, no camera listed
       source: { props: [] },
-      requires: { os: ['bookworm'], packageSet: null },
+      // Trixie: streaming through agent 0.2.0 on stock libcamera 0.8.0, bench 2
+      // (CM5), 2026-11-23 (evidence/2026-11-23-trixie-upgrade).
+      requires: { os: ['bookworm', 'trixie'], packageSet: null },
       unsupportedPresets: [], // all five started at the capture front end (bench 2)
       info: {
         nativeAspect: '4:3', // 3280x2464
@@ -182,7 +186,9 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       // about 4 m in view (evidence/2026-11-21-cm4-imx708-focus). A value
       // chosen later goes here as `lens-position=<dioptres>`.
       source: { props: [] },
-      requires: { os: ['bookworm'], packageSet: null },
+      // Trixie: overlay name, `link-frequency` and rotation default READ
+      // unchanged in the 6.18.60 kernel package; ⚠️ not yet on a Trixie bench.
+      requires: { os: ['bookworm', 'trixie'], packageSet: null },
       unsupportedPresets: [], // all five started at the capture front end (CM4)
       info: {
         nativeAspect: '16:9', // 4608x2592
@@ -249,7 +255,11 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
       // the CM4 this driver bound to an IMX708 with no kernel error.
       identity: 'weak',
       source: { props: [] },
-      requires: { os: ['bookworm'], packageSet: 'arducam-libcamera' },
+      // Trixie: stock libcamera 0.8.0 still has no IMX335 helper (the port
+      // reads `requirements-missing`); with Arducam's 0.8.0 pair (the trixie
+      // target below) it is listed and streams beside an IMX219, bench 2
+      // (CM5), 2026-11-23 (evidence/2026-11-23-trixie-upgrade, Part D).
+      requires: { os: ['bookworm', 'trixie'], packageSet: 'arducam-libcamera' },
       // Measured, 5 of 5 attempts: `framerate=30/1` cannot be negotiated on
       // the full mode (`streaming stopped, reason not-negotiated`), the
       // process exits at once. The other four presets start and hold rate.
@@ -283,15 +293,34 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
   ],
 
   planned: [
-    // No driver, overlay or tuning file exists on Bookworm (kernel 6.12). The
-    // driver arrived in the 6.18 kernel line with libcamera 0.7.2+rpt, both
-    // Trixie. Last in the plan and allowed to fail.
+    // Back here in catalog 4 (revision 2): the plan owner dropped it
+    // 2026-11-23 after the one board tried never answered on I2C ("SDA stuck
+    // at low" on every boot, at every clock value, connection re-checked).
+    // A planned entry has no overlay facts, so what was learned lives in the
+    // notes and here:
+    //   - Bookworm (kernel 6.12) has no driver, overlay or helper. The driver
+    //     (`sony-starvis2`) is first packaged in kernel 6.18.60 (Trixie);
+    //     libcamera 0.8.0 carries the helper and tuning (pisp and vc4).
+    //   - Line `dtoverlay=imx662,<port>`; `imx662-overlay.dts` includes
+    //     `starvis2-overlay.dts`, so the device-tree node is `starvis2@1a`.
+    //   - Default rotation 180, read in the live device tree on bench 2
+    //     (the overlay README says 0; the dtsi's 180 is right).
+    //   - Overlay `clock-frequency` 24 MHz default (27, 37.125, 72, 74.25
+    //     listed), `4lane` flag; the driver checks a real chip ID.
+    //   - Nothing above was seen streaming: the board was electrically silent.
+    // Evidence: plans/support-other-camera-models/phase-6/.
     {
       id: 'imx662',
       label: 'Sony IMX662',
       tier: PLANNED_TIER,
       requires: { os: ['trixie'] },
-      notes: ['Not available yet. It needs a device image built on Debian Trixie.'],
+      notes: [
+        'Not available. The one board tried did not answer on its I2C bus, so nothing ' +
+          'about this sensor has been verified.',
+        'It would need Debian Trixie with kernel 6.18.60 or later. Its overlay is imx662; ' +
+          'the device-tree node is starvis2, and the default rotation is 180 (read in the ' +
+          'device tree).',
+      ],
     },
   ],
 
@@ -313,6 +342,11 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
           'later stock libcamera fixes off that device.',
         "Fetched from Arducam's GitHub release and checked against the pinned sha256. " +
           'Release assets can be replaced upstream; a file that no longer matches is refused.',
+        // Added in catalog 4; the first note above is about Bookworm and is
+        // kept byte for byte.
+        'On Debian Trixie the pair is libcamera0.8 and libcamera-ipa 0.8.0, Arducam\'s ' +
+          'build of the stock 0.8.0. The two releases cannot share files: each OS has its ' +
+          'own pinned pair.',
       ],
       targets: [
         {
@@ -332,6 +366,37 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
               url: `${ARDUCAM_RELEASES}/libcamera-v0.0.5/libcamera-ipa_0.5.2+rpt20250909-1_arm64.deb`,
               sha256: '247961da888ab177dfac1ceb8e0e75edf2cd2f8722be2fd46984041e87d12503',
               bytes: 600732,
+            },
+          ],
+        },
+        // The same GitHub release, uploaded 2026-11-12: Arducam's build of the
+        // stock Trixie libcamera 0.8.0 with the IMX335 helper added (build
+        // string `v0.8.0+rpt20261104+25-3838bd38-dirty`; t64 dependencies,
+        // libc6 >= 2.38). The library package is `libcamera0.8` here, not
+        // `libcamera0.5`: each target carries its own package list.
+        // Sizes and sha256 checked against the downloaded files on bench 2,
+        // where the pair installed over stock 0.8.0 in one transaction (only
+        // these two upgraded), the stock GStreamer plugin kept loading, and
+        // the IMX335 streamed beside an IMX219 (2026-11-23,
+        // evidence/2026-11-23-trixie-upgrade, D1/D3-D4). Installed by hand
+        // there, so the agent's own install of this target is ⚠️ not yet run.
+        {
+          os: 'trixie',
+          arch: 'arm64',
+          packages: [
+            {
+              name: 'libcamera0.8',
+              version: '0.8.0+rpt20261106-2',
+              url: `${ARDUCAM_RELEASES}/libcamera-v0.0.5/libcamera0.8_0.8.0+rpt20261106-2_arm64.deb`,
+              sha256: '8f591a09c3faf866821eb421c4f601a1ff9029ff36baa8aeb32de3467b7728eb',
+              bytes: 591404,
+            },
+            {
+              name: 'libcamera-ipa',
+              version: '0.8.0+rpt20261106-2',
+              url: `${ARDUCAM_RELEASES}/libcamera-v0.0.5/libcamera-ipa_0.8.0+rpt20261106-2_arm64.deb`,
+              sha256: '5145f1961c195f1bf782e7f1233afb605c1afe97ceae79888ec5557ddfd26ccc',
+              bytes: 659076,
             },
           ],
         },
