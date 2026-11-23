@@ -37,7 +37,7 @@ const ARTIFACT = join(__dirname, '..', 'src', 'camera-catalog', 'camera-catalog.
  */
 const PINNED = {
   catalogVersion: 4,
-  sha256: '99b8d5e948b0802d2877f281695263ce399fdf66cfa0266876a08ea9a4dbf5e4',
+  sha256: 'd65cde662c5f0b0eeb541c5e79e9559060285af795bc224c916214145b833ffc',
 };
 
 /** Catalog 3 (backend e4a6a28), the last Bookworm-only catalog. */
@@ -62,19 +62,6 @@ function mutated(edit: (draft: any) => void): unknown {
   edit(draft);
   return draft;
 }
-
-/** A planned entry for the schema cases (the shipped catalog has none since v4). */
-const PLANNED_FIXTURE = {
-  id: 'imx678',
-  label: 'Sony IMX678',
-  tier: 'planned',
-  requires: { os: ['trixie'] },
-  notes: ['Not available yet.'],
-};
-const withPlanned = (edit: (draft: any) => void) => (c: any) => {
-  c.planned.push(JSON.parse(JSON.stringify(PLANNED_FIXTURE)));
-  edit(c);
-};
 
 function refusal(edit: (draft: any) => void): string {
   const parsed = cameraCatalogSchema.safeParse(mutated(edit));
@@ -163,7 +150,7 @@ describe('the shared catalog object', () => {
     expect(() => (cameraSensor('imx290') as any).libcameraNames.push('imx708')).toThrow(TypeError);
     // Nothing moved, and validation still answers from the original data.
     expect(serializeCameraCatalog(CAMERA_CATALOG)).toBe(before);
-    expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335', 'imx662']);
+    expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
     expect(cameraSensor('evil')).toBeUndefined();
     expect(cameraPresetSupport('imx335', '1080p30-4mbps').supported).toBe(false);
   });
@@ -178,20 +165,40 @@ describe('the shared catalog object', () => {
 });
 
 describe('catalog entries (the measured facts, PROGRESS.md)', () => {
-  it('lists the sensors in order; nothing is planned since catalog 4', () => {
-    expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335', 'imx662']);
-    expect(CAMERA_CATALOG.planned).toEqual([]);
-    expect(plannedCameraSensor('imx662')).toBeUndefined();
+  it('lists the v1 sensors in order, and imx662 only as planned', () => {
+    expect(SELECTABLE_SENSOR_IDS).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
+    expect(CAMERA_CATALOG.planned.map((s) => s.id)).toEqual(['imx662']);
+    expect(cameraSensor('imx662')).toBeUndefined();
+    // Dropped 2026-11-23 (the one board tried never answered on I2C); what was
+    // learned is in its notes, the only free field a planned entry has.
+    expect(plannedCameraSensor('imx662')).toEqual({
+      id: 'imx662',
+      label: 'Sony IMX662',
+      tier: 'planned',
+      requires: { os: ['trixie'] },
+      notes: [
+        'Not available. The one board tried did not answer on its I2C bus, so nothing ' +
+          'about this sensor has been verified.',
+        'It would need Debian Trixie with kernel 6.18.60 or later. Its overlay is imx662; ' +
+          'the device-tree node is starvis2, and the default rotation is 180 (read in the ' +
+          'device tree).',
+      ],
+    });
   });
 
-  it('the four Bookworm sensors also run on Trixie; the imx662 runs only there', () => {
+  it('every sensor needs only the first catalog-aware agent (0.2.0)', () => {
+    // Nothing in catalog 4 needs a newer agent: it adds an OS release and a
+    // package target, which the released 0.2.0 parser already reads.
+    for (const s of CAMERA_CATALOG.sensors) expect(s.minAgent, s.id).toBe('0.2.0');
+  });
+
+  it('the four sensors run on Bookworm and on Trixie', () => {
     const os = Object.fromEntries(CAMERA_CATALOG.sensors.map((s) => [s.id, s.requires.os]));
     expect(os).toEqual({
       imx290: ['bookworm', 'trixie'],
       imx219: ['bookworm', 'trixie'],
       imx708: ['bookworm', 'trixie'],
       imx335: ['bookworm', 'trixie'],
-      imx662: ['trixie'],
     });
   });
 
@@ -285,49 +292,6 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     expect(s.notes.join(' ')).toContain('Mount the camera the right way up');
   });
 
-  it('imx662: Trixie only, starvis2 node, chip id, can flip, clock frequency, no packages', () => {
-    const s = cameraSensor('imx662')!;
-    expect(s.label).toBe('Sony IMX662');
-    expect(s.tier).toBe('supported');
-    // Newer than every other entry: the released 0.2.0 compiles catalog 3 in.
-    expect(s.minAgent).toBe('0.2.1');
-    for (const other of CAMERA_CATALOG.sensors.filter((x) => x.id !== 'imx662')) {
-      expect(other.minAgent, other.id).toBe('0.2.0');
-    }
-    // ⚠️ 180 is the dtsi's value (the README says 0); awaits a bench.
-    expect(s.overlay).toEqual({
-      name: 'imx662',
-      fixedParams: [],
-      defaultRotation: 180,
-      canFlip: true,
-    });
-    expect(s.options).toEqual([
-      expect.objectContaining({
-        key: 'clockFrequency',
-        param: 'clock-frequency',
-        unit: 'Hz',
-        values: [24000000, 27000000, 37125000, 72000000, 74250000],
-        default: 24000000,
-      }),
-    ]);
-    // The name libcamera lists is the variant; the device-tree node is the family.
-    expect(s.libcameraNames).toEqual(['imx662']);
-    expect(s.dtNodeNames).toEqual(['starvis2']);
-    expect(s.identity).toBe('chip-id');
-    expect(s.source.props).toEqual([]);
-    expect(s.requires).toEqual({ os: ['trixie'], packageSet: null });
-    expect(s.unsupportedPresets).toEqual([]);
-    expect(s.info).toEqual({
-      nativeAspect: '16:9',
-      fullModeMaxFps: null,
-      sensorWidthPercent: { p720: null, p1080: null },
-      sensorHeightPercent: { p720: null, p1080: null },
-    });
-    // The minimum kernel and libcamera have no field: the note carries them.
-    expect(s.notes[0]).toContain('kernel 6.18.60 or later');
-    expect(s.notes[0]).toContain('libcamera 0.8.0 or later');
-  });
-
   it('imx335 cannot run 1080p30; every other sensor runs all five presets', () => {
     const limited = CAMERA_CATALOG.sensors.filter((s) => s.unsupportedPresets.length > 0);
     expect(limited.map((s) => s.id)).toEqual(['imx335']);
@@ -405,7 +369,7 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     }
   });
 
-  it('catalog 4 is catalog 3 plus additions: every existing value is byte-identical', () => {
+  it('catalog 4 is catalog 3 plus Trixie: every other value is byte-identical', () => {
     // Undo exactly the catalog-4 additions on the emitted artifact, re-emit it
     // the generator's way, and the bytes must be catalog 3's. So nothing that
     // a Bookworm device (or a console) read in catalog 3 changed.
@@ -413,19 +377,10 @@ describe('catalog entries (the measured facts, PROGRESS.md)', () => {
     const back = JSON.parse(JSON.stringify(v4));
     back.catalogVersion = 3;
     for (const s of back.sensors) s.requires.os = s.requires.os.filter((o: string) => o !== 'trixie');
-    const imx662 = back.sensors.pop();
-    expect(imx662.id).toBe('imx662');
-    expect(back.sensors.map((s: any) => s.id)).toEqual(['imx290', 'imx219', 'imx708', 'imx335']);
-    // Catalog 3 announced it as planned, verbatim.
-    back.planned = [
-      {
-        id: 'imx662',
-        label: 'Sony IMX662',
-        tier: 'planned',
-        requires: { os: ['trixie'] },
-        notes: ['Not available yet. It needs a device image built on Debian Trixie.'],
-      },
-    ];
+    // The one revised value: the planned imx662's notes (what the bench
+    // learned); its id, label, tier and OS are catalog 3's.
+    expect(back.planned.map((p: any) => p.id)).toEqual(['imx662']);
+    back.planned[0].notes = ['Not available yet. It needs a device image built on Debian Trixie.'];
     const set = back.packageSets[0];
     expect(set.notes.pop()).toMatch(/^On Debian Trixie the pair is libcamera0\.8/);
     expect(set.targets.pop().os).toBe('trixie');
@@ -458,18 +413,12 @@ describe('catalog lookups', () => {
     expect(cameraSensorByDtNode('/base/soc/i2c0mux/i2c@0/ov5647@36')).toBeUndefined();
   });
 
-  it('finds the imx662 by its starvis2 node, never by an imx662 node', () => {
-    expect(cameraSensor('imx662')?.id).toBe('imx662');
-    expect(cameraSensorByOverlay('imx662')?.id).toBe('imx662');
-    expect(cameraSensorByLibcameraName('imx662')?.id).toBe('imx662');
-    expect(cameraSensorByDtNode('starvis2@1a')?.id).toBe('imx662');
-    expect(
-      cameraSensorByDtNode('/base/axi/pcie@1000120000/rp1/i2c@88000/starvis2@1a')?.id,
-    ).toBe('imx662');
-    // The driver's device-tree node is never named after the variant.
+  it('never returns a planned sensor from a selectable lookup', () => {
+    expect(cameraSensor('imx662')).toBeUndefined();
+    expect(cameraSensorByOverlay('imx662')).toBeUndefined();
+    expect(cameraSensorByLibcameraName('imx662')).toBeUndefined();
     expect(cameraSensorByDtNode('imx662@1a')).toBeUndefined();
-    // The family's overlay is not a catalog overlay.
-    expect(cameraSensorByOverlay('starvis2')).toBeUndefined();
+    expect(cameraSensorByDtNode('starvis2@1a')).toBeUndefined();
     expect(cameraPackageSet('nope')).toBeUndefined();
   });
 });
@@ -496,13 +445,13 @@ describe('cameraPresetSupport', () => {
     for (const preset of ['1080p15-2mbps', '720p30-2mbps', '720p15-2mbps', '720p15-1mbps']) {
       expect(cameraPresetSupport('imx335', preset), preset).toEqual({ supported: true });
     }
-    for (const id of ['imx290', 'imx219', 'imx708', 'imx662']) {
+    for (const id of ['imx290', 'imx219', 'imx708']) {
       expect(cameraPresetSupport(id, '1080p30-4mbps'), id).toEqual({ supported: true });
     }
   });
 
   it('fails closed on a sensor that is not selectable or a name that is not a preset', () => {
-    for (const id of ['imx678', 'none', 'imx477', '', 'IMX335']) {
+    for (const id of ['imx662', 'none', 'imx477', '', 'IMX335']) {
       expect(cameraPresetSupport(id, '720p15-1mbps'), id).toEqual({
         supported: false,
         reason: `"${id}" is not a selectable camera sensor`,
@@ -584,15 +533,9 @@ describe('catalog schema (what an entry may not be)', () => {
 
   it('refuses the reserved id and a duplicate id, across both lists', () => {
     expect(refusal((c) => (c.sensors[0].id = 'none'))).toMatch(/reserved/);
-    expect(refusal(withPlanned(() => {}))).toBe('');
-    expect(refusal(withPlanned((c) => (c.planned[0].id = 'none')))).toMatch(/reserved/);
+    expect(refusal((c) => (c.planned[0].id = 'none'))).toMatch(/reserved/);
     expect(refusal((c) => (c.sensors[1].id = 'imx290'))).toMatch(/duplicate sensor id "imx290"/);
-    expect(refusal(withPlanned((c) => (c.planned[0].id = 'imx708')))).toMatch(
-      /duplicate sensor id "imx708"/,
-    );
-    expect(refusal(withPlanned((c) => (c.planned[0].id = 'imx662')))).toMatch(
-      /duplicate sensor id "imx662"/,
-    );
+    expect(refusal((c) => (c.planned[0].id = 'imx708'))).toMatch(/duplicate sensor id "imx708"/);
   });
 
   it('refuses an unknown key anywhere (a typo must not ship as a silent no-op)', () => {
@@ -867,8 +810,8 @@ describe('catalog schema (what an entry may not be)', () => {
       ['option description', (c, t) => (c.sensors[0].options[0].description = t)],
       ['option unit', (c, t) => (c.sensors[0].options[0].unit = t)],
       ['preset reason', (c, t) => (c.sensors[3].unsupportedPresets[0].reason = t)],
-      ['planned label', (c, t) => withPlanned((d) => (d.planned[0].label = t))(c)],
-      ['planned note', (c, t) => withPlanned((d) => (d.planned[0].notes[0] = t))(c)],
+      ['planned label', (c, t) => (c.planned[0].label = t)],
+      ['planned note', (c, t) => (c.planned[0].notes[0] = t)],
       ['package set label', (c, t) => (c.packageSets[0].label = t)],
       ['package set note', (c, t) => (c.packageSets[0].notes[0] = t)],
       ['generatedBy', (c, t) => (c.generatedBy = t)],

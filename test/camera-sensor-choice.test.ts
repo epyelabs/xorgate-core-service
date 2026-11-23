@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
   CAMERA_CATALOG,
@@ -78,7 +78,7 @@ describe('validateSensorChoice', () => {
       {
         path: ['sensor'],
         message:
-          '"imx477" is not a known camera sensor (known: imx290, imx219, imx708, imx335, imx662)',
+          '"imx477" is not a known camera sensor (known: imx290, imx219, imx708, imx335)',
       },
     ]);
     // Ids are exact: no case folding, no trimming, no overlay-family guessing.
@@ -87,68 +87,13 @@ describe('validateSensorChoice', () => {
     }
   });
 
-  it('says a planned sensor is planned, and what it is waiting for', async () => {
-    // The shipped catalog has no planned entry since version 4 (the IMX662
-    // became a sensor), so the branch is exercised on a catalog that has one.
-    vi.resetModules();
-    vi.doMock('../src/camera-catalog/data', async (importOriginal) => {
-      const real = await importOriginal<typeof import('../src/camera-catalog/data')>();
-      return {
-        ...real,
-        CAMERA_CATALOG_SOURCE: {
-          ...real.CAMERA_CATALOG_SOURCE,
-          planned: [
-            {
-              id: 'imx678',
-              label: 'Sony IMX678',
-              tier: 'planned',
-              requires: { os: ['trixie'] },
-              notes: ['Not available yet.'],
-            },
-          ],
-        },
-      };
-    });
-    try {
-      const mocked = await import('../src/camera-catalog/sensor-choice');
-      const first = (v: unknown) => {
-        const out = mocked.validateSensorChoice(v);
-        return 'issues' in out ? mocked.formatSensorChoiceIssue(out.issues[0]) : '';
-      };
-      expect(first({ sensor: 'imx678' })).toBe(
-        'camera.sensor: "imx678" (Sony IMX678) is planned and cannot be selected yet ' +
-          '(it needs a device image on Debian trixie); available: imx290, imx219, imx708, ' +
-          'imx335, imx662',
-      );
-      // Options do not change that.
-      expect(first({ sensor: 'imx678', options: {} })).toContain('is planned');
-    } finally {
-      vi.doUnmock('../src/camera-catalog/data');
-      vi.resetModules();
-    }
-  });
-
-  it('accepts the imx662 (catalog 4) with and without its clock frequency', () => {
-    expect(check({ sensor: 'imx662' })).toEqual({ value: { sensor: 'imx662' } });
-    for (const hz of [24000000, 27000000, 37125000, 72000000, 74250000]) {
-      expect(check({ sensor: 'imx662', options: { clockFrequency: hz } }), String(hz)).toEqual({
-        value: { sensor: 'imx662', options: { clockFrequency: hz } },
-      });
-    }
-    expect(resolveSensorOptions({ sensor: 'imx662' })).toEqual({ clockFrequency: 24000000 });
-    // A clock the overlay does not list: refused in the same sentence as
-    // every other option value.
-    expect(issuesOf({ sensor: 'imx662', options: { clockFrequency: 25000000 } })).toEqual([
-      {
-        path: ['options', 'clockFrequency'],
-        message:
-          'must be one of 24000000, 27000000, 37125000, 72000000, 74250000 Hz (got 25000000)',
-      },
-    ]);
-    // It has no 4lane or link-frequency option in catalog 4.
-    expect(errorOf({ sensor: 'imx662', options: { linkFrequency: 594000000 } })).toBe(
-      'camera.options: imx662 has no option "linkFrequency" (its options: clockFrequency)',
+  it('says a planned sensor is planned, and what it is waiting for', () => {
+    expect(errorOf({ sensor: 'imx662' })).toBe(
+      'camera.sensor: "imx662" (Sony IMX662) is planned and cannot be selected yet ' +
+        '(it needs a device image on Debian trixie); available: imx290, imx219, imx708, imx335',
     );
+    // Options do not change that.
+    expect(errorOf({ sensor: 'imx662', options: {} })).toContain('is planned');
   });
 
   it('does not accept the reserved "none": the namespace handles an empty port itself', () => {
@@ -160,7 +105,7 @@ describe('validateSensorChoice', () => {
   it('requires a sensor, as a string', () => {
     for (const v of [{}, { options: {} }, { sensor: '' }, { sensor: null }, { sensor: 290 }]) {
       expect(errorOf(v), JSON.stringify(v)).toBe(
-        'camera.sensor: required, one of: imx290, imx219, imx708, imx335, imx662',
+        'camera.sensor: required, one of: imx290, imx219, imx708, imx335',
       );
     }
     expect(errorOf({ sensor: ['imx290'] })).toContain('camera.sensor: required');
@@ -366,7 +311,7 @@ describe('validateSensorChoice', () => {
     ).toBe('');
     expect(firstError({ cameras: { cam0: { sensor: 'imx477' } } })).toBe(
       'cameraSensors.cameras.cam0.sensor: "imx477" is not a known camera sensor ' +
-        '(known: imx290, imx219, imx708, imx335, imx662)',
+        '(known: imx290, imx219, imx708, imx335)',
     );
     expect(
       firstError({ cameras: { cam1: { sensor: 'imx290', options: { clockFrequency: 5 } } } }),
@@ -398,7 +343,7 @@ describe('resolveSensorOptions', () => {
   });
 
   it('returns null for a sensor that is not selectable', () => {
-    expect(resolveSensorOptions({ sensor: 'imx678' })).toBeNull();
+    expect(resolveSensorOptions({ sensor: 'imx662' })).toBeNull();
     expect(resolveSensorOptions({ sensor: 'none' })).toBeNull();
   });
 

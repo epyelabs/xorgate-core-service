@@ -1,5 +1,6 @@
 import {
   CAMERA_CATALOG_SCHEMA_VERSION,
+  PLANNED_TIER,
   type CameraCatalogInput,
 } from './schema';
 
@@ -47,18 +48,6 @@ export const CAMERA_CATALOG_VERSION = 4;
  * first catalog-aware build is tagged.
  */
 const FIRST_CATALOG_AGENT_VERSION = '0.2.0';
-
-/**
- * First Rust agent version whose compiled-in catalog is version 4 (the first
- * to know the IMX662). The released 0.2.0 carries catalog 3: handed `imx662`
- * it refuses the port (`unknown-sensor`) and leaves config.txt alone.
- *
- * ⚠️ WORKING VALUE: the smallest version after 0.2.0. Release tags are the
- * owner's; this must equal the first tagged build that vendors catalog 4, so
- * move it if that tag is not 0.2.1. The console disables the IMX662 for a
- * device that reports a lower release; nothing else reads it.
- */
-const CATALOG_V4_AGENT_VERSION = '0.2.1';
 
 const ARDUCAM_RELEASES =
   'https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download';
@@ -301,100 +290,39 @@ export const CAMERA_CATALOG_SOURCE: CameraCatalogInput = {
           'Mount the camera the right way up; turning the picture in software is not offered.',
       ],
     },
+  ],
 
-    // ── IMX662 ──────────────────────────────────────────────────────────────
-    // Sony STARVIS 2, 2 MP. Was the one `planned` entry until catalog 4.
-    //
-    // ⚠️ NOT YET ON A BENCH. Every value below was READ from the shipped
-    // Trixie packages (`linux-image-6.18.60+rpt-rpi-2712`, its overlay README,
-    // and `libcamera-ipa_0.8.0+rpt20261104-1`) and from the overlay and
-    // driver sources on `rpi-6.18.y` (phase-6/research-trixie.md §3), and the
-    // driver, both overlays and the tuning file were seen present on bench 2
-    // after its Trixie upgrade (evidence/2026-11-23-trixie-upgrade, C4). No
-    // IMX662 has been attached yet.
-    //
-    // Bookworm (kernel 6.12) has no driver, overlay or helper at all. The
-    // driver (`sony-starvis2`, raspberrypi/linux PR #7615) is first packaged
-    // in kernel 6.18.60; the 2026-10-06 Trixie Lite image ships 6.18.50,
-    // which lacks it. libcamera carries the helper and the tuning for both
-    // pipelines (CM5 `pisp`, CM4 `vc4`) from 0.8.0 (and in 0.7.2+rpt builds
-    // from 2026-08). The catalog cannot express a minimum kernel or libcamera
-    // version, so the first note says it; a device on an older kernel shows
-    // the camera as not detected.
+  planned: [
+    // Back here in catalog 4 (revision 2): the plan owner dropped it
+    // 2026-11-23 after the one board tried never answered on I2C ("SDA stuck
+    // at low" on every boot, at every clock value, connection re-checked).
+    // A planned entry has no overlay facts, so what was learned lives in the
+    // notes and here:
+    //   - Bookworm (kernel 6.12) has no driver, overlay or helper. The driver
+    //     (`sony-starvis2`) is first packaged in kernel 6.18.60 (Trixie);
+    //     libcamera 0.8.0 carries the helper and tuning (pisp and vc4).
+    //   - Line `dtoverlay=imx662,<port>`; `imx662-overlay.dts` includes
+    //     `starvis2-overlay.dts`, so the device-tree node is `starvis2@1a`.
+    //   - Default rotation 180, read in the live device tree on bench 2
+    //     (the overlay README says 0; the dtsi's 180 is right).
+    //   - Overlay `clock-frequency` 24 MHz default (27, 37.125, 72, 74.25
+    //     listed), `4lane` flag; the driver checks a real chip ID.
+    //   - Nothing above was seen streaming: the board was electrically silent.
+    // Evidence: plans/support-other-camera-models/phase-6/.
     {
       id: 'imx662',
       label: 'Sony IMX662',
-      tier: 'supported',
-      minAgent: CATALOG_V4_AGENT_VERSION,
-      overlay: {
-        // `imx662-overlay.dts` is a one-line include of `starvis2-overlay.dts`.
-        name: 'imx662',
-        fixedParams: [],
-        // ⚠️ AWAITS A HARDWARE CHECK. `starvis2.dtsi` sets `rotation = <180>`;
-        // the overlay README says 0. The same disagreement existed for the
-        // IMX335, where the dtsi was right (measured), so 180 here. The
-        // agent always writes `rotation=` explicitly, so a wrong value here
-        // turns the picture the wrong way, it breaks nothing else.
-        defaultRotation: 180,
-        // The driver has both the horizontal and the vertical flip control.
-        canFlip: true,
-      },
-      options: [
-        {
-          key: 'clockFrequency',
-          label: 'Clock frequency',
-          description:
-            'Frequency of the crystal on the camera board. The overlay default is 24 MHz; ' +
-            'check the board vendor for others. The sensor cannot report it, and the driver ' +
-            'refuses a rate it does not support.',
-          param: 'clock-frequency',
-          unit: 'Hz',
-          // 24 MHz: the overlay default. Every value READ, NOT EXERCISED (the
-          // overlay README lists all five; no IMX662 has been on a bench).
-          values: [24000000, 27000000, 37125000, 72000000, 74250000],
-          default: 24000000,
-        },
-      ],
-      // The overlay's `4lane` flag is left out: an option here is an integer
-      // parameter (`<param>=<value>`), and the catalog has no flag kind. Its
-      // `link-frequency` (README 445.5 MHz, dtsi 594 MHz: they disagree) is
-      // left out until a bench needs it.
-      //
-      // The driver names the subdevice after the variant, so libcamera lists
-      // `imx662`; the device-tree NODE is `starvis2@1a`, not `imx662@1a`.
-      // (If another STARVIS 2 sensor served by the same driver becomes an
-      // entry, the "one owner per node name" rule in the schema has to admit
-      // a shared node name.)
-      libcameraNames: ['imx662'],
-      dtNodeNames: ['starvis2'],
-      // The probe reads a real chip ID (register 0x4d1c, mask 0x3ff, value
-      // 0x296; colour or mono detected) and fails with "No Starvis2 camera
-      // found" on anything else.
-      identity: 'chip-id',
-      source: { props: [] },
-      requires: { os: ['trixie'], packageSet: null },
-      // As for the IMX290, the other 1920x1080-class sensor: no preset is
-      // known not to run. ⚠️ Not measured.
-      unsupportedPresets: [],
-      info: {
-        nativeAspect: '16:9', // 1936x1096 active
-        fullModeMaxFps: null, // not recorded
-        sensorWidthPercent: { p720: null, p1080: null }, // not measured
-        sensorHeightPercent: { p720: null, p1080: null }, // not measured
-      },
+      tier: PLANNED_TIER,
+      requires: { os: ['trixie'] },
       notes: [
-        'Needs Debian Trixie with kernel 6.18.60 or later and libcamera 0.8.0 or later: run ' +
-          'sudo apt full-upgrade on the device first. On an older kernel the camera is not ' +
-          'detected.',
-        'Not yet tested on a bench by xorgate. The driver and the tuning files ship with ' +
-          'Raspberry Pi OS for both the CM5 and the CM4.',
+        'Not available. The one board tried did not answer on its I2C bus, so nothing ' +
+          'about this sensor has been verified.',
+        'It would need Debian Trixie with kernel 6.18.60 or later. Its overlay is imx662; ' +
+          'the device-tree node is starvis2, and the default rotation is 180 (read in the ' +
+          'device tree).',
       ],
     },
   ],
-
-  // Empty since catalog 4 (the IMX662 became a sensor). The mechanism stays:
-  // the next announced sensor goes here.
-  planned: [],
 
   packageSets: [
     // Bench 2, 2026-11-21 (evidence/2026-11-21-bench2-arducam-libcamera):
