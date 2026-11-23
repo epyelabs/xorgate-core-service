@@ -202,6 +202,42 @@ describe('PATCH /devices/{id}/config { cameraSensors }: accepted devices', () =>
     expect(deviceHardwareBlock).toHaveBeenCalledWith(ID);
   });
 
+  it('the imx662 (catalog 4) is stored with or without its clock; the gate is per namespace, not per sensor', async () => {
+    // A device that reports agent v0.2.0 (catalog 3 compiled in) is still
+    // accepted: the backend gates on the capability only. That agent refuses
+    // the port itself (verdict `unknown-sensor`, config.txt left alone); the
+    // console disables the choice below the sensor's `minAgent`.
+    device = base({
+      reportedConfig: reported([...OLD_CAPS, 'camera.sensors']),
+      agentVersion: 'v0.2.0',
+    });
+    const value = {
+      cameraSensors: {
+        cameras: {
+          cam0: { sensor: 'imx662' },
+          cam1: { sensor: 'imx662', options: { clockFrequency: 74250000 } },
+        },
+      },
+    };
+    const r = await patch(value);
+    expect(r.status).toBe(200);
+    expect(writes[0].config).toEqual({ gnssAntBias: true, ...value });
+    expect(publishDeviceConfig).toHaveBeenCalledWith(ID, { gnssAntBias: true, ...value }, 4);
+  });
+
+  it('an imx662 clock the overlay does not list → 400 in the option-value sentence', async () => {
+    device = base({});
+    const r = await patch({
+      cameraSensors: { cameras: { cam0: { sensor: 'imx662', options: { clockFrequency: 37125001 } } } },
+    });
+    expect(r.status).toBe(400);
+    expect(r.body.error.message).toBe(
+      'cameraSensors.cameras.cam0.options.clockFrequency: must be one of 24000000, 27000000, ' +
+        '37125000, 72000000, 74250000 Hz (got 37125001)',
+    );
+    expect(writes).toHaveLength(0);
+  });
+
   it('a port the model does not declare → 400 naming the port and the ports there are', async () => {
     device = base({});
     const r = await patch({ cameraSensors: { cameras: { cam2: { sensor: 'imx219' } } } });
@@ -274,7 +310,7 @@ describe('PATCH /devices/{id}/config { cameraSensors }: accepted devices', () =>
     expect(r.status).toBe(400);
     expect(r.body.error.message).toBe(
       'cameraSensors.cameras.cam0.sensor: "imx477" is not a known camera sensor ' +
-        '(known: imx290, imx219, imx708, imx335); or "none" for a port with no camera',
+        '(known: imx290, imx219, imx708, imx335, imx662); or "none" for a port with no camera',
     );
     expect(writes).toHaveLength(0);
   });

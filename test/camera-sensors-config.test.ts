@@ -43,7 +43,7 @@ const errorOf = (v: unknown): string => {
 };
 const cams = (cameras: unknown) => ({ cameras });
 
-const KNOWN = 'imx290, imx219, imx708, imx335';
+const KNOWN = 'imx290, imx219, imx708, imx335, imx662';
 
 describe('cameraSensors: registration in the registry', () => {
   it('is the LAST namespace, so no existing published key moves', () => {
@@ -114,6 +114,21 @@ describe('cameraSensors: accepted values', () => {
     }
   });
 
+  it('accepts the imx662 (catalog 4) with and without its clock frequency', () => {
+    const bare = cams({ cam0: { sensor: 'imx662' } });
+    expect(parse(bare)).toEqual({ value: bare });
+    const clocked = cams({
+      cam0: { sensor: 'imx662', options: { clockFrequency: 37125000 } },
+      cam1: { sensor: 'imx219' },
+    });
+    expect(parse(clocked)).toEqual({ value: clocked });
+    // The overlay default, set explicitly, is kept as sent.
+    const atDefault = cams({ cam1: { sensor: 'imx662', options: { clockFrequency: 24000000 } } });
+    expect(parse(atDefault)).toEqual({ value: atDefault });
+    // An empty options object is dropped, as for every sensor.
+    expect(parse(cams({ cam0: { sensor: 'imx662', options: {} } }))).toEqual({ value: bare });
+  });
+
   it('accepts "none": a port declared empty', () => {
     const v = cams({ cam0: { sensor: 'imx219' }, cam1: { sensor: 'none' } });
     expect(parse(v)).toEqual({ value: v });
@@ -156,11 +171,15 @@ describe('cameraSensors: refused values, each naming the port and what is allowe
     );
   });
 
-  it('a planned sensor that cannot be selected yet', () => {
-    const e = errorOf(cams({ cam1: { sensor: 'imx662' } }));
-    expect(e).toContain('cameraSensors.cameras.cam1.sensor: "imx662"');
-    expect(e).toContain('is planned and cannot be selected yet');
-    expect(e).toContain(`available: ${KNOWN}`);
+  it('an imx662 clock frequency the overlay does not list', () => {
+    // Catalog 4. The same sentence as every other option value refusal.
+    expect(errorOf(cams({ cam0: { sensor: 'imx662', options: { clockFrequency: 25000000 } } }))).toBe(
+      'cameraSensors.cameras.cam0.options.clockFrequency: must be one of 24000000, 27000000, ' +
+        '37125000, 72000000, 74250000 Hz (got 25000000)',
+    );
+    expect(
+      errorOf(cams({ cam1: { sensor: 'imx662', options: { clockFrequency: 1 } } })),
+    ).toMatch(/^cameraSensors\.cameras\.cam1\.options\.clockFrequency: must be one of /);
   });
 
   it('a sensor that is not an id at all', () => {
@@ -412,7 +431,15 @@ describe('cameraSensors: who may hold it (cameraSensorsEligibility)', () => {
     expect(CAMERA_SENSORS_CAPABILITY).toBe('camera.sensors');
     // The lowest `minAgent` of the catalog: the working value until the release.
     expect(CAMERA_SENSORS_MIN_AGENT).toBe('0.2.0');
-    expect(CAMERA_CATALOG.sensors.every((s) => s.minAgent === '0.2.0')).toBe(true);
+    // Every sensor but the imx662 (catalog 4, first in the build after 0.2.0),
+    // which does not move the namespace's own minimum.
+    expect(Object.fromEntries(CAMERA_CATALOG.sensors.map((s) => [s.id, s.minAgent]))).toEqual({
+      imx290: '0.2.0',
+      imx219: '0.2.0',
+      imx708: '0.2.0',
+      imx335: '0.2.0',
+      imx662: '0.2.1',
+    });
     expect(CAMERA_SENSORS_ONLY_NAMESPACES).toEqual(['cameraSensors']);
   });
 
@@ -760,8 +787,8 @@ describe('cameraSensors: the config contract', () => {
       readFileSync(join(__dirname, '..', 'src/config-registry/config-contract.json'), 'utf8'),
     );
     expect(committed.namespaces.cameraSensors).toEqual(JSON.parse(JSON.stringify(entry)));
-    // The catalog artifact is pinned by content in camera-catalog.test.ts; a
-    // new NAMESPACE must not have touched it.
-    expect(CAMERA_CATALOG.catalogVersion).toBe(3);
+    // The catalog artifact is pinned by content in camera-catalog.test.ts, and
+    // a catalog change (version 4 added a sensor) must not move the contract.
+    expect(CAMERA_CATALOG.catalogVersion).toBe(4);
   });
 });
